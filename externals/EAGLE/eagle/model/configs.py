@@ -93,9 +93,13 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
+        draft_vocab_size=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
+        # Newer Qwen3 EAGLE3 checkpoints omit this field because the draft
+        # and target vocabularies are identical.
+        self.draft_vocab_size = vocab_size if draft_vocab_size is None else draft_vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
