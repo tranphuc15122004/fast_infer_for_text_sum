@@ -1,0 +1,18 @@
+[project]
+name = "fast-infer-text-sum"
+version = "0.1.0"
+description = "Training and evaluation workspace for speculative decoding"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    "specforge",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+specforge = {
+    path = "externals/SpecForge",
+    editable = true
+}
