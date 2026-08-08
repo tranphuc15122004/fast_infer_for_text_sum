@@ -206,6 +206,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            return_stats=False,
 
     ):
         if is_llama3:
@@ -246,6 +247,12 @@ class EaModel(nn.Module):
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
+        # Match DFlash's decode-only timing: prefill and initial draft
+        # construction are excluded from the measured interval.
+        if return_stats:
+            torch.cuda.synchronize()
+            decode_start = time.perf_counter()
+        acceptance_lengths = []
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -270,6 +277,10 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            # EAGLE's update step emits the accepted draft path plus one
+            # target token, which is the same convention used by DFlash.
+            if return_stats:
+                acceptance_lengths.append(int(accept_length) + 1)
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
@@ -297,8 +308,20 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        if return_stats:
+            torch.cuda.synchronize()
+            decode_time = time.perf_counter() - decode_start
+
+        # A speculative step can overshoot max_new_tokens.  For benchmark
+        # statistics, report the actually returned sequence length, as DFlash
+        # does after truncation. Preserve the legacy return path otherwise.
+        if return_stats:
+            input_ids = input_ids[:, :input_len + max_new_tokens]
+            new_token = input_ids.shape[1] - input_len
         if not log:
             return input_ids
+        if return_stats:
+            return input_ids, new_token, idx, decode_time, acceptance_lengths
         else:
             return input_ids, new_token, idx
 
@@ -313,6 +336,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            return_stats=False,
 
     ):
         if is_llama3:
@@ -350,6 +374,11 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        # Exclude prefill from decoding latency, matching DFlash's
+        # time_per_output_token measurement.
+        if return_stats:
+            torch.cuda.synchronize()
+            decode_start = time.perf_counter()
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -374,8 +403,17 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        if return_stats:
+            torch.cuda.synchronize()
+            decode_time = time.perf_counter() - decode_start
+
+        if return_stats:
+            input_ids = input_ids[:, :input_len + max_new_tokens]
+            new_token = input_ids.shape[1] - input_len
         if not log:
             return input_ids
+        if return_stats:
+            return input_ids, new_token, idx, decode_time
         else:
             return input_ids, new_token, idx
 

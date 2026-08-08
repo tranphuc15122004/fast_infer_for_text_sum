@@ -79,15 +79,22 @@ PY
 
 export PYTHONPATH="$ROOT/externals/EAGLE${PYTHONPATH:+:$PYTHONPATH}"
 
+NAIVE_ARGS=()
+if [[ "${SKIP_NAIVE:-0}" == "1" ]]; then
+  NAIVE_ARGS+=(--skip-naive)
+fi
+
 exec uv run --project "$ROOT" --locked python "$ROOT/scripts/eagle3_infer_qwen3.py" \
   --base-model "$BASE_MODEL" \
   --eagle-model "$EAGLE_MODEL" \
   --question-file "$QUESTION_FILE" \
   --question-begin "$QUESTION_BEGIN" \
   --question-end "$QUESTION_END" \
+  --num-choices "$NUM_CHOICES" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
   --total-token "$TOTAL_TOKEN" \
   --depth "$DEPTH" \
   --top-k "$TOP_K" \
   --temperature "$TEMPERATURE" \
+  "${NAIVE_ARGS[@]}" \
   --output "$OUTPUT_FILE"
