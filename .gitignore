@@ -11,7 +11,15 @@ dist/
 # Virtual environments
 .venv/
 venv/
-envs/
+
+# Env build dirs: only pyproject.toml + uv.lock (and README) are committed,
+# so the server can reproduce environments with `uv sync --locked`.
+envs/*
+!envs/README.md
+!envs/*/
+!envs/*/pyproject.toml
+!envs/*/uv.lock
+envs/*/.venv/
 
 # Test / lint caches
 .pytest_cache/
@@ -19,6 +27,9 @@ envs/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Benchmark outputs (smoke/verification artifacts)
+outputs/
 
 # IDE
 .vscode/

@@ -5,7 +5,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func, flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+except ImportError:
+    flash_attn_func = flash_attn_varlen_func = None
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama.modeling_llama import (

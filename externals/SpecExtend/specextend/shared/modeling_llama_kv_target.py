@@ -26,7 +26,10 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers import LlamaConfig
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = flash_attn_with_kvcache = None
 from shared.triton_tree_attn import tree_part_fwd_target
 
 logger = logging.get_logger(__name__)

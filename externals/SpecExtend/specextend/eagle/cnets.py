@@ -34,7 +34,10 @@ from transformers.activations import ACT2FN
 from shared.opt_tree import Tree
 from termcolor import colored
 
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(

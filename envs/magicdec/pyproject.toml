@@ -1,0 +1,41 @@
+# Env: MagicDec (transformers 4.36.2 + flashinfer wheel matching torch/CUDA)
+[project]
+name = "env-magicdec"
+version = "0.1.0"
+description = "Dependency env for MagicDec baseline"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.4.1",
+    "transformers==4.36.2",
+    "numpy==1.26.3",
+    "protobuf",
+    "sentencepiece",
+    "datasets==2.16.1",
+    "tiktoken",
+    "packaging",
+    "ninja",
+    "einops",
+    "safetensors",
+    "pyyaml",
+    "tqdm",
+    "flashinfer-python",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+# flashinfer wheels are published per torch+cuda; adjust URL if the resolved
+# torch version changes (https://flashinfer.ai/whl/{cu121|cu124|cu126}/torch2.4/)
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl/cu124/torch2.4/"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+flashinfer-python = { index = "flashinfer" }

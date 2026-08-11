@@ -41,6 +41,11 @@ if [[ ! -f "$EAGLE_MODEL/model.safetensors" && ! -f "$EAGLE_MODEL/pytorch_model.
 fi
 
 QUESTION_FILE="$ROOT/externals/EAGLE/eagle/data/$BENCH_NAME/question.jsonl"
+# Plug-and-play: set DATA_FILE in the env to point at your own jsonl.
+# Records must use the EAGLE chat format: {"id": N, "turns": ["user prompt"]}.
+if [[ -n "${DATA_FILE:-}" ]]; then
+  QUESTION_FILE="$DATA_FILE"
+fi
 if [[ ! -f "$QUESTION_FILE" ]]; then
   echo "Question file not found: $QUESTION_FILE" >&2
   exit 1

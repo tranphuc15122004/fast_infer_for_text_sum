@@ -28,7 +28,10 @@ from transformers.utils import (
 )
 from transformers import LlamaConfig
 
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
 logger = logging.get_logger(__name__)
 
