@@ -25,3 +25,5 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+
+*.egg-info/

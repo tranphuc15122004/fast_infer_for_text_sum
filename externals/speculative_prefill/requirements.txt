@@ -1,0 +1,10 @@
+torch==2.4.0
+transformers==4.50.2
+vllm==0.6.3.post1
+lm_eval==0.4.5
+datasets==2.21.0
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+rouge==1.0.1
+python-Levenshtein
+sentence-transformers

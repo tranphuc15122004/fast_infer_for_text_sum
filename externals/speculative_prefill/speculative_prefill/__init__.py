@@ -1,0 +1,1 @@
+from speculative_prefill.vllm_patch import enable_prefill_spec
