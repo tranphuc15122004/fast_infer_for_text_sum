@@ -40,6 +40,7 @@ ARGS=(
   --prefix-len "${PREFIX_LEN:-2048}"
   --max-len "${MAX_LEN:-2176}"
   --num-runs "${NUM_RUNS:-1}"
+  --window-size "${WINDOW_SIZE:-128}"
   --output "$OUTPUT_FILE"
 )
 [[ "${SELF_SPEC:-0}" == "1" ]] && ARGS+=(--self-spec --gamma "${GAMMA:-3}" --draft-budget "${DRAFT_BUDGET:-257}")

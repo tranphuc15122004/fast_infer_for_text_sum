@@ -264,7 +264,9 @@ def prepare_inputs_for_generation_llama(
         
         ##### for 4.45 compatibility
         if past_key_values.get_seq_length() == 0:
-            if isinstance(past_key_values.key_cache[0], list):
+            # key_cache is empty on the first generation step -> reset kv_seq_len
+            # (guard both empty cache and legacy list-of-tuples format).
+            if len(past_key_values.key_cache) == 0 or isinstance(past_key_values.key_cache[0], list):
                 for layer in self.model.layers:
                     layer.self_attn.kv_seq_len = 0
         
@@ -349,7 +351,9 @@ def prepare_inputs_for_generation_mistral(
 
         ##### for 4.45 compatibility
         if past_key_values.get_seq_length() == 0:
-            if isinstance(past_key_values.key_cache[0], list):
+            # key_cache is empty on the first generation step -> reset kv_seq_len
+            # (guard both empty cache and legacy list-of-tuples format).
+            if len(past_key_values.key_cache) == 0 or isinstance(past_key_values.key_cache[0], list):
                 for layer in self.model.layers:
                     layer.self_attn.kv_seq_len = 0
         # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens

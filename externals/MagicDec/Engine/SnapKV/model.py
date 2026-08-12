@@ -87,7 +87,7 @@ class KVCache(nn.Module):
             draft_shape = (draft_max_num_pages, 2, page_size, n_heads, head_dim)
             self.register_buffer('draft_cache', torch.zeros(draft_shape, dtype=dtype))
         
-    def update_target(self, k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen):
+    def update_target(self, k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets):
         torch.ops.mylib.update_kv(
             k,
             v,
@@ -96,10 +96,11 @@ class KVCache(nn.Module):
             kv_page_indices,
             kv_page_indptr,
             kv_page_lastlen,
+            offsets,
         )
         return self.kv_cache
     
-    def update_draft(self, k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen):
+    def update_draft(self, k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets):
         torch.ops.mylib.update_kv(
             k,
             v,
@@ -108,6 +109,7 @@ class KVCache(nn.Module):
             kv_page_indices,
             kv_page_indptr,
             kv_page_lastlen,
+            offsets,
         )
         return self.draft_cache
 
@@ -327,7 +329,7 @@ class Attention(nn.Module):
         k = k.view(bsz * seqlen, self.n_local_heads, self.head_dim)
         v = v.contiguous().view(bsz * seqlen, self.n_local_heads, self.head_dim)
         q, k = self.rope(q, k, kv_append_indptr, offsets)
-        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen)
+        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets)
         y = self.attn_decode(q, kv_cache)
         y = y.contiguous().view(bsz, seqlen, self.dim)
         y = self.wo(y)
@@ -343,8 +345,8 @@ class Attention(nn.Module):
         k = k.view(bsz * seqlen, self.n_local_heads, self.head_dim)
         v = v.contiguous().view(bsz * seqlen, self.n_local_heads, self.head_dim)
         q, k = self.rope(q, k, kv_append_indptr, offsets)
-        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen)
-        self.kv_cache.update_draft(k, v, kv_append_indptr, draft_kv_page_indices, draft_kv_page_indptr, draft_kv_page_lastlen)
+        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets)
+        self.kv_cache.update_draft(k, v, kv_append_indptr, draft_kv_page_indices, draft_kv_page_indptr, draft_kv_page_lastlen, offsets)
         y = self.attn_decode(q, kv_cache)
         y = y.contiguous().view(bsz, seqlen, self.dim)
         y = self.wo(y)
@@ -360,7 +362,7 @@ class Attention(nn.Module):
         k = k.view(bsz * seqlen, self.n_local_heads, self.head_dim)
         v = v.contiguous().view(bsz * seqlen, self.n_local_heads, self.head_dim)
         q, k = self.rope(q, k, kv_append_indptr, offsets)
-        kv_cache = self.kv_cache.update_draft(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen)
+        kv_cache = self.kv_cache.update_draft(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets)
         y = self.attn_draft(q, kv_cache)
         y = y.contiguous().view(bsz, seqlen, self.dim)
         y = self.wo(y)
@@ -376,7 +378,7 @@ class Attention(nn.Module):
         k = k.view(bsz * seqlen, self.n_local_heads, self.head_dim)
         v = v.contiguous().view(bsz * seqlen, self.n_local_heads, self.head_dim)
         q, k = self.rope(q, k, kv_append_indptr, offsets)
-        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen)
+        kv_cache = self.kv_cache.update_target(k, v, kv_append_indptr, kv_page_indices, kv_page_indptr, kv_page_lastlen, offsets)
         y = self.attn_prefill(q, kv_cache)
         if is_last and self.is_spec:
             self.gen_draft_kv(q, kv_cache[:, 0], kv_cache[:, 1], bsz, seqlen, offsets[0]+seqlen, (kv_append_indptr/seqlen*self.draft_budget).to(torch.int32), draft_paged_kv_indptr, draft_paged_kv_indices, draft_paged_kv_last_page_len)
@@ -436,7 +438,9 @@ class Attention(nn.Module):
         v_cur = value_states[:, :, -window_size:, :]
         new_key_states = torch.cat([k_past_compress, k_cur], dim = 2).transpose(1,2).contiguous().view(-1, self.n_local_heads, self.head_dim)
         new_value_states = torch.cat([v_past_compress, v_cur], dim = 2).transpose(1,2).contiguous().view(-1, self.n_local_heads, self.head_dim)
-        self.kv_cache.update_draft(new_key_states, new_value_states, kv_append_indptr, draft_paged_kv_indices, draft_paged_kv_indptr, draft_paged_kv_last_page_len)
+        # fresh draft cache: positions start at 0
+        draft_offsets = torch.zeros(bsz, dtype=torch.int32, device=new_key_states.device)
+        self.kv_cache.update_draft(new_key_states, new_value_states, kv_append_indptr, draft_paged_kv_indices, draft_paged_kv_indptr, draft_paged_kv_last_page_len, draft_offsets)
 
 
 

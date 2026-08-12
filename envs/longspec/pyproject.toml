@@ -16,6 +16,8 @@ dependencies = [
     "sentencepiece",
     "accelerate",
     "numpy<2",
+    "setuptools",
+    "wheel",
 ]
 
 [project.optional-dependencies]

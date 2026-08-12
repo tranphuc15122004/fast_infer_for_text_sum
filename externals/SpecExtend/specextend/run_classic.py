@@ -74,12 +74,12 @@ def main():
     args = parser.parse_args()
 
     base_model_map = {
-        "vicuna_7b":  "lmsys/vicuna-7b-v1.5-16k",
-        "longchat_7b": "lmsys/longchat-7b-16k",
+        "vicuna_7b":  os.environ.get("SPECEXTEND_BASE_MODEL", "lmsys/vicuna-7b-v1.5-16k"),
+        "longchat_7b": os.environ.get("SPECEXTEND_BASE_MODEL", "lmsys/longchat-7b-16k"),
     }
     draft_model_map = {
-        "vicuna_7b":  "double7/vicuna-68m",
-        "longchat_7b": "JackFram/llama-68m",
+        "vicuna_7b":  os.environ.get("SPECEXTEND_DRAFT_MODEL", "double7/vicuna-68m"),
+        "longchat_7b": os.environ.get("SPECEXTEND_DRAFT_MODEL", "JackFram/llama-68m"),
     }
 
     base_model_path  = base_model_map[args.model_name]

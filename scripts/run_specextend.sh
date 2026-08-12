@@ -25,6 +25,8 @@ ARGS=(
   --max-gen-len "${MAX_GEN_LEN:-64}"
   --output "$OUTPUT_FILE"
 )
+[[ -n "${BASE_MODEL:-}" ]] && ARGS+=(--base-model "$BASE_MODEL")
+[[ -n "${DRAFT_MODEL:-}" ]] && ARGS+=(--draft-model "$DRAFT_MODEL")
 [[ "${USE_SPECEXTEND:-1}" == "1" ]] && ARGS+=(--use-specextend)
 [[ "${SMOKE:-1}" == "1" ]] && ARGS+=(--smoke)
 

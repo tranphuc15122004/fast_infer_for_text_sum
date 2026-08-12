@@ -31,6 +31,10 @@ htmlcov/
 # Benchmark outputs (smoke/verification artifacts)
 outputs/
 
+# MagicDec converted checkpoints (model.pth etc., large build artifacts)
+checkpoints/
+externals/*/checkpoints/
+
 # IDE
 .vscode/
 .idea/

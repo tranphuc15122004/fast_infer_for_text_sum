@@ -113,9 +113,9 @@ def main() -> None:
         max_capacity_prompts=args.max_capacity_prompts,
         window_size=args.window_size,
         kernel_size=args.kernel_size,
-        pooling="mean",
+        pooling="avgpool",
         retain_rate=args.retain_rate,
-        merge=True,
+        merge=None,  # FastKV's merge_kv is undefined in the vendored repo
         eviction_mode=args.eviction_mode,
     )
 

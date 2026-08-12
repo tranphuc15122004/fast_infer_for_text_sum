@@ -11,7 +11,7 @@ EXTRA_FLASH="${EXTRA_FLASH:-0}"
 
 cd "$ROOT"
 
-UV_ARGS=(sync --locked)
+UV_ARGS=(--locked)
 if [[ "$EXTRA_FLASH" == "1" ]]; then
   UV_ARGS+=(--extra flash)
 fi

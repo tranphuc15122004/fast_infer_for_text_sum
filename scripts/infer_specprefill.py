@@ -52,6 +52,7 @@ def main() -> None:
         model=args.target_model,
         tokenizer=args.target_model,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype="half",  # bf16 needs sm80+; T4 (sm75) must use float16
         enforce_eager=True,
         enable_chunked_prefill=False,
         tensor_parallel_size=1,

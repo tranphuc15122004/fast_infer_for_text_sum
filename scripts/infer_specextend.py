@@ -27,6 +27,10 @@ def main() -> None:
                         choices=["run_classic.py", "run_eagle.py"])
     parser.add_argument("--model-name", default="vicuna_7b",
                         choices=["vicuna_7b", "longchat_7b"])
+    parser.add_argument("--base-model", default=None,
+                        help="override base model path/id (T4 smoke: TinyLlama)")
+    parser.add_argument("--draft-model", default=None,
+                        help="override draft model path/id (T4 smoke: TinyLlama)")
     parser.add_argument("--input-file", default="data/govreport/govreport_512.jsonl")
     parser.add_argument("--max-samples", type=int, default=1)
     parser.add_argument("--max-gen-len", type=int, default=64)
@@ -51,7 +55,14 @@ def main() -> None:
         cmd += ["--use_specextend"]
 
     print("+ " + " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=SPECEXTEND, capture_output=True, text=True)
+    env = dict(__import__("os").environ)
+    # Optional model overrides (T4 smoke uses TinyLlama via the wrapper).
+    if args.base_model:
+        env["SPECEXTEND_BASE_MODEL"] = args.base_model
+    if args.draft_model:
+        env["SPECEXTEND_DRAFT_MODEL"] = args.draft_model
+    proc = subprocess.run(cmd, cwd=SPECEXTEND, env=env,
+                          capture_output=True, text=True)
     stdout = proc.stdout or ""
     log = stdout + (proc.stderr or "")
     print(log[-4000:])

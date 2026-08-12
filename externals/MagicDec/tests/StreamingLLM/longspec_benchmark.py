@@ -70,7 +70,8 @@ print(f"Using device={DEVICE}")
 draft_target_equal = (len(args.draft_rank_group) == len(args.rank_group))
 
 MAX_LEN_TARGET = args.max_len
-DTYPE = torch.bfloat16
+DTYPE = (torch.float16 if torch.cuda.get_device_capability()[0] < 8
+        else torch.bfloat16)  # T4/sm75: no bf16 compute; fp16
 BATCH_SIZE = args.B
 benchmark = args.benchmark
 checkpoint_path = args.target

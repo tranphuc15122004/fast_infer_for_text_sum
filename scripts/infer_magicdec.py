@@ -32,6 +32,8 @@ def main() -> None:
     parser.add_argument("--gamma", type=int, default=3)
     parser.add_argument("--draft-budget", type=int, default=257)
     parser.add_argument("--num-runs", type=int, default=1)
+    parser.add_argument("--window-size", type=int, default=128,
+                        help="SnapKV window; needs (prefix_len - window_size) % 128 == 0")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -47,6 +49,12 @@ def main() -> None:
     env["PYTHONPATH"] = str(MAGICDEC) + ":" + env.get("PYTHONPATH", "")
     env["ENABLE_INTRA_NODE_COMM"] = "1"
 
+    # The benchmark subprocess runs with cwd=MAGICDEC, so the model path must
+    # be absolute (a ROOT-relative path would resolve under externals/MagicDec).
+    model_pth = Path(args.model_pth)
+    if not model_pth.is_absolute():
+        model_pth = (ROOT / model_pth).resolve()
+
     script = (
         "tests/SnapKV/selfspec_benchmark.py" if args.self_spec
         else "tests/baseline_benchmark.py"
@@ -54,7 +62,7 @@ def main() -> None:
     cmd = [
         "torchrun", "--standalone", "--nproc_per_node=1",
         script,
-        "--model", str(args.model_pth),
+        "--model", str(model_pth),
         "--model_name", args.model_name,
         "--rank_group", "0",
         "--B", str(args.batch_size),
@@ -63,7 +71,9 @@ def main() -> None:
         "--printoutput",
     ]
     if args.self_spec:
-        cmd += ["--gamma", str(args.gamma), "--draft_budget", str(args.draft_budget),
+        # --window_size only exists in selfspec_benchmark.py
+        cmd += ["--window_size", str(args.window_size),
+                "--gamma", str(args.gamma), "--draft_budget", str(args.draft_budget),
                 "--benchmark"]
 
     print("+ " + " ".join(cmd))
@@ -95,7 +105,8 @@ def main() -> None:
     checks: list[tuple[bool, str]] = [
         (proc.returncode == 0, f"benchmark process exit code = {proc.returncode}"),
         ("Throughput" in log or "Token/sec" in log or "tokens/s" in log
-         or "Speed" in log or "output" in log.lower(),
+         or "tokens per second" in log.lower() or "Speed" in log
+         or "output" in log.lower(),
          "benchmark produced timing/output lines"),
     ]
     summary = {"type": "summary", "method": record["method"],

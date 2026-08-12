@@ -20,6 +20,9 @@ dependencies = [
     "tiktoken",
     "numpy<2",
     "tqdm",
+    "setuptools",
+    "tilelang",
+    "wheel",
 ]
 
 [tool.uv]

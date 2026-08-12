@@ -20,7 +20,10 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import is_flash_attn_2_available, logging
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = flash_attn_with_kvcache = None
 
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward

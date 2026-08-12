@@ -19,6 +19,8 @@ dependencies = [
     "pyyaml",
     "tqdm",
     "flashinfer-python",
+    "setuptools",
+    "wheel",
 ]
 
 [tool.uv]

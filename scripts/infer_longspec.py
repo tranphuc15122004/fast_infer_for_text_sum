@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -22,6 +23,9 @@ from common import io_util, verify
 from common.paths import ROOT
 
 LONGSPEC = ROOT / "externals" / "LongSpec" / "longspec" / "test"
+# LongSpec modules (llama_glide / qwen2_glide / triton_tree_attn) live in the
+# repo's test dir and are imported as top-level modules.
+sys.path.insert(0, str(LONGSPEC))
 
 
 def main() -> None:
@@ -56,24 +60,35 @@ def main() -> None:
             msg = f"import failed: {e}"
         checks.append((import_ok, msg))
 
-        kernel_ok = False
+        # Kernel forward: the triton TreeAttention kernel compiles only on
+        # sm80+ (it fails in triton's LLVM pass on sm75/T4). Report SKIP on
+        # sm<80 (validated on the big-GPU server) instead of a hard FAIL.
+        kernel_ok: bool | None = False
         try:
             from triton_tree_attn import attention as tree_attention
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            n, h, t, d = 1, 8, 16, 64
-            q = torch.randn(n, h, t, d, device=device)
-            k = torch.randn(n, h, t, d, device=device)
-            v = torch.randn(n, h, t, d, device=device)
-            # accept an optional shape arg; fall back gracefully.
-            try:
-                out = tree_attention(q, k, v)
-            except TypeError:
-                out = tree_attention(q, k, v, torch.ones(n, t, t, device=device))
-            kernel_ok = bool(torch.isfinite(out).all()) and out.shape == q.shape
+            cap = torch.cuda.get_device_capability() if device == "cuda" else None
+            if cap is not None and cap[0] < 8:
+                print(f"kernel smoke SKIPPED: triton TreeAttention needs sm80+ "
+                      f"(this GPU is sm{cap[0]}{cap[1]})")
+                kernel_ok = None
+            else:
+                n, h, t, d = 1, 8, 8, 64
+                N = 24  # realistic tree attention: M (draft) < N (full cache)
+                q = torch.randn(n, h, t, d, device=device)
+                k = torch.randn(n, h, N, d, device=device)
+                v = torch.randn(n, h, N, d, device=device)
+                mask = torch.ones(n, t, N, device=device)
+                out, _ = tree_attention(q, k, v, mask)
+                kernel_ok = bool(torch.isfinite(out).all()) and out.shape == q.shape
         except Exception as e:
             print(f"kernel smoke skipped/failed: {e}")
-        checks.append((kernel_ok, f"triton TreeAttention dummy forward finite"))
+        if kernel_ok is None:
+            print("NOTE: kernel check skipped on sm<80; run on A100/H100 (FULL=1 "
+                  "or the smoke there)")
+        else:
+            checks.append((kernel_ok, f"triton TreeAttention dummy forward finite"))
 
         record = {
             "method": "longspec_smoke",

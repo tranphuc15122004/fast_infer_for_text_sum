@@ -145,6 +145,12 @@ class LMBackend:
     
     def pre_decode(self, dec_len):
             self.paged_kv_last_page_len += dec_len
+            # The page table built during prefill only covers the prefix pages;
+            # decode appends beyond them, and flashinfer >= 0.2 indexes pages
+            # via the table, so extend it to cover the positions being written.
+            pages_needed = ((self.cachelens + dec_len - 1) // self.page_size + 1).to(torch.int32)
+            self.paged_kv_indptr[1:] = torch.cumsum(pages_needed, dim=0)
+            self.paged_kv_indices = torch.arange(0, int(pages_needed.sum()), dtype=torch.int32, device=self.device)
             self.decode_wrapper.plan(
                 qo_indptr=self.qo_indptr*dec_len,
                 paged_kv_indptr=self.paged_kv_indptr,
@@ -152,7 +158,7 @@ class LMBackend:
                 paged_kv_last_page_len=self.paged_kv_last_page_len,
                 num_qo_heads=self.model.config.n_head, 
                 num_kv_heads=self.model.config.n_local_heads, 
-                head_dim=self.model.config.head_dim, 
+                head_dim_qk=self.model.config.head_dim, head_dim_vo=self.model.config.head_dim, 
                 page_size=self.page_size, 
                 q_data_type=self.dtype, 
                 causal=True,
@@ -190,7 +196,7 @@ class LMBackend:
                 paged_kv_last_page_len=self.paged_kv_last_page_len,
                 num_qo_heads=self.model.config.n_head, 
                 num_kv_heads=self.model.config.n_local_heads, 
-                head_dim=self.model.config.head_dim, 
+                head_dim_qk=self.model.config.head_dim, head_dim_vo=self.model.config.head_dim, 
                 page_size=self.page_size, 
                 q_data_type=self.dtype, 
                 causal=True,
@@ -222,7 +228,7 @@ class LMBackend:
                 paged_kv_last_page_len=self.draft_paged_kv_last_page_len,
                 num_qo_heads=self.model.config.n_head, 
                 num_kv_heads=self.model.config.n_local_heads, 
-                head_dim=self.model.config.head_dim, 
+                head_dim_qk=self.model.config.head_dim, head_dim_vo=self.model.config.head_dim, 
                 page_size=self.page_size, 
                 q_data_type=self.dtype, 
                 causal=True,
@@ -280,7 +286,7 @@ class LMBackend:
             paged_kv_last_page_len=self.paged_kv_last_page_len,
             num_qo_heads=self.model.config.n_head, 
             num_kv_heads=self.model.config.n_local_heads, 
-            head_dim=self.model.config.head_dim, 
+            head_dim_qk=self.model.config.head_dim, head_dim_vo=self.model.config.head_dim, 
             page_size=self.page_size, 
             q_data_type=self.dtype, 
             causal=True

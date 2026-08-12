@@ -30,7 +30,7 @@ def unrepeat_kv(repeated_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 torch.library.define(
     "mylib::update_kv",
-    "(Tensor k, Tensor v, Tensor kv_append_indptr, Tensor(a!) kv_cache, Tensor kv_page_indices, Tensor kv_page_indptr, Tensor cachelen) -> ()",
+    "(Tensor k, Tensor v, Tensor kv_append_indptr, Tensor(a!) kv_cache, Tensor kv_page_indices, Tensor kv_page_indptr, Tensor cachelen, Tensor offsets) -> ()",
 )
 
 @torch.library.impl("mylib::update_kv", "cuda")
@@ -42,11 +42,24 @@ def update_kv(
             kv_page_indices,
             kv_page_indptr,
             kv_page_last_len,
+            offsets,
         ):
+        # flashinfer >= 0.2 requires explicit batch_indices + positions.
+        batch = kv_page_indptr.shape[0] - 1
+        pos_parts = []
+        idx_parts = []
+        for b in range(batch):
+            start = int(offsets[b])
+            length = int(kv_append_indptr[b + 1] - kv_append_indptr[b])
+            pos_parts.append(torch.arange(start, start + length, device=k.device))
+            idx_parts.append(torch.full((length,), b, dtype=torch.int32, device=k.device))
+        positions = torch.cat(pos_parts).to(torch.int32)
+        batch_indices = torch.cat(idx_parts)
         flashinfer.append_paged_kv_cache(
             k,
             v,
-            kv_append_indptr,
+            batch_indices,
+            positions,
             kv_cache,
             kv_page_indices,
             kv_page_indptr,
@@ -62,6 +75,7 @@ def update_kv_abstract(
             kv_page_indices,
             kv_page_indptr,
             kv_page_last_len,
+            offsets,
         ):
     return None
 

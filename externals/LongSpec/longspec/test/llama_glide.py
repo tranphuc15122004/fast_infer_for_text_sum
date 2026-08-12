@@ -9,7 +9,10 @@ from llama import LlamaForCausalLM, LlamaRotaryEmbedding, LlamaRMSNorm, LlamaMLP
 from triton_tree_attn import attention as tree_attention
 from dataclasses import dataclass
 import random
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = flash_attn_with_kvcache = None
 from transformers import LlamaConfig
 from transformers.utils import ModelOutput
 from transformers.modeling_utils import PreTrainedModel

@@ -15,8 +15,11 @@ source "$CONFIG_FILE"
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 
 # HiGOE is not a package: it imports sibling modules from the repo root.
+# cwd is NOT added to sys.path when running `python /abs/script.py`, so the
+# HiGOE dir itself must be on PYTHONPATH too.
 cd "$ROOT/externals/HiGOE"
 export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/externals/HiGOE${PYTHONPATH:+:$PYTHONPATH}"
 
 ARGS=(
   --retriever-model "${RETRIEVER_MODEL:-facebook/contriever}"

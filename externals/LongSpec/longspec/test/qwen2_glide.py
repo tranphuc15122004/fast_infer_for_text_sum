@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from transformers import Qwen2Config
 from transformers.utils import ModelOutput
 from transformers.modeling_utils import PreTrainedModel
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = flash_attn_with_kvcache = None
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 from qwen2 import Qwen2ForCausalLM, Qwen2RotaryEmbedding, Qwen2RMSNorm, Qwen2MLP, apply_rotary_pos_emb

@@ -99,17 +99,42 @@ class LlamaSelectAttention(LlamaAttention):
             key_states = key_states.to(torch.float16)
             value_states = value_states.to(torch.float16)
 
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            dropout=0.0,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=True,
-        )
+        try:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                q_len,
+                dropout=0.0,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=True,
+            )
+        except (NameError, ImportError):
+            # Fallback without flash-attn (T4 smoke): torch SDPA.
+            # _flash_attention_forward is unavailable when flash-attn is not
+            # installed (its helper _flash_supports_window_size is undefined).
+            mask = attention_mask
+            if mask is not None:
+                mask = mask[:, :, :, : key_states.shape[1]]  # seq dim (S in B,S,H,D)
+            # GQA: SDPA needs kv heads == query heads (flash-attn broadcasts).
+            if key_states.shape[2] != query_states.shape[2]:
+                kv = key_states.repeat_interleave(
+                    query_states.shape[2] // key_states.shape[2], dim=2)
+                vv = value_states.repeat_interleave(
+                    query_states.shape[2] // value_states.shape[2], dim=2)
+            else:
+                kv, vv = key_states, value_states
+            attn_output = F.scaled_dot_product_attention(
+                query_states.transpose(1, 2),
+                kv.transpose(1, 2),
+                vv.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=mask is None,
+            )
+            attn_output = attn_output.transpose(1, 2)
         if input_dtype == torch.float32:
             attn_output = attn_output.to(torch.float32)
         return attn_output, None
