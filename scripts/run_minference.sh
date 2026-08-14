@@ -25,6 +25,7 @@ ARGS=(
   --max-new-tokens "${MAX_NEW_TOKENS:-32}"
   --max-model-len "${MAX_MODEL_LEN:-8192}"
   --device "${DEVICE:-cuda}"
+  --attn-implementation "${ATTN_IMPLEMENTATION:-auto}"
   --output "$OUTPUT_FILE"
 )
 [[ -n "${DATA_FILE:-}" ]] && {

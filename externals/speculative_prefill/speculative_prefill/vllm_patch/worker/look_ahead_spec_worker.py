@@ -197,8 +197,13 @@ class LookAheadSpecWorker(Worker):
         key_lens = None
 
         for layer_idx in range(self._get_model_num_layers()):
-            # (num_blocks, block_size, num_kv_heads, head_size)
-            key_cache = kv_cache[layer_idx][0]
+            # FlashAttention stores the cache as
+            # (2, num_blocks, block_size, num_kv_heads, head_size), while
+            # the XFormers/PagedAttention backend used on Turing (sm75)
+            # stores it as (2, num_blocks, block_size * num_kv_heads *
+            # head_size).  Normalize both layouts before indexing by token
+            # slot.  The original upstream code only handled the former.
+            key_cache = self._key_cache_as_tokens(kv_cache[layer_idx])
             block_size = key_cache.shape[1]
 
             layer_keys = []
@@ -240,6 +245,50 @@ class LookAheadSpecWorker(Worker):
             ]
         
         return all_keys
+
+    def _key_cache_as_tokens(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Return key cache as ``[blocks, block, kv_heads, head_size]``.
+
+        vLLM 0.6.3 uses the packed PagedAttention layout for XFormers,
+        which is selected automatically on T4 because FlashAttention-2 does
+        not support sm75.  SpecPrefill's upstream worker assumed the
+        FlashAttention layout and consequently indexed a 2-D tensor with
+        four indices.
+        """
+        key_cache = kv_cache[0]
+        if key_cache.ndim == 4:
+            return key_cache
+        if key_cache.ndim != 2:
+            raise RuntimeError(
+                "Unsupported vLLM key-cache layout: "
+                f"shape={tuple(key_cache.shape)}"
+            )
+
+        model_config = self.model_runner.model_config
+        num_kv_heads = model_config.get_num_kv_heads(
+            self.model_runner.parallel_config
+        )
+        head_size = model_config.get_head_size()
+        num_blocks = key_cache.shape[0]
+        packed_size = key_cache.shape[1]
+        if packed_size % (num_kv_heads * head_size) != 0:
+            raise RuntimeError(
+                "Cannot unpack vLLM key cache: "
+                f"shape={tuple(key_cache.shape)}, "
+                f"num_kv_heads={num_kv_heads}, head_size={head_size}"
+            )
+
+        block_size = packed_size // (num_kv_heads * head_size)
+        # PagedAttention's packed key layout is
+        # [blocks, kv_heads, head_size/x, block, x], where x is the number
+        # of scalar values grouped into a 16-byte vector.
+        x = 16 // key_cache.element_size()
+        unpacked = key_cache.view(
+            num_blocks, num_kv_heads, head_size // x, block_size, x
+        )
+        return unpacked.permute(0, 3, 1, 2, 4).contiguous().view(
+            num_blocks, block_size, num_kv_heads, head_size
+        )
 
     def _get_actual_look_ahead_cnts(
         self, 
@@ -429,7 +478,7 @@ class LookAheadSpecWorker(Worker):
         kv_cache: List[torch.Tensor]
     ) -> List[torch.Tensor]:
         # (num_blocks, block_size, num_kv_heads, head_size)
-        key_cache = kv_cache[layer_idx][0]
+        key_cache = self._key_cache_as_tokens(kv_cache[layer_idx])
         block_size = key_cache.shape[1]
 
         keys = []

@@ -1,3 +1,5 @@
+import importlib.util
+
 import torch
 import torch.nn as nn
 from shared.modeling_llama_kv_target import LlamaForCausalLM as KVLlamaForCausalLM
@@ -340,9 +342,17 @@ class SPModel(nn.Module):
         input_len = input_ids.shape[1]
         
         self.use_retrieval_cache = use_specextend
-        self.target_use_flash_prefill = use_specextend
+        # FlashAttention-2 is optional and unavailable on the repo's T4
+        # smoke path.  SpecExtend still runs there via its PyTorch prefix /
+        # tree fallbacks; only the flash prefill shortcuts are disabled.
+        flash_prefill_ok = (
+            importlib.util.find_spec("flash_attn") is not None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 8
+        )
+        self.target_use_flash_prefill = use_specextend and flash_prefill_ok
         self.target_use_hybrid_tree_attn = use_specextend
-        self.draft_use_flash_prefill = use_specextend
+        self.draft_use_flash_prefill = use_specextend and flash_prefill_ok
         
         self.retrieval_chunk_size = retrieval_chunk_size
         self.retrieve_top_k = retrieve_top_k
@@ -472,8 +482,11 @@ class SPModel(nn.Module):
         """
         # Get values from the model config.
         num_hidden_layers = self.draft_model.config.num_hidden_layers
-        num_heads = self.draft_model.config.num_attention_heads
-        head_dim = self.draft_model.config.hidden_size // num_heads
+        # KV caches store K/V heads, not expanded query heads.  TinyLlama
+        # uses GQA (32 query heads, 4 KV heads); allocating with
+        # num_attention_heads makes cache writes fail during retrieval.
+        num_heads = self.draft_model.config.num_key_value_heads
+        head_dim = self.draft_model.config.hidden_size // self.draft_model.config.num_attention_heads
 
         # full cache: shape: [layers, batch_size, num_heads, full_cache_budget, head_dim]
         self.full_draft_kv = []

@@ -26,15 +26,18 @@ def main() -> None:
     parser.add_argument("--model-name", required=True, help="HF id for tokenizer")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--prefix-len", type=int, default=2048)
-    parser.add_argument("--max-len", type=int, default=2176, help="must be % 128 == 0")
+    parser.add_argument("--max-len", type=int, default=2176,
+                        help="must be divisible by 128")
     parser.add_argument("--self-spec", action="store_true",
                         help="run tests/SnapKV/selfspec_benchmark.py instead of dense")
     parser.add_argument("--gamma", type=int, default=3)
     parser.add_argument("--draft-budget", type=int, default=257)
     parser.add_argument("--num-runs", type=int, default=1)
     parser.add_argument("--window-size", type=int, default=128,
-                        help="SnapKV window; needs (prefix_len - window_size) % 128 == 0")
+                        help="SnapKV window; prefix/window difference divisible by 128")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--use-torchrun", action="store_true",
+                        help="use torchrun even for single-GPU smoke")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -59,8 +62,9 @@ def main() -> None:
         "tests/SnapKV/selfspec_benchmark.py" if args.self_spec
         else "tests/baseline_benchmark.py"
     )
-    cmd = [
-        "torchrun", "--standalone", "--nproc_per_node=1",
+    launcher = (["torchrun", "--standalone", "--nproc_per_node=1"]
+                if args.use_torchrun else [sys.executable])
+    cmd = launcher + [
         script,
         "--model", str(model_pth),
         "--model_name", args.model_name,

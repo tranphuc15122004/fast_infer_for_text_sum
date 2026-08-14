@@ -23,6 +23,7 @@ ARGS=(
   --input-file "${INPUT_FILE:-data/govreport/govreport_512.jsonl}"
   --max-samples "${MAX_SAMPLES:-1}"
   --max-gen-len "${MAX_GEN_LEN:-64}"
+  --warmup-runs "${WARMUP_RUNS:-3}"
   --output "$OUTPUT_FILE"
 )
 [[ -n "${BASE_MODEL:-}" ]] && ARGS+=(--base-model "$BASE_MODEL")

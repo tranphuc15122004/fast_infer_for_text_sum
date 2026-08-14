@@ -23,7 +23,8 @@ bash scripts/run.sh minference
 ```
 
 Cấu hình `config/minference.env`: `MODEL`, `ATTN_TYPE`, `MAX_NEW_TOKENS`,
-`MAX_MODEL_LEN`, `DEVICE`.
+`MAX_MODEL_LEN`, `DEVICE`, `ATTN_IMPLEMENTATION`. `auto` dùng
+FlashAttention-2 trên GPU sm80+ nếu đã cài; trên T4 tự dùng SDPA.
 
 ## Dữ liệu của bạn
 

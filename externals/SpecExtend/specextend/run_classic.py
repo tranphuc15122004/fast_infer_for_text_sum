@@ -104,12 +104,13 @@ def main():
 
     # Warmup GPUs
     print(colored(f'Warming up GPUs...', 'yellow'))
+    warmup_runs = int(os.environ.get("SPECEXTEND_WARMUP_RUNS", "3"))
     for idx, text in enumerate(texts[:1]):
         input_ids = tokenizer.encode(
             text, return_tensors="pt", add_special_tokens=True
         ).to(accelerator.device)
 
-        for _ in range(3):
+        for _ in range(warmup_runs):
             _ = model.spgenerate(
                 input_ids,
                 temperature=0,

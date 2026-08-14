@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,7 @@ def main() -> None:
     parser.add_argument("--input-file", default="data/govreport/govreport_512.jsonl")
     parser.add_argument("--max-samples", type=int, default=1)
     parser.add_argument("--max-gen-len", type=int, default=64)
+    parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument("--use-specextend", action="store_true", default=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
@@ -42,6 +44,7 @@ def main() -> None:
     if args.smoke:
         args.max_samples = 1
         args.max_gen_len = min(args.max_gen_len, 64)
+        args.warmup_runs = 0
 
     cmd = [
         "python", args.script,
@@ -61,18 +64,24 @@ def main() -> None:
         env["SPECEXTEND_BASE_MODEL"] = args.base_model
     if args.draft_model:
         env["SPECEXTEND_DRAFT_MODEL"] = args.draft_model
+    env["SPECEXTEND_WARMUP_RUNS"] = str(args.warmup_runs)
     proc = subprocess.run(cmd, cwd=SPECEXTEND, env=env,
                           capture_output=True, text=True)
     stdout = proc.stdout or ""
     log = stdout + (proc.stderr or "")
     print(log[-4000:])
 
-    # run_classic prints one result line per sample (JSON-ish).
+    # run_classic prints metrics as human-readable lines rather than JSON.
     result_lines = [
         line.strip() for line in stdout.splitlines()
-        if line.strip() and "{" in line and "summary" in line.lower()
+        if line.strip() and "Generated " in line and " tokens in " in line
     ]
     got_output = bool(result_lines)
+    generated_tokens = None
+    if result_lines:
+        match = re.search(r"Generated\s+(\d+)\s+tokens", result_lines[-1])
+        if match:
+            generated_tokens = int(match.group(1))
 
     writer = io_util.JsonlWriter(Path(args.output))
     record = {
@@ -81,7 +90,7 @@ def main() -> None:
         "model": args.model_name,
         "input_tokens": None,
         "retained_tokens": None,
-        "output_tokens": None,
+        "output_tokens": generated_tokens,
         "batch_size": 1,
         "selector_latency_ms": None,
         "ttft_ms": None,
@@ -98,7 +107,7 @@ def main() -> None:
 
     checks: list[tuple[bool, str]] = [
         (proc.returncode == 0, f"process exit code = {proc.returncode}"),
-        (got_output, f"generated summary line(s): {len(result_lines)}"),
+        (got_output, f"generated result line(s): {len(result_lines)}"),
     ]
     summary = {"type": "summary", "method": record["method"],
                "returncode": proc.returncode, "got_output": got_output}

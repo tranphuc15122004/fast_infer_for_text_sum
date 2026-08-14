@@ -43,4 +43,7 @@ tự gắn). Đặt vào `data/` và trỏ `INPUT_FILE="data/<file>.jsonl"`.
 ## Troubleshooting
 
 - Nếu OOM trên T4: giảm `MAX_GEN_LEN`/dùng `govreport_512`, hoặc chuyển GPU lớn.
+- Trên T4 không có FlashAttention-2: smoke tự tắt flash-prefill và dùng
+  SDPA/PyTorch prefix fallback; tree kernel vẫn cần kiểm chứng riêng trên
+  GPU phù hợp nếu backend Triton không compile được.
 - `eval_classic.py`/`eval_eagle.py` chạy sweep nhiều độ dài (dành cho GPU lớn).

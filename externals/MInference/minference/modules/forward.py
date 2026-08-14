@@ -1,9 +1,11 @@
 # Copyright (c) 2024-2025 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 
+import importlib.util
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
@@ -17,6 +19,87 @@ from ..modules.retr_attn import retr_attn
 from ..modules.tri_mix import tri_mix_forward, tri_mix_minference_forward
 from ..modules.xattention import xattention_forward
 from ..ops.streaming_kernel import a_shape_kernel, tri_shape_kernel
+
+
+def _flash_attention_is_usable() -> bool:
+    """Return whether the optional FlashAttention path is usable here.
+
+    MInference's upstream code assumes that importing Transformers' flash
+    attention helper is enough.  On T4, flash-attn is normally absent (and
+    its kernels are not the right backend), so that helper can still be
+    called and fail before producing an output.  Keep the fallback local to
+    this module so the MInference patch remains usable with SDPA.
+    """
+    if importlib.util.find_spec("flash_attn") is None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+def _sdpa_attention_forward(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    is_causal: bool,
+) -> torch.Tensor:
+    """Attention fallback for T4/sm75 without FlashAttention-2."""
+    q_len = query_states.shape[-2]
+    kv_len = key_states.shape[-2]
+
+    if attention_mask is not None and attention_mask.ndim == 2:
+        # HF generation commonly supplies [batch, kv_len] masks.
+        attention_mask = attention_mask[:, None, None, :].to(torch.bool)
+
+    # For one-token decoding, every cached key is in the past and must be
+    # visible.  Using SDPA's square causal mask here would hide most of the
+    # KV cache, so only use is_causal for a square prefill operation.
+    sdpa_causal = is_causal and q_len == kv_len and attention_mask is None
+    sdpa_mask = None if sdpa_causal else attention_mask
+    return F.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=sdpa_mask,
+        dropout_p=0.0,
+        is_causal=sdpa_causal,
+    )
+
+
+def _attention_forward(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    q_len: int,
+    position_ids: Optional[torch.Tensor],
+    dropout: float,
+    sliding_window: Optional[int],
+    is_causal: bool,
+) -> torch.Tensor:
+    if not _flash_attention_is_usable():
+        # Callers provide the Transformers/FlashAttention layout
+        # [batch, seq, heads, dim]; SDPA expects [batch, heads, seq, dim].
+        sdpa_output = _sdpa_attention_forward(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            value_states.transpose(1, 2),
+            attention_mask,
+            is_causal,
+        )
+        return sdpa_output.transpose(1, 2).contiguous()
+    return _flash_attention_forward(
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        q_len,
+        position_ids=position_ids,
+        dropout=dropout,
+        sliding_window=sliding_window,
+        is_causal=is_causal,
+    )
 
 
 def attn_forward(
@@ -153,7 +236,7 @@ def attn_forward(
             attn_output = attn_output.transpose(1, 2).contiguous()
 
         else:  # if not specified, use flash attention
-            attn_output = _flash_attention_forward(  # [bsz, q_len, num_heads, head_dim]
+            attn_output = _attention_forward(  # [bsz, q_len, num_heads, head_dim]
                 query_states.transpose(1, 2),
                 key_states.transpose(1, 2),
                 value_states.transpose(1, 2),
@@ -210,7 +293,7 @@ def attn_forward(
                 1, 2
             )  # [bsz, q_len, num_heads, head_dim]
         else:
-            attn_output = _flash_attention_forward(
+            attn_output = _attention_forward(
                 query_states.transpose(1, 2),
                 key_states.transpose(1, 2),
                 value_states.transpose(1, 2),

@@ -12,6 +12,7 @@ the smallest supported one (e.g. Qwen2.5-7B-Instruct with a short context).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import time
 from pathlib import Path
 
@@ -19,6 +20,24 @@ import torch
 
 from common import io_util, verify
 from common.data_loader import load_records
+
+
+def _select_attention_implementation(requested: str) -> str:
+    """Select a Transformers attention backend that works on this GPU.
+
+    FlashAttention-2 is not available on the T4 setup used by this repo.
+    MInference replaces the attention forward path after model loading, so
+    loading with SDPA/eager is a valid fallback for the patch path.
+    """
+    if requested != "auto":
+        return requested
+
+    has_flash_attn = importlib.util.find_spec("flash_attn") is not None
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        if has_flash_attn and major >= 8:
+            return "flash_attention_2"
+    return "sdpa"
 
 
 def main() -> None:
@@ -33,6 +52,10 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--attn-implementation", default="auto",
+                        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+                        help="Transformers backend used while loading; auto "
+                             "falls back to SDPA on T4/sm75")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -48,12 +71,17 @@ def main() -> None:
     supported = set(get_support_models())
     print(f"Model: {args.model} (in support list: {args.model in supported})")
 
+    attn_implementation = _select_attention_implementation(
+        args.attn_implementation
+    )
+    print(f"Transformers attention backend: {attn_implementation}")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float16,
         device_map="auto",
-        _attn_implementation="flash_attention_2",
+        _attn_implementation=attn_implementation,
         max_position_embeddings=args.max_model_len,
     )
     model.eval()
@@ -73,11 +101,18 @@ def main() -> None:
     checks: list[tuple[bool, str]] = []
 
     for sample in prompts:
-        ids = tokenizer(sample["prompt"], return_tensors="pt").input_ids.to(model.device)
+        encoded = tokenizer(sample["prompt"], return_tensors="pt")
+        ids = encoded.input_ids.to(model.device)
+        attention_mask = encoded.attention_mask.to(model.device)
         ilen = ids.shape[1]
         with torch.inference_mode():
             t0 = time.perf_counter()
-            out = model.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+            out = model.generate(
+                input_ids=ids,
+                attention_mask=attention_mask,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+            )
             elapsed = time.perf_counter() - t0
 
         output_ids = out[0, ilen:]

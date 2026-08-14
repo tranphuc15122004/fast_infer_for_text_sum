@@ -45,5 +45,6 @@ ARGS=(
 )
 [[ "${SELF_SPEC:-0}" == "1" ]] && ARGS+=(--self-spec --gamma "${GAMMA:-3}" --draft-budget "${DRAFT_BUDGET:-257}")
 [[ "${SMOKE:-1}" == "1" ]] && ARGS+=(--smoke)
+[[ "${USE_TORCHRUN:-0}" == "1" ]] && ARGS+=(--use-torchrun)
 
 exec uv run --project "$ROOT/envs/magicdec" --locked python "$ROOT/scripts/infer_magicdec.py" "${ARGS[@]}"

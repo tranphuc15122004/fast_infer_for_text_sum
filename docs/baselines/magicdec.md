@@ -7,7 +7,8 @@ Dựa trên `externals/MagicDec`.
 
 - Env: **`envs/magicdec`** (transformers 4.36.2, torch 2.4.1+cu124, `flashinfer-python`).
 - `uv sync --project envs/magicdec --locked`
-- Bắt buộc CUDA + NCCL (chạy qua `torchrun`).
+- Bắt buộc CUDA + NCCL cho distributed; single-GPU smoke chạy trực tiếp bằng
+  Python để không cần rendezvous localhost.
 
 ## Model (checkpoint phải convert)
 

@@ -610,7 +610,10 @@ class LlamaAttention(nn.Module):
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask=attention_mask.to(dtype=query_states.dtype),
+                    attn_mask=(
+                        attention_mask.to(dtype=query_states.dtype)
+                        if attention_mask is not None else None
+                    ),
                     dropout_p=self.attention_dropout if self.training else 0.0,
                     is_causal=is_causal,
                 )
@@ -705,13 +708,37 @@ class LlamaAttention(nn.Module):
                     q_flash = query_states.transpose(1,2)
                     full_k = key_states.transpose(1,2)
                     full_v = value_states.transpose(1,2)
-                    prefix_o, prefix_lse = flash_attn_with_kvcache(q_flash, 
-                                                                full_k, 
-                                                                full_v, 
-                                                                # window_size=(512,-1),
-                                                                causal=False,
-                                                                cache_seqlens=cache_len, 
-                                                                return_softmax_lse=True)
+                    if flash_attn_with_kvcache is not None:
+                        prefix_o, prefix_lse = flash_attn_with_kvcache(
+                            q_flash,
+                            full_k,
+                            full_v,
+                            # window_size=(512,-1),
+                            causal=False,
+                            cache_seqlens=cache_len,
+                            return_softmax_lse=True,
+                        )
+                    else:
+                        # T4/sm75 has no usable FlashAttention-2.  Recreate
+                        # the prefix part needed by the hybrid tree path
+                        # with regular PyTorch attention.  Keep the same
+                        # [batch, query, heads, 1] log-sum-exp layout used by
+                        # tree_part_fwd_target below.
+                        prefix_k = full_k[:, :cache_len].transpose(1, 2)
+                        prefix_v = full_v[:, :cache_len].transpose(1, 2)
+                        prefix_q = q_flash.transpose(1, 2)
+                        prefix_scores = torch.matmul(
+                            prefix_q, prefix_k.transpose(-1, -2)
+                        ) / math.sqrt(self.head_dim)
+                        prefix_lse = prefix_scores.float().logsumexp(
+                            dim=-1, keepdim=True
+                        ).contiguous()
+                        prefix_o = torch.matmul(
+                            torch.softmax(prefix_scores.float(), dim=-1).to(
+                                prefix_q.dtype
+                            ),
+                            prefix_v,
+                        ).transpose(1, 2)
                     current_out, weight = tree_part_fwd_target(q_flash, 
                                                                full_k[:,cache_len:,:,:], 
                                                                full_v[:,cache_len:,:,:],

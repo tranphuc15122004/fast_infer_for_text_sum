@@ -59,9 +59,13 @@ def main() -> None:
         print("CUDA not available, falling back to CPU")
         device = "cpu"
 
-    print(f"Loading compressor: {args.compressor_model} (device={device})")
+    compressor_model = args.compressor_model
+    cached_compressor = snapshot_dir(args.compressor_model)
+    if cached_compressor is not None:
+        compressor_model = str(cached_compressor)
+    print(f"Loading compressor: {compressor_model} (device={device})")
     compressor = PromptCompressor(
-        model_name=args.compressor_model,
+        model_name=compressor_model,
         use_llmlingua2=args.use_llmlingua2,
         device_map=device,
     )
