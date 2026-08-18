@@ -8,6 +8,7 @@ Accepted fields (first match wins):
     {"id": 0, "prompt": "..."}                 # preferred
     {"id": 0, "question": "...", "answer": "..."}
     {"id": 0, "text": "...", "answer": "..."}  # summarization-style docs
+    {"id": 0, "document": "...", "reference": "..."}  # representative_100 summarization format
     {"id": 0, "turns": ["user prompt", ...]}   # EAGLE-style chat turns
     {"id": 0, "instruction": "..."}
 
@@ -37,7 +38,9 @@ def _get(record: dict, *keys) -> str | None:
 
 
 def normalize(record: dict, idx: int) -> dict:
-    prompt = _get(record, "prompt", "question", "instruction", "text", "turns")
+    prompt = _get(
+        record, "prompt", "question", "instruction", "document", "text", "turns"
+    )
     return {
         "id": record.get("id", idx),
         "prompt": str(prompt) if prompt is not None else "",

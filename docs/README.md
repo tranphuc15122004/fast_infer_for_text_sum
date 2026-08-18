@@ -80,6 +80,18 @@ Mọi script ghi `outputs/<baseline>_*.jsonl` theo schema thống nhất
 - Baseline không sinh text (kernel smoke: `rocketkv`, `higoe`, `longspec`,
   `magicdec`, `specextend`) không có ROUGE.
 
+## Benchmark baseline có adapter trên representative_100
+
+Runner + collector strict (tốc độ + ROUGE/BLEU) cho các baseline có adapter đọc
+trực tiếp `data/representative_100`: [docs/representative_100_benchmark.md](representative_100_benchmark.md).
+Các baseline chỉ có kernel/pipeline smoke được tách riêng và không được tính
+vào báo cáo representative nếu chưa có adapter dữ liệu.
+
+## Báo cáo kết quả semantic selection
+
+Phân tích latency, memory và ROUGE của các scheme `random`, `lead`, `tfidf`,
+`textrank`, `mmr`: [docs/semantic_selection_analysis.md](semantic_selection_analysis.md).
+
 ## Ghi chú portability
 
 - `uv.lock` đã commit cho từng env → `uv sync --locked` tái lập được trên máy khác.

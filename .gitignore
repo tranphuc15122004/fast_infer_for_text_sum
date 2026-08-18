@@ -46,3 +46,4 @@ data/normalized/
 .DS_Store
 
 *.egg-info/
+.jspace/

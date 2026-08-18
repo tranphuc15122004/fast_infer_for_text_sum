@@ -26,9 +26,10 @@ case "$BASELINE" in
   longspec)    WRAPPER="scripts/run_longspec.sh" ;;
   specextend)  WRAPPER="scripts/run_specextend.sh" ;;
   higoe)       WRAPPER="scripts/run_higoe.sh" ;;
+  semantic_selection) WRAPPER="scripts/run_semantic_selection.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: eagle3 dflash llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe" >&2
+    echo "Available: eagle3 dflash llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection" >&2
     exit 1
     ;;
 esac
