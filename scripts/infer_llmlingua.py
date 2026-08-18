@@ -25,7 +25,7 @@ from pathlib import Path
 
 import torch
 
-from common import io_util, verify
+from common import io_util, rouge, verify
 from common.data_loader import load_records
 from common.paths import ROOT, snapshot_dir
 
@@ -154,6 +154,12 @@ def main() -> None:
             "compression_rate": args.compression_rate,
             "summary": summary_text,
         }
+        # ROUGE-1/2/L vs reference summary (nếu data có trường reference/answer)
+        if rouge.add_rouge(record, summary_text, doc.get("reference")):
+            print(
+                f"  [rouge] r1={record['rouge1']:.4f} "
+                f"r2={record['rouge2']:.4f} rL={record['rougeL']:.4f}"
+            )
         writer.add(record)
         print(
             f"[{doc_id}] origin={origin_tokens} -> retained={compressed_tokens} "
@@ -181,6 +187,7 @@ def main() -> None:
             io_util.mean([r["retained_tokens"] / r["input_tokens"] for r in writer.records if r["input_tokens"]]), 4),
         "mean_selector_latency_ms": round(io_util.mean([r["selector_latency_ms"] for r in writer.records]), 3),
         "mean_e2e_ms": round(io_util.mean([r["e2e_ms"] for r in writer.records]), 3),
+        **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

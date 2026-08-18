@@ -35,6 +35,10 @@ outputs/
 checkpoints/
 externals/*/checkpoints/
 
+# Large, regenerable datasets (prepare_data.py tải từ HuggingFace; xem data/README.md)
+data/raw/
+data/normalized/
+
 # IDE
 .vscode/
 .idea/

@@ -42,6 +42,8 @@ def normalize(record: dict, idx: int) -> dict:
         "id": record.get("id", idx),
         "prompt": str(prompt) if prompt is not None else "",
         "answer": record.get("answer"),
+        # Reference summary dùng để tính ROUGE: nhận cả answer/reference/summary.
+        "reference": _get(record, "reference", "summary", "answer"),
         "keyword": record.get("keyword"),
         "text": record.get("text"),
         "raw": record,

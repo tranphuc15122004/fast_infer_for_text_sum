@@ -22,6 +22,21 @@ Các trường được loader chung (`scripts/common/data_loader.py`) tự nh�
 `answer` (đáp án tham chiếu), `keyword` (entity kỳ vọng còn sống sót — dùng cho
 verify retention của nhóm compression/KV).
 
+## Reference cho ROUGE
+
+Khi record có một trong các trường `reference` / `summary` / `answer`, script
+infer sẽ tự tính **ROUGE-1/2/L** (F1) của summary sinh ra so với reference và
+ghi `rouge1/rouge2/rougeL` vào từng record + `mean_rouge*` vào bản `summary`
+cuối file. Triển khai: `scripts/common/rouge.py` (pure-Python, không cần cài
+package).
+
+```json
+{"id": 0, "text": "<long doc>", "reference": "<tóm tắt mẫu>"}   // summarization
+{"id": 0, "prompt": "...", "answer": "..."}                      // QA cũng tính ROUGE
+```
+
+Nếu không có reference, các key ROUGE đơn giản không xuất hiện trong output.
+
 ## Trạng thái hỗ trợ theo baseline
 
 | Baseline | Đọc `DATA_FILE`? | Ghi chú |
@@ -45,3 +60,23 @@ Mọi script ghi kết quả vào `outputs/<baseline>_*.jsonl` theo schema thố
 (`externals/baseline_repo_guide.md` §13): input_tokens, retained_tokens,
 output_tokens, selector_latency_ms, ttft/e2e_ms, throughput_tok_s, ... + bản
 `summary` cuối file, kèm verify PASS/FAIL.
+
+## Trích tập mẫu đại diện
+
+Sau khi có các file normalized trong `data/normalized/`, có thể trích khoảng
+100 mẫu cho mỗi dataset bằng:
+
+```bash
+python data/extract_representative_samples.py \
+  --normalized-dir data/normalized \
+  --output-dir data/representative_100 \
+  --samples-per-dataset 100
+```
+
+Script chọn các điểm cách đều sau khi xếp theo độ dài `document`, nên bao phủ
+được tài liệu ngắn, trung bình và dài mà không phụ thuộc random seed. Mặc định
+độ dài là số từ và không cần tải model/tokenizer. Kết quả gồm một file riêng
+cho từng dataset và `manifest.json`. Có thể dùng
+`--length-metric tokens --tokenizer Qwen/Qwen3-4B`
+để chọn theo token length của Qwen. Record có `document` hoặc `reference` rỗng
+sẽ được bỏ qua và số lượng được ghi trong `manifest.json`.

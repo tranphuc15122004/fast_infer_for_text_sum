@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 
-from common import io_util, verify
+from common import io_util, rouge, verify
 from common.data_loader import load_records
 from common.paths import snapshot_dir
 
@@ -183,6 +183,8 @@ def main() -> None:
                 "run": run,
                 "text": text,
             }
+            # ROUGE-1/2/L vs reference summary (nếu data có reference/answer)
+            rouge.add_rouge(record, text, sample.get("reference"))
             writer.add(record)
             print(f"[sample {sample['id']} run {run}] tokens={n_tok} e2e={elapsed:.2f}s {record['throughput_tok_s']:.1f} tok/s | {text[:60]!r}")
 
@@ -197,6 +199,7 @@ def main() -> None:
         "num_runs": args.num_runs,
         "mean_tpot_ms": round(io_util.mean([r["tpot_ms"] for r in writer.records if r["tpot_ms"]]), 3),
         "mean_throughput_tok_s": round(io_util.mean([r["throughput_tok_s"] for r in writer.records]), 2),
+        **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

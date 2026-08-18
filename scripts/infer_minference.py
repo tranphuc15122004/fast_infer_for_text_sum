@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from common import io_util, verify
+from common import io_util, rouge, verify
 from common.data_loader import load_records
 
 
@@ -137,6 +137,8 @@ def main() -> None:
             "sample_id": sample["id"],
             "text": text,
         }
+        # ROUGE-1/2/L vs reference summary (nếu data có reference/answer)
+        rouge.add_rouge(record, text, sample.get("reference"))
         writer.add(record)
         print(f"[sample {sample['id']}] tokens={n_tok} e2e={elapsed:.2f}s | {text[:60]!r}")
 
@@ -151,6 +153,7 @@ def main() -> None:
         "num_samples": len(prompts),
         "mean_e2e_ms": round(io_util.mean([r["e2e_ms"] for r in writer.records]), 3),
         "mean_throughput_tok_s": round(io_util.mean([r["throughput_tok_s"] for r in writer.records]), 2),
+        **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

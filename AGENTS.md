@@ -21,7 +21,8 @@ fast_infer_text_sum/
 │       ├── paths.py            # ROOT, repo_dir(), hf_token(), snapshot_dir(), gpu_name()
 │       ├── io_util.py          # JsonlWriter + schema §13, finalize() ghi summary
 │       ├── verify.py           # check PASS/FAIL, set exit code
-│       ├── data_loader.py      # chuẩn hóa jsonl → {id, prompt, answer?, keyword?}
+│       ├── rouge.py            # ROUGE-1/2/L pure-Python (no-deps), add_rouge()/aggregate_rouge()
+│       ├── data_loader.py      # chuẩn hóa jsonl → {id, prompt, answer?, reference?, keyword?}
 │       └── __init__.py
 ├── config/                     # cấu hình per baseline: config/<b>.env (+ _smoke/_dense/_prepare/_gsm8k)
 │                               # biến: SMOKE, FULL, OUTPUT_FILE, DATA_FILE, MAX_SAMPLES, MAX_NEW_TOKENS...
@@ -67,6 +68,10 @@ fast_infer_text_sum/
 - **Dữ liệu plug-and-play**: bỏ jsonl vào `data/`, set `DATA_FILE`/`DOC_FILE` +
   `MAX_SAMPLES` trong config. Loader ưu tiên `prompt → question → instruction → text → turns[0]`.
   Lưu ý: HiGOE & DFlash KHÔNG đọc `DATA_FILE`.
+- **ROUGE quality**: khi data có `reference`/`summary`/`answer`, script sinh text
+  gọi `rouge.add_rouge(record, text, ref)` (ghi `rouge1/rouge2/rougeL` vào record)
+  và `rouge.aggregate_rouge(records)` cho bản summary. Module `common/rouge.py`
+  là pure-Python (không cài thêm package vào env).
 
 ## Commands
 

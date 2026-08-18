@@ -15,7 +15,7 @@ import argparse
 import time
 from pathlib import Path
 
-from common import io_util, verify
+from common import io_util, rouge, verify
 from common.data_loader import load_records
 
 
@@ -93,6 +93,8 @@ def main() -> None:
             "sample_id": p["id"],
             "text": text,
         }
+        # ROUGE-1/2/L vs reference summary (nếu data có reference/answer)
+        rouge.add_rouge(record, text, p.get("reference"))
         writer.add(record)
         print(f"[sample {p['id']}] tokens={n_tok} | {text[:60]!r}")
 
@@ -107,6 +109,7 @@ def main() -> None:
         "throughput_tok_s": round(
             sum(r["output_tokens"] for r in writer.records) / elapsed, 2
         ) if elapsed else 0.0,
+        **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

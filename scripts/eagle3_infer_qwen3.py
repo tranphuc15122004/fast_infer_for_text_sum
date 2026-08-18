@@ -33,9 +33,12 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from eagle.model.ea_model import EaModel  # noqa: E402
 from eagle.model.kv_cache import initialize_past_key_values  # noqa: E402
+
+from common import rouge  # noqa: E402
 
 
 def load_questions(question_file: Path, begin: int, end: int) -> list[dict]:
@@ -259,6 +262,11 @@ def main() -> None:
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
                 }
+                # ROUGE-1/2/L vs reference (nếu question file có reference/answer)
+                rouge.add_rouge(
+                    record, answer,
+                    question.get("reference") or question.get("answer"),
+                )
                 records.append(record)
                 raw_metrics.append({
                     "eagle_tokens": new_tokens,
@@ -345,6 +353,7 @@ def main() -> None:
                         if naive_throughput is not None else None),
         "decoding_speedup": (round(speedup, 3) if speedup is not None else None),
         "mean_speedup": (round(statistics.mean(speedups), 3) if speedups else None),
+        **rouge.aggregate_rouge(records),
     }
     with output.open("a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
