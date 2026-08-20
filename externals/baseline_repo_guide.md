@@ -651,9 +651,12 @@ Mỗi run nên lưu ít nhất:
   "output_tokens": 0,
   "batch_size": 0,
   "selector_latency_ms": 0.0,
+  "prefill_ms": 0.0,
+  "decode_ms": 0.0,
   "ttft_ms": 0.0,
   "tpot_ms": 0.0,
   "e2e_ms": 0.0,
+  "pipeline_e2e_ms": 0.0,
   "throughput_tok_s": 0.0,
   "qps": 0.0,
   "peak_memory_gb": 0.0,
@@ -666,6 +669,23 @@ Mỗi run nên lưu ít nhất:
   "number_recall": 0.0
 }
 ```
+
+Khi chạy cùng một request với dense/reference target, có thể ghi thêm các
+timing cặp sau để tính speedup:
+
+```json
+{
+  "dense_e2e_ms": 0.0,
+  "dense_ttft_ms": 0.0,
+  "dense_prefill_ms": 0.0,
+  "dense_decode_ms": 0.0
+}
+```
+
+Collector tính ratio của mean: `ESR = dense_e2e / method_pipeline_e2e`,
+`DSR = dense_decode / method_decode`, cùng `prefill_speedup` và
+`ttft_speedup`. Timing thiếu làm metric tương ứng unavailable, không bị thay
+bằng zero.
 
 Speculative methods add:
 

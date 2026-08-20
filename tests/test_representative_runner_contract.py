@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 import sys
 
@@ -86,6 +87,55 @@ def test_representative_runner_selects_t4_configs_in_smoke_mode():
 def test_semantic_selection_adapter_files_exist():
     assert (ROOT / "scripts/run_semantic_selection.sh").is_file()
     assert (ROOT / "config/semantic_selection.env").is_file()
+
+
+def test_dflash_and_longspec_have_representative_adapters():
+    assert (ROOT / "scripts/infer_dflash.py").is_file()
+    assert (ROOT / "scripts/run_dflash.sh").is_file()
+    assert (ROOT / "config/dflash.env").is_file()
+    assert (ROOT / "scripts/infer_longspec.py").is_file()
+    assert (ROOT / "scripts/run_longspec.sh").is_file()
+
+    runner = (ROOT / "scripts/run_representative_100.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'REPRESENTATIVE_BASELINES="llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec"' in runner
+    assert "dflash longspec" in runner
+    assert "dflash|longspec" in runner
+
+
+def test_representative_runner_dflash_longspec_dry_run(tmp_path):
+    output_dir = tmp_path / "representative"
+    proc = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/run_representative_100.sh"),
+            "--mode",
+            "full",
+            "--baselines",
+            "dflash longspec",
+            "--datasets",
+            "xsum",
+            "--max-samples",
+            "1",
+            "--output-dir",
+            str(output_dir),
+            "--dry-run",
+            "--skip-collect",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    dflash_config = (output_dir / "configs/dflash_xsum.env").read_text()
+    assert "LLaMA3.1-8B-Instruct-DFlash-UltraChat" in dflash_config
+    assert "data/representative_100/xsum_representative.jsonl" in dflash_config
+
+    longspec_config = (output_dir / "configs/longspec_xsum.env").read_text()
+    assert "MODEL_NAME='vicuna7b'" in longspec_config
+    assert "DATA_FILE='data/representative_100/xsum_representative.jsonl'" in longspec_config
 
 
 def test_collector_normalizes_semantic_selection_schema():

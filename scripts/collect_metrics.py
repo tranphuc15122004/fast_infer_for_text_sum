@@ -11,8 +11,13 @@ Output: metrics_summary.json (đầy đủ) + metrics_summary.csv (bảng rộng
 
 Metric tốc độ (mean/median/p90/std của từng key schema §13):
   input_tokens, retained_tokens, output_tokens, selector_latency_ms, ttft_ms,
-  tpot_ms, e2e_ms, throughput_tok_s, qps, peak_memory_gb
+  tpot_ms, prefill_ms, decode_ms, e2e_ms, pipeline_e2e_ms,
+  throughput_tok_s, qps, peak_memory_gb
   + retained_ratio, compression_ratio (suy ra) + key speculative (nếu có).
+
+Paired speedup (ratio of means, dense/reference divided by method):
+  ESR (end-to-end), DSR (decode), prefill_speedup, ttft_speedup.
+  These are emitted only when both sides of the timing pair are present.
 
 Metric semantic (mean, theo từng text key có trong record):
   ROUGE-1/2/L P/R/F, ROUGE-Lsum, BLEU-1..4, length_ratio
@@ -150,6 +155,62 @@ def normalize_record(record: dict, fallback_method: str) -> dict:
         if out.get(target) is None and out.get(source) is not None:
             out[target] = out[source]
 
+    # Canonical names for timings from a paired dense/reference run.  The
+    # semantic-selection adapter historically called these baseline_full_*;
+    # accept both spellings so old JSONL remains usable.
+    dense_aliases = {
+        "dense_e2e_ms": ("baseline_full_e2e_ms", "baseline_e2e_ms"),
+        "dense_ttft_ms": ("baseline_full_ttft_ms", "baseline_ttft_ms"),
+        "dense_prefill_ms": (
+            "baseline_full_prefill_ms",
+            "baseline_prefill_ms",
+        ),
+        "dense_decode_ms": (
+            "baseline_full_decode_ms",
+            "baseline_decode_ms",
+        ),
+    }
+    for target, sources in dense_aliases.items():
+        if out.get(target) is not None:
+            continue
+        for source in sources:
+            if out.get(source) is not None:
+                out[target] = out[source]
+                break
+
+    # Existing adapters already measure a dense paired run under a
+    # baseline-specific name.  Normalize those names into the shared timing
+    # fields used by aggregate_speedup().
+    if out.get("dense_e2e_ms") is None and out.get("base_time_s") is not None:
+        out["dense_e2e_ms"] = float(out["base_time_s"]) * 1000.0
+    if out.get("dense_e2e_ms") is None and out.get("naive_time") is not None:
+        # EAGLE's benchmark is decode-only, so naive_time is its dense decode
+        # and end-to-end reference in the same measurement domain.
+        out["dense_e2e_ms"] = float(out["naive_time"]) * 1000.0
+    if out.get("dense_decode_ms") is None and out.get("naive_time") is not None:
+        out["dense_decode_ms"] = float(out["naive_time"]) * 1000.0
+
+    if out.get("decode_ms") is None and out.get("eagle_time") is not None:
+        out["decode_ms"] = float(out["eagle_time"]) * 1000.0
+    if out.get("e2e_ms") is None and out.get("eagle_time") is not None:
+        out["e2e_ms"] = float(out["eagle_time"]) * 1000.0
+    if out.get("output_tokens") is None and out.get("new_tokens") is not None:
+        out["output_tokens"] = out["new_tokens"]
+    if out.get("throughput_tok_s") is None and out.get("eagle_tok_s") is not None:
+        out["throughput_tok_s"] = out["eagle_tok_s"]
+
+    # LLMLingua reports compressor time separately from target generation.
+    # Make the selector-inclusive wall-clock timing available for ESR while
+    # preserving the original target-only e2e_ms field.
+    if (
+        out.get("pipeline_e2e_ms") is None
+        and out.get("e2e_ms") is not None
+        and out.get("selector_latency_ms") is not None
+    ):
+        out["pipeline_e2e_ms"] = (
+            float(out["e2e_ms"]) + float(out["selector_latency_ms"])
+        )
+
     if out.get("doc_id") is None and out.get("example_id") is not None:
         out["doc_id"] = out["example_id"]
 
@@ -201,6 +262,9 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
         group["speed"] = speed
     if spec:
         group["speculative"] = spec
+    speedup = metrics.aggregate_speedup(records)
+    if speedup:
+        group["speedup"] = speedup
     if semantic:
         group["semantic"] = semantic
     return group
@@ -383,6 +447,11 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
                     if label not in seen:
                         seen.add(label)
                         col_meta.append((section, key, stat))
+        for key in group.get("speedup", {}):
+            label = f"{key}_ratio"
+            if label not in seen:
+                seen.add(label)
+                col_meta.append(("speedup", key, "ratio"))
         for key in group.get("semantic", {}):
             label = f"{key}_mean"
             if label not in seen:
@@ -397,6 +466,9 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
         for section, key, stat in col_meta:
             if section == "semantic":
                 v = group.get("semantic", {}).get(key)
+                row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+            elif section == "speedup":
+                v = group.get("speedup", {}).get(key)
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             else:
                 agg = group.get(section, {}).get(key)
@@ -423,6 +495,7 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
         f"- Outputs: {result['outputs_dir']}",
         f"- Datasets: {', '.join(datasets)}",
         "- Speed: mean/median/p90/std theo schema §13 (metrics_summary.json có đầy đủ).",
+        "- Speedup: ratio của mean timing dense/reference chia cho mean timing method (chỉ khi có cặp ghép).",
         "- Semantic: ROUGE-1/2/L P/R/F, ROUGE-Lsum, BLEU-1..4, length ratio (mean).",
         "",
     ]
@@ -432,17 +505,31 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
         md.append("")
         md.append("### Tốc độ (mean)")
         md.append("")
-        md.append("| method | n | input | ret% | out | sel_ms | ttft | tpot | e2e | tok/s | qps | mem |")
-        md.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        md.append("| method | n | input | ret% | out | sel_ms | prefill | decode | ttft | tpot | e2e | pipeline | tok/s | qps | mem |")
+        md.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for method, group in sorted(groups.items()):
             sp = group.get("speed", {})
             md.append(
                 f"| {method} | {group.get('num_records', 0)} "
                 f"| {_fmt(sp.get('input_tokens'))} | {_fmt(sp.get('retained_ratio'))} "
                 f"| {_fmt(sp.get('output_tokens'))} | {_fmt(sp.get('selector_latency_ms'))} "
+                f"| {_fmt(sp.get('prefill_ms'))} | {_fmt(sp.get('decode_ms'))} "
                 f"| {_fmt(sp.get('ttft_ms'))} | {_fmt(sp.get('tpot_ms'))} "
-                f"| {_fmt(sp.get('e2e_ms'))} | {_fmt(sp.get('throughput_tok_s'))} "
+                f"| {_fmt(sp.get('e2e_ms'))} | {_fmt(sp.get('pipeline_e2e_ms'))} "
+                f"| {_fmt(sp.get('throughput_tok_s'))} "
                 f"| {_fmt(sp.get('qps'))} | {_fmt(sp.get('peak_memory_gb'))} |"
+            )
+        md.append("")
+        md.append("### Speedup so với dense/reference (ratio mean)")
+        md.append("")
+        md.append("| method | ESR | DSR | prefill | TTFT |")
+        md.append("|---|---|---|---|---|")
+        for method, group in sorted(groups.items()):
+            su = group.get("speedup", {})
+            md.append(
+                f"| {method} | {_fmt(su.get('esr'))} "
+                f"| {_fmt(su.get('dsr'))} | {_fmt(su.get('prefill_speedup'))} "
+                f"| {_fmt(su.get('ttft_speedup'))} |"
             )
         md.append("")
         md.append("### Semantic (mean)")

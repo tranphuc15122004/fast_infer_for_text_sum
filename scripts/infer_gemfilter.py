@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-from common import io_util, rouge, verify
+from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.paths import snapshot_dir
 
@@ -133,6 +133,7 @@ def main() -> None:
                 "gemfilter_text": gem_text,
                 "base_time_s": round(base_s, 4),
                 "gemfilter_time_s": round(gem_s, 4),
+                "dense_e2e_ms": round(base_s * 1e3, 3),
             }
             # ROUGE-1/2/L cho cả 2 nhánh (nếu data có reference/answer);
             # base_text lưu dưới prefix "base_" để phân biệt với gemfilter_text.
@@ -152,6 +153,7 @@ def main() -> None:
         "num_runs": args.num_runs,
         "mean_gemfilter_time_s": round(io_util.mean([r["gemfilter_time_s"] for r in writer.records]), 4),
         "mean_base_time_s": round(io_util.mean([r["base_time_s"] for r in writer.records]), 4),
+        "speedup": metrics.aggregate_speedup(writer.records),
         **rouge.aggregate_rouge(writer.records),
         **rouge.aggregate_rouge(writer.records, prefix="base_"),
     }

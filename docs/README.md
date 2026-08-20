@@ -77,7 +77,8 @@ Mọi script ghi `outputs/<baseline>_*.jsonl` theo schema thống nhất
   `mean_rouge*` vào bản `summary`.
 - `externals/Sematic_selection/infer.py` có cờ `--rouge` để tính ROUGE trên
   toàn bộ selector/budget (quality vs retention, RQ3).
-- Baseline không sinh text (kernel smoke: `rocketkv`, `higoe`, `longspec`,
+- Baseline không sinh text trong smoke probe độc lập (kernel smoke:
+  `rocketkv`, `higoe`, `longspec`,
   `magicdec`, `specextend`) không có ROUGE.
 
 ## Benchmark baseline có adapter trên representative_100

@@ -1262,8 +1262,28 @@ def make_result_row(
         # Full-context comparison
         "baseline_full_ttft_ms": baseline_ttft,
         "baseline_full_e2e_ms": baseline_e2e,
+        "baseline_full_prefill_ms": (
+            baseline_generation.prefill_ms
+            if baseline_generation is not None
+            else None
+        ),
+        "baseline_full_decode_ms": (
+            baseline_generation.decode_ms
+            if baseline_generation is not None
+            else None
+        ),
         "ttft_speedup_vs_full": ttft_speedup,
         "e2e_speedup_vs_full": e2e_speedup,
+        "prefill_speedup_vs_full": (
+            baseline_generation.prefill_ms / generation.prefill_ms
+            if baseline_generation is not None and generation.prefill_ms > 0.0
+            else None
+        ),
+        "decode_speedup_vs_full": (
+            baseline_generation.decode_ms / generation.decode_ms
+            if baseline_generation is not None and generation.decode_ms > 0.0
+            else None
+        ),
         "net_latency_saved_ms": latency_saved_ms,
         "net_latency_reduction_ratio": (
             latency_reduction_ratio
@@ -1312,6 +1332,26 @@ def aggregate_results(
     }
 
     for (selector, budget_label), group in sorted(groups.items()):
+        def ratio_of_means(
+            dense_key: str,
+            method_key: str,
+        ) -> Optional[float]:
+            pairs = [
+                (float(row[dense_key]), float(row[method_key]))
+                for row in group
+                if row.get(dense_key) is not None
+                and row.get(method_key) is not None
+                and float(row[dense_key]) > 0.0
+                and float(row[method_key]) > 0.0
+            ]
+            if not pairs:
+                return None
+            return round(
+                statistics.fmean(d for d, _ in pairs)
+                / statistics.fmean(m for _, m in pairs),
+                4,
+            )
+
         selection_latencies = [
             float(r["selection_total_wall_ms"])
             for r in group
@@ -1403,6 +1443,33 @@ def aggregate_results(
             "mean_ttft_speedup_vs_full": _mean_or_none(
                 r.get("ttft_speedup_vs_full")
                 for r in group
+            ),
+            "mean_prefill_speedup_vs_full": _mean_or_none(
+                r.get("prefill_speedup_vs_full")
+                for r in group
+            ),
+            "mean_decode_speedup_vs_full": _mean_or_none(
+                r.get("decode_speedup_vs_full")
+                for r in group
+            ),
+            # Benchmark-level ratios use ratio of means, matching
+            # scripts/common/metrics.py and avoiding short requests
+            # dominating the aggregate.
+            "esr": ratio_of_means(
+                "baseline_full_e2e_ms",
+                "pipeline_e2e_ms",
+            ),
+            "dsr": ratio_of_means(
+                "baseline_full_decode_ms",
+                "decode_ms",
+            ),
+            "prefill_speedup": ratio_of_means(
+                "baseline_full_prefill_ms",
+                "prefill_ms",
+            ),
+            "ttft_speedup": ratio_of_means(
+                "baseline_full_ttft_ms",
+                "pipeline_ttft_ms",
             ),
             "mean_net_latency_reduction_ratio": _mean_or_none(
                 r.get("net_latency_reduction_ratio")

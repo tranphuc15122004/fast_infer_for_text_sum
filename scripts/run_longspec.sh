@@ -18,7 +18,17 @@ cd "$ROOT"
 export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
 
 ARGS=(--output "$OUTPUT_FILE")
-if [[ "${FULL:-0}" == "1" ]]; then
+if [[ -n "${DATA_FILE:-}" ]]; then
+  : "${TARGET_MODEL:?TARGET_MODEL required when DATA_FILE is set}"
+  : "${DRAFT_MODEL:?DRAFT_MODEL required when DATA_FILE is set}"
+  ARGS+=(--data-file "$DATA_FILE"
+         --max-samples "${MAX_SAMPLES:-5}"
+         --model-name "${MODEL_NAME:-vicuna7b}"
+         --target-model "$TARGET_MODEL"
+         --draft-model "$DRAFT_MODEL"
+         --max-gen-len "${MAX_GEN_LEN:-64}")
+  [[ "${SMOKE:-0}" == "1" ]] && ARGS+=(--smoke)
+elif [[ "${FULL:-0}" == "1" ]]; then
   ARGS+=(--full --model-name "${MODEL_NAME:-llama8b}" --method "${METHOD:-tree}"
          --task "${TASK:-gov_report}" --max-gen-len "${MAX_GEN_LEN:-1024}"
          --tree-shape "${TREE_SHAPE:-4 16 16 16 16}")

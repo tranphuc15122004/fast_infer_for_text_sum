@@ -6,7 +6,7 @@
 #   bash scripts/run_representative_100.sh [options]
 #
 # Options:
-#   --baselines a,b,c      baseline có adapter representative (mặc định: 8 baseline)
+#   --baselines a,b,c      baseline có adapter representative (mặc định: 10 baseline)
 #   --datasets a,b,c       dataset trong data/representative_100 (mặc định: tất cả)
 #   --max-samples N        số mẫu / (baseline, dataset) [smoke=5, full=100]
 #   --max-new-tokens N     override độ dài sinh (theo biến của từng baseline)
@@ -86,8 +86,8 @@ case "$MODE" in
   *) echo "bad --mode: $MODE (smoke|full)" >&2; exit 2 ;;
 esac
 
-REPRESENTATIVE_BASELINES="llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection"
-UNSUPPORTED_BASELINES="higoe dflash rocketkv magicdec longspec"
+REPRESENTATIVE_BASELINES="llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec"
+UNSUPPORTED_BASELINES="higoe rocketkv magicdec"
 ALL_BASELINES="$REPRESENTATIVE_BASELINES $UNSUPPORTED_BASELINES"
 
 if [[ -z "$BASELINES" ]]; then
@@ -205,6 +205,7 @@ REP_COMPRESSOR_MODEL="${REP_COMPRESSOR_MODEL:-microsoft/llmlingua-2-xlm-roberta-
 REP_EMBEDDING_MODEL="${REP_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
 REP_VICUNA_MODEL="${REP_VICUNA_MODEL:-lmsys/vicuna-7b-v1.5-16k}"
 REP_SPECEXTEND_DRAFT_MODEL="${REP_SPECEXTEND_DRAFT_MODEL:-double7/vicuna-68m}"
+REP_LONGSPEC_DRAFT_MODEL="${REP_LONGSPEC_DRAFT_MODEL:-sail/longspec-vicuna-7b-v1.5-16k}"
 
 # Resolve a cached HF repo to its snapshot when possible.  This matters for
 # EAGLE3, whose wrapper validates that the draft checkpoint is a local dir;
@@ -230,7 +231,23 @@ PY
 
 apply_full_model_overrides() {
   local b="$1"
-  [[ "$MODE" == "full" ]] || return 0
+  if [[ "$MODE" != "full" ]]; then
+    # These two representative adapters intentionally use their paired
+    # research checkpoints in smoke mode too; only generation length is
+    # reduced by SMOKE.
+    case "$b" in
+      dflash)
+        set_env TARGET_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_DFLASH_MODEL")"
+        ;;
+      longspec)
+        set_env MODEL_NAME "vicuna7b"
+        set_env TARGET_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_LONGSPEC_DRAFT_MODEL")"
+        ;;
+    esac
+    return 0
+  fi
   case "$b" in
     llmlingua)
       set_env COMPRESSOR_MODEL "$(resolve_model_ref "$REP_COMPRESSOR_MODEL")"
@@ -256,10 +273,19 @@ apply_full_model_overrides() {
       set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
       set_env EAGLE_MODEL "$(resolve_model_ref "$REP_EAGLE_MODEL")"
       ;;
+    dflash)
+      set_env TARGET_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_DFLASH_MODEL")"
+      ;;
     specextend)
       set_env MODEL_NAME "vicuna_7b"
       set_env BASE_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
       set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_DRAFT_MODEL")"
+      ;;
+    longspec)
+      set_env MODEL_NAME "vicuna7b"
+      set_env TARGET_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_LONGSPEC_DRAFT_MODEL")"
       ;;
     semantic_selection)
       set_env MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
@@ -275,8 +301,8 @@ config_for() {
     gemfilter:smoke)   echo "gemfilter_smoke" ;;
     specprefill:smoke) echo "specprefill_smoke" ;;
     specextend:smoke)  echo "specextend_smoke" ;;
+    dflash:*)          echo "dflash" ;;
     eagle3:*)          echo "eagle3_qwen3" ;;
-    dflash:*)          echo "dflash_smoke" ;;
     *)                 echo "$1" ;;
   esac
 }
@@ -304,6 +330,9 @@ gen_config() {
       fastkv|gemfilter|specprefill|minference)
         set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
         ;;
+      dflash|longspec)
+        set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
+        ;;
       eagle3)
         set_env DATA_FILE "$OUT_DIR/data/eagle3_${ds}.jsonl"
         set_env QUESTION_BEGIN "0"
@@ -318,7 +347,7 @@ gen_config() {
     esac
     if [[ -n "$MAX_NEW_TOKENS" ]]; then
       case "$b" in
-        gemfilter|specextend) set_env MAX_GEN_LEN "$MAX_NEW_TOKENS" ;;
+        gemfilter|specextend|longspec) set_env MAX_GEN_LEN "$MAX_NEW_TOKENS" ;;
         specprefill)          set_env MAX_TOKENS "$MAX_NEW_TOKENS" ;;
         *)                    set_env MAX_NEW_TOKENS "$MAX_NEW_TOKENS" ;;
       esac

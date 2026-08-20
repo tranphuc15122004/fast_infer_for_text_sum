@@ -35,8 +35,8 @@ probe vào thư mục `smoke/`, không được tính vào benchmark/metric.
 
 | Nhóm | Baseline | Ghi chú |
 |---|---|---|
-| Đọc dữ liệu representative (chạy mặc định) | llmlingua, fastkv, gemfilter, specprefill, minference, specextend, eagle3, semantic_selection | Runner sinh config full canonical riêng cho từng (baseline, dataset) trong `<output-dir>/configs/` |
-| Chưa có adapter representative | higoe, dflash, rocketkv, magicdec, longspec | Chỉ chạy khi có `--include-unsupported`; là smoke probe riêng, không đọc dataset và không được đưa vào metric |
+| Đọc dữ liệu representative (chạy mặc định) | llmlingua, fastkv, gemfilter, specprefill, minference, specextend, eagle3, semantic_selection, dflash, longspec | Runner sinh config full canonical riêng cho từng (baseline, dataset) trong `<output-dir>/configs/` |
+| Chưa có adapter representative | higoe, rocketkv, magicdec | Chỉ chạy khi có `--include-unsupported`; là smoke probe riêng, không đọc dataset và không được đưa vào metric |
 
 `semantic_selection` chạy cùng target canonical M1 và embedding M6 cho `full`, `random`, `lead`, `tfidf`,
 `textrank`, `mmr`; các scheme được tách riêng khi collector tổng hợp metric.
@@ -50,6 +50,10 @@ Data được convert tự động cho baseline có format riêng (vào
   (EAGLE chat format).
 - **specextend**: record dạng `{"text": "<prompt wrapper + document>"}`
   (đúng format `run_classic.py` đọc).
+- **dflash**: đọc trực tiếp unified `{id, document, reference}` JSONL và dùng
+  target `Llama-3.1-8B-Instruct` cùng draft `LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
+- **longspec**: đọc trực tiếp unified JSONL và dùng cặp chính thức
+  `lmsys/vicuna-7b-v1.5-16k` + `sail/longspec-vicuna-7b-v1.5-16k`.
 
 ### Output
 
@@ -68,7 +72,7 @@ uv run --project . --locked python scripts/collect_metrics.py
 # kiểm tra strict thủ công
 uv run --project . --locked python scripts/collect_metrics.py \
   --strict \
-  --expected-baselines "llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection" \
+  --expected-baselines "llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec" \
   --expected-datasets "cnn_dailymail govreport multinews xsum" \
   --expected-samples 100
 
@@ -89,13 +93,36 @@ Sinh ra trong `<output-dir>`:
 ### Metric tốc độ (schema §13)
 
 `input_tokens`, `retained_tokens`, `output_tokens`, `selector_latency_ms`,
-`ttft_ms`, `tpot_ms`, `e2e_ms`, `throughput_tok_s`, `qps`, `peak_memory_gb`
+`prefill_ms`, `decode_ms`, `ttft_ms`, `tpot_ms`, `e2e_ms`, `pipeline_e2e_ms`,
+`throughput_tok_s`, `qps`, `peak_memory_gb`
 + `retained_ratio`, `compression_ratio` (suy ra) + key speculative
 (`avg_accept_length`, `acceptance_rate`, `draft_latency_ms`,
 `verification_latency_ms`, `rejected_draft_ratio`).
 
 Mỗi key báo **mean / median / p90 / std**. Key không được baseline ghi
 (vd `ttft_ms` của script dùng transformers) tự động vắng mặt — không phải lỗi.
+
+### Paired speedup
+
+Khi mỗi record có timing của dense/reference run tương ứng, collector thêm
+`speedup` vào JSON và các cột `*_ratio` vào CSV:
+
+- **ESR** (`esr`): `mean(dense_e2e_ms) / mean(method_pipeline_e2e_ms)`;
+- **DSR** (`dsr`): `mean(dense_decode_ms) / mean(method_decode_ms)`;
+- **Prefill speedup** (`prefill_speedup`):
+  `mean(dense_prefill_ms) / mean(method_prefill_ms)`;
+- **TTFT speedup** (`ttft_speedup`):
+  `mean(dense_ttft_ms) / mean(method_pipeline_ttft_ms)`.
+
+Các tỷ số dùng ratio của mean trên những record có đủ hai vế, không phải mean
+của các tỷ số từng record. Giá trị lớn hơn `1.0` nghĩa là method nhanh hơn.
+Nếu baseline không đo được component tương ứng, metric đó được bỏ qua thay vì
+coi timing thiếu là `0`.
+
+Các adapter hiện có paired reference cho GemFilter, EAGLE-3, semantic
+selection, DFlash và LongSpec; LLMLingua đo thêm dense target E2E. Các
+baseline chỉ ghi một E2E chung sẽ chỉ có ESR khi có `dense_e2e_ms`, còn
+DSR/prefill cần instrument riêng.
 
 ### Metric semantic
 
@@ -113,8 +140,8 @@ Triển khai: `scripts/common/metrics.py` (pure-Python, chạy được trong m�
 đang khóa `--locked`). ROUGE base: `scripts/common/rouge.py`.
 
 Lưu ý: baseline không ghi text sinh ra vào record (specextend, rocketkv,
-higoe, magicdec, longspec smoke) sẽ không có metric semantic — collector chỉ
-báo phần dữ liệu có.
+higoe, magicdec và LongSpec kernel smoke độc lập) sẽ không có metric semantic;
+LongSpec representative adapter có ghi text và được tính quality.
 
 ## 3. Kiểm chứng nhanh metric
 

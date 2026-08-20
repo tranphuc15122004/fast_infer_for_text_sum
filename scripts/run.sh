@@ -15,7 +15,7 @@ shift || true
 
 case "$BASELINE" in
   eagle3)      WRAPPER="scripts/run_eagle3_qwen3.sh" ;;
-  dflash)      WRAPPER="scripts/run_dflash_gsm8k.sh" ;;
+  dflash)      WRAPPER="scripts/run_dflash.sh" ;;
   llmlingua)   WRAPPER="scripts/run_llmlingua.sh" ;;
   fastkv)      WRAPPER="scripts/run_fastkv.sh" ;;
   rocketkv)    WRAPPER="scripts/run_rocketkv.sh" ;;

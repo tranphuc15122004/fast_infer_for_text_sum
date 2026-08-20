@@ -33,9 +33,12 @@ SPEED_KEYS = [
     "retained_tokens",
     "output_tokens",
     "selector_latency_ms",
+    "prefill_ms",
+    "decode_ms",
     "ttft_ms",
     "tpot_ms",
     "e2e_ms",
+    "pipeline_e2e_ms",
     "throughput_tok_s",
     "qps",
     "peak_memory_gb",
@@ -49,6 +52,17 @@ SPEC_KEYS = [
     "verification_latency_ms",
     "rejected_draft_ratio",
 ]
+
+# Paired speedup metrics.  The numerator is the dense/reference timing and
+# the denominator is the optimized timing.  These are intentionally kept
+# separate from SPEED_KEYS because a speedup is only valid when both timings
+# were measured for the same source sample/configuration.
+SPEEDUP_TIMINGS = {
+    "esr": ("dense_e2e_ms", ("pipeline_e2e_ms", "e2e_ms")),
+    "dsr": ("dense_decode_ms", ("decode_ms",)),
+    "prefill_speedup": ("dense_prefill_ms", ("prefill_ms",)),
+    "ttft_speedup": ("dense_ttft_ms", ("pipeline_ttft_ms", "ttft_ms")),
+}
 
 # Key tỷ lệ bổ sung (tính từ record).
 DERIVED_KEYS = [
@@ -277,3 +291,44 @@ def aggregate_speculative(records: Sequence[Mapping]) -> dict:
     """{key: {mean, median, p90, std}} cho các key speculative decoding."""
     return aggregate_speed(records, keys=SPEC_KEYS, include_derived=False)
 
+
+def _first_positive(record: Mapping, keys: Sequence[str]) -> Optional[float]:
+    for key in keys:
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return None
+
+
+def aggregate_speedup(records: Sequence[Mapping]) -> dict:
+    """Calculate paired speedups as ``mean(dense) / mean(method)``.
+
+    Only records carrying both sides of a timing pair contribute.  Returning
+    a scalar ratio (rather than averaging per-record ratios) makes the report
+    agree with the benchmark-level definition and avoids tiny samples with
+    unusually short requests dominating the result.
+
+    The result contains only metrics with at least one complete positive pair;
+    a missing timing is therefore reported as unavailable instead of being
+    treated as zero.
+    """
+    out: dict = {}
+    for name, (dense_key, method_keys) in SPEEDUP_TIMINGS.items():
+        dense_values: list[float] = []
+        method_values: list[float] = []
+        for record in records:
+            dense = _first_positive(record, (dense_key,))
+            method = _first_positive(record, method_keys)
+            if dense is None or method is None:
+                continue
+            dense_values.append(dense)
+            method_values.append(method)
+        if method_values:
+            out[name] = round(mean(dense_values) / mean(method_values), 4)
+    return out

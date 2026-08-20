@@ -25,9 +25,17 @@ from pathlib import Path
 
 import torch
 
-from common import io_util, rouge, verify
+from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.paths import ROOT, snapshot_dir
+
+
+def _fits_model_context(input_tokens: int, max_new_tokens: int, model) -> bool:
+    """Return whether a prompt plus generation fits the target context."""
+    limit = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if not isinstance(limit, int) or limit <= 0:
+        return True
+    return input_tokens + max_new_tokens <= limit
 
 
 def main() -> None:
@@ -115,7 +123,40 @@ def main() -> None:
         origin_tokens = int(result.get("origin_tokens", 0))
         compressed_tokens = int(result.get("compressed_tokens", 0))
 
-        # 2) generate summary with target model
+        # 2) Paired dense reference with the same target model and generation
+        # settings.  The compressor is intentionally excluded from this
+        # reference; the collector adds selector_latency_ms back for the
+        # selector-inclusive ESR denominator.
+        dense_messages = [{
+            "role": "user",
+            "content": "Summarize the following document.\n\n" + source,
+        }]
+        dense_input_ids = tokenizer.apply_chat_template(
+            dense_messages, tokenize=True, add_generation_prompt=True,
+            return_tensors="pt",
+        ).to(device)
+        dense_input_len = dense_input_ids.shape[1]
+        dense_e2e_s = None
+        dense_output_tokens = None
+        dense_reference_status = "measured"
+        if _fits_model_context(dense_input_len, args.max_new_tokens, model):
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                dense_out = model.generate(
+                    dense_input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,
+                )
+            dense_e2e_s = time.perf_counter() - t0
+            dense_output_tokens = int(dense_out[0, dense_input_len:].shape[0])
+        else:
+            dense_reference_status = "skipped_context_limit"
+            print(
+                f"[{doc_id}] dense reference skipped: prompt={dense_input_len} "
+                f"+ new_tokens={args.max_new_tokens} exceeds target context"
+            )
+
+        # 3) generate summary with the compressed target prompt
         messages = [{"role": "user", "content": "Summarize the following document.\n\n" + compressed}]
         input_ids = tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
@@ -152,6 +193,14 @@ def main() -> None:
             "peak_memory_gb": None,
             "doc_id": doc_id,
             "compression_rate": args.compression_rate,
+            "dense_e2e_ms": (
+                round(dense_e2e_s * 1e3, 3)
+                if dense_e2e_s is not None
+                else None
+            ),
+            "dense_output_tokens": dense_output_tokens,
+            "dense_reference_status": dense_reference_status,
+            "pipeline_e2e_ms": round((compress_s + e2e_s) * 1e3, 3),
             "summary": summary_text,
         }
         # ROUGE-1/2/L vs reference summary (nếu data có trường reference/answer)
@@ -187,6 +236,7 @@ def main() -> None:
             io_util.mean([r["retained_tokens"] / r["input_tokens"] for r in writer.records if r["input_tokens"]]), 4),
         "mean_selector_latency_ms": round(io_util.mean([r["selector_latency_ms"] for r in writer.records]), 3),
         "mean_e2e_ms": round(io_util.mean([r["e2e_ms"] for r in writer.records]), 3),
+        "speedup": metrics.aggregate_speedup(writer.records),
         **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)
