@@ -17,6 +17,7 @@ source "$CONFIG_FILE"
 : "${MODEL_NAME:?MODEL_NAME is required}"
 
 cd "$ROOT"
+export MAGICDEC_DATA_ROOT="${MAGICDEC_DATA_ROOT:-${HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/MagicDec/Data}"
 
 if [[ "${PREPARE_CHECKPOINT:-0}" == "1" ]]; then
   export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"

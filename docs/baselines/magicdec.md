@@ -42,8 +42,10 @@ Cấu hình `config/magicdec.env`: `MODEL_PTH`, `MODEL_NAME`, `BATCH_SIZE`,
 
 ## Dữ liệu
 
-Benchmark đọc dataset pg19 nội bộ (`Data/pg19/`). Muốn data riêng phải sửa
-đoạn load dataset trong `tests/*_benchmark.py`.
+Benchmark đọc dataset pg19 từ
+`${HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/MagicDec/Data/pg19`.
+Có thể đổi vị trí bằng biến `MAGICDEC_DATA_ROOT`; không cần đặt dataset trong
+`externals/MagicDec/Data/` nữa.
 
 ## Output
 

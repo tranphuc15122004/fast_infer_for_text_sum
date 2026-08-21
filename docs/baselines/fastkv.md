@@ -33,6 +33,11 @@ Cấu hình `config/fastkv.env`: `MODEL`, `METHOD` (fastkv|snapkv|h2o|streamingl
 DATA_FILE="data/user_prompts.jsonl" MAX_SAMPLES=5 bash scripts/run.sh fastkv
 ```
 
+Dữ liệu full của FastKV (`LongBench` và `RULER`) được lưu ngoài repository tại
+`${HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/FastKV/data`.
+Có thể đổi vị trí bằng biến `FASTKV_DATA_ROOT`; các evaluator upstream sẽ tự
+dùng biến này khi không truyền `--data_file`.
+
 ## Output
 
 `outputs/fastkv_smoke.jsonl` — per record: input/output tokens, e2e, throughput,

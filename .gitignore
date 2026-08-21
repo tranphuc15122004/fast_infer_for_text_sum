@@ -35,6 +35,12 @@ outputs/
 checkpoints/
 externals/*/checkpoints/
 
+# Full benchmark datasets live in the shared HF cache, not Git.
+externals/FastKV/data/
+externals/MagicDec/Data/c4_small.json
+externals/MagicDec/Data/pg19/
+externals/MagicDec/Data/Ruler/synthetic/json/*.json
+
 # Large, regenerable datasets (prepare_data.py tải từ HuggingFace; xem data/README.md)
 data/raw/
 data/normalized/

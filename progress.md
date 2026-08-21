@@ -42,3 +42,15 @@
 - Infer thật 1 sample PASS: LLMLingua, FastKV, GemFilter, SpecPrefill, MInference, SpecExtend, EAGLE-3, semantic_selection, DFlash, MagicDec.
 - FastKV/GemFilter/SpecPrefill cần retry bằng config TinyLlama local vì config runner mặc định trỏ model thiếu weight/gated; retry đã có output và verification PASS.
 - HiGOE/RocketKV/LongSpec chỉ có smoke path trong repo hiện tại; đã chạy path đó trên GPU nhưng chưa gán nhãn là text infer thật.
+
+## 2026-08-21 — chuyển dataset lớn ra cache
+
+- Đã xác nhận thiết kế cache và nhận được phê duyệt từ người dùng.
+- Lỗi lần đầu khi chạy session-catchup do quoting shell; chưa làm thay đổi
+  repository. Sẽ dùng lệnh tách riêng để tránh lặp lại lỗi.
+- Đã thêm `dataset_cache_dir`, cập nhật FastKV/MagicDec resolver, wrapper,
+  config và docs; unit test cache path, compile và shell syntax đều pass.
+- Đã chuyển 908M FastKV và 99M MagicDec dataset vào
+  `~/.cache/huggingface/datasets/fast_infer_text_sum/`.
+- `git gc --prune=now` bị chặn vì `.git/gc.pid.lock` nằm trên filesystem
+  read-only; object database chưa thể dọn trong sandbox.

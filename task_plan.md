@@ -47,3 +47,10 @@ contract của runner chạy độc lập và pass.
 - Không gọi lại Hugging Face nếu model đã có trong cache.
 - Ghi rõ `full_infer`, `smoke` hoặc `kernel_only` cho từng baseline.
 - Một baseline lỗi không làm mất log/kết quả của các baseline còn lại.
+
+## Kế hoạch hiện tại: chuyển dataset lớn ra HF cache
+
+- [complete] Thêm helper/cache contract và kiểm tra test trước khi sửa.
+- [complete] Cập nhật runner/tài liệu để đọc `HF_HOME/datasets/fast_infer_text_sum`.
+- [complete] Di chuyển `externals/FastKV/data` và `externals/MagicDec/Data` ra cache.
+- [complete] Xoá dữ liệu khỏi Git working tree, kiểm tra tracked files và dung lượng.

@@ -17,6 +17,7 @@ source "$CONFIG_FILE"
 cd "$ROOT"
 export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH="$ROOT/externals/FastKV${PYTHONPATH:+:$PYTHONPATH}"
+export FASTKV_DATA_ROOT="${FASTKV_DATA_ROOT:-${HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/FastKV/data}"
 
 ARGS=(
   --max-new-tokens "${MAX_NEW_TOKENS:-64}"

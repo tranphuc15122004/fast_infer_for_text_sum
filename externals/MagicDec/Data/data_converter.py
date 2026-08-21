@@ -2,6 +2,7 @@ import torch
 from datasets import load_dataset
 import os
 import importlib
+from pathlib import Path
 import yaml
 from torch.utils.data import TensorDataset
 from tqdm import tqdm
@@ -40,9 +41,21 @@ def convert_cnn_dataset(tokenizer, seq_len = 256):
     return dataset
 
 def convert_pg19_dataset(tokenizer, seq_len = 4096, end = 20):
-    datasetparent = "Data/pg19/"
-    d_files = os.listdir(datasetparent)
-    dataset = load_dataset("json", data_files = [datasetparent + name for name in d_files], split = "train")
+    default_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    dataset_root = Path(os.environ.get(
+        "MAGICDEC_DATA_ROOT",
+        default_root / "datasets" / "fast_infer_text_sum" / "MagicDec" / "Data",
+    )).expanduser()
+    datasetparent = dataset_root / "pg19"
+    if not datasetparent.is_dir():
+        raise FileNotFoundError(
+            "MagicDec pg19 dataset not found at "
+            f"{datasetparent}. Set MAGICDEC_DATA_ROOT or populate the shared cache."
+        )
+    d_files = sorted(datasetparent.glob("*.json"))
+    if not d_files:
+        raise FileNotFoundError(f"MagicDec pg19 dataset directory is empty: {datasetparent}")
+    dataset = load_dataset("json", data_files=[str(path) for path in d_files], split="train")
     tokenized_prompts = []
     for i in tqdm(range(0,50)):
         prompt = dataset[i]['text']
@@ -103,4 +116,3 @@ def convert_pg19_dataset(tokenizer, seq_len = 4096, end = 20):
 #     num_eval_steps = len(dataloader)
 #     for step, batch in tqdm(enumerate(dataloader), total=num_eval_steps):
 #         input_ids = batch[0]
-    

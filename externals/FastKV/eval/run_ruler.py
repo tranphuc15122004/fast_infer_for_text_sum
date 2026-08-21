@@ -275,6 +275,9 @@ if __name__ == "__main__":
             print(f"Working on retain_rate {args.retain_rate} dataset {dataset} - {idx}/{len(datasets)}")
             
         args.dataset = dataset
-        args.data_file = f"data/RULER/{args.context_length}/{args.dataset}.jsonl"
+        data_root = os.environ.get("FASTKV_DATA_ROOT", "data")
+        args.data_file = os.path.join(
+            data_root, "RULER", str(args.context_length), f"{args.dataset}.jsonl"
+        )
 
         main(model, args)

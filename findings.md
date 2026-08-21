@@ -93,3 +93,13 @@
 
 - Runner đầu của FastKV/GemFilter/SpecPrefill fail do chọn config model gated/weight chưa cache; retry bằng config T4-safe TinyLlama local đã PASS.
 - Toàn bộ log/output của lượt GPU nằm trong `outputs/gpu_1sample/`.
+
+## 2026-08-21 — chuyển dataset lớn ra cache
+
+- Cache model hiện dùng `HF_HOME`, mặc định `~/.cache/huggingface`.
+- Dữ liệu Git lớn nằm ở `externals/FastKV/data` và `externals/MagicDec/Data`,
+  tổng khoảng 1.014 GiB trong HEAD.
+- Thiết kế đã được người dùng duyệt: lưu ở
+  `${HF_HOME}/datasets/fast_infer_text_sum/{FastKV,MagicDec}/`.
+- Repo đang có thay đổi chưa commit ở các file MagicDec; không được reset hoặc
+  ghi đè các thay đổi này.

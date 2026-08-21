@@ -21,11 +21,19 @@ OUTPUTS = ROOT / "outputs"
 # HF cache root (HF_HOME override respected).
 HF_HOME = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
 HF_HUB = HF_HOME / "hub"
+DATASET_CACHE_ROOT = HF_HOME / "datasets" / "fast_infer_text_sum"
 
 
 def repo_dir(name: str) -> Path:
     """Return the vendored repo dir for ``name`` under externals/."""
     return EXTERNALS / name
+
+
+def dataset_cache_dir(name: str) -> Path:
+    """Return the shared cache directory for a benchmark dataset group."""
+    if not name or Path(name).name != name:
+        raise ValueError(f"dataset cache name must be a single directory: {name!r}")
+    return DATASET_CACHE_ROOT / name
 
 
 def hf_token() -> str | None:
