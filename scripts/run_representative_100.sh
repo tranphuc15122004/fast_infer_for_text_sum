@@ -18,6 +18,19 @@
 #   --skip-collect         bỏ qua bước tổng hợp collect_metrics.py
 #
 # Sau cùng tự động chạy scripts/collect_metrics.py → metrics_summary.{json,csv,md}.
+
+#Baseline	Target/Base model	Model phụ / draft
+#LLM-Lingua	          Llama-3.1-8B-Instruct	LLM-Lingua-2 XLM-R compressor
+#FastKV	              Llama-3.1-8B-Instruct	—
+#GEMFilter	          Llama-3.1-8B-Instruct	—
+#SpecPrefill	        Llama-3.1-8B-Instruct	Llama-3.2-1B-Instruct
+#MInference	          Llama-3.1-8B-Instruct	—
+#EAGLE3	              Llama-3.1-8B-Instruct	EAGLE3-LLaMA3.1-Instruct-8B
+#DFlash	              Llama-3.1-8B-Instruct	LLaMA3.1-8B-Instruct-DFlash-UltraChat
+#Semantic Selection	  Llama-3.1-8B-Instruct	all-MiniLM-L6-v2 embedding model
+#SpecExtend	          Vicuna-7B-v1.5-16k	Vicuna-68M
+#LongSpec	            Vicuna-7B-v1.5-16k	LongSpec-Vicuna-7B-v1.5-16k
+
 set -uo pipefail   # không dùng -e: vẫn chạy tiếp các baseline khác khi 1 baseline fail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

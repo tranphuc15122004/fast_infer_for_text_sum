@@ -53,3 +53,7 @@ data/normalized/
 
 *.egg-info/
 .jspace/
+
+findings.md
+progress.md
+task_plan.md

@@ -25,6 +25,11 @@ MODEL_KEY="tinyllama" \
 bash scripts/run.sh magicdec
 ```
 
+Checkpoint chuyển đổi được lưu ngoài repository tại
+`${HF_HOME:-$HOME/.cache/huggingface}/magicdec/<model-key>/`, để không đưa
+weight nhiều GB lên GitHub. Có thể đổi vị trí bằng biến
+`MAGICDEC_CACHE_ROOT` trước khi gọi wrapper.
+
 ⚠️ **Tên thư mục chứa checkpoint phải khớp key** trong
 `externals/MagicDec/Engine/SnapKV/model.py` (vd `tinyllama`, `llama-3.1-8b`,
 `qwen2.5-7b`...) vì `Transformer.from_name(folder_name)` quyết định config.

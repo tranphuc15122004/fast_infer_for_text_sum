@@ -7,7 +7,8 @@ matches an entry in Engine/SnapKV/model.py (e.g. "tinyllama", "llama-3.1-8b",
 
   python scripts/magicdec_prepare_checkpoint.py \
       --repo-id TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-      --model-key tinyllama --out-dir checkpoints/tinyllama
+      --model-key tinyllama \
+      --out-dir ~/.cache/huggingface/magicdec/tinyllama
 """
 
 from __future__ import annotations
