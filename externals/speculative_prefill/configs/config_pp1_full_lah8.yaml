@@ -1,0 +1,7 @@
+keep_strategy: percentage
+keep_kwargs:
+  chunk: True
+  chunk_size: 32
+  percentage: 0.01
+look_ahead_cnt: 8
+pool_kernel_size: 13

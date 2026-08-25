@@ -1,0 +1,8 @@
+keep_strategy: percentage
+keep_kwargs:
+  # chunk: True
+  # chunk_size: 32
+  percentage: 0.9
+look_ahead_cnt: 1
+# pool_kernel_size: 13
+# ignore_eos: True

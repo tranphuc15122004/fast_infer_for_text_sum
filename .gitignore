@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Env build dirs: only pyproject.toml + uv.lock (and README) are committed,
+# so the server can reproduce environments with `uv sync --locked`.
+envs/*
+!envs/README.md
+!envs/*/
+!envs/*/pyproject.toml
+!envs/*/uv.lock
+envs/*/.venv/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Benchmark outputs (smoke/verification artifacts)
+outputs/
+
+# MagicDec converted checkpoints (model.pth etc., large build artifacts)
+checkpoints/
+externals/*/checkpoints/
+
+# Full benchmark datasets live in the shared HF cache, not Git.
+externals/FastKV/data/
+externals/MagicDec/Data/c4_small.json
+externals/MagicDec/Data/pg19/
+externals/MagicDec/Data/Ruler/synthetic/json/*.json
+
+# Large, regenerable datasets (prepare_data.py tải từ HuggingFace; xem data/README.md)
+data/raw/
+data/normalized/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+*.egg-info/
+.jspace/
+
+findings.md
+progress.md
+task_plan.md

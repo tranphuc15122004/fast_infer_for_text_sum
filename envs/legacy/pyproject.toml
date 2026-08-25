@@ -1,0 +1,90 @@
+# Env group: FastKV + RocketKV + GemFilter + SpecExtend + HiGOE
+#
+# All five baselines are consolidated on ONE shared stack so the server only
+# needs a single `uv sync --locked` for this whole "legacy transformers 4.4x"
+# family: transformers 4.45.2 + torch 2.4.1 (cu124) + numpy 1.26.
+#
+# Notes on version choices:
+#   * transformers 4.45.2 is the common denominator: FastKV/RocketKV were
+#     verified here; GemFilter (author pin 4.43.3) and SpecExtend (author pin
+#     4.41.0) use transformers APIs that still exist in 4.45 (LlamaAttention,
+#     LLAMA_ATTENTION_CLASSES, AttentionMaskConverter, cache_utils...).
+#   * SpecExtend's tokenizers==0.19.1 pin is relaxed -> 0.20.x (required by
+#     transformers 4.45). Its protobuf pin is relaxed to 4.25.1 (RocketKV's).
+#   * HiGOE needs numpy<2, dgl (PyPI wheel works with torch 2.4.x) and the
+#     langchain 0.2.10 / openai 0.28 stack - all compatible with this group.
+#   * triton==3.0.0 matches torch 2.4.x (SpecExtend + gpt-fast kernels).
+[project]
+name = "env-legacy"
+version = "0.1.0"
+description = "Shared dependency env for FastKV, RocketKV, GemFilter, SpecExtend and HiGOE baselines"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # core (FastKV / RocketKV)
+    "torch==2.4.1",
+    "transformers==4.45.2",
+    "datasets==2.21.0",
+    "accelerate==0.34.2",
+    "numpy==1.26.4",
+    "sentencepiece==0.2.0",
+    "protobuf==4.25.1",
+    "huggingface-hub==0.23.4",
+    "jieba==0.42.1",
+    "rouge==1.0.1",
+    "fuzzywuzzy==0.18.0",
+    "rouge-score",
+    "safetensors",
+    "evaluate",
+    "nltk",
+    "tiktoken",
+    "tqdm",
+    "bitsandbytes",
+    "packaging",
+    "setuptools",
+    "wheel",
+    # SpecExtend / GemFilter extras
+    "triton==3.0.0",
+    "ninja",
+    "einops",
+    "seaborn",
+    "termcolor",
+    # HiGOE extras
+    "openai==0.28",
+    "pandas",
+    "bert-score",
+    "networkx",
+    "python-louvain",
+    "scikit-learn",
+    "langchain==0.2.10",
+    "langchain-community==0.2.10",
+    "langchain-experimental==0.0.62",
+    "langchain-text-splitters==0.2.2",
+    "dgl==2.4.0; sys_platform == 'linux'",
+    "faiss-cpu",
+    "requests",
+    "pyyaml",
+]
+
+# flash-attn is NOT installed on T4 by default (sm_75 requires a source build).
+# On big-GPU servers run: uv sync --locked --extra flash
+[project.optional-dependencies]
+flash = ["flash-attn==2.6.3"]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+# dgl publishes Linux wheels only on its own index; uv gets 403 from that
+# index (server blocks non-pip clients) and the wheel filename mismatches its
+# metadata (2.5.0 vs 2.5.0+cpu), so we vendor the wheel locally (renamed to
+# match) and reference it by path - no env vars needed anywhere.
+dgl = { path = "wheels/dgl-2.5.0+cpu-cp311-cp311-manylinux1_x86_64.whl" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]

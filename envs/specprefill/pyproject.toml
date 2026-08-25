@@ -1,0 +1,37 @@
+# Env group: speculative_prefill + MInference (vllm 0.6.3, transformers 4.50.2)
+[project]
+name = "env-specprefill"
+version = "0.1.0"
+description = "Dependency env for speculative_prefill and MInference baselines"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.4.0",
+    "transformers==4.50.2",
+    "vllm==0.6.3.post1",
+    "datasets==2.21.0",
+    "accelerate",
+    "jieba==0.42.1",
+    "fuzzywuzzy==0.18.0",
+    "rouge==1.0.1",
+    "python-Levenshtein",
+    "sentence-transformers",
+    "triton",
+    "einops",
+    "tiktoken",
+    "numpy<2",
+    "tqdm",
+    "setuptools",
+    "tilelang",
+    "wheel",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
