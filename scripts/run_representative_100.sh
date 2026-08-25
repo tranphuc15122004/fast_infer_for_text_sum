@@ -10,7 +10,8 @@
 #   --datasets a,b,c       dataset trong data/representative_100 (mặc định: tất cả)
 #   --max-samples N        số mẫu / (baseline, dataset) [smoke=5, full=100]
 #   --max-new-tokens N     override độ dài sinh (theo biến của từng baseline)
-#   --mode smoke|full      smoke = cấu hình T4-safe, full = cấu hình đầy đủ
+#   --mode smoke|full      smoke = cấu hình thận trọng; một số baseline chạy
+#                         được trên T4, còn SpecExtend Llama cần GPU >=20 GiB
 #   --config FILE          env defaults (mặc định config/representative_100.env)
 #   --output-dir DIR       nơi chứa outputs/logs/configs (mặc định outputs/representative_100)
 #   --include-unsupported  chạy thêm smoke probe ngoài benchmark representative
@@ -28,7 +29,7 @@
 #EAGLE3	              Llama-3.1-8B-Instruct	EAGLE3-LLaMA3.1-Instruct-8B
 #DFlash	              Llama-3.1-8B-Instruct	LLaMA3.1-8B-Instruct-DFlash-UltraChat
 #Semantic Selection	  Llama-3.1-8B-Instruct	all-MiniLM-L6-v2 embedding model
-#SpecExtend	          Vicuna-7B-v1.5-16k	Vicuna-68M
+#SpecExtend	          Llama-3.1-8B-Instruct	EAGLE3-LLaMA3.1-Instruct-8B
 #LongSpec	            Vicuna-7B-v1.5-16k	LongSpec-Vicuna-7B-v1.5-16k
 #FlexPrefill	        Llama-3.1-8B-Instruct	—  (smoke T4: Qwen2.5-3B — REP_FLEXPREFILL_SMOKE_MODEL)
 #
@@ -222,7 +223,9 @@ REP_DFLASH_MODEL="${REP_DFLASH_MODEL:-z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraCha
 REP_COMPRESSOR_MODEL="${REP_COMPRESSOR_MODEL:-microsoft/llmlingua-2-xlm-roberta-large-meetingbank}"
 REP_EMBEDDING_MODEL="${REP_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
 REP_VICUNA_MODEL="${REP_VICUNA_MODEL:-lmsys/vicuna-7b-v1.5-16k}"
-REP_SPECEXTEND_DRAFT_MODEL="${REP_SPECEXTEND_DRAFT_MODEL:-double7/vicuna-68m}"
+# SpecExtend follows the paper's EAGLE path for Llama-3.1.  Keep the old
+# variable as a fallback so a pre-existing server config remains usable.
+REP_SPECEXTEND_EAGLE_MODEL="${REP_SPECEXTEND_EAGLE_MODEL:-${REP_SPECEXTEND_DRAFT_MODEL:-$REP_EAGLE_MODEL}}"
 REP_LONGSPEC_DRAFT_MODEL="${REP_LONGSPEC_DRAFT_MODEL:-sail/longspec-vicuna-7b-v1.5-16k}"
 # T4 smoke overrides: smaller model pairs that fit 16GB and are cached locally.
 REP_DFLASH_SMOKE_TARGET_MODEL="${REP_DFLASH_SMOKE_TARGET_MODEL:-Qwen/Qwen3-4B}"
@@ -272,6 +275,12 @@ apply_full_model_overrides() {
       flexprefill)
         set_env MODEL "$(resolve_model_ref "$REP_FLEXPREFILL_SMOKE_MODEL")"
         ;;
+      specextend)
+        set_env SCRIPT "run_eagle.py"
+        set_env MODEL_NAME "llama3_1_8b"
+        set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_EAGLE_MODEL")"
+        ;;
       longspec)
         set_env MODEL_NAME "vicuna7b"
         set_env TARGET_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
@@ -313,9 +322,10 @@ apply_full_model_overrides() {
       set_env DRAFT_MODEL "$(resolve_model_ref "$REP_DFLASH_MODEL")"
       ;;
     specextend)
-      set_env MODEL_NAME "vicuna_7b"
-      set_env BASE_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
-      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_DRAFT_MODEL")"
+      set_env SCRIPT "run_eagle.py"
+      set_env MODEL_NAME "llama3_1_8b"
+      set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_EAGLE_MODEL")"
       ;;
     longspec)
       set_env MODEL_NAME "vicuna7b"
@@ -374,6 +384,9 @@ gen_config() {
         # for the tree/KV structures.
         eagle3)
           set_env MAX_INPUT_TOKENS "${REP_EAGLE3_MAX_INPUT_TOKENS:-1024}"
+          ;;
+        specextend)
+          set_env MAX_INPUT_TOKENS "${REP_SPECEXTEND_MAX_INPUT_TOKENS:-512}"
           ;;
         llmlingua|semantic_selection|flexprefill)
           set_env MAX_INPUT_TOKENS "$REP_MAX_INPUT_TOKENS"

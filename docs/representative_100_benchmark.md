@@ -11,7 +11,7 @@ tốc độ infer + semantic (ROUGE-1/2/L, ROUGE-Lsum, BLEU-1..4, ...).
 # full: 100 mẫu / dataset, model canonical M1-M9 (mặc định trên server GPU lớn)
 bash scripts/run_representative_100.sh
 
-# smoke: 5 mẫu / (baseline, dataset), cấu hình T4-safe
+# smoke: 5 mẫu / (baseline, dataset), cấu hình thận trọng theo từng baseline
 bash scripts/run_representative_100.sh --mode smoke
 
 # chạy 1 nhóm baseline / 1 dataset / giới hạn mẫu
@@ -49,7 +49,7 @@ Data được convert tự động cho baseline có format riêng (vào
 - **eagle3**: record dạng `{"question_id", "turns": [...], "reference"}`
   (EAGLE chat format).
 - **specextend**: record dạng `{"text": "<prompt wrapper + document>"}`
-  (đúng format `run_classic.py` đọc).
+  (đúng format `run_eagle.py` đọc), chạy target M1 + EAGLE-3 draft M3.
 - **dflash**: đọc trực tiếp unified `{id, document, reference}` JSONL và dùng
   target `Llama-3.1-8B-Instruct` cùng draft `LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
 - **longspec**: đọc trực tiếp unified JSONL và dùng cặp chính thức

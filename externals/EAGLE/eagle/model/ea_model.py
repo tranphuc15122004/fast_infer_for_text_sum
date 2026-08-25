@@ -13,7 +13,12 @@ from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 #from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
-from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
+try:
+    # Llama-3.1 EAGLE-3 only needs the Llama loader.  Keep Qwen3 optional so
+    # this module can run in SpecExtend's legacy Transformers 4.45 env.
+    from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
+except ImportError:
+    KVQwen3ForCausalLM = None
 from .utils import *
 from .kv_cache import initialize_past_key_values
 

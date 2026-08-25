@@ -156,7 +156,7 @@ class LlamaRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
                 self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
-        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
@@ -320,6 +320,57 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         )
         self.register_buffer(
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+        )
+
+
+class Llama3RotaryEmbedding(LlamaRotaryEmbedding):
+    """Llama 3.1 RoPE scaling used by the 8B target checkpoint.
+
+    SpecExtend's attention code predates the ``rope_type=llama3`` config
+    format.  Keep the original cache interface, but compute the inverse
+    frequencies using the same interpolation as Transformers 4.45.
+    """
+
+    def __init__(self, dim, max_position_embeddings, config):
+        self.llama_config = config
+        base = getattr(config, "rope_theta", 10000.0)
+        super().__init__(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+        )
+
+        scaling = config.rope_scaling
+        factor = float(scaling["factor"])
+        low_freq_factor = float(scaling["low_freq_factor"])
+        high_freq_factor = float(scaling["high_freq_factor"])
+        old_context_len = float(scaling["original_max_position_embeddings"])
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2).float() / dim)
+        )
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        wavelen = 2 * math.pi / inv_freq
+        inv_freq_llama = torch.where(
+            wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+        )
+        smooth_factor = (
+            old_context_len / wavelen - low_freq_factor
+        ) / (high_freq_factor - low_freq_factor)
+        smoothed_inv_freq = (
+            (1 - smooth_factor) * inv_freq_llama / factor
+            + smooth_factor * inv_freq_llama
+        )
+        is_medium_freq = (wavelen >= high_freq_wavelen) & (wavelen <= low_freq_wavelen)
+        inv_freq_llama = torch.where(
+            is_medium_freq, smoothed_inv_freq, inv_freq_llama
+        )
+        self.inv_freq = inv_freq_llama
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
         )
 
 
@@ -498,10 +549,21 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim, max_position_embeddings=self.max_position_embeddings
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000.0),
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
+            scaling_type = self.config.rope_scaling.get(
+                "type", self.config.rope_scaling.get("rope_type")
+            )
+            if scaling_type == "llama3":
+                self.rotary_emb = Llama3RotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    config=self.config,
+                )
+                return
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
@@ -1111,6 +1173,14 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        # The official EAGLE-3 generation loop sets ``tree_mask`` directly and
+        # does not know SpecExtend's extra target-attention flags.  Allow the
+        # adapter to enable the hybrid tree path through a model attribute.
+        target_use_hybrid_tree_attn = (
+            target_use_hybrid_tree_attn
+            or getattr(self, "specextend_hybrid_tree_attn", False)
+        )
+
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
@@ -1191,7 +1261,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 use_cache = False
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
+        # EAGLE-3 consumes three intermediate target hidden states even when
+        # the caller did not request the public Transformers hidden-state
+        # output. Keep the same three checkpoints as the official EAGLE
+        # implementation.
+        all_hidden_states = ()
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
@@ -1200,7 +1274,7 @@ class LlamaModel(LlamaPreTrainedModel):
             is_last_layer = idx == len(self.layers) - 1
             output_attentions = (retrieve_attn_scores and is_last_layer)
 
-            if output_hidden_states:
+            if idx in (len(self.layers) - 3, len(self.layers) // 2, 2):
                 all_hidden_states += (hidden_states,)
 
             past_key_value = (

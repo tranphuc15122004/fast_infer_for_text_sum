@@ -14,8 +14,8 @@ text summarization. Mục tiêu là dùng một target model chung nhiều nhấ
 | M4 | `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat` | DFlash draft cho Llama 3.1 |
 | M5 | `microsoft/llmlingua-2-xlm-roberta-large-meetingbank` | Compressor của LLMLingua-2 |
 | M6 | `sentence-transformers/all-MiniLM-L6-v2` | Encoder cho semantic selection |
-| M7 | `lmsys/vicuna-7b-v1.5-16k` | Target cho SpecExtend và LongSpec |
-| M8 | `double7/vicuna-68m` | Draft cho SpecExtend classic |
+| M7 | `lmsys/vicuna-7b-v1.5-16k` | Target cho LongSpec và SpecExtend classic fallback |
+| M8 | `double7/vicuna-68m` | Draft cho SpecExtend classic fallback |
 | M9 | `sail/longspec-vicuna-7b-v1.5-16k` | LongSpec draft tương ứng Vicuna 7B |
 
 ## 2. Ánh xạ baseline → model
@@ -31,7 +31,8 @@ text summarization. Mục tiêu là dùng một target model chung nhiều nhấ
 | `speculative_prefill` | M1 | M2 | Target Llama 3.1 8B, draft Llama 3.2 1B; smoke có thể dùng target nhỏ hơn. |
 | EAGLE-3 | M1 | M3 | M3 là checkpoint EAGLE-3 được huấn luyện cho đúng Llama 3.1; không hoán đổi sang base model khác. |
 | DFlash | M1 | M4 | M4 là DFlash draft tương ứng Llama 3.1; target và draft phải cùng họ/tokenizer tương thích. |
-| SpecExtend classic | M7 | M8 | Dùng cặp Vicuna 7B + Vicuna-68M; không dùng M3 vì M3 dành cho Llama 3.1/EAGLE-3. |
+| SpecExtend + EAGLE-3 | M1 | M3 | Đúng setup ở Figure 1 của paper; headline 3.86x của paper lại dùng DeepSeek-R1-Distill-Llama-8B + EAGLE-3 trên AIME-24. |
+| SpecExtend classic fallback | M7 | M8 | Chỉ dùng khi benchmark riêng nhánh classic của repo; không đại diện cho cấu hình EAGLE-3. |
 | LongSpec | M7 | M9 | Đây là cặp chính thức `lmsys/vicuna-7b-v1.5-16k` + `sail/longspec-vicuna-7b-v1.5-16k`. |
 | MagicDec | M1 | Không có draft riêng ở self-spec | MagicDec self-spec dùng target Llama 3.1 đã convert sang `model.pth`; `double7/vicuna-68m` không phải dependency bắt buộc của cấu hình này. |
 | HiGOE | Không có target inference chung cố định | Mô hình phụ trợ | Retriever bắt buộc theo repo là `facebook/contriever`; LLM judge mặc định gọi API, hoặc có thể cấu hình local Llama 3.1. |
@@ -54,9 +55,8 @@ MagicDec
 ```
 
 Điều này giúp so sánh latency, throughput và chất lượng summary trên cùng một
-LLM. Riêng SpecExtend và LongSpec phải dùng Vicuna vì checkpoint draft của
-chúng được huấn luyện cho Vicuna; không nên thay bằng Llama 3.1 chỉ để giảm số
-model.
+LLM. LongSpec và SpecExtend classic giữ cặp Vicuna chính thức; riêng nhánh
+SpecExtend + EAGLE-3 dùng M1/M3 theo checkpoint tương thích của paper.
 
 ## 4. Phân biệt full evaluation và smoke test
 
@@ -72,7 +72,7 @@ kết quả cuối cùng.
 | EAGLE-3 | Qwen3-4B + Qwen3-EAGLE hiện có trong config cũ | M1 + M3 |
 | DFlash | Qwen3-4B + Qwen3-DFlash hiện có trong config cũ | M1 + M4 |
 | MagicDec | TinyLlama checkpoint | M1 đã convert sang MagicDec `model.pth` |
-| SpecExtend | TinyLlama fallback | M7 + M8 |
+| SpecExtend + EAGLE-3 | M1 + M3, giới hạn input/output ngắn | M1 + M3 |
 | LongSpec | Import/kernel smoke | M7 + M9 |
 | `speculative_prefill` | TinyLlama fallback | M1 + M2 |
 | RocketKV | Không tải model | M1 trong full pipeline |
@@ -89,7 +89,9 @@ kết quả cuối cùng.
 4. MagicDec không nhận trực tiếp checkpoint HF khi chạy benchmark; cần convert
    M1 sang định dạng `model.pth` và đặt đúng model key `llama-3.1-8b`.
 5. LongSpec phải chạy với `MODEL_NAME=vicuna7b` để lấy đúng cặp M7/M9.
-6. SpecExtend classic phải dùng `MODEL_NAME=vicuna_7b` và draft M8.
+6. Smoke SpecExtend + EAGLE-3 dùng `SCRIPT=run_eagle.py`,
+   `MODEL_NAME=llama3_1_8b` và cặp M1/M3; M7/M8 chỉ là classic fallback.
+   Không dùng smoke này để khẳng định đã tái hiện số 3.86x trong paper.
 7. Khi so sánh các baseline, phải cố định dataset normalized, số mẫu, prompt
    template, `MAX_NEW_TOKENS`, decoding và cách đo prefill/decode.
 
@@ -99,4 +101,3 @@ kết quả cuối cùng.
 
 Chưa có: M1 và M2. Hai model này đang bị chặn bởi quyền gated vì phiên
 Hugging Face chưa đăng nhập.
-

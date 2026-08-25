@@ -99,7 +99,7 @@ def test_dflash_and_longspec_have_representative_adapters():
     runner = (ROOT / "scripts/run_representative_100.sh").read_text(
         encoding="utf-8"
     )
-    assert 'REPRESENTATIVE_BASELINES="llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec"' in runner
+    assert 'REPRESENTATIVE_BASELINES="llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec flexprefill"' in runner
     assert "dflash longspec" in runner
     assert "dflash|longspec" in runner
 
