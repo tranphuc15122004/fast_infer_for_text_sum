@@ -54,3 +54,29 @@ contract của runner chạy độc lập và pass.
 - [complete] Cập nhật runner/tài liệu để đọc `HF_HOME/datasets/fast_infer_text_sum`.
 - [complete] Di chuyển `externals/FastKV/data` và `externals/MagicDec/Data` ra cache.
 - [complete] Xoá dữ liệu khỏi Git working tree, kiểm tra tracked files và dung lượng.
+
+## Kế hoạch hiện tại: profile Qwen3-4B long-summary theo độ dài
+
+- [complete] Chốt phạm vi: Qwen3-4B target đơn, không speculative decoding, chạy 1 GPU T4.
+- [complete] Kiểm tra backend hiện có và thiết kế phép đo tách model load, tokenize,
+  prefill/KV-cache, decode, postprocess và peak VRAM.
+- [complete] Thêm profiler chạy các mốc 256/512/1024/2048/3072 từ, sinh CSV/JSONL và PNG.
+- [complete] Chạy benchmark trên sample GovReport đủ dài; ghi nhận OOM/giới hạn phần cứng.
+- [complete] Kiểm tra artifact, tổng hợp insight về tỷ lệ thời gian và bàn giao.
+
+### Protocol đã chốt
+
+- Input: `data/representative_100/govreport_representative.jsonl`, cắt prefix theo số từ.
+- Output: greedy, tối đa 128 token, batch size 1, FP16, SDPA.
+- Mỗi mốc có warmup riêng và đo lặp tối thiểu 3 lần nếu VRAM cho phép.
+- `model_load` là one-time, không đưa vào tỷ lệ per-sample; báo riêng.
+- `prefill` bao gồm forward toàn input và tạo/ghi KV cache lần đầu; không tuyên bố
+  đây là một kernel event riêng nếu backend HF không expose event đó.
+
+## Kết quả tổ chức artifact
+
+- [complete] Đưa profiler canonical vào `src/analyze/full_infer/`.
+- [complete] Sao chép raw measurements, summary, metadata và các PNG vào
+  `src/analyze/full_infer/results/`, giữ nguyên bản gốc trong `outputs/`.
+- [complete] Cập nhật wrapper/config để các lần chạy sau dùng source và output
+  canonical mới.

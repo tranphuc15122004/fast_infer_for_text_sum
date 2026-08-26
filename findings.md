@@ -103,3 +103,28 @@
   `${HF_HOME}/datasets/fast_infer_text_sum/{FastKV,MagicDec}/`.
 - Repo đang có thay đổi chưa commit ở các file MagicDec; không được reset hoặc
   ghi đè các thay đổi này.
+
+## 2026-08-25 — profile Qwen3-4B long-summary
+
+- User chọn Qwen3-4B target đơn trước; chưa profile EAGLE-3/DFlash.
+- GPU mục tiêu: Tesla T4 15,360 MiB; T4 smoke cần dùng FP16 và SDPA.
+- Repo đã có số đo Qwen3-4B FP16 + SDPA: peak khoảng 9,744 MB với mean
+  1,791.9 source tokens và max output 128 token.
+- Các mốc profile dự kiến: 256, 512, 1024, 2048, 3072 từ; mốc cuối có thể
+  bị hạ/bỏ nếu input token thực tế hoặc KV cache gây OOM.
+- Cần phân biệt model load one-time với per-sample latency; tỷ lệ component chỉ
+  tính trên sample path sau warmup.
+
+### Kết quả run trên Tesla T4 — 2026-08-25
+
+- Runtime: Tesla T4 15,360 MiB, PyTorch `2.13.0+cu126`, CUDA available, FP16 + SDPA.
+- Model load one-time: khoảng 10.25 s.
+- Mỗi mốc chạy 3 repeats, lấy median; output tối đa 128 token; không speculative.
+- 5/5 mốc hoàn tất, không OOM. Input thực tế sau chat template là 397 / 746 /
+  1,502 / 2,954 / 3,830 tokens cho 256 / 512 / 1,024 / 2,048 / 3,072 từ.
+- Decode là thành phần lớn nhất: khoảng 95.3% ở 256 từ, giảm còn 67.3% ở 3,072 từ;
+  prefill tăng từ 3.4% lên 31.9%.
+- KV cache tăng từ 55.8 MB lên 538.6 MB; peak allocated tăng từ 7.69 GiB lên
+  12.42 GiB ở 3,072 từ.
+- Artifact canonical: `src/analyze/full_infer/results/{summary.csv,summary.jsonl,metadata.json,*.png}`;
+  bản trong `outputs/qwen3_long_profile/` vẫn được giữ nguyên để tương thích.

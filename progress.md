@@ -54,3 +54,23 @@
   `~/.cache/huggingface/datasets/fast_infer_text_sum/`.
 - `git gc --prune=now` bị chặn vì `.git/gc.pid.lock` nằm trên filesystem
   read-only; object database chưa thể dọn trong sandbox.
+
+## 2026-08-25 — bắt đầu profile Qwen3-4B
+
+- Đã đọc protocol/profile code hiện có và xác nhận user chọn target đơn.
+- Đang chuẩn bị profiler đo latency breakdown và sinh hình ảnh theo các mốc từ.
+
+## 2026-08-25 — hoàn tất profile Qwen3-4B target đơn
+
+- Đã thêm `scripts/profile_qwen3_long_summary.py` và wrapper/config tương ứng.
+- Đã đo 5 mốc GovReport (256/512/1024/2048/3072 từ), 3 repeats/mốc, FP16 + SDPA,
+  max 128 output tokens trên Tesla T4.
+- Đã sửa helper đọc `DynamicCache.layers[*].keys/values`; chạy lại toàn bộ để KV
+  cache bytes không còn bằng 0.
+- Artifact PNG/CSV/JSONL đã sinh ở `outputs/qwen3_long_profile/` và được tổ chức
+  canonical tại `src/analyze/full_infer/results/`.
+- Source profiler canonical là `src/analyze/full_infer/profile_qwen3_long_summary.py`;
+  wrapper/config đã được cập nhật để chạy và ghi output tại vị trí này.
+- Verification cuối: bộ test của repo (`pytest -q tests`) `33 passed`; Python
+  compile, shell syntax và `git diff --check` đều pass. `pytest -q` toàn repo
+  vẫn bị giới hạn bởi test upstream trong `externals/` thiếu dependency riêng.
