@@ -23,6 +23,17 @@ def test_b200_smoke_preflight_only_records_hardware_block(tmp_path):
             "TORCH_EXTENSIONS_DIR": str(tmp_path / "torch-ext"),
         }
     )
+    master = tmp_path / "master.env"
+    master.write_text(
+        "MODEL_TARGET=/models/target\n"
+        "MODEL_DFLASH_DRAFT=/models/draft\n"
+        "DATA_INPUT=data/sample.jsonl\n"
+        "B200_TARGET_GPU=B200\n"
+        "B200_MAX_SAMPLES=1\n"
+        "B200_MAX_NEW_TOKENS=8\n",
+        encoding="utf-8",
+    )
+    env["FAST_INFER_MASTER_CONFIG"] = str(master)
     proc = subprocess.run(
         [
             "bash",

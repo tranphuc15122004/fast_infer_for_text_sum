@@ -24,8 +24,9 @@ Dựa trên `externals/GemFilter`.
 bash scripts/run.sh gemfilter      # smoke: Phi-3.5-mini + eager (không cần flash-attn)
 ```
 
-Cấu hình `config/gemfilter.env`: `MODEL`, `TOPK`, `SELECT_LAYER_IDX`
-(13 = Llama-3.1-8B; 19 = Nemo/Phi-3.5), `MAX_GEN_LEN`, `NUM_RUNS`.
+Cấu hình trong master: `MODEL_TARGET`, `GEMFILTER_TOP_K`,
+`GEMFILTER_SELECT_LAYER` (13 = Llama-3.1-8B; 19 = Nemo/Phi-3.5),
+`GEMFILTER_MAX_NEW_TOKENS`, `GEMFILTER_NUM_RUNS`.
 
 ## Dữ liệu của bạn
 

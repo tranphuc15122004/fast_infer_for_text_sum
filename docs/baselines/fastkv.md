@@ -21,21 +21,22 @@ Joint prefill + KV optimization (Llama/Mistral). Dựa trên `externals/FastKV`.
 bash scripts/run.sh fastkv        # mặc định smoke: snapkv + sdpa (không cần flash-attn)
 ```
 
-Cấu hình `config/fastkv.env`: `MODEL`, `METHOD` (fastkv|snapkv|h2o|streamingllm|fullkv),
-`ATTN_IMPL` (flash_attention_2|sdpa|eager), `WINDOW_SIZE`, `RETAIN_RATE`,
-`EVICTION_MODE`, `NUM_RUNS`, `SMOKE`.
+Cấu hình trong master: `MODEL_TARGET`, `FASTKV_METHOD`
+(fastkv|snapkv|h2o|streamingllm|fullkv), `FASTKV_ATTN_IMPL`
+(flash_attention_2|sdpa|eager), `FASTKV_WINDOW_SIZE`, `FASTKV_RETAIN_RATE`,
+`FASTKV_EVICTION_MODE`, `FASTKV_NUM_RUNS`, `RUN_MODE`.
 
 - **Full (GPU lớn)**: `SMOKE=0 METHOD=fastkv ATTN_IMPL=flash_attention_2`.
 
 ## Dữ liệu của bạn
 
 ```bash
-DATA_FILE="data/user_prompts.jsonl" MAX_SAMPLES=5 bash scripts/run.sh fastkv
+DATA_INPUT="data/user_prompts.jsonl" RUN_SAMPLES=5 bash scripts/run.sh fastkv
 ```
 
 Dữ liệu full của FastKV (`LongBench` và `RULER`) được lưu ngoài repository tại
-`${HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/FastKV/data`.
-Có thể đổi vị trí bằng biến `FASTKV_DATA_ROOT`; các evaluator upstream sẽ tự
+`${FI_HF_HOME:-$HOME/.cache/huggingface}/datasets/fast_infer_text_sum/FastKV/data`.
+Có thể đổi vị trí bằng biến `DATA_ROOT`; các evaluator upstream sẽ tự
 dùng biến này khi không truyền `--data_file`.
 
 ## Output

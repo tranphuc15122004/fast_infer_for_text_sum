@@ -21,18 +21,19 @@ Dựa trên `externals/LLMLingua`.
 bash scripts/run.sh llmlingua        # mặc định smoke (SMOKE=1)
 ```
 
-Cấu hình `config/llmlingua.env`: `COMPRESSOR_MODEL`, `TARGET_MODEL`,
-`DOC_FILE`, `COMPRESSION_RATE`, `MAX_SAMPLES`, `MAX_NEW_TOKENS`, `DEVICE`.
+Cấu hình trong master: `MODEL_COMPRESSOR`, `MODEL_TARGET`, `DATA_INPUT`,
+`LLMLINGUA_COMPRESSION_RATE`, `LLMLINGUA_MAX_SAMPLES`,
+`LLMLINGUA_MAX_NEW_TOKENS`, `LLMLINGUA_DEVICE`.
 
 ## Dữ liệu của bạn
 
-Set `DOC_FILE` (jsonl, trường `prompt`/`text`/`turns` đều được):
+Set `DATA_INPUT` (jsonl, trường `prompt`/`text`/`turns` đều được):
 
 ```json
 {"id": 0, "prompt": "Nội dung dài cần nén...", "keyword": "entity_quan_trong"}
 ```
 
-`DOC_FILE="data/user_prompts.jsonl" bash scripts/run.sh llmlingua`
+`DATA_INPUT="data/user_prompts.jsonl" bash scripts/run.sh llmlingua`
 
 ## Output
 

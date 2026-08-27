@@ -38,9 +38,11 @@ metric.
 bash scripts/run.sh specextend   # smoke: Llama-3.1-8B + EAGLE-3
 ```
 
-Cấu hình `config/specextend.env`: `SCRIPT=run_eagle.py`, `MODEL_NAME`,
-`BASE_MODEL`, `DRAFT_MODEL`, `INPUT_FILE` (jsonl có trường `text`),
-`MAX_SAMPLES`, `MAX_GEN_LEN`, `MAX_INPUT_TOKENS`, `USE_SPECEXTEND`.
+Cấu hình trong master: `SPECEXTEND_SCRIPT=run_eagle.py`,
+`SPECEXTEND_MODEL_NAME`, `MODEL_TARGET`, `MODEL_EAGLE_DRAFT`,
+`SPECEXTEND_DATA_FILE` (jsonl có trường `text`), `SPECEXTEND_MAX_SAMPLES`,
+`SPECEXTEND_MAX_NEW_TOKENS`, `SPECEXTEND_MAX_INPUT_TOKENS`,
+`SPECEXTEND_ENABLED`.
 
 Data kèm sẵn: `externals/SpecExtend/specextend/data/govreport/govreport_{512,1K,2K,4K,8K,16K}.jsonl`
 (đã nhúng prompt summarize).

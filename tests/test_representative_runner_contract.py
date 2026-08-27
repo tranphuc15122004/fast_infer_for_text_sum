@@ -41,6 +41,7 @@ def test_representative_runner_defaults_cover_all_inference_baselines():
     for baseline in ALL_INFERENCE_BASELINES:
         assert baseline in runner
     assert 'BASELINES="$REPRESENTATIVE_BASELINES"' in runner
+    assert 'BASELINES="${BASELINES:-${BENCH_BASELINES:-}}"' in runner
     assert "UNSUPPORTED_BASELINES" in runner
 
 
@@ -48,8 +49,8 @@ def test_representative_runner_defaults_to_full_and_strict_collection():
     runner = (ROOT / "scripts/run_representative_100.sh").read_text(
         encoding="utf-8"
     )
-    config = (ROOT / "config/representative_100.env").read_text(encoding="utf-8")
-    assert 'MODE="full"' in config
+    config = (ROOT / "docs/fast_infer_master.example.env").read_text(encoding="utf-8")
+    assert 'BENCH_MODE="${BENCH_MODE:-full}"' in config
     assert "--strict" in runner
     assert "--expected-baselines" in runner
     assert "--expected-datasets" in runner
@@ -61,38 +62,34 @@ def test_representative_runner_has_canonical_model_overrides():
         encoding="utf-8"
     )
     for marker in (
-        "REP_TARGET_MODEL",
-        "REP_SPEC_MODEL",
-        "REP_EAGLE_MODEL",
-        "REP_DFLASH_MODEL",
-        "REP_VICUNA_MODEL",
-        "REP_SPECEXTEND_DRAFT_MODEL",
+        "BENCH_TARGET_MODEL",
+        "BENCH_SPEC_MODEL",
+        "BENCH_EAGLE_MODEL",
+        "BENCH_DFLASH_MODEL",
+        "BENCH_LONGSPEC_TARGET_MODEL",
+        "BENCH_SPECEXTEND_DRAFT_MODEL",
     ):
         assert marker in runner
 
 
-def test_representative_runner_selects_t4_configs_in_smoke_mode():
+def test_representative_runner_selects_t4_overrides_in_smoke_mode():
     runner = (ROOT / "scripts/run_representative_100.sh").read_text(
         encoding="utf-8"
     )
-    for marker in (
-        "fastkv:smoke",
-        "gemfilter:smoke",
-        "specprefill:smoke",
-        "specextend:smoke",
-    ):
-        assert marker in runner
+    assert "prepare_run_env" in runner
+    assert "RUN_ENV=()" in runner
+    assert "OUT_DIR/configs" not in runner
 
 
 def test_semantic_selection_adapter_files_exist():
     assert (ROOT / "scripts/run_semantic_selection.sh").is_file()
-    assert (ROOT / "config/semantic_selection.env").is_file()
+    assert (ROOT / "config/master.path").is_file()
 
 
 def test_dflash_and_longspec_have_representative_adapters():
     assert (ROOT / "scripts/infer_dflash.py").is_file()
     assert (ROOT / "scripts/run_dflash.sh").is_file()
-    assert (ROOT / "config/dflash.env").is_file()
+    assert "fast_infer_load_config dflash" in (ROOT / "scripts/run_dflash.sh").read_text()
     assert (ROOT / "scripts/infer_longspec.py").is_file()
     assert (ROOT / "scripts/run_longspec.sh").is_file()
 
@@ -118,6 +115,8 @@ def test_representative_runner_dflash_longspec_dry_run(tmp_path):
             "xsum",
             "--max-samples",
             "1",
+            "--config",
+            "docs/fast_infer_master.example.env",
             "--output-dir",
             str(output_dir),
             "--dry-run",
@@ -129,13 +128,10 @@ def test_representative_runner_dflash_longspec_dry_run(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
-    dflash_config = (output_dir / "configs/dflash_xsum.env").read_text()
-    assert "LLaMA3.1-8B-Instruct-DFlash-UltraChat" in dflash_config
-    assert "data/representative_100/xsum_representative.jsonl" in dflash_config
-
-    longspec_config = (output_dir / "configs/longspec_xsum.env").read_text()
-    assert "MODEL_NAME='vicuna7b'" in longspec_config
-    assert "DATA_FILE='data/representative_100/xsum_representative.jsonl'" in longspec_config
+    assert "LLaMA3.1-8B-Instruct-DFlash-UltraChat" in proc.stdout
+    assert "data/representative_100/xsum_representative.jsonl" in proc.stdout
+    assert "MODEL_NAME=vicuna7b" in proc.stdout
+    assert not (output_dir / "configs").exists()
 
 
 def test_representative_runner_dry_run_does_not_need_python_for_conversions(tmp_path):
@@ -152,6 +148,8 @@ def test_representative_runner_dry_run_does_not_need_python_for_conversions(tmp_
             "xsum",
             "--max-samples",
             "1",
+            "--config",
+            "docs/fast_infer_master.example.env",
             "--output-dir",
             str(output_dir),
             "--dry-run",

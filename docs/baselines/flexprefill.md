@@ -17,10 +17,10 @@ Oral, ByteDance). Dựa trên `externals/FlexPrefill` (vendored).
 Patch model transformers arch **qwen2 / llama / glm** (modules tương ứng).
 
 - **Full mode** (runner): `Llama-3.1-8B-Instruct` (canonical, cùng target với các
-  baseline khác) — override qua `REP_FLEXPREFILL_FULL_MODEL`. Cần GPU lớn
+  baseline khác) — override qua `BENCH_FLEXPREFILL_FULL_MODEL`. Cần GPU lớn
   (8B bf16 ≈ 16GB + context).
 - **Smoke mode** (T4): `Qwen/Qwen2.5-3B-Instruct` (đã cache local, ~6GB bf16) —
-  override qua `REP_FLEXPREFILL_SMOKE_MODEL`.
+  override qua `BENCH_FLEXPREFILL_SMOKE_MODEL`.
 
 Pattern: `flex_prefill` (mặc định), ngoài ra có `streaming_llm`,
 `vertical_slash`, `minfer`, `default`, `flash`.
@@ -31,13 +31,14 @@ Pattern: `flex_prefill` (mặc định), ngoài ra có `streaming_llm`,
 bash scripts/run.sh flexprefill
 ```
 
-Cấu hình `config/flexprefill.env`: `MODEL`, `PATTERN`, `MAX_NEW_TOKENS`,
-`DATA_FILE`, `MAX_SAMPLES`, `MAX_INPUT_TOKENS`, `SKIP_NAIVE`, `SMOKE`.
+Cấu hình trong master: `MODEL_TARGET`, `FLEXPREFILL_PATTERN`,
+`FLEXPREFILL_MAX_NEW_TOKENS`, `DATA_INPUT`, `RUN_SAMPLES`,
+`RUN_MAX_INPUT_TOKENS`, `FLEXPREFILL_SKIP_NAIVE`, `RUN_MODE`.
 
 ## Dữ liệu của bạn
 
 ```bash
-DATA_FILE="data/user_prompts.jsonl" MAX_SAMPLES=5 bash scripts/run.sh flexprefill
+DATA_INPUT="data/user_prompts.jsonl" RUN_SAMPLES=5 bash scripts/run.sh flexprefill
 ```
 
 Script chạy **dense baseline trước khi patch** (paired speedup) rồi patch model

@@ -9,7 +9,7 @@ của bạn.
 
 ```
 scripts/           # script kiểm chứng từng baseline + common helpers + runner
-config/            # cấu hình per baseline (model path, data, tham số)
+config/master.path  # pointer duy nhất tới master config ngoài repository
 requirements.txt   # dependency manifest của server GPU Python 3.12
 externals/         # các baseline repo (vendored)
 data/              # dữ liệu plug-and-play (jsonl) + README định dạng
@@ -23,8 +23,10 @@ docs/              # hướng dẫn cài đặt + infer từng baseline
 # Python 3.12 phải được cài sẵn trên server offline
 python3 --version
 
-# nạp profile B200; không cần activate virtualenv
-set -a; source config/b200.env; set +a
+# master config nằm ngoài repo; config/master.path đã trỏ tới nó
+# Lần đầu: cp docs/fast_infer_master.example.env /workspace/shared_storage/config/fast_infer_master.env
+export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+source scripts/common/config.sh && fast_infer_load_master
 python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 
 # model gated (Llama) cần token
@@ -36,6 +38,9 @@ bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
                                       # longspec specextend higoe semantic_selection
                                       # flexprefill
 ```
+
+Sau khi sửa master một lần trên server, các lần cập nhật code không cần copy
+lại model hoặc nhiều file config.
 
 Smoke toàn bộ 14 baseline trên B200 (mỗi baseline một sample):
 
@@ -62,10 +67,11 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 ## Nguyên tắc
 
-- Mỗi baseline: `scripts/infer_<b>.py` + `scripts/run_<b>.sh` + `config/<b>.env`,
-  có chế độ `--smoke` và mode full; B200 smoke được điều phối bởi
+- Mỗi baseline: `scripts/infer_<b>.py` + `scripts/run_<b>.sh`; mọi launcher dùng
+  cùng master config qua `config/master.path`, có chế độ `--smoke` và mode full; B200 smoke được điều phối bởi
   `scripts/run_b200_smoke.sh`.
-- Dữ liệu của bạn: bỏ jsonl vào `data/`, set `DATA_FILE` trong config → chạy.
+- Dữ liệu/model/cache của bạn: sửa `DATA_INPUT`, `MODEL_*`, `FI_*` trong master
+  config ngoài repo → chạy.
 - Kết quả: `outputs/*.jsonl` theo schema §13 của `baseline_repo_guide.md`
   (input/retained/output tokens, TTFT/TPOT/E2E, throughput, quality metrics...).
 - Môi trường production: `python3` Python 3.12 từ PATH dùng `requirements.txt`;

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -76,21 +75,23 @@ def _prepare_special_inputs(data_file: str | None, generated: Path, root: Path) 
     }
 
 
-def _overlay_values(
+def _run_env_values(
     baseline: str, output: Path, generated_inputs: dict[str, str]
 ) -> dict[str, str]:
     env = os.environ
-    target = env.get("B200_TARGET_MODEL", "")
-    data_file = env.get("B200_DATA_FILE", "")
-    device = env.get("B200_DEVICE", "cuda")
+    target = env.get("MODEL_TARGET") or env.get("B200_TARGET_MODEL", "")
+    data_file = env.get("DATA_INPUT") or env.get("B200_DATA_FILE", "")
+    device = env.get("FI_DEVICE") or env.get("B200_DEVICE", "cuda")
+    max_samples = env.get("B200_MAX_SAMPLES") or env.get("B200_SMOKE_MAX_SAMPLES", "1")
+    max_new_tokens = env.get("B200_MAX_NEW_TOKENS") or env.get("B200_SMOKE_MAX_NEW_TOKENS", "8")
     common = {
         "SMOKE": "1",
         "OUTPUT_FILE": str(output),
-        "MAX_SAMPLES": env.get("B200_SMOKE_MAX_SAMPLES", "1"),
-        "MAX_NEW_TOKENS": env.get("B200_SMOKE_MAX_NEW_TOKENS", "8"),
-        "MAX_GEN_LEN": env.get("B200_SMOKE_MAX_NEW_TOKENS", "8"),
-        "MAX_TOKENS": env.get("B200_SMOKE_MAX_NEW_TOKENS", "8"),
-        "MAX_INPUT_TOKENS": "512",
+        "MAX_SAMPLES": max_samples,
+        "MAX_NEW_TOKENS": max_new_tokens,
+        "MAX_GEN_LEN": max_new_tokens,
+        "MAX_TOKENS": max_new_tokens,
+        "MAX_INPUT_TOKENS": env.get("B200_MAX_INPUT_TOKENS", "512"),
         "WARMUP_RUNS": "0",
         "NUM_RUNS": "1",
     }
@@ -99,7 +100,7 @@ def _overlay_values(
         values.update(
             {
                 "BASE_MODEL": target,
-                "EAGLE_MODEL": env.get("B200_EAGLE_MODEL", ""),
+                "EAGLE_MODEL": env.get("MODEL_EAGLE_DRAFT") or env.get("B200_EAGLE_MODEL", ""),
                 "DATA_FILE": generated_inputs.get("EAGLE_DATA_FILE", data_file),
                 "QUESTION_BEGIN": "0",
                 "QUESTION_END": "1",
@@ -109,7 +110,7 @@ def _overlay_values(
         values.update(
             {
                 "TARGET_MODEL": target,
-                "DRAFT_MODEL": env.get("B200_DFLASH_MODEL", ""),
+                "DRAFT_MODEL": env.get("MODEL_DFLASH_DRAFT") or env.get("B200_DFLASH_MODEL", ""),
                 "DATA_FILE": data_file,
                 "ATTN_IMPLEMENTATION": "flash_attention_2",
             }
@@ -140,7 +141,7 @@ def _overlay_values(
         values.update(
             {
                 "TARGET_MODEL": target,
-                "SPEC_MODEL": env.get("B200_SPEC_MODEL", ""),
+                "SPEC_MODEL": env.get("MODEL_SPEC_DRAFT") or env.get("B200_SPEC_MODEL", ""),
                 "DATA_FILE": data_file,
             }
         )
@@ -157,15 +158,15 @@ def _overlay_values(
         values.update(
             {
                 "MODEL_PTH": env.get("B200_MAGICDEC_MODEL_PTH", ""),
-                "MODEL_NAME": env.get("B200_MAGICDEC_MODEL_NAME", ""),
+                "MODEL_NAME": env.get("MODEL_MAGICDEC_NAME") or env.get("B200_MAGICDEC_MODEL_NAME", ""),
             }
         )
     elif baseline == "longspec":
         values.update(
             {
                 "MODEL_NAME": "vicuna7b",
-                "TARGET_MODEL": env.get("B200_VICUNA_MODEL", ""),
-                "DRAFT_MODEL": env.get("B200_LONGSPEC_DRAFT_MODEL", ""),
+                "TARGET_MODEL": env.get("MODEL_LONGSPEC_TARGET") or env.get("B200_VICUNA_MODEL", ""),
+                "DRAFT_MODEL": env.get("MODEL_LONGSPEC_DRAFT") or env.get("B200_LONGSPEC_DRAFT_MODEL", ""),
                 "DATA_FILE": data_file,
             }
         )
@@ -175,7 +176,7 @@ def _overlay_values(
                 "SCRIPT": "run_eagle.py",
                 "MODEL_NAME": "llama3_1_8b",
                 "BASE_MODEL": target,
-                "DRAFT_MODEL": env.get("B200_EAGLE_MODEL", ""),
+                "DRAFT_MODEL": env.get("MODEL_EAGLE_DRAFT") or env.get("B200_EAGLE_MODEL", ""),
                 "INPUT_FILE": generated_inputs.get("SPECEXTEND_INPUT_FILE", data_file),
                 "USE_SPECEXTEND": "1",
             }
@@ -187,7 +188,7 @@ def _overlay_values(
             {
                 "MODEL": target,
                 "INPUT_FILE": data_file,
-                "EMBEDDING_MODEL": env.get("B200_EMBEDDING_MODEL", ""),
+                "EMBEDDING_MODEL": env.get("MODEL_EMBEDDING") or env.get("B200_EMBEDDING_MODEL", ""),
                 "DEVICE": device,
                 "EMBEDDING_DEVICE": "cpu",
             }
@@ -195,16 +196,6 @@ def _overlay_values(
     elif baseline == "flexprefill":
         values.update({"MODEL": target, "DATA_FILE": data_file})
     return values
-
-
-def _write_overlay(path: Path, values: dict[str, str]) -> None:
-    path.write_text(
-        "\n".join(
-            f"{key}={shlex.quote(value)}" for key, value in sorted(values.items())
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 def main() -> int:
@@ -263,11 +254,8 @@ def main() -> int:
                 continue
             output = output_dir / f"{baseline}.jsonl"
             log_path = output_dir / f"{baseline}.log"
-            overlay = output_dir / "generated" / f"{baseline}.env"
-            overlay.parent.mkdir(parents=True, exist_ok=True)
-            _write_overlay(overlay, _overlay_values(baseline, output, generated_inputs))
             child_env = dict(os.environ)
-            child_env["FAST_INFER_CONFIG_OVERLAY"] = str(overlay)
+            child_env.update(_run_env_values(baseline, output, generated_inputs))
             command = ["bash", str(root / "scripts" / "run.sh"), baseline, "--smoke"]
             start = time.perf_counter()
             try:

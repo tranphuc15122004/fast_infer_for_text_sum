@@ -12,8 +12,8 @@
 #   --max-new-tokens N     override độ dài sinh (theo biến của từng baseline)
 #   --mode smoke|full      smoke = cấu hình thận trọng; một số baseline chạy
 #                         được trên T4, còn SpecExtend Llama cần GPU >=20 GiB
-#   --config FILE          env defaults (mặc định config/representative_100.env)
-#   --output-dir DIR       nơi chứa outputs/logs/configs (mặc định outputs/representative_100)
+#   --config FILE          master env override (mặc định theo config/master.path)
+#   --output-dir DIR       nơi chứa outputs/logs/data (mặc định outputs/representative_100)
 #   --include-unsupported  chạy thêm smoke probe ngoài benchmark representative
 #   --dry-run              chỉ in kế hoạch, không chạy
 #   --skip-collect         bỏ qua bước tổng hợp collect_metrics.py
@@ -31,11 +31,11 @@
 #Semantic Selection	  Llama-3.1-8B-Instruct	all-MiniLM-L6-v2 embedding model
 #SpecExtend	          Llama-3.1-8B-Instruct	EAGLE3-LLaMA3.1-Instruct-8B
 #LongSpec	            Vicuna-7B-v1.5-16k	LongSpec-Vicuna-7B-v1.5-16k
-#FlexPrefill	        Llama-3.1-8B-Instruct	—  (smoke T4: Qwen2.5-3B — REP_FLEXPREFILL_SMOKE_MODEL)
+#FlexPrefill	        Llama-3.1-8B-Instruct	—  (smoke T4: Qwen2.5-3B — BENCH_FLEXPREFILL_SMOKE_MODEL)
 #
 # Lưu ý T4 smoke: dflash dùng cặp nhỏ Qwen3-4B + DFlash-b16; longspec chạy kernel
 # probe (không đọc data, không tính metric); input bị cap token cho các baseline
-# full-attention (xem REP_MAX_INPUT_TOKENS và các REP_*_MAX_INPUT_TOKENS).
+# full-attention (xem BENCH_MAX_INPUT_TOKENS và các BENCH_*_MAX_INPUT_TOKENS).
 
 set -uo pipefail   # không dùng -e: vẫn chạy tiếp các baseline khác khi 1 baseline fail
 
@@ -43,20 +43,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # ---- defaults ---------------------------------------------------------------
-MODE="full"
+MODE=""
 MAX_SAMPLES=""
 MAX_NEW_TOKENS=""
-OUTPUT_DIR="outputs/representative_100"
-CONFIG_FILE="$ROOT/config/representative_100.env"
+OUTPUT_DIR=""
 BASELINES=""
 DATASETS=""
 INCLUDE_UNSUPPORTED=0
 DRY_RUN=0
 SKIP_COLLECT=0
 
-# ---- resolve config path before loading defaults -----------------------------
-# Parse only --config in this pre-pass so a custom config is actually sourced.
-# The full CLI pass below still runs afterwards, therefore CLI values win.
+# ---- resolve master config path before loading defaults -----------------------
+# Parse only --config in this pre-pass so a custom master is loaded before the
+# full CLI pass. CLI values are applied again below and therefore win.
 ARGS=("$@")
 for ((i = 0; i < ${#ARGS[@]}; i++)); do
   if [[ "${ARGS[$i]}" == "--config" ]]; then
@@ -64,16 +63,22 @@ for ((i = 0; i < ${#ARGS[@]}; i++)); do
       echo "--config requires a file path" >&2
       exit 2
     fi
-    CONFIG_FILE="${ARGS[$((i + 1))]}"
+    export FAST_INFER_MASTER_CONFIG="${ARGS[$((i + 1))]}"
     ((i++))
   fi
 done
 
-# ---- optional defaults env (đọc TRƯỚC CLI để CLI thắng) ----------------------
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-fi
+# ---- master defaults (đọc TRƯỚC CLI để CLI thắng) ----------------------------
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/config.sh"
+fast_infer_load_master || exit 1
+
+MODE="${MODE:-${BENCH_MODE:-full}}"
+MAX_SAMPLES="${MAX_SAMPLES:-${BENCH_SAMPLES:-}}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-${BENCH_NEW_TOKENS:-}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${BENCH_OUTPUT_DIR:-outputs/representative_100}}"
+BASELINES="${BASELINES:-${BENCH_BASELINES:-}}"
+DATASETS="${DATASETS:-${BENCH_DATASETS:-}}"
 
 # ---- CLI --------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -83,7 +88,7 @@ while [[ $# -gt 0 ]]; do
     --max-samples)    MAX_SAMPLES="$2"; shift 2 ;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
     --mode)           MODE="$2"; shift 2 ;;
-    --config)         CONFIG_FILE="$2"; shift 2 ;;
+    --config)         export FAST_INFER_MASTER_CONFIG="$2"; shift 2 ;;
     --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
     --include-unsupported) INCLUDE_UNSUPPORTED=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
@@ -136,7 +141,7 @@ if [[ "$OUTPUT_DIR" = /* ]]; then
 else
   OUT_DIR="$ROOT/$OUTPUT_DIR"
 fi
-mkdir -p "$OUT_DIR/configs" "$OUT_DIR/logs" "$OUT_DIR/data" "$OUT_DIR/smoke"
+mkdir -p "$OUT_DIR/logs" "$OUT_DIR/data" "$OUT_DIR/smoke"
 
 # Refuse to silently mix non-representative smoke probes into the benchmark.
 # They can be requested explicitly for environment diagnostics, but they do
@@ -214,35 +219,35 @@ print("  converted " + ds + ": " + str(len(rows)) + " records -> eagle3/specexte
 PY
 }
 
-# ---- sinh config cho (baseline, dataset) -------------------------------------
-# set_env KEY VALUE  -> dòng 'KEY="VALUE"' cho env file (giá trị không chứa nháy đơn)
-set_env() { echo "$1='$2'"; }
+# ---- tạo environment override cho (baseline, dataset) ------------------------
+# Các override này chỉ tồn tại trong process con của đúng một lần chạy; không
+# ghi file cấu hình tạm vào outputs.
+RUN_ENV=()
+set_env() { RUN_ENV+=("$1=$2"); }
 
-# Canonical model matrix for the large-GPU representative benchmark.  Values
-# are overridable from config/representative_100.env or a custom --config.
-REP_TARGET_MODEL="${REP_TARGET_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
-REP_SPEC_MODEL="${REP_SPEC_MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
-REP_EAGLE_MODEL="${REP_EAGLE_MODEL:-yuhuili/EAGLE3-LLaMA3.1-Instruct-8B}"
-REP_DFLASH_MODEL="${REP_DFLASH_MODEL:-z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat}"
-REP_COMPRESSOR_MODEL="${REP_COMPRESSOR_MODEL:-microsoft/llmlingua-2-xlm-roberta-large-meetingbank}"
-REP_EMBEDDING_MODEL="${REP_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
-REP_VICUNA_MODEL="${REP_VICUNA_MODEL:-lmsys/vicuna-7b-v1.5-16k}"
+BENCH_TARGET_MODEL="${BENCH_TARGET_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
+BENCH_SPEC_MODEL="${BENCH_SPEC_MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
+BENCH_EAGLE_MODEL="${BENCH_EAGLE_MODEL:-yuhuili/EAGLE3-LLaMA3.1-Instruct-8B}"
+BENCH_DFLASH_MODEL="${BENCH_DFLASH_MODEL:-z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat}"
+BENCH_COMPRESSOR_MODEL="${BENCH_COMPRESSOR_MODEL:-microsoft/llmlingua-2-xlm-roberta-large-meetingbank}"
+BENCH_EMBEDDING_MODEL="${BENCH_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+BENCH_LONGSPEC_TARGET_MODEL="${BENCH_LONGSPEC_TARGET_MODEL:-lmsys/vicuna-7b-v1.5-16k}"
 # SpecExtend follows the paper's EAGLE path for Llama-3.1.  Keep the old
 # variable as a fallback so a pre-existing server config remains usable.
-REP_SPECEXTEND_EAGLE_MODEL="${REP_SPECEXTEND_EAGLE_MODEL:-${REP_SPECEXTEND_DRAFT_MODEL:-$REP_EAGLE_MODEL}}"
-REP_LONGSPEC_DRAFT_MODEL="${REP_LONGSPEC_DRAFT_MODEL:-sail/longspec-vicuna-7b-v1.5-16k}"
+BENCH_SPECEXTEND_DRAFT_MODEL="${BENCH_SPECEXTEND_DRAFT_MODEL:-$BENCH_EAGLE_MODEL}"
+BENCH_LONGSPEC_DRAFT_MODEL="${BENCH_LONGSPEC_DRAFT_MODEL:-sail/longspec-vicuna-7b-v1.5-16k}"
 # T4 smoke overrides: smaller model pairs that fit 16GB and are cached locally.
-REP_DFLASH_SMOKE_TARGET_MODEL="${REP_DFLASH_SMOKE_TARGET_MODEL:-Qwen/Qwen3-4B}"
-REP_DFLASH_SMOKE_DRAFT_MODEL="${REP_DFLASH_SMOKE_DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
+BENCH_DFLASH_SMOKE_TARGET_MODEL="${BENCH_DFLASH_SMOKE_TARGET_MODEL:-Qwen/Qwen3-4B}"
+BENCH_DFLASH_SMOKE_DRAFT_MODEL="${BENCH_DFLASH_SMOKE_DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
 # FlexPrefill: full mode = canonical Llama-3.1-8B-Instruct (big GPU); smoke = Qwen2.5-3B (T4).
-REP_FLEXPREFILL_FULL_MODEL="${REP_FLEXPREFILL_FULL_MODEL:-$REP_TARGET_MODEL}"
-REP_FLEXPREFILL_SMOKE_MODEL="${REP_FLEXPREFILL_SMOKE_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
+BENCH_FLEXPREFILL_FULL_MODEL="${BENCH_FLEXPREFILL_FULL_MODEL:-$BENCH_TARGET_MODEL}"
+BENCH_FLEXPREFILL_SMOKE_MODEL="${BENCH_FLEXPREFILL_SMOKE_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
 # Max input tokens applied to full-attention baselines on T4 smoke runs so
 # long docs (e.g. govreport, up to 40k+ tokens) do not OOM the 16GB GPU.
-REP_MAX_INPUT_TOKENS="${REP_MAX_INPUT_TOKENS:-4096}"
+BENCH_MAX_INPUT_TOKENS="${BENCH_MAX_INPUT_TOKENS:-4096}"
 # Baselines whose representative data adapter needs a big GPU: in smoke mode
 # they run their kernel smoke probe instead of the data matrix.
-T4_SMOKE_KERNEL_BASELINES="longspec"
+T4_SMOKE_KERNEL_BASELINES="${BENCH_T4_SMOKE_KERNEL_BASELINES:-longspec}"
 
 # Resolve a cached HF repo to its snapshot when possible.  This matters for
 # EAGLE3, whose wrapper validates that the draft checkpoint is a local dir;
@@ -277,164 +282,128 @@ apply_full_model_overrides() {
     # Full mode keeps the canonical big-GPU pairs below.
     case "$b" in
       dflash)
-        set_env TARGET_MODEL "$(resolve_model_ref "$REP_DFLASH_SMOKE_TARGET_MODEL")"
-        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_DFLASH_SMOKE_DRAFT_MODEL")"
+        set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_DFLASH_SMOKE_TARGET_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_DFLASH_SMOKE_DRAFT_MODEL")"
         ;;
       flexprefill)
-        set_env MODEL "$(resolve_model_ref "$REP_FLEXPREFILL_SMOKE_MODEL")"
+        set_env MODEL "$(resolve_model_ref "$BENCH_FLEXPREFILL_SMOKE_MODEL")"
         ;;
       specextend)
         set_env SCRIPT "run_eagle.py"
         set_env MODEL_NAME "llama3_1_8b"
-        set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_EAGLE_MODEL")"
+        set_env BASE_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_SPECEXTEND_DRAFT_MODEL")"
         ;;
       longspec)
         set_env MODEL_NAME "vicuna7b"
-        set_env TARGET_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
-        set_env DRAFT_MODEL "$(resolve_model_ref "$REP_LONGSPEC_DRAFT_MODEL")"
+        set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_LONGSPEC_TARGET_MODEL")"
+        set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_LONGSPEC_DRAFT_MODEL")"
         ;;
     esac
     return 0
   fi
   case "$b" in
     llmlingua)
-      set_env COMPRESSOR_MODEL "$(resolve_model_ref "$REP_COMPRESSOR_MODEL")"
-      set_env TARGET_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env COMPRESSOR_MODEL "$(resolve_model_ref "$BENCH_COMPRESSOR_MODEL")"
+      set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
       ;;
     fastkv)
-      set_env MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
       set_env METHOD "fastkv"
-      set_env ATTN_IMPL "${FASTKV_FULL_ATTN_IMPL:-flash_attention_2}"
+      set_env ATTN_IMPL "${BENCH_FASTKV_ATTN_IMPL:-flash_attention_2}"
       ;;
     gemfilter)
-      set_env MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
       set_env SELECT_LAYER_IDX "13"
       ;;
     specprefill)
-      set_env TARGET_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-      set_env SPEC_MODEL "$(resolve_model_ref "$REP_SPEC_MODEL")"
+      set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+      set_env SPEC_MODEL "$(resolve_model_ref "$BENCH_SPEC_MODEL")"
       ;;
     minference)
-      set_env MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
+      set_env MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
       ;;
     flexprefill)
-      set_env MODEL "$(resolve_model_ref "$REP_FLEXPREFILL_FULL_MODEL")"
+      set_env MODEL "$(resolve_model_ref "$BENCH_FLEXPREFILL_FULL_MODEL")"
       ;;
     eagle3)
-      set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-      set_env EAGLE_MODEL "$(resolve_model_ref "$REP_EAGLE_MODEL")"
+      set_env BASE_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+      set_env EAGLE_MODEL "$(resolve_model_ref "$BENCH_EAGLE_MODEL")"
       ;;
     dflash)
-      set_env TARGET_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_DFLASH_MODEL")"
+      set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_DFLASH_MODEL")"
       ;;
     specextend)
       set_env SCRIPT "run_eagle.py"
       set_env MODEL_NAME "llama3_1_8b"
-      set_env BASE_MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_EAGLE_MODEL")"
+      set_env BASE_MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_SPECEXTEND_DRAFT_MODEL")"
       ;;
     longspec)
       set_env MODEL_NAME "vicuna7b"
-      set_env TARGET_MODEL "$(resolve_model_ref "$REP_VICUNA_MODEL")"
-      set_env DRAFT_MODEL "$(resolve_model_ref "$REP_LONGSPEC_DRAFT_MODEL")"
+      set_env TARGET_MODEL "$(resolve_model_ref "$BENCH_LONGSPEC_TARGET_MODEL")"
+      set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_LONGSPEC_DRAFT_MODEL")"
       ;;
     semantic_selection)
-      set_env MODEL "$(resolve_model_ref "$REP_TARGET_MODEL")"
-      set_env EMBEDDING_MODEL "$(resolve_model_ref "$REP_EMBEDDING_MODEL")"
+      set_env MODEL "$(resolve_model_ref "$BENCH_TARGET_MODEL")"
+      set_env EMBEDDING_MODEL "$(resolve_model_ref "$BENCH_EMBEDDING_MODEL")"
       ;;
   esac
 }
 
-# tên config của baseline (một số baseline có tên khác với tên dispatcher)
-config_for() {
-  case "$1:$MODE" in
-    fastkv:smoke)      echo "fastkv_smoke" ;;
-    gemfilter:smoke)   echo "gemfilter_smoke" ;;
-    specprefill:smoke) echo "specprefill_smoke" ;;
-    specextend:smoke)  echo "specextend_smoke" ;;
-    dflash:*)          echo "dflash" ;;
-    eagle3:*)          echo "eagle3_qwen3" ;;
-    *)                 echo "$1" ;;
-  esac
-}
-
-gen_config() {
-  local b="$1" ds="$2"
-  local base_cfg="$ROOT/config/$(config_for "$b").env"
-  if [[ ! -f "$base_cfg" ]]; then
-    echo "  missing config: $base_cfg (skip)" >&2
-    return 1
-  fi
-  local cfg="$OUT_DIR/configs/${b}_${ds}.env"
-  {
-    cat "$base_cfg"
-    echo
-    echo "# ---- overrides by run_representative_100.sh ----"
-    if [[ "$MODE" == "smoke" ]]; then set_env SMOKE 1; else set_env SMOKE 0; fi
-    set_env OUTPUT_FILE "$OUT_DIR/${b}_${ds}.jsonl"
-    set_env MAX_SAMPLES "$MAX_SAMPLES"
-    apply_full_model_overrides "$b"
-    if [[ "$MODE" == "smoke" ]]; then
-      case "$b" in
-        # MInference caps max_model_len to 4096 in smoke and must stay below
-        # it (input + generation); the Qwen2.5-7B model also needs headroom.
-        minference)
-          set_env MAX_INPUT_TOKENS "${REP_MINFFERENCE_MAX_INPUT_TOKENS:-3072}"
-          ;;
-        # DFlash 4B+4B pair nearly fills T4 16GB; a short cap leaves room for
-        # the prefill/decode compute.
-        dflash)
-          set_env MAX_INPUT_TOKENS "${REP_DFLASH_MAX_INPUT_TOKENS:-1024}"
-          ;;
-        # EAGLE3 holds base + drafter on the T4; only a short cap leaves room
-        # for the tree/KV structures.
-        eagle3)
-          set_env MAX_INPUT_TOKENS "${REP_EAGLE3_MAX_INPUT_TOKENS:-1024}"
-          ;;
-        specextend)
-          set_env MAX_INPUT_TOKENS "${REP_SPECEXTEND_MAX_INPUT_TOKENS:-512}"
-          ;;
-        llmlingua|semantic_selection|flexprefill)
-          set_env MAX_INPUT_TOKENS "$REP_MAX_INPUT_TOKENS"
-          ;;
-      esac
-    fi
+prepare_run_env() {
+  local b="$1" ds="$2" output_file="${3:-$OUT_DIR/${b}_${ds}.jsonl}"
+  RUN_ENV=()
+  if [[ "$MODE" == "smoke" ]]; then set_env SMOKE 1; else set_env SMOKE 0; fi
+  set_env OUTPUT_FILE "$output_file"
+  set_env MAX_SAMPLES "$MAX_SAMPLES"
+  apply_full_model_overrides "$b"
+  if [[ "$MODE" == "smoke" ]]; then
     case "$b" in
-      llmlingua)
-        set_env DOC_FILE "data/representative_100/${ds}_representative.jsonl"
+      minference)
+        set_env MAX_INPUT_TOKENS "${BENCH_MINFERENCE_MAX_INPUT_TOKENS:-3072}"
         ;;
-      fastkv|gemfilter|specprefill|minference)
-        set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
-        ;;
-      dflash|longspec)
-        set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
-        ;;
-      flexprefill)
-        set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
+      dflash)
+        set_env MAX_INPUT_TOKENS "${BENCH_DFLASH_MAX_INPUT_TOKENS:-1024}"
         ;;
       eagle3)
-        set_env DATA_FILE "$OUT_DIR/data/eagle3_${ds}.jsonl"
-        set_env QUESTION_BEGIN "0"
-        set_env QUESTION_END "$MAX_SAMPLES"
-        ;;
-      semantic_selection)
-        set_env INPUT_FILE "data/representative_100/${ds}_representative.jsonl"
+        set_env MAX_INPUT_TOKENS "${BENCH_EAGLE_MAX_INPUT_TOKENS:-1024}"
         ;;
       specextend)
-        set_env INPUT_FILE "$OUT_DIR/data/specextend_${ds}.jsonl"
+        set_env MAX_INPUT_TOKENS "${BENCH_SPECEXTEND_MAX_INPUT_TOKENS:-512}"
+        ;;
+      llmlingua|semantic_selection|flexprefill)
+        set_env MAX_INPUT_TOKENS "$BENCH_MAX_INPUT_TOKENS"
         ;;
     esac
-    if [[ -n "$MAX_NEW_TOKENS" ]]; then
-      case "$b" in
-        gemfilter|specextend|longspec) set_env MAX_GEN_LEN "$MAX_NEW_TOKENS" ;;
-        specprefill)          set_env MAX_TOKENS "$MAX_NEW_TOKENS" ;;
-        *)                    set_env MAX_NEW_TOKENS "$MAX_NEW_TOKENS" ;;
-      esac
-    fi
-  } > "$cfg"
-  echo "$cfg"
+  fi
+  case "$b" in
+    llmlingua)
+      set_env DOC_FILE "data/representative_100/${ds}_representative.jsonl"
+      ;;
+    fastkv|gemfilter|specprefill|minference|dflash|longspec|flexprefill)
+      set_env DATA_FILE "data/representative_100/${ds}_representative.jsonl"
+      ;;
+    eagle3)
+      set_env DATA_FILE "$OUT_DIR/data/eagle3_${ds}.jsonl"
+      set_env QUESTION_BEGIN "0"
+      set_env QUESTION_END "$MAX_SAMPLES"
+      ;;
+    semantic_selection)
+      set_env INPUT_FILE "data/representative_100/${ds}_representative.jsonl"
+      ;;
+    specextend)
+      set_env INPUT_FILE "$OUT_DIR/data/specextend_${ds}.jsonl"
+      ;;
+  esac
+  if [[ -n "$MAX_NEW_TOKENS" ]]; then
+    case "$b" in
+      gemfilter|specextend|longspec) set_env MAX_GEN_LEN "$MAX_NEW_TOKENS" ;;
+      specprefill)          set_env MAX_TOKENS "$MAX_NEW_TOKENS" ;;
+      *)                    set_env MAX_NEW_TOKENS "$MAX_NEW_TOKENS" ;;
+    esac
+  fi
 }
 
 # ---- chạy -------------------------------------------------------------------
@@ -444,8 +413,7 @@ FAILED_LIST=""
 COLLECT_FAILED=0
 
 run_pair() {
-  local b="$1" ds="$2" cfg="$3" output_file="${4:-}"
-  [[ -n "$output_file" ]] || output_file="$OUT_DIR/${b}_${ds}.jsonl"
+  local b="$1" ds="$2" output_file="${3:-$OUT_DIR/${b}_${ds}.jsonl}"
   local log="$OUT_DIR/logs/${b}_${ds}.log"
   # Infer scripts append JSONL records. Remove only this run's generated
   # artifact so rerunning the same pair does not duplicate samples/summaries.
@@ -453,13 +421,13 @@ run_pair() {
   echo
   echo "== [$b / $ds] =="
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "  would run: bash scripts/run.sh $b $cfg"
+    echo "  would run: env ${RUN_ENV[*]} bash scripts/run.sh $b"
     echo "  log       : $log"
     return
   fi
   rm -f "$output_file"
   local start=$(date +%s)
-  if bash scripts/run.sh "$b" "$cfg" > "$log" 2>&1; then
+  if env "${RUN_ENV[@]}" bash scripts/run.sh "$b" > "$log" 2>&1; then
     PASSED=$((PASSED + 1))
     echo "  PASS ($(( $(date +%s) - start ))s) — log: $log"
   else
@@ -486,30 +454,17 @@ for b in $BASELINES; do
     if [[ "$DRY_RUN" == "1" ]]; then
       echo
       echo "== [$b (smoke-only: không đọc DATA_FILE)] =="
-      echo "  would run: bash scripts/run.sh $b (smoke probe riêng, không tính metric)"
+      prepare_run_env "$b" "smoke" "$OUT_DIR/smoke/${b}_smoke.jsonl"
+      echo "  would run: env ${RUN_ENV[*]} bash scripts/run.sh $b (smoke probe riêng, không tính metric)"
     else
-      base_cfg="$ROOT/config/$(config_for "$b").env"
-      if [[ ! -f "$base_cfg" ]]; then
-        echo "  missing config: $base_cfg (skip)" >&2
-        FAILED=$((FAILED + 1))
-        FAILED_LIST="$FAILED_LIST $b/smoke"
-        continue
-      fi
-      cfg="$OUT_DIR/configs/${b}_smoke.env"
-      {
-        cat "$base_cfg"
-        echo
-        echo "# ---- overrides by run_representative_100.sh ----"
-        set_env SMOKE 1
-        set_env OUTPUT_FILE "$OUT_DIR/smoke/${b}_smoke.jsonl"
-      } > "$cfg"
-      run_pair "$b" "smoke" "$cfg" "$OUT_DIR/smoke/${b}_smoke.jsonl"
+      prepare_run_env "$b" "smoke" "$OUT_DIR/smoke/${b}_smoke.jsonl"
+      run_pair "$b" "smoke" "$OUT_DIR/smoke/${b}_smoke.jsonl"
     fi
     continue
   fi
   for ds in $DATASETS; do
-    cfg=$(gen_config "$b" "$ds") || { FAILED=$((FAILED + 1)); FAILED_LIST="$FAILED_LIST $b/$ds"; continue; }
-    run_pair "$b" "$ds" "$cfg"
+    prepare_run_env "$b" "$ds"
+    run_pair "$b" "$ds"
   done
 done
 

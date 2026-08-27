@@ -12,8 +12,8 @@ verification. Dựa trên `externals/EAGLE`.
 
 | Vai trò | Model | Ghi chú |
 |---|---|---|
-| Base | `Qwen/Qwen3-4B` | đã cache local, snapshot path trong `config/eagle3_qwen3.env` |
-| Draft | `AngelSlim/Qwen3-4B_eagle3` | path trong config |
+| Base | `MODEL_TARGET` | đặt snapshot local trong master nếu server offline |
+| Draft | `MODEL_EAGLE_DRAFT` | đặt snapshot local trong master nếu server offline |
 
 ## Chạy smoke / thật
 
@@ -21,10 +21,9 @@ verification. Dựa trên `externals/EAGLE`.
 bash scripts/run.sh eagle3
 ```
 
-Cấu hình `config/eagle3_qwen3.env`:
-- `BENCH_NAME` = `qa` | `sum` | `gsm8k` | ... (dataset kèm trong repo EAGLE)
-- `QUESTION_BEGIN` / `QUESTION_END`, `MAX_NEW_TOKENS`, `TOTAL_TOKEN`/`DEPTH`/`TOP_K`
-- `OUTPUT_FILE`
+Cấu hình trong master: `EAGLE_BENCHMARK`, `EAGLE_QUESTION_BEGIN` /
+`EAGLE_QUESTION_END`, `EAGLE_MAX_NEW_TOKENS`, `EAGLE_TOTAL_TOKENS` /
+`EAGLE_DEPTH` / `EAGLE_TOP_K`.
 
 ## Dữ liệu của bạn (plug-and-play)
 

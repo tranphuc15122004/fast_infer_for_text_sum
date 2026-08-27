@@ -2,28 +2,29 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="$ROOT/config/dflash.env"
 if [[ $# -gt 0 && "$1" != -* ]]; then
-  CONFIG_FILE="$1"
+  export FAST_INFER_MASTER_CONFIG="$1"
   shift
 fi
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "Configuration file not found: $CONFIG_FILE" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1090
-source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/config.sh"
+fast_infer_load_config dflash || exit 1
 # shellcheck disable=SC1091
 source "$ROOT/scripts/common/runtime.sh" || exit 1
 
-# Preserve the existing GSM8K entry point when callers explicitly provide one
-# of the legacy DFlash configs (they contain BACKEND/DATASET instead of the
-# representative JSONL fields below).
-if [[ -n "${BACKEND:-}" && -n "${DATASET:-}" ]]; then
-  exec bash "$ROOT/scripts/run_dflash_gsm8k.sh" "$CONFIG_FILE" "$@"
-fi
+# Preserve the GSM8K entry point only when the master explicitly selects it.
+# The unified master also contains the GSM8K defaults, so checking whether
+# BACKEND/DATASET happen to be set would incorrectly hijack representative
+# JSONL runs.
+case "${DFLASH_MODE:-representative}" in
+  representative) ;;
+  gsm8k) exec bash "$ROOT/scripts/run_dflash_gsm8k.sh" "$@" ;;
+  *)
+    echo "DFLASH_MODE must be representative or gsm8k: ${DFLASH_MODE}" >&2
+    exit 2
+    ;;
+esac
 
 : "${TARGET_MODEL:?TARGET_MODEL is required}"
 : "${DRAFT_MODEL:?DRAFT_MODEL is required}"

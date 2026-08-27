@@ -34,10 +34,10 @@ server.
 git clone <repo> && cd fast_infer_text_sum
 python3 --version
 
-# 2) Nạp profile production; không cần activate virtualenv
-set -a
-source config/b200.env
-set +a
+# 2) Đặt master config ngoài repository (config/master.path đã trỏ sẵn tới path này)
+#    Lần đầu: cp docs/fast_infer_master.example.env /workspace/shared_storage/config/fast_infer_master.env
+export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+source scripts/common/config.sh && fast_infer_load_master
 
 # 3) Kiểm tra runtime/CUDA/dependency/model cache trước khi chạy
 python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
@@ -61,7 +61,9 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 bash scripts/run.sh <baseline> [args...]
 ```
 
-Mỗi baseline đọc cấu hình `config/<baseline>.env` (model path, data file, tham số).
+Mọi baseline đọc cùng một master shell-env. Pointer mặc định là
+`config/master.path`; có thể override bằng `FAST_INFER_MASTER_CONFIG`. Mẫu đầy
+đủ và tên canonical nằm ở [`docs/fast_infer_master.example.env`](fast_infer_master.example.env).
 `bash scripts/run.sh` là dispatcher gọi wrapper; production dùng `python3`, còn
 local simulation đặt `FAST_INFER_PYTHON` tới `.venv/bin/python`.
 
@@ -70,8 +72,9 @@ local simulation đặt `FAST_INFER_PYTHON` tới `.venv/bin/python`.
 Định dạng file jsonl + trạng thái hỗ trợ từng baseline: xem
 [`data/README.md`](../data/README.md) và `scripts/common/data_loader.py`.
 
-Tóm tắt: bỏ file jsonl vào `data/`, set `DATA_FILE="data/<file>.jsonl"` (và
-`MAX_SAMPLES`) trong `config/<baseline>.env` → chạy `bash scripts/run.sh <baseline>`.
+Tóm tắt: bỏ file jsonl vào `data/`, sửa `DATA_INPUT` và `RUN_SAMPLES` trong
+master → chạy `bash scripts/run.sh <baseline>`. Override nhanh một lần vẫn có
+thể đặt biến môi trường, ví dụ `DATA_INPUT=data/user.jsonl RUN_SAMPLES=5 ...`.
 
 ## Output
 
@@ -115,5 +118,5 @@ Phân tích latency, memory và ROUGE của các scheme `random`, `lead`, `tfidf
   `check_shared_env.py` để kiểm tra import/version/CUDA sau khi cài.
 - Có thể dùng `FAST_INFER_VENV` hoặc `FAST_INFER_PYTHON` để chỉ định interpreter;
   giá trị `FAST_INFER_PYTHON=python3` được resolve qua PATH.
-- `config/b200.env` + `scripts/run_b200_smoke.sh` là đường chạy one-sample có
-  preflight và summary cho server B200.
+- `config/master.path` + master ngoài repo + `scripts/run_b200_smoke.sh` là
+  đường chạy one-sample có preflight và summary cho server B200.

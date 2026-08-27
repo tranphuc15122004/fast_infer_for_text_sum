@@ -20,8 +20,9 @@ Token-selective prefill (monkey-patch vLLM). Dựa trên `externals/speculative_
 bash scripts/run.sh specprefill
 ```
 
-Cấu hình `config/specprefill.env`: `TARGET_MODEL`, `SPEC_MODEL`, `SPEC_CONFIG`,
-`MAX_TOKENS`, `GPU_MEMORY_UTILIZATION`.
+Cấu hình trong master: `MODEL_TARGET`, `MODEL_SPEC_DRAFT`,
+`SPECPREFILL_CONFIG`, `SPECPREFILL_MAX_NEW_TOKENS`,
+`SPECPREFILL_GPU_MEMORY_UTILIZATION`.
 
 Lưu ý: monkey-patch phải được gọi **trước khi import vLLM** (wrapper đã xử lý);
 vLLM bắt buộc `enforce_eager=True` + `enable_chunked_prefill=False`.
@@ -29,7 +30,7 @@ vLLM bắt buộc `enforce_eager=True` + `enable_chunked_prefill=False`.
 ## Dữ liệu của bạn
 
 ```bash
-DATA_FILE="data/user_prompts.jsonl" MAX_SAMPLES=5 bash scripts/run.sh specprefill
+DATA_INPUT="data/user_prompts.jsonl" RUN_SAMPLES=5 bash scripts/run.sh specprefill
 ```
 (chạy batch qua vLLM — `batch_size` ghi = số prompt.)
 

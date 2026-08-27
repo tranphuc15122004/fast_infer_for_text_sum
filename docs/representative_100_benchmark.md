@@ -12,9 +12,8 @@ activate virtualenv:
 
 ```bash
 python3 --version
-set -a
-source config/b200.env
-set +a
+export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+source scripts/common/config.sh && fast_infer_load_master
 python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 ```
 
@@ -40,7 +39,6 @@ bash scripts/run_representative_100.sh --baselines semantic_selection --datasets
 Smoke toàn bộ 14 baseline với profile B200, một sample/baseline:
 
 ```bash
-set -a; source config/b200.env; set +a
 bash scripts/run_b200_smoke.sh --output-dir outputs/b200_smoke
 ```
 
@@ -49,9 +47,9 @@ Trên local T4, thay `python3` bằng
 GPU-only phải xuất hiện là `BLOCKED`, không phải `PASS` giả.
 
 Các tùy chọn đầy đủ: `--baselines`, `--datasets`, `--max-samples`,
-`--max-new-tokens`, `--mode smoke|full`, `--config FILE`, `--output-dir DIR`,
+`--max-new-tokens`, `--mode smoke|full`, `--config MASTER`, `--output-dir DIR`,
 `--include-unsupported`, `--dry-run`, `--skip-collect`. Defaults có thể đặt
-trong `config/representative_100.env`. Runner mặc định chỉ chọn baseline có
+trong master qua các biến `BENCH_*`. Runner mặc định chỉ chọn baseline có
 adapter đọc `representative_100`; `--include-unsupported` chỉ chạy thêm smoke
 probe vào thư mục `smoke/`, không được tính vào benchmark/metric.
 
@@ -59,7 +57,7 @@ probe vào thư mục `smoke/`, không được tính vào benchmark/metric.
 
 | Nhóm | Baseline | Ghi chú |
 |---|---|---|
-| Đọc dữ liệu representative (chạy mặc định) | llmlingua, fastkv, gemfilter, specprefill, minference, specextend, eagle3, semantic_selection, dflash, longspec | Runner sinh config full canonical riêng cho từng (baseline, dataset) trong `<output-dir>/configs/` |
+| Đọc dữ liệu representative (chạy mặc định) | llmlingua, fastkv, gemfilter, specprefill, minference, specextend, eagle3, semantic_selection, dflash, longspec | Runner truyền override bằng environment cho từng (baseline, dataset) |
 | Chưa có adapter representative | higoe, rocketkv, magicdec | Chỉ chạy khi có `--include-unsupported`; là smoke probe riêng, không đọc dataset và không được đưa vào metric |
 
 `semantic_selection` chạy cùng target canonical M1 và embedding M6 cho `full`, `random`, `lead`, `tfidf`,

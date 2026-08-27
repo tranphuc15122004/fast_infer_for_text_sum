@@ -11,8 +11,8 @@ Parallel/diffusion-style drafting (DFlash) — dựa trên `externals/dflash`.
 
 | Vai trò | Model | Ghi chú |
 |---|---|---|
-| Target | `Qwen/Qwen3-4B` | đã cache, path trong `config/dflash_gsm8k.env` |
-| Draft | `z-lab/Qwen3-4B-DFlash-b16` | đã cache |
+| Target | `MODEL_TARGET` | đặt snapshot local trong master nếu server offline |
+| Draft | `MODEL_DFLASH_DRAFT` | đặt snapshot local trong master nếu server offline |
 
 ## Chạy smoke / thật
 
@@ -20,8 +20,10 @@ Parallel/diffusion-style drafting (DFlash) — dựa trên `externals/dflash`.
 bash scripts/run.sh dflash
 ```
 
-Cấu hình `config/dflash_gsm8k.env`: `BACKEND` (transformers|sglang|vllm),
-`DATASET`, `MAX_SAMPLES`, `MAX_NEW_TOKENS`, `BLOCK_SIZE`.
+Cấu hình trong master: `DFLASH_MODE=gsm8k`, `DFLASH_BACKEND`
+(transformers|sglang|vllm), `DFLASH_DATASET`, `DFLASH_MAX_SAMPLES`,
+`DFLASH_MAX_NEW_TOKENS`, `DFLASH_BLOCK_SIZE`. Dùng
+`DFLASH_MODE=representative` để chạy JSONL của repo.
 
 ## Dữ liệu của bạn
 

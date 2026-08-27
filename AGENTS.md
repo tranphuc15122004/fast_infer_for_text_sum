@@ -17,7 +17,7 @@ fast_infer_text_sum/
 │   ├── setup_venv.sh            # tạo/cài venv Python 3.12 offline
 │   ├── check_shared_env.py      # preflight import/version, không tải model
 │   └── common/                 # helpers dùng chung
-├── config/                     # cấu hình per baseline
+├── config/                     # pointer master config duy nhất
 ├── envs/                       # manifest/lock legacy, không còn venv runtime
 ├── externals/                  # baseline repos vendored + guide
 ├── data/                       # dữ liệu plug-and-play jsonl
@@ -43,12 +43,13 @@ cũ. Không tạo hoặc sử dụng venv riêng cho từng baseline.
 ## Conventions
 
 - **1 baseline = 1 bộ file**: `scripts/infer_<b>.py` + `scripts/run_<b>.sh` +
-  `config/<b>.env` + `docs/baselines/<b>.md`, được nối vào `run.sh`.
+  `docs/baselines/<b>.md`, được nối vào `run.sh`. Tất cả launcher dùng master
+  shell-env ngoài repository qua `config/master.path`.
 - **Smoke vs full**: mặc định `--smoke` (T4-safe khi baseline hỗ trợ); full cần
   GPU lớn, kernel tương thích và model/cache thật. `SMOKE=1`/`FULL=1` trong config.
 - **Output schema**: mọi record qua `io_util.JsonlWriter`, kết thúc bằng summary.
-- **Dữ liệu plug-and-play**: bỏ jsonl vào `data/`, set `DATA_FILE`/`DOC_FILE` +
-  `MAX_SAMPLES` trong config. HiGOE và DFlash vẫn có pipeline riêng.
+- **Dữ liệu plug-and-play**: bỏ jsonl vào `data/`, set `DATA_INPUT` +
+  `RUN_SAMPLES` trong master. HiGOE và DFlash vẫn có pipeline riêng.
 - **ROUGE quality**: khi có reference, script sinh text gọi `rouge.add_rouge()`
   và summary gọi `rouge.aggregate_rouge()`.
 

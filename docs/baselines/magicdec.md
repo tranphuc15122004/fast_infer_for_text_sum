@@ -40,8 +40,9 @@ weight nhiều GB lên GitHub. Có thể đổi vị trí bằng biến
 bash scripts/run.sh magicdec     # smoke: self-spec, TinyLlama, B=1, prefix 2048
 ```
 
-Cấu hình `config/magicdec.env`: `MODEL_PTH`, `MODEL_NAME`, `BATCH_SIZE`,
-`PREFIX_LEN`, `MAX_LEN` (bội của 128), `SELF_SPEC`/`GAMMA`/`DRAFT_BUDGET`.
+Cấu hình trong master: `CHECKPOINT_MAGICDEC`, `MODEL_MAGICDEC_NAME`,
+`MAGICDEC_BATCH_SIZE`, `MAGICDEC_PREFIX_LEN`, `MAGICDEC_MAX_INPUT_TOKENS`
+(bội của 128), `MAGICDEC_SELF_SPEC`/`MAGICDEC_GAMMA`/`MAGICDEC_DRAFT_BUDGET`.
 
 - Full (GPU lớn): llama-3.1-8b, TP=8, `--compile`.
 

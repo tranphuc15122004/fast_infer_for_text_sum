@@ -22,14 +22,15 @@ Bắt buộc nằm trong danh sách hỗ trợ (`minference.get_support_models()
 bash scripts/run.sh minference
 ```
 
-Cấu hình `config/minference.env`: `MODEL`, `ATTN_TYPE`, `MAX_NEW_TOKENS`,
-`MAX_MODEL_LEN`, `DEVICE`, `ATTN_IMPLEMENTATION`. `auto` dùng
+Cấu hình trong master: `MODEL_TARGET`, `MINFERENCE_ATTN_TYPE`,
+`MINFERENCE_MAX_NEW_TOKENS`, `MINFERENCE_MAX_INPUT_TOKENS`,
+`MINFERENCE_DEVICE`, `MINFERENCE_ATTN_IMPLEMENTATION`. `auto` dùng
 FlashAttention-2 trên GPU sm80+ nếu đã cài; trên T4 tự dùng SDPA.
 
 ## Dữ liệu của bạn
 
 ```bash
-DATA_FILE="data/user_prompts.jsonl" MAX_SAMPLES=5 bash scripts/run.sh minference
+DATA_INPUT="data/user_prompts.jsonl" RUN_SAMPLES=5 bash scripts/run.sh minference
 ```
 
 ## Output

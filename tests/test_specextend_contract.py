@@ -6,21 +6,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_specextend_defaults_to_llama31_eagle3_path():
-    config = (ROOT / "config/specextend.env").read_text(encoding="utf-8")
-    smoke_config = (ROOT / "config/specextend_smoke.env").read_text(encoding="utf-8")
+    config = (ROOT / "docs/fast_infer_master.example.env").read_text(encoding="utf-8")
     runner = (ROOT / "scripts/run_representative_100.sh").read_text(encoding="utf-8")
     adapter = (ROOT / "scripts/infer_specextend.py").read_text(encoding="utf-8")
 
-    for text in (config, smoke_config):
-        assert 'SCRIPT="run_eagle.py"' in text
-        assert 'MODEL_NAME="llama3_1_8b"' in text
-        assert "meta-llama/Meta-Llama-3.1-8B-Instruct" in text
-        assert "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B" in text
+    assert 'SPECEXTEND_SCRIPT="${SPECEXTEND_SCRIPT:-run_eagle.py}"' in config
+    assert 'SPECEXTEND_MODEL_NAME="${SPECEXTEND_MODEL_NAME:-llama3_1_8b}"' in config
+    assert "MODEL_TARGET" in config
+    assert "MODEL_EAGLE_DRAFT" in config
 
-    assert "REP_SPECEXTEND_EAGLE_MODEL" in runner
+    assert "BENCH_SPECEXTEND_DRAFT_MODEL" in runner
     assert 'set_env SCRIPT "run_eagle.py"' in runner
     assert 'set_env MODEL_NAME "llama3_1_8b"' in runner
-    assert 'set_env DRAFT_MODEL "$(resolve_model_ref "$REP_SPECEXTEND_EAGLE_MODEL")"' in runner
+    assert 'set_env DRAFT_MODEL "$(resolve_model_ref "$BENCH_SPECEXTEND_DRAFT_MODEL")"' in runner
     assert '"llama3_1_8b"' in adapter
 
 

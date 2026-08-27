@@ -11,11 +11,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def test_b200_profile_uses_python3_and_one_sample():
-    config = (ROOT / "config/b200.env").read_text(encoding="utf-8")
-    assert 'FAST_INFER_PYTHON="${FAST_INFER_PYTHON:-python3}"' in config
-    assert 'B200_SMOKE_MAX_SAMPLES="${B200_SMOKE_MAX_SAMPLES:-1}"' in config
-    assert "TRITON_CACHE_DIR" in config
-    assert "FLASHINFER_WORKSPACE_BASE" in config
+    config = (ROOT / "docs/fast_infer_master.example.env").read_text(encoding="utf-8")
+    assert 'FI_PYTHON="${FI_PYTHON:-python3}"' in config
+    assert 'B200_MAX_SAMPLES="${B200_MAX_SAMPLES:-1}"' in config
+    assert "FI_TRITON_CACHE" in config
+    assert "FI_FLASHINFER_CACHE" in config
 
 
 def test_preflight_emits_structured_report_without_cuda(tmp_path):

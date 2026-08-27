@@ -78,7 +78,7 @@ def test_shared_runtime_resolves_interpreter_command_name(tmp_path):
     assert proc.stdout.strip() == str(fake_python)
 
 
-def test_shared_runtime_sources_optional_config_overlay(tmp_path):
+def test_shared_runtime_does_not_source_legacy_config_overlay(tmp_path):
     fake_python = tmp_path / "python3"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
@@ -87,12 +87,8 @@ def test_shared_runtime_sources_optional_config_overlay(tmp_path):
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-    overlay = tmp_path / "overlay.env"
-    overlay.write_text("B200_OVERLAY_TEST=loaded\n", encoding="utf-8")
-
     env = dict(os.environ)
     env["FAST_INFER_PYTHON"] = str(fake_python)
-    env["FAST_INFER_CONFIG_OVERLAY"] = str(overlay)
     proc = subprocess.run(
         [
             "bash",
@@ -100,7 +96,7 @@ def test_shared_runtime_sources_optional_config_overlay(tmp_path):
             (
                 "ROOT=\"$1\"; "
                 "source \"$ROOT/scripts/common/runtime.sh\"; "
-                "printf '%s\\n' \"$B200_OVERLAY_TEST\""
+                "printf '%s\\n' \"${B200_OVERLAY_TEST-absent}\""
             ),
             "bash",
             str(ROOT),
@@ -111,7 +107,7 @@ def test_shared_runtime_sources_optional_config_overlay(tmp_path):
         capture_output=True,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert proc.stdout.strip() == "loaded"
+    assert proc.stdout.strip() == "absent"
 
 
 def test_shared_runtime_falls_back_to_python3_without_project_venv(tmp_path):
@@ -208,9 +204,12 @@ def test_setup_reports_missing_local_requirement_sources():
     assert "--requirements \"$ROOT/requirements.txt\"" in text
 
 
-def test_dispatcher_accepts_smoke_flag_without_treating_it_as_config():
+def test_dispatcher_accepts_smoke_flag_without_treating_it_as_config(tmp_path):
     env = dict(os.environ)
     env["FAST_INFER_PYTHON"] = "/tmp/fast-infer-python-that-does-not-exist"
+    master = tmp_path / "master.env"
+    master.write_text("MODEL_TARGET=/models/target\nOUTPUT_ROOT=outputs\n", encoding="utf-8")
+    env["FAST_INFER_MASTER_CONFIG"] = str(master)
     proc = subprocess.run(
         ["bash", "scripts/run.sh", "fastkv", "--smoke"],
         cwd=ROOT,
@@ -238,12 +237,26 @@ def test_dflash_gsm8k_wrapper_consumes_smoke_flag(tmp_path):
     env = dict(os.environ)
     env["FAST_INFER_PYTHON"] = str(fake_python)
     env["FAKE_ARGUMENT_LOG"] = str(argument_log)
+    master = tmp_path / "master.env"
+    master.write_text(
+        "MODEL_TARGET=/models/target\n"
+        "MODEL_DFLASH_DRAFT=/models/draft\n"
+        "DFLASH_MODE=gsm8k\n"
+        "DFLASH_BACKEND=transformers\n"
+        "DFLASH_DATASET=gsm8k\n"
+        "DFLASH_MAX_SAMPLES=8\n"
+        "DFLASH_MAX_NEW_TOKENS=2048\n"
+        "DFLASH_SMOKE_SAMPLES=1\n"
+        "DFLASH_SMOKE_NEW_TOKENS=128\n"
+        "DFLASH_TEMPERATURE=0\n",
+        encoding="utf-8",
+    )
+    env["FAST_INFER_MASTER_CONFIG"] = str(master)
     proc = subprocess.run(
         [
             "bash",
             "scripts/run.sh",
             "dflash",
-            "config/dflash_gsm8k.env",
             "--smoke",
         ],
         cwd=ROOT,
@@ -272,6 +285,9 @@ def test_semantic_selection_wrapper_has_a_direct_smoke_input(tmp_path):
     env = dict(os.environ)
     env["FAST_INFER_PYTHON"] = str(fake_python)
     env["FAKE_ARGUMENT_LOG"] = str(argument_log)
+    master = tmp_path / "master.env"
+    master.write_text("MODEL_TARGET=/models/target\nOUTPUT_ROOT=outputs\n", encoding="utf-8")
+    env["FAST_INFER_MASTER_CONFIG"] = str(master)
     proc = subprocess.run(
         ["bash", "scripts/run.sh", "semantic_selection", "--smoke"],
         cwd=ROOT,

@@ -31,8 +31,8 @@ FULL=1 DATA_PATH_PREFIX="/path/to/longbench_preprocessed" bash scripts/run.sh lo
 (wrapper gọi `inference_long-bench.py` bằng interpreter chung với các tham số
 `--model_name llama8b --method tree --task gov_report --data_path_prefix ...`)
 
-Cấu hình `config/longspec.env`: `MODEL_NAME`, `METHOD`, `TASK`, `MAX_GEN_LEN`,
-`TREE_SHAPE`.
+Cấu hình trong master: `LONGSPEC_MODEL_NAME`, `LONGSPEC_METHOD`,
+`LONGSPEC_TASK`, `LONGSPEC_MAX_NEW_TOKENS`, `LONGSPEC_TREE_SHAPE`.
 
 ## Dữ liệu
 

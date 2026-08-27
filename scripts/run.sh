@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Dispatcher: maps a baseline name to its env + run wrapper.
+# Dispatcher: maps a baseline name to its launcher. Every launcher loads the
+# same external master through config/master.path.
 #
 # Usage:
 #   bash scripts/run.sh <baseline> [extra args...]
 #
-# Each baseline has a wrapper `scripts/run_<baseline>.sh` that sources
-# `config/<baseline>.env` and invokes the shared Python 3.12 interpreter.
+# Each baseline has a wrapper `scripts/run_<baseline>.sh` that invokes the
+# shared Python 3.12 interpreter after loading the master config.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
