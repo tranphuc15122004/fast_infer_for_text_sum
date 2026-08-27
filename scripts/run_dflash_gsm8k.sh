@@ -66,4 +66,5 @@ if [[ -n "${BLOCK_SIZE:-}" ]]; then
 fi
 
 cd "$ROOT"
+export PYTHONPATH="$ROOT/externals/dflash${PYTHONPATH:+:$PYTHONPATH}"
 exec "$FAST_INFER_PYTHON" "${ARGS[@]}" "${PASSTHROUGH_ARGS[@]}"

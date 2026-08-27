@@ -104,3 +104,38 @@
   tự động từ manifest server trên máy đủ điều kiện.
 - Lock mới chưa thể sinh tại workspace hiện tại vì thiếu Python 3.12 và local
   artifacts server-specific; trạng thái này cần tiếp tục trên server thật.
+
+## 2026-08-27 — debug và smoke lại bằng `.venv`
+
+- Đã khôi phục các file kế hoạch/log vốn đã được git track sau khi cập nhật nhầm phần đầu phiên; không còn ghi đè lịch sử cũ.
+- Đã xác nhận `.venv` Python 3.12.13 và ghi nhận preflight: torch/transformers/vllm/triton/dflash/llmlingua/sentence_transformers pass; flashinfer cache read-only và flash_attn thiếu.
+- Đã chạy `bash -n scripts/*.sh scripts/common/*.sh` và `.venv/bin/python -m compileall -q scripts data`; cả hai pass.
+- Đang tiếp tục smoke từng baseline và sẽ chỉ sửa sau khi tái hiện + truy nguyên lỗi.
+- GemFilter wrapper đã load model và ghi 1/2 record, nhưng timeout 300s trước summary; đang retry khác biệt với 1 run/1 token để tách CPU-duration khỏi lỗi script.
+- Đã chạy đủ 14 entrypoint smoke dưới `.venv`: CPU-safe RocketKV/FastKV/LLMLingua PASS; GemFilter minimal PASS; semantic-selection PASS sau fix; các baseline còn lại đã ghi nhận blocker cụ thể.
+- Đã sửa và kiểm thử DFlash vendored `PYTHONPATH`, semantic-selection default fixture, RocketKV metadata; regression tests hiện 3/3 pass.
+- Toàn bộ test suite hiện `55 passed`; output-contract validator bằng `.venv` pass.
+- Diff source cuối chỉ gồm 3 sửa hành vi: DFlash PYTHONPATH, semantic-selection fixture mặc định, RocketKV biến metadata; thêm 3 regression tests và cập nhật expectation test cũ.
+
+## 2026-08-27 — runtime model cho B200
+
+- Người dùng xác nhận B200 production chạy trực tiếp bằng `python3` từ PATH;
+  `.venv` hiện tại chỉ mô phỏng server.
+- Đã cập nhật spec để tách production interpreter (`python3`) khỏi local
+  simulation interpreter (`.venv/bin/python`), không yêu cầu activate venv.
+
+## 2026-08-27 — B200 readiness implementation
+
+- Đã chuẩn hóa runtime nhận `FAST_INFER_PYTHON=python3` qua PATH; nếu production
+  không có `.venv`, runtime tự dùng Python system và vẫn gate Python 3.12.
+- Đã thêm `config/b200.env`, `scripts/check_b200_env.py` và
+  `scripts/run_b200_smoke.sh`/`scripts/b200_smoke.py`.
+- Preflight kiểm tra CUDA/device target, CUDA tensor probe, imports, model/cache
+  assets và cache JIT writable; cache model chỉ yêu cầu read access.
+- Runner dùng overlay config sau baseline config, ép one-sample, lưu log/output
+  riêng, tiếp tục sau lỗi và chỉ tổng thể PASS khi preflight B200 PASS.
+- Contract tests B200/runtime hiện pass; đã chạy end-to-end overlay RocketKV trên
+  `.venv`: baseline CPU smoke pass nhưng tổng thể đúng là BLOCKED vì thiếu CUDA.
+- Đã cập nhật docs production B200 dùng `python3`, local simulation dùng `.venv`.
+- Đã hoàn tất validation: `68 passed`, shell/compile/diff-check pass; preflight T4
+  báo `BLOCKED` đúng vì không có CUDA và không giả lập thành công B200.

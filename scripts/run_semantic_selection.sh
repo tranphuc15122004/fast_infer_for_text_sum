@@ -32,7 +32,11 @@ done
 
 # Representative runner injects INPUT_FILE per dataset; direct smoke runs
 # still need a deterministic local one-sample input.
-INPUT_FILE="${INPUT_FILE:-data/smoke_long_docs.jsonl}"
+# Semantic-selection's upstream loader requires the representative
+# ``document`` field.  ``data/smoke_long_docs.jsonl`` is the generic fixture
+# for baselines that consume ``text``/``prompt``, so use the matching debug
+# fixture for direct smoke runs.
+INPUT_FILE="${INPUT_FILE:-data/debug/smoke_real.jsonl}"
 : "${INPUT_FILE:?INPUT_FILE is required}"
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 : "${MODEL:?MODEL is required}"

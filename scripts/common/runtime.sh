@@ -8,6 +8,18 @@ if [[ -z "${ROOT:-}" ]]; then
   ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fi
 
+# A coordinator may provide a temporary overlay after the baseline config has
+# been sourced. This lets the production B200 runner keep one shared profile
+# while preserving each launcher's normal config boundary.
+if [[ -n "${FAST_INFER_CONFIG_OVERLAY:-}" ]]; then
+  if [[ ! -f "$FAST_INFER_CONFIG_OVERLAY" ]]; then
+    echo "Shared config overlay not found: $FAST_INFER_CONFIG_OVERLAY" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$FAST_INFER_CONFIG_OVERLAY"
+fi
+
 fast_infer_resolve_python() {
   local candidate=""
 
@@ -17,8 +29,19 @@ fast_infer_resolve_python() {
     candidate="$FAST_INFER_VENV/bin/python"
   elif [[ -n "${VIRTUAL_ENV:-}" ]]; then
     candidate="$VIRTUAL_ENV/bin/python"
-  else
+  elif [[ -x "$ROOT/.venv/bin/python" ]]; then
     candidate="$ROOT/.venv/bin/python"
+  else
+    # A production server may intentionally have no project venv. In that
+    # case use the Python 3.12 command provided by the image/PATH.
+    candidate="${FAST_INFER_SYSTEM_PYTHON:-python3}"
+  fi
+
+  # Production B200 images expose the shared interpreter as `python3` on PATH,
+  # while local simulation commonly supplies an absolute .venv path. Resolve
+  # command names once so every child process receives an executable path.
+  if [[ "$candidate" != */* ]]; then
+    candidate="$(command -v "$candidate" 2>/dev/null || true)"
   fi
 
   if [[ ! -x "$candidate" ]]; then

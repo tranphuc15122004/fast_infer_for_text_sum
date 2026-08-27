@@ -161,3 +161,28 @@ contract của runner chạy độc lập và pass.
 - [blocked] EAGLE-3, DFlash và FlexPrefill cần CUDA; SpecPrefill/MInference/MagicDec/
   LongSpec/SpecExtend/LLMLingua/HiGOE hiện thiếu package hoặc wheel server trong
   workspace mô phỏng. Đây là blocker môi trường, không phải lỗi dispatcher.
+
+## 2026-08-27 — debug và smoke lại bằng `.venv`
+
+- [complete] Rà soát lại toàn bộ dispatcher/wrapper/config và preflight `.venv`.
+- [complete] Chạy lại 14 baseline với đúng 1 sample trên runtime hiện tại.
+- [complete] Sửa và regression-test các lỗi script đã tái hiện.
+
+### Verification cuối
+
+- [complete] Toàn bộ `tests/` pass (`55 passed`), static compile/shell/diff-check pass.
+- [complete] Kiểm tra output JSONL/summary và xác nhận record count/schema.
+- [complete] Phân loại PASS/BLOCKED, ghi rõ blocker môi trường/dependency/GPU.
+
+### Lỗi đã tái hiện trong lượt này
+
+- GemFilter wrapper timeout sau run 0; cần retry với `num_runs=1`/generation ngắn hơn để xác định đây là timeout do khối lượng CPU hay lỗi runtime.
+
+## 2026-08-27 — B200 readiness trên `python3` production
+
+- [complete] Chốt runtime production `python3` từ PATH; `.venv` chỉ là mô phỏng local.
+- [complete] Viết spec và implementation plan cho B200 preflight/smoke.
+- [complete] Thêm profile `config/b200.env`, preflight text/JSON và one-sample runner.
+- [complete] Thêm contract cho command-name resolution, config overlay, B200 CUDA probe,
+  preflight hardware block và runner continuation.
+- [complete] Chạy full regression/static validation và rà soát artifact/documentation.

@@ -42,6 +42,123 @@ def test_main_runners_do_not_bypass_shared_interpreter():
             assert token not in text, (runner, token)
 
 
+def test_shared_runtime_resolves_interpreter_command_name(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == \"-c\" ]]; then exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    env = dict(os.environ)
+    env["FAST_INFER_PYTHON"] = "python3"
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "ROOT=\"$1\"; "
+                "source \"$ROOT/scripts/common/runtime.sh\"; "
+                "printf '%s\\n' \"$FAST_INFER_PYTHON\""
+            ),
+            "bash",
+            str(ROOT),
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == str(fake_python)
+
+
+def test_shared_runtime_sources_optional_config_overlay(tmp_path):
+    fake_python = tmp_path / "python3"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == \"-c\" ]]; then exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    overlay = tmp_path / "overlay.env"
+    overlay.write_text("B200_OVERLAY_TEST=loaded\n", encoding="utf-8")
+
+    env = dict(os.environ)
+    env["FAST_INFER_PYTHON"] = str(fake_python)
+    env["FAST_INFER_CONFIG_OVERLAY"] = str(overlay)
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "ROOT=\"$1\"; "
+                "source \"$ROOT/scripts/common/runtime.sh\"; "
+                "printf '%s\\n' \"$B200_OVERLAY_TEST\""
+            ),
+            "bash",
+            str(ROOT),
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "loaded"
+
+
+def test_shared_runtime_falls_back_to_python3_without_project_venv(tmp_path):
+    fake_root = tmp_path / "root"
+    helper = fake_root / "scripts/common/runtime.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        (ROOT / "scripts/common/runtime.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == \"-c\" ]]; then exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    env = dict(os.environ)
+    for name in ("FAST_INFER_PYTHON", "FAST_INFER_VENV", "VIRTUAL_ENV"):
+        env.pop(name, None)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                "ROOT=\"$1\"; "
+                "source \"$2\"; "
+                "printf '%s\\n' \"$FAST_INFER_PYTHON\""
+            ),
+            "bash",
+            str(fake_root),
+            str(helper),
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.strip() == str(fake_python)
+
+
 def test_python_subprocesses_do_not_use_ambient_python():
     for name in ("infer_magicdec.py", "magicdec_prepare_checkpoint.py",
                  "infer_specextend.py", "infer_longspec.py"):
@@ -164,6 +281,6 @@ def test_semantic_selection_wrapper_has_a_direct_smoke_input(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     args = argument_log.read_text(encoding="utf-8").splitlines()
-    assert args[args.index("--input") + 1] == "data/smoke_long_docs.jsonl"
+    assert args[args.index("--input") + 1] == "data/debug/smoke_real.jsonl"
     assert args[args.index("--limit") + 1] == "1"
     assert "--smoke" not in args

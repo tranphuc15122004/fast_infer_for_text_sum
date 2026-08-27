@@ -7,23 +7,25 @@ tốc độ infer + semantic (ROUGE-1/2/L, ROUGE-Lsum, BLEU-1..4, ...).
 
 ## 1. Chuẩn bị và runner
 
-Trên server offline, tạo venv chung trước:
+Trên server B200 offline, dùng trực tiếp Python 3.12 từ PATH; không cần tạo hoặc
+activate virtualenv:
 
 ```bash
-bash scripts/setup_venv.sh --offline
-# Export the validated interpreter for the manual collector examples below.
-source scripts/common/runtime.sh
+python3 --version
+set -a
+source config/b200.env
+set +a
+python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 ```
 
-Nếu venv đã được tạo ở vị trí khác, đặt `FAST_INFER_VENV` hoặc
-`FAST_INFER_PYTHON` trước khi chạy runner.
+Local simulation dùng `.venv` bằng cách đặt `FAST_INFER_PYTHON` rõ ràng.
 
 ```bash
 # full: 100 mẫu / dataset, model canonical M1-M9 (mặc định trên server GPU lớn)
-bash scripts/run_representative_100.sh
+FAST_INFER_PYTHON=python3 bash scripts/run_representative_100.sh
 
 # smoke: 5 mẫu / (baseline, dataset), cấu hình thận trọng theo từng baseline
-bash scripts/run_representative_100.sh --mode smoke
+FAST_INFER_PYTHON=python3 bash scripts/run_representative_100.sh --mode smoke
 
 # chạy 1 nhóm baseline / 1 dataset / giới hạn mẫu
 bash scripts/run_representative_100.sh --baselines "llmlingua minference" --datasets "cnn_dailymail xsum" --max-samples 20
@@ -34,6 +36,17 @@ bash scripts/run_representative_100.sh --dry-run
 # chọn riêng nhóm semantic-selection
 bash scripts/run_representative_100.sh --baselines semantic_selection --datasets xsum
 ```
+
+Smoke toàn bộ 14 baseline với profile B200, một sample/baseline:
+
+```bash
+set -a; source config/b200.env; set +a
+bash scripts/run_b200_smoke.sh --output-dir outputs/b200_smoke
+```
+
+Trên local T4, thay `python3` bằng
+`FAST_INFER_PYTHON="$PWD/.venv/bin/python"`; nếu không có CUDA, các baseline
+GPU-only phải xuất hiện là `BLOCKED`, không phải `PASS` giả.
 
 Các tùy chọn đầy đủ: `--baselines`, `--datasets`, `--max-samples`,
 `--max-new-tokens`, `--mode smoke|full`, `--config FILE`, `--output-dir DIR`,

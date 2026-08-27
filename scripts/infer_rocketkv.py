@@ -42,7 +42,7 @@ def main() -> None:
 
     # 1) budget math -----------------------------------------------------
     budget = RocketArgs(token_budget=args.token_budget)
-    cap, prompt_budget, chunk, r, k = (
+    cap, prompt_budget, chunk, r, budget_k = (
         __import__("rocket").get_params_for_token_budget(
             args.token_budget, args.seq_len, args.max_new_tokens, args.head_dim
         )
@@ -50,7 +50,7 @@ def main() -> None:
     checks: list[tuple[bool, str]] = []
     checks.append((cap >= 0 and prompt_budget >= 0, f"budgets valid (cap={cap}, prompt={prompt_budget})"))
     checks.append((1 <= r <= args.head_dim, f"r={r} in [1, {args.head_dim}]"))
-    checks.append((1 <= k <= cap, f"k={k} <= capacity={cap}"))
+    checks.append((1 <= budget_k <= cap, f"k={budget_k} <= capacity={cap}"))
 
     # 2) kernel forward (prefill + decode) -------------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -72,13 +72,13 @@ def main() -> None:
             # prefill: 8 tokens at once; boolean causal mask spanning capacity
             pre_len = 8
             q = torch.randn(1, 8, pre_len, 64, device=device)
-            k = torch.randn_like(q)
+            key_states = torch.randn_like(q)
             v = torch.randn_like(q)
             mask = torch.zeros(1, 1, pre_len, args.seq_len, device=device, dtype=torch.bool)
             causal = torch.tril(torch.ones(pre_len, pre_len, device=device, dtype=torch.bool))
             mask[..., :pre_len] = causal
             input_pos = torch.arange(pre_len, device=device)
-            out_pre = attn(q, k, v, mask, input_pos, 0, state=0)  # PREFILL
+            out_pre = attn(q, key_states, v, mask, input_pos, 0, state=0)  # PREFILL
             # decode: one token, everything visible
             qd = torch.randn(1, 8, 1, 64, device=device)
             kd = torch.randn_like(qd)
@@ -113,7 +113,7 @@ def main() -> None:
             "finite": ok,
             "cap_budget": cap,
             "r": r,
-            "k": k,
+            "k": budget_k,
         }
         writer.add(record)
         checks.append((ok, f"run {run}: prefill+decode finite, shapes ok"))

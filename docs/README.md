@@ -1,8 +1,9 @@
 # Baseline Inference Guide
 
 Repo này là máy **code/debug**; inference thật chạy trên **server GPU riêng**.
-Các hướng dẫn dưới đây được viết để chạy lại được trên server mới (chỉ cần
-`git pull` + làm theo từng mục).
+Trên server B200, các launcher dùng trực tiếp `python3` từ PATH; `.venv` trong
+workspace local chỉ dùng để mô phỏng dependency/API trước khi đưa code lên
+server.
 
 ## Nội dung
 
@@ -11,35 +12,47 @@ Các hướng dẫn dưới đây được viết để chạy lại được tr
 
 | Baseline | Env | Doc |
 |---|---|---|
-| EAGLE-3 | venv chung | `docs/baselines/eagle3.md` |
-| DFlash | venv chung | `docs/baselines/dflash.md` |
-| LLMLingua | venv chung | `docs/baselines/llmlingua.md` |
-| FastKV | venv chung | `docs/baselines/fastkv.md` |
-| RocketKV | venv chung | `docs/baselines/rocketkv.md` |
-| GemFilter | venv chung | `docs/baselines/gemfilter.md` |
-| speculative_prefill | venv chung | `docs/baselines/specprefill.md` |
-| MInference | venv chung | `docs/baselines/minference.md` |
-| MagicDec | venv chung | `docs/baselines/magicdec.md` |
-| LongSpec | venv chung | `docs/baselines/longspec.md` |
-| SpecExtend | venv chung | `docs/baselines/specextend.md` |
-| HiGOE | venv chung | `docs/baselines/higoe.md` |
-| semantic_selection | venv chung | adapter trong `docs/representative_100_benchmark.md` |
-| FlexPrefill | venv chung | `docs/baselines/flexprefill.md` |
+| EAGLE-3 | `python3` server / `.venv` mô phỏng | `docs/baselines/eagle3.md` |
+| DFlash | `python3` server / `.venv` mô phỏng | `docs/baselines/dflash.md` |
+| LLMLingua | `python3` server / `.venv` mô phỏng | `docs/baselines/llmlingua.md` |
+| FastKV | `python3` server / `.venv` mô phỏng | `docs/baselines/fastkv.md` |
+| RocketKV | `python3` server / `.venv` mô phỏng | `docs/baselines/rocketkv.md` |
+| GemFilter | `python3` server / `.venv` mô phỏng | `docs/baselines/gemfilter.md` |
+| speculative_prefill | `python3` server / `.venv` mô phỏng | `docs/baselines/specprefill.md` |
+| MInference | `python3` server / `.venv` mô phỏng | `docs/baselines/minference.md` |
+| MagicDec | `python3` server / `.venv` mô phỏng | `docs/baselines/magicdec.md` |
+| LongSpec | `python3` server / `.venv` mô phỏng | `docs/baselines/longspec.md` |
+| SpecExtend | `python3` server / `.venv` mô phỏng | `docs/baselines/specextend.md` |
+| HiGOE | `python3` server / `.venv` mô phỏng | `docs/baselines/higoe.md` |
+| semantic_selection | `python3` server / `.venv` mô phỏng | adapter trong `docs/representative_100_benchmark.md` |
+| FlexPrefill | `python3` server / `.venv` mô phỏng | `docs/baselines/flexprefill.md` |
 
-## Chuẩn bị chung trên server
+## Chuẩn bị chung trên server B200
 
 ```bash
-# 1) Clone; uv và Python 3.12 phải có sẵn trên server offline
+# 1) Clone; Python 3.12 phải có sẵn trên server offline
 git clone <repo> && cd fast_infer_text_sum
-uv --version
+python3 --version
 
-# 2) Tạo venv chung từ cache/wheelhouse local
-bash scripts/setup_venv.sh --offline
+# 2) Nạp profile production; không cần activate virtualenv
+set -a
+source config/b200.env
+set +a
 
-# 3) HF token cho model gated (Llama)
+# 3) Kiểm tra runtime/CUDA/dependency/model cache trước khi chạy
+python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
+
+# 4) HF token cho model gated (Llama), nếu server dùng model cần token
 export HF_TOKEN=hf_xxxx
 
-# 4) Tải model theo yêu cầu từng baseline (xem doc tương ứng)
+# 5) Mirror model/checkpoint và wheel vào cache server theo doc tương ứng
+```
+
+Để mô phỏng đúng profile trên máy local, thay interpreter ở command runner:
+
+```bash
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_b200_smoke.sh --preflight-only
 ```
 
 ## Chạy một baseline
@@ -49,7 +62,8 @@ bash scripts/run.sh <baseline> [args...]
 ```
 
 Mỗi baseline đọc cấu hình `config/<baseline>.env` (model path, data file, tham số).
-`bash scripts/run.sh` là dispatcher gọi wrapper; mọi wrapper dùng `.venv/bin/python`.
+`bash scripts/run.sh` là dispatcher gọi wrapper; production dùng `python3`, còn
+local simulation đặt `FAST_INFER_PYTHON` tới `.venv/bin/python`.
 
 ## Dữ liệu plug-and-play
 
@@ -99,4 +113,7 @@ Phân tích latency, memory và ROUGE của các scheme `random`, `lead`, `tfidf
 - Setup dùng `uv pip --offline`; không tải Python/package qua internet.
 - `setup_venv.sh --check` kiểm tra Python 3.12 và các local source path; dùng
   `check_shared_env.py` để kiểm tra import/version/CUDA sau khi cài.
-- Có thể dùng `FAST_INFER_VENV` hoặc `FAST_INFER_PYTHON` để chỉ định venv/interpreter.
+- Có thể dùng `FAST_INFER_VENV` hoặc `FAST_INFER_PYTHON` để chỉ định interpreter;
+  giá trị `FAST_INFER_PYTHON=python3` được resolve qua PATH.
+- `config/b200.env` + `scripts/run_b200_smoke.sh` là đường chạy one-sample có
+  preflight và summary cho server B200.

@@ -20,11 +20,12 @@ docs/              # hướng dẫn cài đặt + infer từng baseline
 ## Quick start
 
 ```bash
-# uv và Python 3.12 phải được cài sẵn trên server offline
-uv --version
+# Python 3.12 phải được cài sẵn trên server offline
+python3 --version
 
-# tạo venv chung và cài từ cache/wheelhouse local
-bash scripts/setup_venv.sh --offline
+# nạp profile B200; không cần activate virtualenv
+set -a; source config/b200.env; set +a
+python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 
 # model gated (Llama) cần token
 export HF_TOKEN=hf_xxx
@@ -34,6 +35,21 @@ bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
                                       # gemfilter specprefill minference magicdec
                                       # longspec specextend higoe semantic_selection
                                       # flexprefill
+```
+
+Smoke toàn bộ 14 baseline trên B200 (mỗi baseline một sample):
+
+```bash
+bash scripts/run_b200_smoke.sh
+```
+
+Mô phỏng local bằng `.venv`:
+
+```bash
+# Nếu cần dựng lại môi trường mô phỏng từ wheel/cache local:
+bash scripts/setup_venv.sh --offline
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_b200_smoke.sh --preflight-only
 ```
 
 ## Tài liệu
@@ -47,9 +63,10 @@ bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
 ## Nguyên tắc
 
 - Mỗi baseline: `scripts/infer_<b>.py` + `scripts/run_<b>.sh` + `config/<b>.env`,
-  có chế độ `--smoke` (T4-safe) và mode full (GPU lớn).
+  có chế độ `--smoke` và mode full; B200 smoke được điều phối bởi
+  `scripts/run_b200_smoke.sh`.
 - Dữ liệu của bạn: bỏ jsonl vào `data/`, set `DATA_FILE` trong config → chạy.
 - Kết quả: `outputs/*.jsonl` theo schema §13 của `baseline_repo_guide.md`
   (input/retained/output tokens, TTFT/TPOT/E2E, throughput, quality metrics...).
-- Môi trường: một venv `.venv` Python 3.12 dùng `requirements.txt`; launcher
-  dùng trực tiếp interpreter này và không tạo uv project riêng.
+- Môi trường production: `python3` Python 3.12 từ PATH dùng `requirements.txt`;
+  launcher không yêu cầu activate venv. `.venv` chỉ dành cho mô phỏng local.

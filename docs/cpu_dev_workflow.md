@@ -17,6 +17,15 @@
 chạy trên server cu13 để giữ tính công bằng (không hạ cu124 vì kéo cascade
 vllm/transformers cũ, lệch version với server).
 
+`.venv` ở máy T4 chỉ mô phỏng dependency/API của server B200. Production B200
+không activate `.venv`; chạy `python3` trực tiếp sau khi đã có đủ wheel/cache
+server. Có thể mô phỏng profile bằng:
+
+```bash
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_b200_smoke.sh --preflight-only
+```
+
 ## 2. Môi trường
 
 - Venv: `.venv/` (Python 3.12.13), đã cài **`requirements.local.txt`** (không phải

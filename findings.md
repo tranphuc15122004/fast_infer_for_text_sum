@@ -175,3 +175,73 @@
   lock chung trước khi cài venv.
 - Không thể sinh lock trong workspace hiện tại: uv báo không tìm thấy Python 3.12;
   sau đó setup cũng sẽ bị chặn bởi local wheel `deep_ep` và editable path server.
+
+## 2026-08-27 — discovery bằng `.venv`
+
+- `.venv/bin/python` là Python 3.12.13.
+- `check_shared_env.py` pass torch 2.11.0+cu130, transformers 5.12.1, vllm 0.24.0,
+  triton 3.6.0, dflash 0.1.0, llmlingua 0.2.2 và sentence_transformers 5.7.0.
+- Preflight fail ở `flashinfer` do cache JIT `/home/tuantb/.cache/flashinfer/...`
+  read-only và `flash_attn` chưa cài; đây là lỗi môi trường, không phải syntax.
+- `bash -n scripts/*.sh scripts/common/*.sh` và `.venv/bin/python -m compileall -q scripts data` pass.
+- Smoke wrapper GemFilter với config TinyLlama ghi được run 0 (dense 71.8s, filtered 74.1s) nhưng timeout ở 300s trước summary; nguyên nhân hiện tại là config `--smoke` luôn ép 2 runs, tổng 4 generation CPU (~>300s), chưa thấy traceback/kernel error.
+- Smoke semantic-selection ban đầu fail `KeyError: Record 0 does not contain document field 'document'`; regression test xác nhận fixture `smoke_long_docs.jsonl` dùng `text`, wrapper đã đổi default sang `data/debug/smoke_real.jsonl` có `document`.
+- DFlash ban đầu fail `ModuleNotFoundError: dflash` vì GSM8K child wrapper thiếu `PYTHONPATH`; sau patch đã vào `dflash.benchmark` và chỉ còn CUDA blocker.
+- RocketKV ban đầu serialize nhầm tensor key vào field `k`; regression test bắt lỗi, sau patch record ghi numeric budget `k=256` và verifier vẫn pass.
+
+### Verification cuối
+
+- Targeted regression tests: `17 passed`; toàn bộ `tests/`: `55 passed`.
+- `bash -n scripts/*.sh scripts/common/*.sh`, `.venv/bin/python -m compileall -q scripts data tests`, `git diff --check`: pass.
+- Output contract: 8 file JSONL chuẩn có record + summary đúng schema; semantic-selection có 6 rows (`full` + 5 selector) và 6 summary groups; RocketKV `k` là số.
+
+## 2026-08-27 — smoke matrix `.venv`, 1 sample
+
+| Baseline | Kết quả lượt này | Bằng chứng / blocker |
+|---|---|---|
+| rocketkv | PASS | CPU kernel, 2 runs, finite/shape checks, `ALL PASS`; rerun sau fix metadata |
+| fastkv | PASS | TinyLlama CPU, 1 document, 2 runs, output 16 token/run, `ALL PASS` |
+| gemfilter | PASS (minimal) | Wrapper budget 300s timeout ở 1/2 run; direct 1 run/1 token PASS, `ALL PASS` |
+| higoe | BLOCKED | Contriever retrieval finite; thiếu `faiss`, `dgl`, verifier exit 1 |
+| semantic_selection | PASS | 1 document, default fixture sau fix, Qwen2.5-0.5B CPU override, output + summary JSON |
+| llmlingua | PASS | 1 document, 101→50 token, keyword retained, 4 output token, `ALL PASS` |
+| eagle3 | BLOCKED | Compatibility 5/5 fields pass; thiếu CUDA |
+| dflash | BLOCKED | PYTHONPATH fix đã xác nhận; `dflash.benchmark` vào runtime rồi thiếu CUDA |
+| specprefill | BLOCKED | Upstream import yêu cầu `vllm.sequence.SequenceData`, không có trong vLLM 0.24.0 |
+| minference | BLOCKED | Thiếu module compiled `kivi_gemv` |
+| magicdec | BLOCKED | Checkpoint local tồn tại; child fail `torch.cuda.get_device_capability()` trên CPU |
+| longspec | BLOCKED | Thiếu `liger_kernel` và CUDA cho Triton forward |
+| specextend | BLOCKED | Child import thiếu `termcolor` |
+| flexprefill | BLOCKED | Baseline yêu cầu visible CUDA GPU |
+
+## 2026-08-27 — clarification về runtime B200
+
+- Production B200 không cần activate hoặc dùng `.venv`; lệnh canonical là
+  `python3` từ PATH của server.
+- `.venv/bin/python` chỉ là runtime mô phỏng trong workspace hiện tại để kiểm
+  tra trước cùng dependency/API contract.
+- B200 readiness phải hỗ trợ cả `FAST_INFER_PYTHON=python3` và đường dẫn tuyệt
+  đối tới `.venv/bin/python`, nhưng không được coi CPU simulation là CUDA pass.
+
+## 2026-08-27 — B200 readiness validation
+
+- Runtime production không còn phụ thuộc việc activate `.venv`: `FAST_INFER_PYTHON`
+  nhận command name như `python3` và resolve thành executable path; local vẫn
+  override bằng `.venv/bin/python`.
+- `config/b200.env` dùng canonical B200 model matrix, writable JIT cache defaults,
+  one-sample/8-token smoke và `B200_DEVICE` (mặc định `cuda`, có thể đặt `cpu`
+  cho CPU-safe simulation).
+- `check_b200_env.py` chạy offline, không load model; báo `hardware_unavailable`
+  trên T4 hiện tại do torch cu130 gặp driver CUDA 12.4. Mock B200 metadata + CUDA
+  tensor probe contract đã pass.
+- `run_b200_smoke.sh --preflight-only` đã chạy đủ 14 baseline bằng command name
+  `python3` resolve vào `.venv/bin/python3`; GPU-only đều BLOCKED đúng reason,
+  CPU-compatible baseline được phân loại riêng.
+- End-to-end runner RocketKV trên `.venv` chạy output PASS của baseline nhưng
+  summary tổng thể BLOCKED vì preflight CUDA không pass; không có false B200 PASS.
+- Semantic-selection overlay chạy được một sample với model Qwen2.5-0.5B CPU
+  override; baseline PASS, tổng thể vẫn BLOCKED do thiếu CUDA. Đây là kiểm tra
+  pipeline/overlay, không phải xác nhận GPU kernel.
+- Validation cuối: toàn bộ `tests/` đạt `68 passed`; `bash -n`, `compileall` và
+  `git diff --check` đều pass. Preflight trên T4/CPU trả `BLOCKED` đúng nguyên
+  nhân `hardware_unavailable`, nên chưa tuyên bố đã xác nhận kernel trên B200.
