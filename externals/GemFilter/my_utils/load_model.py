@@ -1,12 +1,67 @@
-# transformers.__version__ == '4.43.3'
+# The original GemFilter code targeted Transformers 4.43.  Transformers 4.57+
+# removed the per-backend attention registries and constructs one
+# ``LlamaAttention`` class which dispatches through ``AttentionInterface``.
 from typing import List, Optional, Tuple, Union
 from transformers.cache_utils import Cache
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.llama.modeling_llama import LLAMA_ATTENTION_CLASSES, LlamaForCausalLM
-from transformers.models.mistral.modeling_mistral import MISTRAL_ATTENTION_CLASSES, MistralForCausalLM
-from transformers.models.phi3.modeling_phi3 import PHI3_ATTENTION_CLASSES, Phi3ForCausalLM
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.mistral.modeling_mistral import MistralForCausalLM
+try:
+    from transformers.models.llama.modeling_llama import LLAMA_ATTENTION_CLASSES
+except ImportError:
+    LLAMA_ATTENTION_CLASSES = None
+try:
+    from transformers.models.mistral.modeling_mistral import MISTRAL_ATTENTION_CLASSES
+except ImportError:
+    MISTRAL_ATTENTION_CLASSES = None
+try:
+    from transformers.models.phi3.modeling_phi3 import PHI3_ATTENTION_CLASSES, Phi3ForCausalLM
+except ImportError:
+    PHI3_ATTENTION_CLASSES = None
+    Phi3ForCausalLM = None
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+def _replace_modern_attention_modules(model, modified):
+    """Replace instantiated attention modules for Transformers 4.57+.
+
+    The modern Transformers loader no longer consults the old attention-class
+    dictionaries, so registration before ``from_pretrained`` has no effect.
+    Replacing each module after loading keeps the checkpoint weights while
+    allowing GemFilter's selection state to live on the custom attention class.
+    """
+    if modified != "gemfilter":
+        raise NotImplementedError(
+            f"{modified!r} is not yet supported with the modern Transformers attention API"
+        )
+
+    from my_baseline.GemFilter.llama_select_attention import LlamaSelectAttention
+    from my_baseline.GemFilter.mistral_select_attention import MistralSelectAttention
+    from my_baseline.GemFilter.phi3_select_attention import Phi3SelectAttention
+
+    model_type = getattr(model.config, "model_type", "")
+    attention_cls = {
+        "llama": LlamaSelectAttention,
+        "mistral": MistralSelectAttention,
+        "phi3": Phi3SelectAttention,
+    }.get(model_type)
+    if attention_cls is None:
+        raise ValueError(
+            f"GemFilter modern compatibility does not support model_type={model_type!r}"
+        )
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        old_attention = layer.self_attn
+        new_attention = attention_cls(model.config, layer_idx=layer_idx)
+        reference_param = next(old_attention.parameters())
+        new_attention = new_attention.to(
+            device=reference_param.device,
+            dtype=reference_param.dtype,
+        )
+        new_attention.load_state_dict(old_attention.state_dict())
+        new_attention._modern_transformers_attention_api = True
+        layer.self_attn = new_attention
 
 def my_forward(
         self,
@@ -70,7 +125,8 @@ def my_forward(
 # # }
 LlamaForCausalLM.forward = my_forward
 MistralForCausalLM.forward = my_forward
-Phi3ForCausalLM.forward = my_forward
+if Phi3ForCausalLM is not None:
+    Phi3ForCausalLM.forward = my_forward
 
 def load_model(model_id, modified=None, torch_dtype=torch.float16, device_map='auto', flash_attention_2=False):
     if flash_attention_2:
@@ -81,9 +137,14 @@ def load_model(model_id, modified=None, torch_dtype=torch.float16, device_map='a
         from my_baseline.GemFilter.llama_select_attention import LlamaSelectAttention
         from my_baseline.GemFilter.mistral_select_attention import MistralSelectAttention
         from my_baseline.GemFilter.phi3_select_attention import Phi3SelectAttention
-        LLAMA_ATTENTION_CLASSES[attn_implementation] = LlamaSelectAttention
-        MISTRAL_ATTENTION_CLASSES[attn_implementation] = MistralSelectAttention
-        PHI3_ATTENTION_CLASSES[attn_implementation] = Phi3SelectAttention
+        registries = (
+            (LLAMA_ATTENTION_CLASSES, LlamaSelectAttention),
+            (MISTRAL_ATTENTION_CLASSES, MistralSelectAttention),
+            (PHI3_ATTENTION_CLASSES, Phi3SelectAttention),
+        )
+        for registry, attention_cls in registries:
+            if registry is not None:
+                registry[attn_implementation] = attention_cls
     elif modified == 'snapkv':
         assert flash_attention_2 is True
         from my_baseline.SnapKV.monkeypatch import replace_llama, replace_mistral, replace_phi3
@@ -106,5 +167,7 @@ def load_model(model_id, modified=None, torch_dtype=torch.float16, device_map='a
                                             torch_dtype=torch_dtype, 
                                             device_map=device_map
                                             ).eval() 
+    if LLAMA_ATTENTION_CLASSES is None and modified is not None:
+        _replace_modern_attention_modules(model, modified)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     return model, tokenizer

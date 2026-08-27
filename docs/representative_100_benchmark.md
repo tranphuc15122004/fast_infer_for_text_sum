@@ -5,7 +5,18 @@ Script chạy infer cho các baseline trong `externals/` trên bộ dữ liệu 
 cnn_dailymail, xsum — xem `data/README.md`) và thu thập **toàn bộ metric**:
 tốc độ infer + semantic (ROUGE-1/2/L, ROUGE-Lsum, BLEU-1..4, ...).
 
-## 1. Runner
+## 1. Chuẩn bị và runner
+
+Trên server offline, tạo venv chung trước:
+
+```bash
+bash scripts/setup_venv.sh --offline
+# Export the validated interpreter for the manual collector examples below.
+source scripts/common/runtime.sh
+```
+
+Nếu venv đã được tạo ở vị trí khác, đặt `FAST_INFER_VENV` hoặc
+`FAST_INFER_PYTHON` trước khi chạy runner.
 
 ```bash
 # full: 100 mẫu / dataset, model canonical M1-M9 (mặc định trên server GPU lớn)
@@ -67,17 +78,17 @@ sẽ làm runner exit khác 0.
 
 ```bash
 # tổng hợp thư mục đã chạy đủ ma trận (runner tự truyền các cờ strict)
-uv run --project . --locked python scripts/collect_metrics.py
+"$FAST_INFER_PYTHON" scripts/collect_metrics.py
 
 # kiểm tra strict thủ công
-uv run --project . --locked python scripts/collect_metrics.py \
+"$FAST_INFER_PYTHON" scripts/collect_metrics.py \
   --strict \
   --expected-baselines "llmlingua fastkv gemfilter specprefill minference specextend eagle3 semantic_selection dflash longspec" \
   --expected-datasets "cnn_dailymail govreport multinews xsum" \
   --expected-samples 100
 
 # chỉ 1 file output, ghi report vào chỗ khác
-uv run --project . --locked python scripts/collect_metrics.py \
+"$FAST_INFER_PYTHON" scripts/collect_metrics.py \
   --outputs-dir outputs/representative_100/llmlingua_cnn_dailymail.jsonl \
   --out /tmp/m.json --csv /tmp/m.csv --md /tmp/m.md
 ```
@@ -136,8 +147,8 @@ của GemFilter dùng prefix `base_`):
 - **BLEU-1..4** (smoothed + brevity penalty)
 - **length_ratio** (hyp_tokens / ref_tokens)
 
-Triển khai: `scripts/common/metrics.py` (pure-Python, chạy được trong mọi uv-env
-đang khóa `--locked`). ROUGE base: `scripts/common/rouge.py`.
+Triển khai: `scripts/common/metrics.py` (pure-Python, chạy trực tiếp trong venv
+chung). ROUGE base: `scripts/common/rouge.py`.
 
 Lưu ý: baseline không ghi text sinh ra vào record (specextend, rocketkv,
 higoe, magicdec và LongSpec kernel smoke độc lập) sẽ không có metric semantic;
@@ -146,7 +157,7 @@ LongSpec representative adapter có ghi text và được tính quality.
 ## 3. Kiểm chứng nhanh metric
 
 ```bash
-uv run --project . --locked python - <<'PY'
+"$FAST_INFER_PYTHON" - <<'PY'
 from common import metrics
 s = metrics.semantic_scores("the cat sat on the mat", "the cat sat on the mat today")
 print(s)

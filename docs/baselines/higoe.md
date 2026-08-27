@@ -5,8 +5,8 @@ long-document summarization. Dựa trên `externals/HiGOE`.
 
 ## Env & cài đặt
 
-- Env: **`envs/legacy`** — dùng chung với FastKV/RocketKV/GemFilter/SpecExtend (torch 2.4.1 + dgl 2.5.0 vendored + langchain 0.2.10).
-- `uv sync --project envs/legacy --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 
 ## Chạy smoke (không cần dataset/API key)
 

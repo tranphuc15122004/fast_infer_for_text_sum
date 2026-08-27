@@ -5,8 +5,8 @@ Dựa trên `externals/MagicDec`.
 
 ## Env & cài đặt
 
-- Env: **`envs/magicdec`** (transformers 4.36.2, torch 2.4.1+cu124, `flashinfer-python`).
-- `uv sync --project envs/magicdec --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 - Bắt buộc CUDA + NCCL cho distributed; single-GPU smoke chạy trực tiếp bằng
   Python để không cần rendezvous localhost.
 
@@ -59,6 +59,6 @@ Có thể đổi vị trí bằng biến `MAGICDEC_DATA_ROOT`; không cần đ�
 ## Troubleshooting
 
 - `--max-len` phải `% 128 == 0`.
-- flashinfer wheel phải khớp torch/CUDA; index trong `envs/magicdec/pyproject.toml`
-  (nếu đổi torch → đổi URL `flashinfer.ai/whl/{cu...}/torch.../`).
+- `flashinfer` wheel phải khớp torch/CUDA và phải có sẵn trong cache/wheelhouse
+  local của server.
 - Model nhỏ (TinyLlama/llama-68m) hoặc int8 mới vừa T4 16GB.

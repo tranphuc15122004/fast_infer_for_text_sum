@@ -60,6 +60,7 @@ def build_input_ids(tokenizer, prompt: str, device) -> torch.Tensor:
         add_generation_prompt=True,
         enable_thinking=False,
         return_tensors="pt",
+        return_dict=False,
     ).to(device)
 
 
@@ -132,8 +133,14 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--skip-naive", action="store_true",
                         help="Skip the naive autoregressive baseline (no speedup reported)")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Run exactly one question with a short generation")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+
+    if args.smoke:
+        args.question_end = min(args.question_end, args.question_begin + 1)
+        args.max_new_tokens = min(args.max_new_tokens, 32)
 
     if not torch.cuda.is_available():
         raise RuntimeError("EAGLE3 inference requires a visible CUDA GPU")

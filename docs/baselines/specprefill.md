@@ -4,8 +4,8 @@ Token-selective prefill (monkey-patch vLLM). Dựa trên `externals/speculative_
 
 ## Env & cài đặt
 
-- Env: **`envs/specprefill`** (vllm 0.6.3.post1, transformers 4.50.2, torch 2.4.0+cu124).
-- `uv sync --project envs/specprefill --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 
 ## Model (chỉ Llama family)
 

@@ -50,6 +50,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.smoke:
+        args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     if not torch.cuda.is_available():
@@ -92,6 +93,7 @@ def main() -> None:
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                return_dict=False,
             ).to("cuda")
         except TypeError:
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")

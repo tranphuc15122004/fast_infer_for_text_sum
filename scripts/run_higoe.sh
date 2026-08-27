@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${1:-$ROOT/config/higoe.env}"
+CONFIG_FILE="$ROOT/config/higoe.env"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  CONFIG_FILE="$1"
+  shift
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Configuration file not found: $CONFIG_FILE" >&2
@@ -11,6 +15,8 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 
@@ -28,4 +34,4 @@ ARGS=(
 )
 [[ "${SMOKE:-1}" == "1" ]] && ARGS+=(--smoke)
 
-exec uv run --project "$ROOT/envs/legacy" --locked python "$ROOT/scripts/infer_higoe.py" "${ARGS[@]}"
+exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_higoe.py" "${ARGS[@]}" "$@"

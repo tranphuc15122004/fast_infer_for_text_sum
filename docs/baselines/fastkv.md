@@ -4,10 +4,10 @@ Joint prefill + KV optimization (Llama/Mistral). Dựa trên `externals/FastKV`.
 
 ## Env & cài đặt
 
-- Env: **`envs/legacy`** (dùng chung với RocketKV/GemFilter/SpecExtend/HiGOE: transformers 4.45.2, torch 2.4.1+cu124).
-- `uv sync --project envs/legacy --locked`
-- Method **fastkv thật** cần flash-attn: `EXTRA_FLASH=1 bash scripts/setup_envs.sh`
-  (chỉ khi GPU ≥ sm80; T4/sm75 phải build từ source).
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
+- Method **fastkv thật** cần wheel `flash-attn` tương thích CUDA/GPU có sẵn trong
+  wheelhouse local; smoke dùng SDPA và không cần flash-attn.
 
 ## Model
 

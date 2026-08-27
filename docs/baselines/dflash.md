@@ -4,8 +4,8 @@ Parallel/diffusion-style drafting (DFlash) — dựa trên `externals/dflash`.
 
 ## Env & cài đặt
 
-- Env: **core** (project gốc) — `dflash` là path dependency editable trong root `pyproject.toml`.
-- `bash scripts/setup_envs.sh`.
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`.
 
 ## Model
 

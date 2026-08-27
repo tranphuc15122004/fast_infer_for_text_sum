@@ -5,9 +5,10 @@ Tree Attention). Dựa trên `externals/LongSpec`.
 
 ## Env & cài đặt
 
-- Env: **`envs/longspec`** (transformers 4.46.3, torch 2.5.1, triton 3.1.0, liger-kernel).
-- `uv sync --project envs/longspec --locked`
-- Full inference cần flash-attn + **GPU 80GB-class** (không chạy được T4).
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
+- Full inference cần các kernel tương thích trong requirements và **GPU 80GB-class**
+  (không chạy được T4).
 
 ## Model
 
@@ -27,8 +28,8 @@ bash scripts/run.sh longspec     # smoke mặc định: verify import + triton T
 ```bash
 FULL=1 DATA_PATH_PREFIX="/path/to/longbench_preprocessed" bash scripts/run.sh longspec
 ```
-(→ `python inference_long-bench.py --model_name llama8b --method tree
---task gov_report --data_path_prefix ...`)
+(wrapper gọi `inference_long-bench.py` bằng interpreter chung với các tham số
+`--model_name llama8b --method tree --task gov_report --data_path_prefix ...`)
 
 Cấu hình `config/longspec.env`: `MODEL_NAME`, `METHOD`, `TASK`, `MAX_GEN_LEN`,
 `TREE_SHAPE`.
@@ -45,4 +46,5 @@ Full: log inference.
 ## Troubleshooting
 
 - Triton kernel (`triton_tree_attn.py`) phải khớp phiên bản triton 3.1.0.
-- flash-attn cần `EXTRA_FLASH=1` (GPU sm80+).
+- Các kernel tăng tốc phải tương thích với CUDA/GPU và có sẵn trong wheelhouse
+  local của server.

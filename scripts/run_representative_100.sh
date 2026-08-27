@@ -41,10 +41,6 @@ set -uo pipefail   # không dùng -e: vẫn chạy tiếp các baseline khác kh
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-# uv needs a writable cache for its lock files.  The default user cache can be
-# read-only in managed/CI environments, so use a writable temporary fallback.
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/fast_infer_uv_cache}"
-mkdir -p "$UV_CACHE_DIR"
 
 # ---- defaults ---------------------------------------------------------------
 MODE="full"
@@ -92,9 +88,17 @@ while [[ $# -gt 0 ]]; do
     --include-unsupported) INCLUDE_UNSUPPORTED=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     --skip-collect)   SKIP_COLLECT=1; shift ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+  *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+# A dry-run only renders the execution plan and must remain usable before the
+# shared venv has been created. Real runs resolve and validate Python 3.12 here
+# so every conversion, launcher, and collector below inherits the same binary.
+if [[ "$DRY_RUN" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT/scripts/common/runtime.sh" || exit 1
+fi
 
 # Documentation accepts comma-separated values; normalize them for the loops.
 BASELINES="${BASELINES//,/ }"
@@ -172,7 +176,7 @@ echo "   out dir  : $OUT_DIR"
 # ---- chuyển data sang format riêng của eagle3 (turns) và specextend (text) --
 convert_data() {
   local ds="$1"
-  python3 - "$ds" "$MAX_SAMPLES" "$OUT_DIR/data" <<'PY'
+  "$FAST_INFER_PYTHON" - "$ds" "$MAX_SAMPLES" "$OUT_DIR/data" <<'PY'
 import json
 import pathlib
 import sys
@@ -249,7 +253,11 @@ resolve_model_ref() {
     echo "$ref"
     return
   fi
-  python3 - "$ref" <<'PY'
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "$ref"
+    return
+  fi
+  "$FAST_INFER_PYTHON" - "$ref" <<'PY'
 import sys
 from pathlib import Path
 
@@ -463,7 +471,7 @@ run_pair() {
 }
 
 # convert data trước (chỉ khi có baseline cần)
-if [[ "$BASELINES" == *eagle3* || "$BASELINES" == *specextend* ]]; then
+if [[ "$DRY_RUN" != "1" && ( "$BASELINES" == *eagle3* || "$BASELINES" == *specextend* ) ]]; then
   echo "== converting data formats (eagle3/specextend) =="
   for ds in $DATASETS; do
     convert_data "$ds"
@@ -536,7 +544,7 @@ EXPECTED_BASELINES="$(echo "$EXPECTED_BASELINES" | xargs)"
 if [[ -z "$EXPECTED_BASELINES" ]]; then
   echo "ERROR: no representative baseline selected; nothing to collect" >&2
   COLLECT_FAILED=1
-elif uv run --project "$ROOT" --locked python "$ROOT/scripts/collect_metrics.py" \
+elif "$FAST_INFER_PYTHON" "$ROOT/scripts/collect_metrics.py" \
      --outputs-dir "$OUT_DIR" --data-dir "data/representative_100" \
      --strict \
      --expected-baselines "$EXPECTED_BASELINES" \

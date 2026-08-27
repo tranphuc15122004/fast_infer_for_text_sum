@@ -138,6 +138,33 @@ def test_representative_runner_dflash_longspec_dry_run(tmp_path):
     assert "DATA_FILE='data/representative_100/xsum_representative.jsonl'" in longspec_config
 
 
+def test_representative_runner_dry_run_does_not_need_python_for_conversions(tmp_path):
+    output_dir = tmp_path / "representative"
+    proc = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/run_representative_100.sh"),
+            "--mode",
+            "smoke",
+            "--baselines",
+            "eagle3 specextend",
+            "--datasets",
+            "xsum",
+            "--max-samples",
+            "1",
+            "--output-dir",
+            str(output_dir),
+            "--dry-run",
+            "--skip-collect",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "unbound variable" not in proc.stdout + proc.stderr
+
+
 def test_collector_normalizes_semantic_selection_schema():
     row = collect_metrics.normalize_record(
         {

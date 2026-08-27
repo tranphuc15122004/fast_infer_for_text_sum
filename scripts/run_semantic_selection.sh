@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${1:-$ROOT/config/semantic_selection.env}"
+CONFIG_FILE="$ROOT/config/semantic_selection.env"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  CONFIG_FILE="$1"
+  shift
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Configuration file not found: $CONFIG_FILE" >&2
@@ -11,7 +15,24 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
+# This upstream entrypoint has no --smoke option. Consume the dispatcher flag
+# here and translate it into the one-sample/short-generation settings below.
+PASSTHROUGH_ARGS=()
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--smoke" ]]; then
+    SMOKE=1
+  else
+    PASSTHROUGH_ARGS+=("$1")
+  fi
+  shift
+done
+
+# Representative runner injects INPUT_FILE per dataset; direct smoke runs
+# still need a deterministic local one-sample input.
+INPUT_FILE="${INPUT_FILE:-data/smoke_long_docs.jsonl}"
 : "${INPUT_FILE:?INPUT_FILE is required}"
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 : "${MODEL:?MODEL is required}"
@@ -24,9 +45,11 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
   read -r -a budget_args <<< "${SMOKE_TOKEN_BUDGETS:-512}"
   max_new_tokens="${MAX_NEW_TOKENS:-128}"
   max_new_tokens=$((max_new_tokens < 32 ? max_new_tokens : 32))
+  limit=1
 else
   read -r -a budget_args <<< "${TOKEN_BUDGETS:-512 1024 2048}"
   max_new_tokens="${MAX_NEW_TOKENS:-128}"
+  limit="${MAX_SAMPLES:-5}"
 fi
 
 ARGS=(
@@ -35,7 +58,7 @@ ARGS=(
   --document-field "${DOCUMENT_FIELD:-document}"
   --id-field "${ID_FIELD:-id}"
   --reference-field "${REFERENCE_FIELD:-reference}"
-  --limit "${MAX_SAMPLES:-5}"
+  --limit "$limit"
   --selectors "${selector_args[@]}"
   --token-budgets "${budget_args[@]}"
   --model "$MODEL"
@@ -52,5 +75,5 @@ ARGS=(
   --rouge
 )
 
-exec uv run --project "$ROOT" --locked python \
-  "$ROOT/externals/Sematic_selection/infer.py" "${ARGS[@]}"
+exec "$FAST_INFER_PYTHON" \
+  "$ROOT/externals/Sematic_selection/infer.py" "${ARGS[@]}" "${PASSTHROUGH_ARGS[@]}"

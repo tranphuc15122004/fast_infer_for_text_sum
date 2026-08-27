@@ -12,14 +12,8 @@ dist/
 .venv/
 venv/
 
-# Env build dirs: only pyproject.toml + uv.lock (and README) are committed,
-# so the server can reproduce environments with `uv sync --locked`.
-envs/*
-!envs/README.md
-!envs/*/
-!envs/*/pyproject.toml
-!envs/*/uv.lock
-envs/*/.venv/
+# Shared environment and optional local uv cache.
+.uv-cache/
 
 # Test / lint caches
 .pytest_cache/
@@ -53,6 +47,7 @@ data/normalized/
 
 *.egg-info/
 .jspace/
+.serena/
 
 findings.md
 progress.md

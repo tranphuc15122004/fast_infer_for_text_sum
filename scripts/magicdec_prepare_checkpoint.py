@@ -46,7 +46,7 @@ def main() -> None:
         print("+ " + " ".join(cmd))
         subprocess.run(cmd, cwd=MAGICDEC, env=env, check=True)
 
-    dl_args = ["python", "download.py", "--repo_id", args.repo_id,
+    dl_args = [sys.executable, "download.py", "--repo_id", args.repo_id,
                "--out_dir", str(out_dir)]
     if args.hf_token:
         dl_args += ["--hf_token", args.hf_token]
@@ -54,7 +54,7 @@ def main() -> None:
 
     # convert_hf_checkpoint.py outputs into the same dir; ensure the model-key
     # dir name is used so Transformer.from_name resolves correctly.
-    run(["python", "convert_hf_checkpoint.py",
+    run([sys.executable, "convert_hf_checkpoint.py",
          "--checkpoint_dir", str(out_dir)])
     if not model_pth.exists():
         # converter may place model.pth one level down; report location.

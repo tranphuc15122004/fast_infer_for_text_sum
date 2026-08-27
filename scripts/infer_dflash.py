@@ -92,6 +92,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.smoke:
+        args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     dtype, attn_impl = _dtype_and_attention()

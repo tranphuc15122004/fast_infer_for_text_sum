@@ -80,3 +80,84 @@ contract của runner chạy độc lập và pass.
   `src/analyze/full_infer/results/`, giữ nguyên bản gốc trong `outputs/`.
 - [complete] Cập nhật wrapper/config để các lần chạy sau dùng source và output
   canonical mới.
+
+## 2026-08-26 — shared Python 3.12 migration
+
+### Mục tiêu và ràng buộc
+
+- [complete] Chốt một runtime duy nhất tại `.venv` bằng Python 3.12 và `requirements.txt`.
+- [complete] Chuyển launcher/subprocess sang interpreter chung, không còn project/env execution riêng.
+- [complete] Thiết lập offline-first: không cài Python/package qua internet; yêu cầu local cache/wheel/path.
+
+### Thực thi
+
+- [complete] Ghi spec và implementation plan.
+- [complete] Thêm `scripts/common/runtime.sh` với `FAST_INFER_PYTHON`/`FAST_INFER_VENV` và gate Python 3.12.
+- [complete] Thêm `scripts/setup_venv.sh --offline|--check` và kiểm tra local requirement sources.
+- [complete] Migrate 16 launcher chính; hỗ trợ config tùy chọn và truyền extra CLI flags như `--smoke`.
+- [complete] Migrate child process của MagicDec/SpecExtend/LongSpec sang `sys.executable`.
+- [complete] Thêm `scripts/check_shared_env.py` import-only/offline.
+- [complete] Xóa root/group `.venv` cũ; giữ manifest/lock legacy do lớp an toàn chặn xóa artefact ngoài venv.
+- [complete] Cập nhật README/docs/AGENTS/envs README theo runtime chung.
+
+### Verification và blocker
+
+- [complete] `pytest -q tests`: 46 passed.
+- [complete] `bash -n` toàn bộ shell scripts và `python3 -m compileall -q scripts tests`: pass.
+- [complete] Sweep 14 baseline với `--smoke`: 14/14 đi qua đúng shared-runtime gate, không còn lỗi coi `--smoke` là config.
+- [blocked] Tạo/cài `.venv` thật và chạy full runtime: sandbox không có Python 3.12 cục bộ; uv chỉ báo bản tải xuống, nhưng mô phỏng offline không được tải.
+- [blocked] Import/runtime đầy đủ: các path `/vllm-workspace`, `/workspace/storage-shared` và wheel server-specific chưa có trong sandbox.
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| `python3.12: command not found` | 1 | Chưa có interpreter 3.12 trong môi trường mô phỏng; cần server/cache cung cấp Python 3.12. |
+| `uv python list` không tạo được file tạm trong `/home/tuantb/.cache/uv` | 1 | Dùng `FAST_INFER_UV_CACHE` trỏ cache writable khi chạy setup. |
+| Lệnh xóa toàn bộ `envs/` bị lớp an toàn từ chối | 1 | Xóa các `.venv` thực tế bằng path tường minh, giữ manifest/lock legacy. |
+| `scripts/setup_venv.sh --offline` thiếu local wheel `/vllm-workspace/.../deep_ep` | 1 | Setup dừng sớm với path cụ thể; sau khi mount wheelhouse, cần cung cấp thêm Python 3.12 cục bộ. |
+
+## 2026-08-26 — smoke 1 sample trên workspace hiện tại
+
+### Điều tra ban đầu
+
+- [complete] Chạy smoke 1 sample cho từng baseline có wrapper và lưu log riêng.
+- [complete] Sửa lỗi code/API có thể tái hiện độc lập với GPU và package server.
+- [pending] Xác nhận lại smoke trên Python 3.12 + GPU server sau khi có runtime.
+
+### Môi trường mô phỏng hiện tại
+
+- Python hiện tại: 3.13.9; không có executable Python 3.12.
+- `nvidia-smi` không kết nối được NVIDIA driver; CUDA không khả dụng.
+- `.venv` chưa được tạo; requirements chứa local wheel `/vllm-workspace/...` chưa mount.
+- Wrapper được giữ gate Python 3.12 theo mục tiêu server; smoke trực tiếp sẽ chỉ dùng để phân lập lỗi baseline.
+
+## 2026-08-26 — tái tạo uv project root từ requirements.txt
+
+- [complete] Xóa `uv.lock` root cũ và đổi `.python-version` sang `3.12`.
+- [complete] Đặt `pyproject.toml` về project root không package, yêu cầu chính xác
+  Python `==3.12.*`; `requirements.txt` là nguồn dependency duy nhất.
+- [complete] Cập nhật `scripts/setup_venv.sh` để `uv add -r requirements.txt --no-sync`
+  và tự tạo/cập nhật `uv.lock` trước khi tạo venv.
+- [blocked] Chưa thể sinh `uv.lock` mới trong workspace: không có interpreter Python
+  3.12 và các local source `/vllm-workspace`/`/workspace/storage-shared` không tồn tại.
+  Không tạo lock giả hoặc dùng Python 3.13 để resolve thay thế.
+
+### Kết quả smoke và sửa lỗi
+
+- [complete] FastKV và GemFilter chạy inference thực tế trên model cache TinyLlama,
+  đúng 1 sample; cả hai sinh được `Paris.` và toàn bộ kiểm tra output/logits PASS.
+- [complete] RocketKV chạy kernel prefill/decode smoke trên CPU, budget/shape/finite
+  checks PASS.
+- [complete] Semantic Selection chạy 1 document với các selector random/lead/tfidf/
+  textrank; wrapper đã tự xử lý `--smoke` vì upstream không có cờ này.
+- [complete] FastKV được tương thích với Transformers mới: cache API, attention
+  registration, legacy attention attributes, position embeddings của Llama/Mistral,
+  và short-prefill window.
+- [complete] GemFilter được tương thích với Transformers mới cho Llama/Mistral/Phi-3:
+  loader và custom attention fallback sang SDPA khi flash-attn unavailable.
+- [complete] EAGLE-3 nhận `--smoke`; mọi baseline có dữ liệu ép giới hạn 1 sample
+  trong smoke mode.
+- [blocked] EAGLE-3, DFlash và FlexPrefill cần CUDA; SpecPrefill/MInference/MagicDec/
+  LongSpec/SpecExtend/LLMLingua/HiGOE hiện thiếu package hoặc wheel server trong
+  workspace mô phỏng. Đây là blocker môi trường, không phải lỗi dispatcher.

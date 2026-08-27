@@ -62,7 +62,8 @@ def main() -> None:
         "tests/SnapKV/selfspec_benchmark.py" if args.self_spec
         else "tests/baseline_benchmark.py"
     )
-    launcher = (["torchrun", "--standalone", "--nproc_per_node=1"]
+    launcher = ([sys.executable, "-m", "torch.distributed.run",
+                 "--standalone", "--nproc_per_node=1"]
                 if args.use_torchrun else [sys.executable])
     cmd = launcher + [
         script,

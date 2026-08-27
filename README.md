@@ -10,7 +10,7 @@ của bạn.
 ```
 scripts/           # script kiểm chứng từng baseline + common helpers + runner
 config/            # cấu hình per baseline (model path, data, tham số)
-envs/              # uv env theo nhóm tương thích (mỗi nhóm có uv.lock)
+requirements.txt   # dependency manifest của server GPU Python 3.12
 externals/         # các baseline repo (vendored)
 data/              # dữ liệu plug-and-play (jsonl) + README định dạng
 outputs/           # kết quả JSONL theo schema thống nhất
@@ -20,12 +20,11 @@ docs/              # hướng dẫn cài đặt + infer từng baseline
 ## Quick start
 
 ```bash
-# cài uv
-curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+# uv và Python 3.12 phải được cài sẵn trên server offline
+uv --version
 
-# cài môi trường (tái lập từ uv.lock)
-bash scripts/setup_envs.sh
-# GPU lớn cần flash-attn:  EXTRA_FLASH=1 bash scripts/setup_envs.sh
+# tạo venv chung và cài từ cache/wheelhouse local
+bash scripts/setup_venv.sh --offline
 
 # model gated (Llama) cần token
 export HF_TOKEN=hf_xxx
@@ -33,7 +32,8 @@ export HF_TOKEN=hf_xxx
 # chạy một baseline
 bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
                                       # gemfilter specprefill minference magicdec
-                                      # longspec specextend higoe
+                                      # longspec specextend higoe semantic_selection
+                                      # flexprefill
 ```
 
 ## Tài liệu
@@ -51,5 +51,5 @@ bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
 - Dữ liệu của bạn: bỏ jsonl vào `data/`, set `DATA_FILE` trong config → chạy.
 - Kết quả: `outputs/*.jsonl` theo schema §13 của `baseline_repo_guide.md`
   (input/retained/output tokens, TTFT/TPOT/E2E, throughput, quality metrics...).
-- Môi trường: mỗi nhóm 1 uv venv với `uv.lock` commit → tái lập trên server khác
-  bằng `uv sync --locked`.
+- Môi trường: một venv `.venv` Python 3.12 dùng `requirements.txt`; launcher
+  dùng trực tiếp interpreter này và không tạo uv project riêng.

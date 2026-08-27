@@ -4,8 +4,8 @@ Dynamic sparse attention cho prefill (long context). Dựa trên `externals/MInf
 
 ## Env & cài đặt
 
-- Env: **`envs/specprefill`** (dùng chung; gồm triton/einops cho MInference).
-- `uv sync --project envs/specprefill --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 - Cần CUDA (triton kernels); flash-attn khuyến nghị cho model 7B+.
 
 ## Model

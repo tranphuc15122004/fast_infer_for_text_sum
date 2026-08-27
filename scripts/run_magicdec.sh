@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${1:-$ROOT/config/magicdec.env}"
+CONFIG_FILE="$ROOT/config/magicdec.env"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  CONFIG_FILE="$1"
+  shift
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Configuration file not found: $CONFIG_FILE" >&2
@@ -11,6 +15,8 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 : "${MODEL_PTH:?MODEL_PTH is required}"
@@ -21,7 +27,7 @@ export MAGICDEC_DATA_ROOT="${MAGICDEC_DATA_ROOT:-${HF_HOME:-$HOME/.cache/hugging
 
 if [[ "${PREPARE_CHECKPOINT:-0}" == "1" ]]; then
   export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-  uv run --project "$ROOT/envs/magicdec" --locked python "$ROOT/scripts/magicdec_prepare_checkpoint.py" \
+  "$FAST_INFER_PYTHON" "$ROOT/scripts/magicdec_prepare_checkpoint.py" \
     --repo-id "${REPO_ID:?REPO_ID required when PREPARE_CHECKPOINT=1}" \
     --model-key "${MODEL_KEY:?MODEL_KEY required when PREPARE_CHECKPOINT=1}" \
     --out-dir "$(dirname "$MODEL_PTH")"
@@ -48,4 +54,4 @@ ARGS=(
 [[ "${SMOKE:-1}" == "1" ]] && ARGS+=(--smoke)
 [[ "${USE_TORCHRUN:-0}" == "1" ]] && ARGS+=(--use-torchrun)
 
-exec uv run --project "$ROOT/envs/magicdec" --locked python "$ROOT/scripts/infer_magicdec.py" "${ARGS[@]}"
+exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_magicdec.py" "${ARGS[@]}" "$@"

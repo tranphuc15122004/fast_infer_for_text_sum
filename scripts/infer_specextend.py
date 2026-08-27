@@ -13,6 +13,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from common import io_util, verify
@@ -62,7 +63,7 @@ def main() -> None:
                           candidates[0])
 
     cmd = [
-        "python", args.script,
+        sys.executable, args.script,
         "--input_file", str(input_file),
         "--model_name", args.model_name,
         "--max_samples", str(args.max_samples),

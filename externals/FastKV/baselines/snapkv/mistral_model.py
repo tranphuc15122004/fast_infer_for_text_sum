@@ -13,8 +13,11 @@ from transformers.models.mistral.modeling_mistral import (
     apply_rotary_pos_emb,
     repeat_kv,
     MistralAttention,
-    MistralFlashAttention2
 )
+try:
+    from transformers.models.mistral.modeling_mistral import MistralFlashAttention2
+except ImportError:  # Transformers >= 4.57 folds backend classes into MistralAttention.
+    MistralFlashAttention2 = MistralAttention
 from transformers.utils import (
     logging,
     is_flash_attn_2_available,
@@ -43,6 +46,7 @@ def mistral_attn_forward_SnapKV(
     output_attentions: bool = False,
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     if "padding_mask" in kwargs:
@@ -84,7 +88,10 @@ def mistral_attn_forward_SnapKV(
                 kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -149,6 +156,7 @@ def mistral_sdpa_attn_forward_SnapKV(
     output_attentions: bool = False,
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     if output_attentions:
         # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -203,7 +211,10 @@ def mistral_sdpa_attn_forward_SnapKV(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -294,6 +305,7 @@ def mistral_flash_attn2_forward_SnapKV(
     output_attentions: bool = False,
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ):
     if isinstance(past_key_value, StaticCache):
@@ -346,7 +358,10 @@ def mistral_flash_attn2_forward_SnapKV(
     # cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
     # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     # repeat k/v heads if n_kv_heads < n_heads

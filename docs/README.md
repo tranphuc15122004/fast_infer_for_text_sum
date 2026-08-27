@@ -6,36 +6,35 @@ Các hướng dẫn dưới đây được viết để chạy lại được tr
 
 ## Nội dung
 
-- **Chung** — cài uv, sync env, định dạng dữ liệu, lệnh chạy (mục dưới)
+- **Chung** — chuẩn bị venv Python 3.12 offline, định dạng dữ liệu, lệnh chạy
 - **Từng baseline** — `docs/baselines/*.md`:
 
 | Baseline | Env | Doc |
 |---|---|---|
-| EAGLE-3 | core (root) | `docs/baselines/eagle3.md` |
-| DFlash | core (root) | `docs/baselines/dflash.md` |
-| LLMLingua | core (root) | `docs/baselines/llmlingua.md` |
-| FastKV | `envs/legacy` | `docs/baselines/fastkv.md` |
-| RocketKV | `envs/legacy` | `docs/baselines/rocketkv.md` |
-| GemFilter | `envs/legacy` | `docs/baselines/gemfilter.md` |
-| speculative_prefill | `envs/specprefill` | `docs/baselines/specprefill.md` |
-| MInference | `envs/specprefill` | `docs/baselines/minference.md` |
-| MagicDec | `envs/magicdec` | `docs/baselines/magicdec.md` |
-| LongSpec | `envs/longspec` | `docs/baselines/longspec.md` |
-| SpecExtend | `envs/legacy` | `docs/baselines/specextend.md` |
-| HiGOE | `envs/legacy` | `docs/baselines/higoe.md` |
+| EAGLE-3 | venv chung | `docs/baselines/eagle3.md` |
+| DFlash | venv chung | `docs/baselines/dflash.md` |
+| LLMLingua | venv chung | `docs/baselines/llmlingua.md` |
+| FastKV | venv chung | `docs/baselines/fastkv.md` |
+| RocketKV | venv chung | `docs/baselines/rocketkv.md` |
+| GemFilter | venv chung | `docs/baselines/gemfilter.md` |
+| speculative_prefill | venv chung | `docs/baselines/specprefill.md` |
+| MInference | venv chung | `docs/baselines/minference.md` |
+| MagicDec | venv chung | `docs/baselines/magicdec.md` |
+| LongSpec | venv chung | `docs/baselines/longspec.md` |
+| SpecExtend | venv chung | `docs/baselines/specextend.md` |
+| HiGOE | venv chung | `docs/baselines/higoe.md` |
+| semantic_selection | venv chung | adapter trong `docs/representative_100_benchmark.md` |
+| FlexPrefill | venv chung | `docs/baselines/flexprefill.md` |
 
 ## Chuẩn bị chung trên server
 
 ```bash
-# 1) Clone + cài uv
+# 1) Clone; uv và Python 3.12 phải có sẵn trên server offline
 git clone <repo> && cd fast_infer_text_sum
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
+uv --version
 
-# 2) Sync toàn bộ env từ lock files (tái lập chính xác, không cần đoán version)
-bash scripts/setup_envs.sh
-#    - GPU lớn (A100/H100) muốn dùng flash-attn cho FastKV/GemFilter/LongSpec/SpecExtend:
-#      EXTRA_FLASH=1 bash scripts/setup_envs.sh
+# 2) Tạo venv chung từ cache/wheelhouse local
+bash scripts/setup_venv.sh --offline
 
 # 3) HF token cho model gated (Llama)
 export HF_TOKEN=hf_xxxx
@@ -50,7 +49,7 @@ bash scripts/run.sh <baseline> [args...]
 ```
 
 Mỗi baseline đọc cấu hình `config/<baseline>.env` (model path, data file, tham số).
-`bash scripts/run.sh` là dispatcher tự chọn đúng env + wrapper.
+`bash scripts/run.sh` là dispatcher gọi wrapper; mọi wrapper dùng `.venv/bin/python`.
 
 ## Dữ liệu plug-and-play
 
@@ -95,6 +94,9 @@ Phân tích latency, memory và ROUGE của các scheme `random`, `lead`, `tfidf
 
 ## Ghi chú portability
 
-- `uv.lock` đã commit cho từng env → `uv sync --locked` tái lập được trên máy khác.
-- Sau khi sửa `envs/<g>/pyproject.toml`: chạy `uv lock --project envs/<g>` và commit cả lock.
-- flash-attn (sm80+) chỉ cài khi `EXTRA_FLASH=1`; T4 (sm75) phải build từ source.
+- `requirements.txt` là nguồn dependency duy nhất; các local wheel/editable path
+  trong đó phải tồn tại trên server.
+- Setup dùng `uv pip --offline`; không tải Python/package qua internet.
+- `setup_venv.sh --check` kiểm tra Python 3.12 và các local source path; dùng
+  `check_shared_env.py` để kiểm tra import/version/CUDA sau khi cài.
+- Có thể dùng `FAST_INFER_VENV` hoặc `FAST_INFER_PYTHON` để chỉ định venv/interpreter.

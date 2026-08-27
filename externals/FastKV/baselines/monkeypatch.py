@@ -1,15 +1,103 @@
 import torch
 
 import transformers
-from transformers.models.llama.modeling_llama import  StaticCache
-
-from baselines.fullkv.llama_model import llama_model_forward_general
-from baselines.fullkv.mistral_model import mistral_model_forward_general
+try:
+    from transformers.models.llama.modeling_llama import StaticCache
+except ImportError:  # Transformers >= 4.57 moved cache classes to cache_utils.
+    from transformers.cache_utils import StaticCache
 
 import json
 import sys
 
+
+def _modern_attention_api(module):
+    """Return whether Transformers uses AttentionInterface instead of registries."""
+    return not hasattr(module, "LLAMA_ATTENTION_CLASSES")
+
+
+def _install_modern_cache_compat():
+    """Provide the cache method name used by the vendored FastKV kernels."""
+    from transformers.cache_utils import Cache
+
+    if not hasattr(Cache, "get_usable_length"):
+        Cache.get_usable_length = lambda self, _new_seq_length, layer_idx=0: self.get_seq_length(layer_idx)
+
+
+def _modern_attention_forward(forward_fn):
+    """Adapt a legacy FastKV attention function to Transformers' 4.57+ API."""
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings=None,
+        attention_mask=None,
+        past_key_values=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        _install_modern_cache_compat()
+        # Transformers 4.57+ derives these values directly from config and no
+        # longer stores all of the legacy attributes on LlamaAttention.
+        self.hidden_size = getattr(self, "hidden_size", self.config.hidden_size)
+        self.num_heads = getattr(
+            self, "num_heads", self.config.num_attention_heads
+        )
+        self.num_key_value_heads = getattr(
+            self, "num_key_value_heads", self.config.num_key_value_heads
+        )
+        self.attention_dropout = getattr(
+            self, "attention_dropout", self.config.attention_dropout
+        )
+        result = forward_fn(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=kwargs.get("position_ids"),
+            past_key_value=past_key_values,
+            output_attentions=kwargs.get("output_attentions", False),
+            use_cache=kwargs.get("use_cache", past_key_values is not None),
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        # Modern DecoderLayer expects (attention_output, attention_weights).
+        return result[:2]
+
+    forward.__name__ = f"modern_{forward_fn.__name__}"
+    forward.__doc__ = forward_fn.__doc__
+    return forward
+
+
+def _patch_modern_attention(module, forward_fn):
+    _install_modern_cache_compat()
+    attention_cls = next(
+        (
+            getattr(module, name, None)
+            for name in ("LlamaAttention", "MistralAttention", "Qwen2Attention")
+            if getattr(module, name, None) is not None
+        ),
+        None,
+    )
+    if attention_cls is None:
+        raise AttributeError(
+            f"Could not find a modern attention class in {module.__name__}"
+        )
+    attention_cls.forward = _modern_attention_forward(forward_fn)
+
 def replace_llama(method):
+    llama = transformers.models.llama.modeling_llama
+    if _modern_attention_api(llama):
+        if method == "snapkv":
+            from baselines.snapkv.llama_model import llama_sdpa_attn_forward_SnapKV
+            _patch_modern_attention(llama, llama_sdpa_attn_forward_SnapKV)
+            return
+        if method == "streamingllm":
+            from baselines.streamingllm.llama_model import llama_sdpa_attn_forward_StreamingLLM
+            _patch_modern_attention(llama, llama_sdpa_attn_forward_StreamingLLM)
+            return
+        if method == "h2o":
+            from baselines.h2o.llama_model import llama_sdpa_attn_forward_H2O
+            _patch_modern_attention(llama, llama_sdpa_attn_forward_H2O)
+            return
+
     if method == "fastkv":
         from baselines.fastkv.llama_model import llama_model_forward_fastkv, llama_decoderlayer_forward_fastkv, LlamaFastKVAttention
         transformers.models.llama.modeling_llama.LlamaModel.forward = llama_model_forward_fastkv
@@ -47,6 +135,7 @@ def replace_llama(method):
         sys.modules["transformers.models.llama.modeling_llama"] = llama_model
     
     elif method == "fullkv":
+        from baselines.fullkv.llama_model import llama_model_forward_general
         transformers.models.llama.modeling_llama.LlamaModel.forward = llama_model_forward_general
 
     else:
@@ -57,6 +146,21 @@ def replace_llama(method):
         
 
 def replace_mistral(method):
+    mistral = transformers.models.mistral.modeling_mistral
+    if not hasattr(mistral, "MISTRAL_ATTENTION_CLASSES"):
+        if method == "snapkv":
+            from baselines.snapkv.mistral_model import mistral_attn_forward_SnapKV
+            _patch_modern_attention(mistral, mistral_attn_forward_SnapKV)
+            return
+        if method == "streamingllm":
+            from baselines.streamingllm.mistral_model import mistral_sdpa_attn_forward_StreamingLLM
+            _patch_modern_attention(mistral, mistral_sdpa_attn_forward_StreamingLLM)
+            return
+        if method == "h2o":
+            from baselines.h2o.mistral_model import mistral_sdpa_attn_forward_H2O
+            _patch_modern_attention(mistral, mistral_sdpa_attn_forward_H2O)
+            return
+
     if method == "fastkv":
         from baselines.fastkv.mistral_model import mistral_model_forward_fastkv, mistral_decoderlayer_forward_fastkv, MistralFastKVAttention
         transformers.models.mistral.modeling_mistral.MistralModel.forward = mistral_model_forward_fastkv
@@ -93,6 +197,7 @@ def replace_mistral(method):
         sys.modules["transformers.models.mistral.modeling_mistral"] = mistral_model
     
     elif method == "fullkv":
+        from baselines.fullkv.mistral_model import mistral_model_forward_general
         transformers.models.mistral.modeling_mistral.MistralModel.forward = mistral_model_forward_general
 
     else:

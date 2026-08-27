@@ -128,3 +128,50 @@
   12.42 GiB ở 3,072 từ.
 - Artifact canonical: `src/analyze/full_infer/results/{summary.csv,summary.jsonl,metadata.json,*.png}`;
   bản trong `outputs/qwen3_long_profile/` vẫn được giữ nguyên để tương thích.
+
+## 2026-08-26 — shared Python 3.12 migration
+
+- Runtime hiện tại của workspace là Python 3.13.9; không có Python 3.12 executable và uv chỉ báo bản 3.12 là `download available`.
+- `requirements.txt` là file untracked do người dùng cung cấp; đã bổ sung `sentence-transformers==5.7.0` vì semantic-selection dùng trực tiếp package này. File có local/direct artefact (`deep_ep`, `eviseq`, `vllm`, `mooncake-transfer-engine`).
+- Đã xóa root `.venv` Python 3.11 và các `envs/*/.venv`; giữ manifest/lock legacy vì lớp an toàn chặn xóa toàn bộ env metadata/wheel.
+- Tất cả launcher chính dùng `scripts/common/runtime.sh` và trực tiếp gọi `FAST_INFER_PYTHON`.
+- MagicDec, SpecExtend, LongSpec và representative runner dùng interpreter kế thừa; representative runner dừng đúng khi runtime thiếu.
+- `pytest -q tests`: 46 passed; `bash -n` toàn bộ shell script: pass; compileall scripts/tests: pass.
+- `scripts/check_shared_env.py` chạy import-only/offline, kiểm tra dflash/CUDA và vendored LLMLingua; trên workspace báo Python 3.13, thiếu `vllm`/`flashinfer`/`sentence_transformers` và lỗi ABI `flash_attn`.
+- `scripts/setup_venv.sh --offline` dừng sớm và đúng vì local wheel `deep_ep` dưới `/vllm-workspace` chưa được mount; sau khi path được cung cấp, gate Python 3.12 vẫn sẽ chặn workspace hiện tại.
+- Phát hiện và sửa bug wrapper coi `--smoke` là tên config; sau sửa, sweep 14 baseline đều dừng tại cùng runtime gate với `config_errors=0`.
+- Sửa representative dry-run để không cần venv và không gọi Python khi convert/resolve model; test dry-run EAGLE/SpecExtend pass.
+
+## 2026-08-26 — smoke 1 sample trên workspace hiện tại
+
+- Workspace hiện tại chạy Python 3.13.9, không có Python 3.12 và không có NVIDIA driver/GPU.
+- `scripts/run.sh <baseline> --smoke` dừng đồng nhất ở shared-runtime gate; đây là blocker môi trường, không phải lỗi riêng baseline.
+- Có cache nhiều model HF, nhưng requirements còn cần mount local wheel `/vllm-workspace/...` và các package CUDA/server-specific.
+
+## 2026-08-26 — smoke 1 sample và debug baseline
+
+- Wrapper sweep với `FAST_INFER_PYTHON` mô phỏng Python 3.12 đạt `14/14`, không
+  còn lỗi coi `--smoke` là file config; semantic-selection cũng không còn truyền
+  cờ lạ xuống upstream và dùng `--limit 1`.
+- Smoke thực tế PASS: FastKV trên TinyLlama CPU (modern Llama API), GemFilter trên
+  TinyLlama CPU (modern custom attention), RocketKV kernel CPU, Semantic Selection
+  trên Qwen2.5-0.5B CPU với 1 document.
+- Đã thêm tương thích FastKV cho modern Transformers và Mistral; thêm fallback
+  SDPA/position embeddings/cache API cho GemFilter Llama/Mistral/Phi-3.
+- Đã chuẩn hóa `--smoke` của DFlash/FastKV/GemFilter/LLMLingua/MInference/
+  SpecPrefill/FlexPrefill/SpecExtend/EAGLE-3 thành tối đa đúng 1 sample.
+- Các blocker khi chạy trực tiếp workspace hiện tại: Python 3.13.9 thay vì 3.12,
+  không có NVIDIA driver; thiếu `vllm`, `flashinfer`, `nltk`, `tilelang`,
+  `liger-kernel`, `termcolor`, `faiss`, `dgl`; `flash_attn` lỗi GLIBC ABI.
+- `setup_venv.sh --offline` dừng đúng tại local wheel bắt buộc chưa mount:
+  `/vllm-workspace/ep_kernels/dist/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl`.
+
+## 2026-08-26 — tái tạo uv lock root
+
+- Đã xóa `uv.lock` cũ, đổi `.python-version` từ `3.11` sang `3.12`, và đặt
+  `pyproject.toml` yêu cầu `==3.12.*`.
+- `scripts/setup_venv.sh` hiện tự chạy `uv add --requirements requirements.txt
+  --no-sync --offline --no-python-downloads --python <python3.12>` để tạo/cập nhật
+  lock chung trước khi cài venv.
+- Không thể sinh lock trong workspace hiện tại: uv báo không tìm thấy Python 3.12;
+  sau đó setup cũng sẽ bị chặn bởi local wheel `deep_ep` và editable path server.

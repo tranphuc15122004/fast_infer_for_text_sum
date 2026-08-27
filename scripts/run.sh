@@ -5,8 +5,7 @@
 #   bash scripts/run.sh <baseline> [extra args...]
 #
 # Each baseline has a wrapper `scripts/run_<baseline>.sh` that sources
-# `config/<baseline>.env` and invokes `uv run --project <env> --locked python
-# scripts/infer_<baseline>.py ...`.
+# `config/<baseline>.env` and invokes the shared Python 3.12 interpreter.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

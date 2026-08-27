@@ -8,9 +8,9 @@ Reference implementation (thuật toán + interface) lấy từ
         score = rouge.get_scores(hyps, refer)[0]   # {"rouge-1"/"rouge-2"/"rouge-l": {p, r, f}}
         return score
 
-Repo này dùng 5 uv-env tách biệt (root/legacy/specprefill/magicdec/longspec),
-mỗi env đều bị khóa ``--locked`` — thêm package ``rouge`` vào mọi env là không
-đáng giá. Module này là bản pure-Python, không phụ thuộc gì, có cùng interface
+Repo này dùng một venv chung; ROUGE được triển khai pure-Python nên không cần
+thêm package ``rouge`` vào dependency manifest. Module này không phụ thuộc gì,
+có cùng interface
 ``rouge_all(hyp, ref)`` và bổ sung key phẳng theo schema §13
 (``rouge1/rouge2/rougeL``) để ghi trực tiếp vào record output.
 

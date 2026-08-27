@@ -6,7 +6,7 @@ Loads a Llama/Mistral model with the FastKV monkey-patch
 
 Two modes:
   * full  : method=fastkv + attn_implementation=flash_attention_2 (needs
-            flash-attn; install via `EXTRA_FLASH=1 scripts/setup_envs.sh`).
+            flash-attn installed in the shared server wheelhouse).
   * smoke : method=snapkv + attn_implementation=sdpa (no flash-attn needed,
             T4-runnable). Verifies the patch path + generation end-to-end.
 
@@ -83,13 +83,14 @@ def main() -> None:
         # T4-safe path: no flash-attn build required.
         args.method = "snapkv"
         args.attn_implementation = "sdpa"
+        args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
         args.num_runs = 2
 
     if args.attn_implementation == "flash_attention_2" and not has_flash_attn:
         raise SystemExit(
-            "flash-attn is not installed. Run: EXTRA_FLASH=1 scripts/setup_envs.sh, "
-            "or use --attn-implementation sdpa / --smoke"
+            "flash-attn is not installed in the shared venv. Install the matching "
+            "local wheel, or use --attn-implementation sdpa / --smoke"
         )
 
     model_path = resolve_model(args.model)

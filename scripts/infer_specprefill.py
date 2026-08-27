@@ -36,6 +36,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.smoke:
+        args.max_samples = 1
         args.max_tokens = min(args.max_tokens, 32)
 
     # patch MUST happen before importing vllm

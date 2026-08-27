@@ -1,4 +1,4 @@
-# transformers.__version__ == '4.43.3'
+# Compatible with both the legacy (4.43) and modern (4.57+) attention APIs.
 import math
 import torch
 from torch import nn
@@ -20,6 +20,13 @@ from .gem_filter_utils import find_context
 class MistralSelectAttention(MistralAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.hidden_size = getattr(self, "hidden_size", self.config.hidden_size)
+        self.num_heads = getattr(
+            self, "num_heads", self.config.num_attention_heads
+        )
+        self.num_key_value_heads = getattr(
+            self, "num_key_value_heads", self.config.num_key_value_heads
+        )
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
         self.reset()
         self.topk = 1024
@@ -37,10 +44,15 @@ class MistralSelectAttention(MistralAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ):
+        if past_key_values is not None:
+            past_key_value = past_key_values
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -58,7 +70,10 @@ class MistralSelectAttention(MistralAttention):
         if past_key_value is not None:
             kv_seq_len += cache_position[0]
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
 
@@ -113,6 +128,8 @@ class MistralSelectAttention(MistralAttention):
         if not output_attentions:
             attn_weights = None
 
+        if getattr(self, "_modern_transformers_attention_api", False):
+            return attn_output, attn_weights
         return attn_output, attn_weights, past_key_value
 
     def flash_softmax(self, query_states, key_states, value_states, attention_mask, q_len, position_ids):
@@ -125,17 +142,40 @@ class MistralSelectAttention(MistralAttention):
             key_states = key_states.to(torch.float16)
             value_states = value_states.to(torch.float16)
 
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            dropout=0.0,
-            sliding_window=getattr(self.config, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=True,
-        )
+        try:
+            import flash_attn  # noqa: F401
+            has_flash_attn = True
+        except Exception:
+            has_flash_attn = False
+
+        if has_flash_attn:
+            try:
+                attn_output = _flash_attention_forward(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    q_len,
+                    dropout=0.0,
+                    sliding_window=getattr(self.config, "sliding_window", None),
+                    use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                    is_causal=True,
+                )
+            except (TypeError, ImportError, RuntimeError):
+                has_flash_attn = False
+
+        if not has_flash_attn:
+            mask = attention_mask
+            if mask is not None:
+                mask = mask[:, :, :, : key_states.shape[1]]
+            attn_output = F.scaled_dot_product_attention(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=mask is None,
+            ).transpose(1, 2)
         if input_dtype == torch.float32:
             attn_output = attn_output.to(torch.float32)
         return attn_output, None

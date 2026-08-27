@@ -17,8 +17,11 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     repeat_kv,
     LlamaAttention,
-    LlamaFlashAttention2
 )
+try:
+    from transformers.models.llama.modeling_llama import LlamaFlashAttention2
+except ImportError:  # Transformers >= 4.57 folds backend classes into LlamaAttention.
+    LlamaFlashAttention2 = LlamaAttention
 from transformers.utils import (
     logging,
     is_flash_attn_greater_or_equal_2_10,

@@ -74,3 +74,33 @@
 - Verification cuối: bộ test của repo (`pytest -q tests`) `33 passed`; Python
   compile, shell syntax và `git diff --check` đều pass. `pytest -q` toàn repo
   vẫn bị giới hạn bởi test upstream trong `externals/` thiếu dependency riêng.
+
+## 2026-08-26 — shared Python 3.12 migration
+
+- Đã ghi spec và implementation plan cho migration.
+- Commit spec bị chặn bởi sandbox vì `.git/index.lock` nằm trên filesystem read-only; không stage/commit các thay đổi người dùng.
+- Đã thêm `scripts/common/runtime.sh`, `scripts/setup_venv.sh` và preflight `scripts/check_shared_env.py`.
+- Đã migrate tất cả shell launcher và child process sang runtime chung; sửa lỗi representative runner tiếp tục sau khi helper fail.
+- Đã xóa các `.venv` cũ; giữ manifest/lock legacy sau khi lệnh xóa toàn bộ `envs/` bị lớp an toàn chặn.
+- Static verification: 46 tests pass, shell syntax pass, compileall pass.
+- Runtime setup còn blocked do sandbox thiếu cả local wheel/path server-specific (`/vllm-workspace/...`) và Python 3.12; không tải các artefact này qua internet.
+- Review đã bổ sung kiểm tra direct URL chỉ dùng từ uv cache, cho phép root `.venv` trong test và thêm dependency sentence-transformers còn thiếu.
+
+## 2026-08-26 — smoke 1 sample trên workspace hiện tại
+
+- Đã hoàn tất phân lập smoke CPU/kernel khỏi shared-runtime gate Python 3.12.
+- Đã chạy xác nhận lại FastKV và GemFilter inference thực tế trên TinyLlama cache;
+  RocketKV và Semantic Selection cũng có artifact smoke PASS.
+- Đã sửa các lỗi tương thích Transformers và chuẩn hóa `--smoke` thành 1 sample.
+- Runtime hiện tại không có CUDA/GPU; các baseline GPU/server-specific được ghi
+  nhận blocked với nguyên nhân package/wheel cụ thể.
+- Còn lại: chạy lại `scripts/run.sh <baseline> --smoke` trên server thật sau khi
+  cung cấp Python 3.12, wheelhouse `/vllm-workspace` và NVIDIA runtime.
+
+## 2026-08-26 — tái tạo uv lock root từ requirements.txt
+
+- Đã xóa lock root cũ và đặt project pin Python 3.12.
+- Đã đưa bước `uv add -r requirements.txt` vào setup offline để lock được tạo
+  tự động từ manifest server trên máy đủ điều kiện.
+- Lock mới chưa thể sinh tại workspace hiện tại vì thiếu Python 3.12 và local
+  artifacts server-specific; trạng thái này cần tiếp tục trên server thật.

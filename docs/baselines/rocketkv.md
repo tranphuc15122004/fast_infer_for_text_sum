@@ -4,8 +4,8 @@ KV-cache compression / sparse decode attention (NVlabs). Dựa trên `externals/
 
 ## Env & cài đặt
 
-- Env: **`envs/legacy`** (dùng chung với FastKV/GemFilter/SpecExtend/HiGOE: transformers 4.45.2, torch 2.4.1+cu124).
-- `uv sync --project envs/legacy --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 
 ## Chạy smoke (kernel, không cần model)
 
@@ -24,9 +24,9 @@ cd externals/RocketKV
 export HF_TOKEN=...
 bash scripts/longbench/llama3.1-8b-instruct.sh rocket <results_dir> <token_budget>
 ```
-(chạy `python pipeline/inf_stream_llm/main.py --method rocket ...` với config JSON
-trong `config/pipeline_config/longbench/`; model Llama-3.1-8B gated cần HF_TOKEN,
-`config/access_tokens.py` phải điền token).
+(wrapper vẫn dùng interpreter chung khi gọi pipeline `rocket`; config JSON nằm
+trong `config/pipeline_config/longbench/`; model Llama-3.1-8B gated cần
+`HF_TOKEN`, `config/access_tokens.py` phải điền token).
 
 ## Output
 

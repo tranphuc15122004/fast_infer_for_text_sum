@@ -62,11 +62,17 @@ class SnapKVCluster():
         bsz, num_heads, q_len, head_dim = query_states.shape
 
         if self.eviction_mode == "proportional":
-            self.max_capacity_prompt = int(q_len * self.retain_rate)
+            # Keep the recent-token window valid for short smoke prompts.
+            # Otherwise proportional capacity can become smaller than the
+            # window and the first prefill crashes while building its mask.
+            self.max_capacity_prompt = max(
+                self.window_size + 1,
+                int(q_len * self.retain_rate),
+            )
         
         #print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
         
-        if q_len < self.max_capacity_prompt:
+        if q_len <= self.window_size or q_len < self.max_capacity_prompt:
             return key_states, value_states
         else:
             attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)

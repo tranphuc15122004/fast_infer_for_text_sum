@@ -5,8 +5,8 @@ verification. Dựa trên `externals/EAGLE`.
 
 ## Env & cài đặt
 
-- Env: **core** (project gốc) — đã có `uv.lock`.
-- `bash scripts/setup_envs.sh` (hoặc `uv sync --locked`).
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`.
 
 ## Model
 

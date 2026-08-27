@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${1:-$ROOT/config/dflash.env}"
+CONFIG_FILE="$ROOT/config/dflash.env"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  CONFIG_FILE="$1"
+  shift
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Configuration file not found: $CONFIG_FILE" >&2
@@ -11,12 +15,14 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 # Preserve the existing GSM8K entry point when callers explicitly provide one
 # of the legacy DFlash configs (they contain BACKEND/DATASET instead of the
 # representative JSONL fields below).
 if [[ -n "${BACKEND:-}" && -n "${DATASET:-}" ]]; then
-  exec bash "$ROOT/scripts/run_dflash_gsm8k.sh" "$CONFIG_FILE"
+  exec bash "$ROOT/scripts/run_dflash_gsm8k.sh" "$CONFIG_FILE" "$@"
 fi
 
 : "${TARGET_MODEL:?TARGET_MODEL is required}"
@@ -41,4 +47,4 @@ fi
 
 cd "$ROOT"
 export PYTHONPATH="$ROOT/scripts:$ROOT/externals/dflash${PYTHONPATH:+:$PYTHONPATH}"
-exec uv run --project "$ROOT" --locked python "$ROOT/scripts/infer_dflash.py" "${ARGS[@]}"
+exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_dflash.py" "${ARGS[@]}" "$@"

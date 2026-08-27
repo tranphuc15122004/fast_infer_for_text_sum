@@ -1,4 +1,4 @@
-# transformers.__version__ == '4.43.3'
+# Compatible with both the legacy (4.43) and modern (4.57+) attention APIs.
 import math
 import torch
 from torch import nn
@@ -20,6 +20,16 @@ from .gem_filter_utils import find_context
 class LlamaSelectAttention(LlamaAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Transformers 4.57+ keeps these values on the config rather than on
+        # each attention module; the vendored GemFilter forward still uses the
+        # legacy attribute names.
+        self.hidden_size = getattr(self, "hidden_size", self.config.hidden_size)
+        self.num_heads = getattr(
+            self, "num_heads", self.config.num_attention_heads
+        )
+        self.num_key_value_heads = getattr(
+            self, "num_key_value_heads", self.config.num_key_value_heads
+        )
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
         self.reset()
         self.topk = 1024
@@ -37,6 +47,7 @@ class LlamaSelectAttention(LlamaAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -45,6 +56,8 @@ class LlamaSelectAttention(LlamaAttention):
                                             torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if past_key_values is not None:
+            past_key_value = past_key_values
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -87,6 +100,8 @@ class LlamaSelectAttention(LlamaAttention):
         if not output_attentions:
             attn_weights = None
 
+        if getattr(self, "_modern_transformers_attention_api", False):
+            return attn_output, attn_weights
         return attn_output, attn_weights, past_key_value
 
     def flash_softmax(self, query_states, key_states, value_states, attention_mask, q_len, position_ids):
@@ -100,21 +115,30 @@ class LlamaSelectAttention(LlamaAttention):
             value_states = value_states.to(torch.float16)
 
         try:
-            attn_output = _flash_attention_forward(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                q_len,
-                dropout=0.0,
-                sliding_window=getattr(self, "sliding_window", None),
-                use_top_left_mask=self._flash_attn_uses_top_left_mask,
-                is_causal=True,
-            )
-        except (NameError, ImportError):
-            # Fallback without flash-attn (T4 smoke): torch SDPA.
-            # _flash_attention_forward is unavailable when flash-attn is not
-            # installed (its helper _flash_supports_window_size is undefined).
+            import flash_attn  # noqa: F401
+            has_flash_attn = True
+        except Exception:
+            has_flash_attn = False
+
+        if has_flash_attn:
+            try:
+                attn_output = _flash_attention_forward(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    q_len,
+                    dropout=0.0,
+                    sliding_window=getattr(self, "sliding_window", None),
+                    use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                    is_causal=True,
+                )
+            except (TypeError, NameError, ImportError, RuntimeError):
+                has_flash_attn = False
+
+        if not has_flash_attn:
+            # Fallback without flash-attn: torch SDPA.  This is also used by
+            # CPU smoke runs and by the server when flash-attn is unavailable.
             mask = attention_mask
             if mask is not None:
                 mask = mask[:, :, :, : key_states.shape[1]]  # seq dim (S in B,S,H,D)

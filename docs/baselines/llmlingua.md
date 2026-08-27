@@ -5,8 +5,8 @@ Dựa trên `externals/LLMLingua`.
 
 ## Env & cài đặt
 
-- Env: **core** (root) — `llmlingua` đã thêm vào `pyproject.toml` + `uv.lock`.
-- `bash scripts/setup_envs.sh`.
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`.
 
 ## Model
 

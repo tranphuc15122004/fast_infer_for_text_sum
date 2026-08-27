@@ -4,8 +4,7 @@ Bổ sung cho common/rouge.py (ROUGE-1/2/L F1): các metric semantic mở rộng
 (ROUGE P/R/F đầy đủ, ROUGE-Lsum, BLEU-1..4, length ratio) + các hàm tổng hợp
 metric tốc độ (mean/median/p90/std) từ schema §13 (baseline_repo_guide.md).
 
-Module pure-Python, không cài thêm package vào bất kỳ uv-env nào (mọi env đang
-khóa --locked). Dùng chung cho:
+Module pure-Python, không cần cài thêm package ngoài venv chung. Dùng chung cho:
 
   * scripts/infer_*.py        - ghi metric semantic mở rộng vào từng record;
   * scripts/collect_metrics.py - tổng hợp toàn bộ run thành báo cáo.

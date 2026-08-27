@@ -5,8 +5,8 @@ Oral, ByteDance). Dựa trên `externals/FlexPrefill` (vendored).
 
 ## Env & cài đặt
 
-- Env: **`envs/flexprefill`** (torch 2.4.0 cu124, triton 3.0.0, transformers 4.44.0).
-- `uv sync --project envs/flexprefill --locked`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
 - Không cần flash-attn: script gọi `disable_hf_flash_attention_check()`
   (monkey-patch HF để `_attn_implementation="flash_attention_2"` không cần
   kernel thật — patch_model thay attention bằng kernel triton của FlexPrefill).

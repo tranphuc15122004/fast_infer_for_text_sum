@@ -59,7 +59,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.smoke:
-        args.max_samples = min(args.max_samples, 2)
+        args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     # ---- compressor -------------------------------------------------------
@@ -143,7 +143,7 @@ def main() -> None:
         }]
         dense_input_ids = tokenizer.apply_chat_template(
             dense_messages, tokenize=True, add_generation_prompt=True,
-            return_tensors="pt",
+            return_tensors="pt", return_dict=False,
         ).to(device)
         dense_input_len = dense_input_ids.shape[1]
         dense_e2e_s = None
@@ -169,7 +169,7 @@ def main() -> None:
         # 3) generate summary with the compressed target prompt
         messages = [{"role": "user", "content": "Summarize the following document.\n\n" + compressed}]
         input_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=False,
         ).to(device)
         input_len = input_ids.shape[1]
 

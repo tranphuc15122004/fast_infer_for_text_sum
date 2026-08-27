@@ -5,9 +5,9 @@ long-document summarization. Dựa trên `externals/SpecExtend`.
 
 ## Env & cài đặt
 
-- Env: **`envs/legacy`** (dùng chung với FastKV/RocketKV/GemFilter/HiGOE: transformers 4.45.2 — pin gốc 4.41.0 đã thả lỏng; `tokenizers` lên 0.20.x, `protobuf` lên 4.25.1).
-- `uv sync --project envs/legacy --locked`
-- Full cần flash-attn (`EXTRA_FLASH=1`, GPU sm80+).
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
+- Full cần wheel `flash-attn` tương thích CUDA/GPU có sẵn trong wheelhouse local.
 
 ## Model
 

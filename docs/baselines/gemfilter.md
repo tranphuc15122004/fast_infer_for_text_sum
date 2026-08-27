@@ -5,10 +5,10 @@ Dựa trên `externals/GemFilter`.
 
 ## Env & cài đặt
 
-- Env: **`envs/legacy`** (dùng chung với FastKV/RocketKV/SpecExtend/HiGOE: transformers 4.45.2 — pin gốc của GemFilter là 4.43.3, các API dùng vẫn tồn tại ở 4.45).
-- `uv sync --project envs/legacy --locked`
-- Method gemfilter thật (flash_attention_2 path) cần flash-attn trên GPU sm80+:
-  `EXTRA_FLASH=1 bash scripts/setup_envs.sh`
+- Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
+- `bash scripts/setup_venv.sh --offline`
+- Method gemfilter thật (flash_attention_2 path) cần wheel `flash-attn` tương thích
+  CUDA/GPU có sẵn trong wheelhouse local.
 
 ## Model (chỉ các model được hỗ trợ)
 

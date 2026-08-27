@@ -290,7 +290,7 @@ def main() -> None:
         if not args.data_path_prefix:
             raise SystemExit("--data-path-prefix is required in full mode")
         cmd = [
-            "python", "inference_long-bench.py",
+            sys.executable, "inference_long-bench.py",
             "--model_name", args.model_name,
             "--method", args.method,
             "--task", args.task,

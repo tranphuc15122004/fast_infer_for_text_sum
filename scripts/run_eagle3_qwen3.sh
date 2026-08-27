@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${1:-$ROOT/config/eagle3_qwen3.env}"
+CONFIG_FILE="$ROOT/config/eagle3_qwen3.env"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  CONFIG_FILE="$1"
+  shift
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Configuration file not found: $CONFIG_FILE" >&2
@@ -11,6 +15,8 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 : "${BASE_MODEL:?BASE_MODEL is required}"
 : "${EAGLE_MODEL:?EAGLE_MODEL is required}"
@@ -54,8 +60,7 @@ fi
 cd "$ROOT"
 
 # Check dimensions before loading several GB of weights onto the GPU.
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/fast_infer_uv_cache}"
-uv run --project "$ROOT" --locked python - "$BASE_MODEL/config.json" "$EAGLE_MODEL/config.json" <<'PY'
+"$FAST_INFER_PYTHON" - "$BASE_MODEL/config.json" "$EAGLE_MODEL/config.json" <<'PY'
 import json
 import sys
 
@@ -89,7 +94,12 @@ if [[ "${SKIP_NAIVE:-0}" == "1" ]]; then
   NAIVE_ARGS+=(--skip-naive)
 fi
 
-exec uv run --project "$ROOT" --locked python "$ROOT/scripts/eagle3_infer_qwen3.py" \
+SMOKE_ARGS=()
+if [[ "${SMOKE:-0}" == "1" ]]; then
+  SMOKE_ARGS+=(--smoke)
+fi
+
+exec "$FAST_INFER_PYTHON" "$ROOT/scripts/eagle3_infer_qwen3.py" \
   --base-model "$BASE_MODEL" \
   --eagle-model "$EAGLE_MODEL" \
   --question-file "$QUESTION_FILE" \
@@ -103,4 +113,6 @@ exec uv run --project "$ROOT" --locked python "$ROOT/scripts/eagle3_infer_qwen3.
   --top-k "$TOP_K" \
   --temperature "$TEMPERATURE" \
   "${NAIVE_ARGS[@]}" \
-  --output "$OUTPUT_FILE"
+  "${SMOKE_ARGS[@]}" \
+  --output "$OUTPUT_FILE" \
+  "$@"
