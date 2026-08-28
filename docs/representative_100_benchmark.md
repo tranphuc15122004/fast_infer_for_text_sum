@@ -12,7 +12,7 @@ activate virtualenv:
 
 ```bash
 python3 --version
-export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 source scripts/common/config.sh && fast_infer_load_master
 python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 ```

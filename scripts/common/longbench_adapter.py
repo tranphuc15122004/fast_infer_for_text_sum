@@ -253,14 +253,19 @@ def preflight_baseline(
                 "available": ok,
                 "reason": reason,
             }
+            if not ok and result["status"] == "ready":
+                result.update(status="missing_checkpoint", reason=reason)
         else:
             result["requirements"]["datastore"] = {
                 "configured": False,
                 "available": False,
-                "reason": "SSSD datastore path is not configured",
+                "reason": "empty datastore is allowed; using prompt/self-output-only retrieval",
             }
-        if not datastore and result["status"] == "ready":
-            result.update(status="missing_checkpoint", reason="SSSD datastore path is not configured")
+            if result["status"] == "ready":
+                result.update(
+                    status="aggregate_only",
+                    reason="SSSD datastore is empty; using prompt/self-output-only retrieval",
+                )
 
     if baseline == "magicdec":
         checkpoint = str(cfg.get("magicdec_model_pth") or "") or None

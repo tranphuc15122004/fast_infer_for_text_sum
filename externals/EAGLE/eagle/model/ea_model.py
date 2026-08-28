@@ -51,6 +51,15 @@ class EaModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
+        base_rope_scaling = getattr(self.config, "rope_scaling", None)
+        if isinstance(base_rope_scaling, dict) and base_rope_scaling.get("rope_type") == "llama3":
+            # EAGLE's draft config may predate the Llama 3.1 fields.  The
+            # draft and target must use the same frequency-dependent RoPE.
+            config.rope_scaling = dict(base_rope_scaling)
+            base_rope_parameters = getattr(self.config, "rope_parameters", None)
+            if isinstance(base_rope_parameters, dict):
+                config.rope_parameters = dict(base_rope_parameters)
+            config.rope_theta = self.config.rope_theta
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
         try:
@@ -103,23 +112,39 @@ class EaModel(nn.Module):
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
-        Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
+        base_config = AutoConfig.from_pretrained(base_model_path)
+        # Transformers 5 no longer exposes rope_theta as a top-level field,
+        # while the vendored EAGLE target and draft modules still use it.
+        if not isinstance(getattr(base_config, "rope_theta", None), (int, float)):
+            rope_parameters = getattr(base_config, "rope_parameters", {})
+            rope_scaling = getattr(base_config, "rope_scaling", {})
+            if isinstance(rope_parameters, dict):
+                theta = rope_parameters.get("rope_theta")
+            else:
+                theta = None
+            if theta is None and isinstance(rope_scaling, dict):
+                theta = rope_scaling.get("rope_theta")
+            base_config.rope_theta = float(theta or 10000.0)
+
+        Type = base_config.architectures[0]
+        model_kwargs = dict(kwargs)
+        model_kwargs.setdefault("config", base_config)
 
         if Type == 'LlamaForCausalLM':
             base_model = KVLlamaForCausalLM.from_pretrained(
-                base_model_path, **kwargs
+                base_model_path, **model_kwargs
             )
         elif Type == 'Qwen2ForCausalLM':
             base_model = KVQwen2ForCausalLM.from_pretrained(
-                base_model_path, **kwargs
+                base_model_path, **model_kwargs
             )
         elif Type == 'Qwen3ForCausalLM':
             base_model = KVQwen3ForCausalLM.from_pretrained(
-                base_model_path, **kwargs
+                base_model_path, **model_kwargs
             )
         else:
             base_model = KVMixtralForCausalLM.from_pretrained(
-                base_model_path, **kwargs
+                base_model_path, **model_kwargs
             )
 
         configpath = os.path.join(ea_model_path, "config.json")

@@ -134,6 +134,15 @@ class EConfig(PretrainedConfig):
         if self.rope_scaling is None:
             return
 
+        # Transformers 5 / Llama 3.1 uses the richer schema with
+        # ``rope_type`` plus the low/high frequency factors.  It is consumed
+        # by the compatibility rotary embedding in cnets.py; retain the old
+        # strict validation for legacy linear/dynamic configurations.
+        if isinstance(self.rope_scaling, dict) and (
+            "rope_type" in self.rope_scaling or "rope_theta" in self.rope_scaling
+        ):
+            return
+
         if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
             raise ValueError(
                 "`rope_scaling` must be a dictionary with with two fields, `name` and `factor`, "

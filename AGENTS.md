@@ -3,8 +3,9 @@
 Benchmark repo cho **long-context text summarization**: so sánh công bằng các
 baseline tăng tốc inference (semantic reduction, sparse attention, KV
 optimization, speculative decoding) trên cùng dữ liệu/output schema. Toàn bộ
-docs tiếng Việt. Runtime server chính: Python 3.12 + `requirements.txt` trong
-một venv dùng chung; server không có kết nối internet trực tiếp.
+docs tiếng Việt. Runtime server chính: `python3` hệ thống, Python 3.12, với
+dependency đã cài sẵn; server không có kết nối internet trực tiếp. Hồ sơ path
+canonical của server nằm tại [`docs/server_environment.md`](docs/server_environment.md).
 
 ## Cấu trúc folder
 
@@ -25,7 +26,7 @@ fast_infer_text_sum/
 ├── checkpoints/                # checkpoint đã convert (GITIGNORED)
 ├── docs/                       # docs master + docs/baselines
 ├── requirements.txt            # dependency manifest duy nhất của server
-└── .venv/                      # venv Python 3.12, GITIGNORED
+└── .venv/                      # chỉ dùng mô phỏng local, GITIGNORED
 ```
 
 Các `envs/*/pyproject.toml` và `envs/*/uv.lock` chỉ còn để truy vết dependency
@@ -33,7 +34,8 @@ cũ. Không tạo hoặc sử dụng venv riêng cho từng baseline.
 
 ## Runtime chung
 
-- Mặc định interpreter là `.venv/bin/python`.
+- Production server dùng `python3` từ `PATH`; local runtime có thể dùng
+  `.venv/bin/python` để mô phỏng.
 - `FAST_INFER_VENV=/path/to/venv` chọn một venv Python 3.12 khác.
 - `FAST_INFER_PYTHON=/path/to/python` chọn trực tiếp executable Python 3.12.
 - `scripts/common/runtime.sh` kiểm tra major/minor trước khi launcher chạy.
@@ -56,9 +58,8 @@ cũ. Không tạo hoặc sử dụng venv riêng cho từng baseline.
 ## Commands
 
 ```bash
-# Server offline: uv và Python 3.12 phải cài sẵn, package phải nằm trong cache/wheelhouse
-bash scripts/setup_venv.sh --offline
-bash scripts/setup_venv.sh --check
+# Server production: không tạo venv; khởi tạo/kiểm tra bằng python3 hệ thống
+python3 scripts/setup_server_env.py --all
 
 # Kiểm tra interpreter/import không tải model
 FAST_INFER_VENV="$PWD/.venv" "$PWD/.venv/bin/python" scripts/check_shared_env.py

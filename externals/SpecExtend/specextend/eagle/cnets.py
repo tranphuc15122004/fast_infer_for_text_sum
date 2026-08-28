@@ -32,7 +32,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from shared.opt_tree import Tree
-from termcolor import colored
+from optional_deps import colored
 
 try:
     from flash_attn import flash_attn_func

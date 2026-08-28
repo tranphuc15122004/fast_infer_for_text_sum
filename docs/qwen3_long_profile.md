@@ -7,7 +7,7 @@ speculative decoding. Mặc định chạy trên một GPU CUDA, FP16 + SDPA, ba
 ## Chạy
 
 ```bash
-FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env \
+FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
   bash scripts/run_qwen3_long_profile.sh
 ```
 

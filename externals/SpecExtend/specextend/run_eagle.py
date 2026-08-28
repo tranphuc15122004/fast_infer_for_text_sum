@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator 
-from termcolor import colored
+from optional_deps import colored
 import argparse
 
 

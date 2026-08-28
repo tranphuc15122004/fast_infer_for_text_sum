@@ -1,11 +1,15 @@
 import torch
 import warnings
 from typing import List, Optional, Union
-from transformers.generation.utils import (
-    LogitsProcessorList, 
-    StoppingCriteriaList, 
-    GreedySearchOutput
-)
+from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList
+
+try:
+    from transformers.generation.utils import GreedySearchOutput
+except ImportError:
+    # Transformers 5 removed the old public alias.  It was used here only as
+    # a return annotation; generation itself still returns the regular
+    # decoder-only/encoder-decoder output objects.
+    from transformers.generation.utils import GenerateDecoderOnlyOutput as GreedySearchOutput
 from transformers.generation.stopping_criteria import (
     MaxLengthCriteria
 )

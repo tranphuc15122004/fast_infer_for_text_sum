@@ -265,7 +265,16 @@ class Qwen2Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = getattr(config, "rope_theta", None)
+        if self.rope_theta is None:
+            rope_parameters = getattr(config, "rope_parameters", {})
+            rope_scaling = getattr(config, "rope_scaling", {})
+            if isinstance(rope_parameters, dict):
+                self.rope_theta = rope_parameters.get("rope_theta")
+            if self.rope_theta is None and isinstance(rope_scaling, dict):
+                self.rope_theta = rope_scaling.get("rope_theta")
+            self.rope_theta = float(self.rope_theta or 10000.0)
+            config.rope_theta = self.rope_theta
         self.is_causal = True
 
         if (self.head_dim * self.num_heads) != self.hidden_size:

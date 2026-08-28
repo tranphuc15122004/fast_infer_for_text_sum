@@ -23,6 +23,10 @@ from common.data_loader import load_records
 from common.paths import ROOT
 
 MAGICDEC = ROOT / "externals" / "MagicDec"
+MAGICDEC_PARENT = ROOT / "externals"
+if str(MAGICDEC_PARENT) not in sys.path:
+    # ``from MagicDec.Engine...`` resolves the package from its parent.
+    sys.path.insert(0, str(MAGICDEC_PARENT))
 
 
 def _canonical_next_token(logits, temperature: float):
@@ -39,8 +43,6 @@ def _run_canonical(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("MagicDec canonical inference requires CUDA")
     from transformers import AutoTokenizer
-    if str(MAGICDEC) not in sys.path:
-        sys.path.insert(0, str(MAGICDEC))
     from MagicDec.Engine.SnapKV.backend import LMBackend
 
     records = load_records(Path(args.data_file), args.max_samples)

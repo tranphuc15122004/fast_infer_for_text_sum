@@ -215,6 +215,7 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
+        self._uses_llama3_rope = False
         if self.config.rope_scaling is None:
             if hasattr(self.config, "rope_theta"):
                 self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
@@ -224,8 +225,41 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
                                                        max_position_embeddings=self.max_position_embeddings)
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling = self.config.rope_scaling
+            scaling_type = scaling.get("type") or scaling.get("rope_type")
+            if scaling_type in (None, "default"):
+                rope_theta = getattr(self.config, "rope_theta", 10000.0)
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
+                )
+                return
+            if scaling_type == "llama3":
+                # Llama 3.1 uses frequency-dependent scaling.  Mapping it to
+                # legacy dynamic/linear scaling would make the benchmark run
+                # but silently change model semantics, so reuse EAGLE's
+                # Transformers-compatible implementation instead.
+                from .modeling_llama_kv import (
+                    LlamaRotaryEmbedding_L31,
+                    apply_rotary_pos_emb_L31,
+                )
+
+                if not isinstance(getattr(self.config, "rope_theta", None), (int, float)):
+                    rope_parameters = getattr(self.config, "rope_parameters", {})
+                    self.config.rope_theta = rope_parameters.get(
+                        "rope_theta", scaling.get("rope_theta", 10000.0)
+                    )
+                self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
+                self._apply_llama3_rope = apply_rotary_pos_emb_L31
+                self._uses_llama3_rope = True
+                return
+
+            if scaling_type is None:
+                raise ValueError(
+                    "RoPE scaling is missing both legacy 'type' and modern 'rope_type'"
+                )
+            scaling_factor = scaling.get("factor", 1.0)
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
@@ -280,8 +314,20 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if self._uses_llama3_rope:
+            if position_ids is None:
+                position_ids = torch.arange(
+                    kv_seq_len, device=value_states.device, dtype=torch.long
+                ).unsqueeze(0)
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = self._apply_llama3_rope(
+                query_states, key_states, cos, sin
+            )
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
 
         if past_key_value is not None:
             # reuse k, v, self_attention

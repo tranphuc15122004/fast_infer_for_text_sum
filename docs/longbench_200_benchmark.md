@@ -98,7 +98,7 @@ Toàn bộ ma trận dùng một master shell-env ngoài repository, được tr
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
   bash scripts/run_longbench_200.sh \
-  --config /workspace/shared_storage/config/fast_infer_master.env \
+  --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
   --mode smoke
 ```
 
@@ -115,6 +115,23 @@ chế độ phù hợp để kiểm tra máy T4/CPU. Không được diễn gi�
 `unsupported_cpu`, `missing_checkpoint`, `missing_dependency` hoặc
 `unsupported_dataset` thành số đo tốc độ; các field timing của chúng là
 `null`.
+
+### Compatibility với runtime server
+
+Các adapter đã có lớp tương thích cho đúng stack Python 3.12/Transformers
+trên server:
+
+- DFlash và MagicDec tự đăng ký source vendored vào `sys.path`; không cần
+  `pip install` hai package này.
+- LongSpec và EAGLE-3 xử lý RoPE schema mới của Llama 3.1. EAGLE-3 dùng
+  frequency-dependent Llama 3.1 RoPE, không đổi thành linear/dynamic RoPE
+  chỉ để né lỗi `KeyError: type`.
+- SpecExtend không bắt buộc `termcolor`; FAFO không bắt buộc FastChat và có
+  fallback cho các alias Transformers cũ đã bị bỏ.
+- SSSD cho phép datastore rỗng khi smoke để kiểm tra wiring prompt/self-output.
+  Muốn đo đúng retrieval SSSD phải đặt `SSSD_DATASTORE_PATH` trỏ tới `.idx`
+  đã build cho đúng tokenizer/model; nếu path đã khai báo nhưng không tồn tại,
+  preflight vẫn dừng cell với `missing_checkpoint`.
 
 Ví dụ kiểm tra đầy đủ pipeline local:
 

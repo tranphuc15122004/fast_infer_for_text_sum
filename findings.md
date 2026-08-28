@@ -66,3 +66,44 @@ Mỗi record JSONL sẽ có các field ổn định:
 - `scripts/collect_metrics.py`
 - `/home/tuantb/.codex/attachments/99b12101-d46d-4dfb-9003-b1d80d684e78/pasted-text.txt`
 - `AGENTS.md`
+
+## Server setup request (2026-08-28)
+- Repository trên server: `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum`.
+- Shared stable data/config directory:
+  `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data`.
+- Cần bootstrap canonical datasets (`longbench_200`, `representative_100`) và
+  `fast_infer_master.env` bằng một script duy nhất.
+- Không được tự động ghi đè master config hoặc dataset đã tồn tại.
+- Server không có runtime venv; interpreter chuẩn là `python3` hệ thống,
+  Python 3.12, với các dependency cần thiết đã được cài sẵn.
+- User đã xác nhận thiết kế điều chỉnh: server dùng trực tiếp `python3` hệ
+  thống, không tạo venv.
+- Script setup đã được implement và kiểm thử; xem
+  `scripts/setup_server_env.py`.
+- Hồ sơ server canonical đã được ghi tại `docs/server_environment.md` và
+  các entrypoint chính đã được cập nhật để trỏ tới master path mới.
+
+## Runtime compatibility fixes (2026-08-28)
+
+- Log server đã được truy nguyên theo từng traceback, không phải do một lỗi
+  chung của model: DFlash/MagicDec thiếu source path, LongSpec/EAGLE3 đọc
+  RoPE schema cũ, SpecExtend thiếu `termcolor`, FAFO thiếu FastChat và alias
+  `GreedySearchOutput` không còn trong Transformers 5.
+- DFlash/MagicDec đã tự đăng ký vendored path trong adapter; không phụ thuộc
+  vào `PYTHONPATH` của shell cha.
+- LongSpec, EAGLE3 và FAFO đọc được `rope_parameters`/`rope_scaling` hiện đại.
+  EAGLE3 dùng Llama 3.1 frequency-dependent RoPE thật, không map tạm sang
+  dynamic RoPE.
+- SpecExtend có fallback màu terminal; FAFO có fallback tối thiểu cho FastChat
+  và loader/adapter tương ứng. FAFO cũng chịu được alias generation đã bị bỏ
+  trong Transformers 5.
+- SSSD không còn bị preflight loại bỏ chỉ vì datastore rỗng; path `.idx` đã
+  khai báo nhưng không tồn tại vẫn là lỗi cấu hình.
+
+### Verification
+
+- `pytest -q tests` sau patch: **119 passed**.
+- Preflight local 9 × 5 hoàn thành với status `unsupported_cpu` đúng thiết kế;
+  không sinh timing giả trên máy T4/CPU.
+- Chưa tuyên bố GPU inference thành công: cần đồng bộ source lên server và
+  chạy lại smoke với model/checkpoint local trên B200.

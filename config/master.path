@@ -1,4 +1,4 @@
 # Đường dẫn tuyệt đối tới file cấu hình master dùng chung trên server.
 # Có thể thay bằng đường dẫn tuyệt đối thực tế, ví dụ:
-# /workspace/shared_storage/config/fast_infer_master.env
-/workspace/shared_storage/config/fast_infer_master.env
+# /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env

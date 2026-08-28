@@ -3,7 +3,7 @@
 Repo này là máy **code/debug**; inference thật chạy trên **server GPU riêng**.
 Trên server B200, các launcher dùng trực tiếp `python3` từ PATH; `.venv` trong
 workspace local chỉ dùng để mô phỏng dependency/API trước khi đưa code lên
-server.
+server. Thông tin path/runtime canonical: [`docs/server_environment.md`](server_environment.md).
 
 ## Nội dung
 
@@ -37,8 +37,9 @@ git clone <repo> && cd fast_infer_text_sum
 python3 --version
 
 # 2) Đặt master config ngoài repository (config/master.path đã trỏ sẵn tới path này)
-#    Lần đầu: cp docs/fast_infer_master.example.env /workspace/shared_storage/config/fast_infer_master.env
-export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+#    Master config ổn định nằm tại:
+#    /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 source scripts/common/config.sh && fast_infer_load_master
 
 # 3) Kiểm tra runtime/CUDA/dependency/model cache trước khi chạy
@@ -49,6 +50,38 @@ export HF_TOKEN=hf_xxxx
 
 # 5) Mirror model/checkpoint và wheel vào cache server theo doc tương ứng
 ```
+
+## Bootstrap server không dùng venv
+
+Server benchmark dùng trực tiếp `python3` hệ thống (Python 3.12). Script sau
+không tạo virtualenv và không cài package; script chỉ khởi tạo cấu trúc dùng
+chung, trỏ `config/master.path` tới master config ổn định và chạy preflight:
+
+```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
+
+# Tạo thư mục data/config và link còn thiếu; không kiểm tra package/model.
+python3 scripts/setup_server_env.py --init
+
+# Sau khi copy đủ longbench_200 và representative_100 vào shared data:
+python3 scripts/setup_server_env.py --check
+
+# Hoặc thực hiện init + check trong một lần.
+python3 scripts/setup_server_env.py --all
+```
+
+Mặc định script dùng:
+
+```text
+repository: /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
+shared data: /workspace/storage-shared/nlp/dungdx4/phuc_projects/data
+master:      <shared data>/fast_infer_master.env
+```
+
+Nếu chỉ muốn kiểm tra filesystem trước khi dataset được copy, dùng
+`--check --skip-dependencies --skip-data-validation`. Script không ghi đè
+master config đã tồn tại; hãy chỉnh các đường dẫn model/checkpoint trực tiếp
+trong `fast_infer_master.env`.
 
 Để mô phỏng đúng profile trên máy local, thay interpreter ở command runner:
 
@@ -108,7 +141,7 @@ Hai launcher dùng cùng `config/master.path`, cùng interpreter Python 3.12 và
 cùng `DATA_INPUT`. Cấu hình mẫu đã có các namespace `SSSD_*` và `FAFO_*`.
 
 ```bash
-export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 export MODEL_TARGET=/workspace/shared_storage/model/Llama3.1-8B-Instruct
 export DATA_INPUT=data/representative_100/xsum_representative.jsonl
 export RUN_SAMPLES=1

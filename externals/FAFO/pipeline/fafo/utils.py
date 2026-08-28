@@ -6,7 +6,10 @@ logger = logging.getLogger("main")
 from transformers import GenerationMixin, AutoTokenizer
 from transformers.models.llama import modeling_llama
 from transformers.models.qwen2 import modeling_qwen2
-from fastchat.model.model_adapter import Llama2Adapter, Llama3Adapter, QwenChatAdapter
+try:
+    from fastchat.model.model_adapter import Llama2Adapter, Llama3Adapter, QwenChatAdapter
+except ImportError:
+    from fastchat_compat import Llama2Adapter, Llama3Adapter, QwenChatAdapter
 
 from pipeline.fafo.decoding import greedy_search_proxy, FUNC_MAP, CONFIG_MAP, get_device
 from pipeline.fafo.models import modeling_llama as fafo_modeling_llama

@@ -97,3 +97,29 @@ CPU/T4 cannot produce valid GPU benchmark numbers in this environment. On B200,
 copy the master example to the external master path, verify local model and
 draft/checkpoint paths, then run the same launcher with `--mode smoke` before
 `representative`/`full`.
+
+### Server setup bootstrap
+- **Status:** complete.
+- **Requested paths:** repository under `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum`; stable data/config under `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data`.
+- **Actual artifact:** `scripts/setup_server_env.py` with idempotent checks,
+  optional initialization, shared-data symlinks and direct `python3` system
+  runtime validation; server-side venv creation has been removed.
+- **Verification:** `pytest -q tests` → **111 passed**; `py_compile` and
+  `git diff --check` pass.
+
+### Canonical server profile
+- **Status:** complete.
+- Đã ghi repository, shared data, master config, runtime `python3` hệ thống
+  Python 3.12 và lệnh setup/benchmark tại `docs/server_environment.md`.
+- Đã cập nhật `AGENTS.md`, README, tài liệu benchmark active và
+  `config/master.path` theo server path do người dùng cung cấp.
+
+### Runtime compatibility remediation
+- **Status:** complete locally; B200 smoke rerun pending.
+- Đã sửa toàn bộ traceback đã cung cấp cho các adapter DFlash, MagicDec,
+  LongSpec, EAGLE3, SpecExtend và FAFO; bổ sung test hồi quy riêng tại
+  `tests/test_runtime_compat_fixes.py`.
+- Đã cho phép SSSD smoke chạy với datastore rỗng theo contract upstream;
+  benchmark retrieval vẫn yêu cầu `.idx` đúng model/tokenizer.
+- Verification: `pytest -q tests` → **119 passed**, `git diff --check`,
+  `py_compile` và preflight canonical 45 cell đều pass theo giới hạn CPU/T4.

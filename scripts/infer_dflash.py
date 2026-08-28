@@ -9,6 +9,7 @@ autoregressive reference used for the speedup fields.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -16,6 +17,15 @@ import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.paths import ROOT
+
+
+# DFlash is vendored rather than installed into the shared server Python.
+# Register its package root before the lazy import in ``main`` so direct
+# adapter runs and orchestrated runs behave identically.
+DFLASH_ROOT = ROOT / "externals" / "dflash"
+if str(DFLASH_ROOT) not in sys.path:
+    sys.path.insert(0, str(DFLASH_ROOT))
 
 
 def _dtype_and_attention() -> tuple[torch.dtype, str]:

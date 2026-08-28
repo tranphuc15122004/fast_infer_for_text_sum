@@ -22,6 +22,7 @@ import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.model_compat import ensure_rope_theta
 from common.paths import ROOT
 
 LONGSPEC = ROOT / "externals" / "LongSpec" / "longspec" / "test"
@@ -74,6 +75,9 @@ def _run_representative(args: argparse.Namespace) -> None:
         )
 
     config = AutoConfig.from_pretrained(target_model)
+    # LongSpec's vendored Llama attention still reads this legacy attribute;
+    # Transformers 5 keeps it nested under rope_parameters/rope_scaling.
+    ensure_rope_theta(config)
     tokenizer = AutoTokenizer.from_pretrained(target_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -73,3 +73,23 @@ Phase 5
 - Full output đã được build tại `data/longbench_200/`: 5 × 200 = 1.000 record; validator pass và rebuild độc lập byte-identical.
 - `pytest -q tests` là phạm vi test dự án; `pytest -q` toàn repo còn thu thập test vendored cần package tùy chọn không có trong venv local.
 - `task_plan.md`, `findings.md`, `progress.md` là ledger làm việc; không phải benchmark artifact.
+
+## Phase 7: Server environment bootstrap
+
+### Goal
+Tạo một launcher setup có thể chạy trên server, dùng code tại
+`/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum` và
+thư mục dùng chung `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data`
+cho dataset, master config và các artifact ổn định.
+
+### Implementation complete
+- [x] Tạo `scripts/setup_server_env.py` với các chế độ `--check`, `--init` và
+  `--all`.
+- [x] Giữ nguyên `fast_infer_master.env` hiện có; chỉ tạo từ example khi file
+  chưa tồn tại.
+- [x] Tạo symlink dataset từ repo tới thư mục data dùng chung khi target repo
+  chưa tồn tại, không xoá/ghi đè dataset hiện có.
+- [x] Không tạo/activate venv trên server; dùng trực tiếp `python3` hệ thống
+  và kiểm tra Python 3.12 cùng các package đã cài.
+- [x] Viết test contract trước implementation và chạy smoke kiểm thử.
+- **Status:** complete

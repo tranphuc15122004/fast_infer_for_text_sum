@@ -7,7 +7,10 @@ logger = logging.getLogger("main")
 
 import torch
 from torch.nn.attention.flex_attention import flex_attention
-from fastchat.model import get_conversation_template
+try:
+    from fastchat.model import get_conversation_template
+except ImportError:
+    from fastchat_compat import get_conversation_template
 import pipeline.fafo
 from pipeline.fafo import (
     get_device,

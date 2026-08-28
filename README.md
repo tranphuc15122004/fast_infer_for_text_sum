@@ -24,8 +24,8 @@ docs/              # hướng dẫn cài đặt + infer từng baseline
 python3 --version
 
 # master config nằm ngoài repo; config/master.path đã trỏ tới nó
-# Lần đầu: cp docs/fast_infer_master.example.env /workspace/shared_storage/config/fast_infer_master.env
-export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+# Master config ổn định trên server
+export FAST_INFER_MASTER_CONFIG=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 source scripts/common/config.sh && fast_infer_load_master
 python3 scripts/check_b200_env.py --json outputs/b200_preflight.json
 
@@ -76,3 +76,4 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
   (input/retained/output tokens, TTFT/TPOT/E2E, throughput, quality metrics...).
 - Môi trường production: `python3` Python 3.12 từ PATH dùng `requirements.txt`;
   launcher không yêu cầu activate venv. `.venv` chỉ dành cho mô phỏng local.
+- Hồ sơ server canonical: [`docs/server_environment.md`](docs/server_environment.md)
