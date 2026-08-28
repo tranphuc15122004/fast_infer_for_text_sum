@@ -53,6 +53,15 @@ Benchmark đọc dataset pg19 từ
 Có thể đổi vị trí bằng biến `MAGICDEC_DATA_ROOT`; không cần đặt dataset trong
 `externals/MagicDec/Data/` nữa.
 
+## Canonical LongBench
+
+Runner ma trận `scripts/run_longbench_200.sh` dùng nhánh prompt tùy ý trong
+`scripts/infer_magicdec.py`, không dùng benchmark PG19 cố định. Với Llama 3.1,
+checkpoint phải được convert dưới thư mục có tên `llama-3.1-8b`, chẳng hạn
+`.../magicdec/llama-3.1-8b/model.pth`, và khai báo qua
+`LONG_BENCH_MAGICDEC_MODEL_PTH`. Tokenizer path khai báo qua
+`LONG_BENCH_MAGICDEC_MODEL_NAME` (mặc định là `LONG_BENCH_MODEL`).
+
 ## Output
 
 `outputs/magicdec_smoke.jsonl` — returncode + log tail của benchmark.

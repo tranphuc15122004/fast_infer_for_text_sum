@@ -14,8 +14,13 @@ BASELINE="${1:?usage: run.sh <baseline> [args...]}"
 shift || true
 
 case "$BASELINE" in
+  longbench_200) WRAPPER="scripts/run_longbench_200.sh" ;;
+  vanilla_hf)   WRAPPER="scripts/run_vanilla_hf.sh" ;;
+  vanilla_fa)   WRAPPER="scripts/run_vanilla_fa.sh" ;;
   eagle3)      WRAPPER="scripts/run_eagle3_qwen3.sh" ;;
   dflash)      WRAPPER="scripts/run_dflash.sh" ;;
+  sssd)       WRAPPER="scripts/run_sssd.sh" ;;
+  fafo)       WRAPPER="scripts/run_fafo.sh" ;;
   llmlingua)   WRAPPER="scripts/run_llmlingua.sh" ;;
   fastkv)      WRAPPER="scripts/run_fastkv.sh" ;;
   rocketkv)    WRAPPER="scripts/run_rocketkv.sh" ;;
@@ -30,7 +35,7 @@ case "$BASELINE" in
   flexprefill)     WRAPPER="scripts/run_flexprefill.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: eagle3 dflash llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill" >&2
+    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill" >&2
     exit 1
     ;;
 esac

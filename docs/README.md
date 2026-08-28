@@ -14,6 +14,8 @@ server.
 |---|---|---|
 | EAGLE-3 | `python3` server / `.venv` mô phỏng | `docs/baselines/eagle3.md` |
 | DFlash | `python3` server / `.venv` mô phỏng | `docs/baselines/dflash.md` |
+| SSSD | `python3` server / `.venv` mô phỏng | `docs/baselines/sssd.md` |
+| FAFO | `python3` server / `.venv` mô phỏng | `docs/baselines/fafo.md` |
 | LLMLingua | `python3` server / `.venv` mô phỏng | `docs/baselines/llmlingua.md` |
 | FastKV | `python3` server / `.venv` mô phỏng | `docs/baselines/fastkv.md` |
 | RocketKV | `python3` server / `.venv` mô phỏng | `docs/baselines/rocketkv.md` |
@@ -24,7 +26,7 @@ server.
 | LongSpec | `python3` server / `.venv` mô phỏng | `docs/baselines/longspec.md` |
 | SpecExtend | `python3` server / `.venv` mô phỏng | `docs/baselines/specextend.md` |
 | HiGOE | `python3` server / `.venv` mô phỏng | `docs/baselines/higoe.md` |
-| semantic_selection | `python3` server / `.venv` mô phỏng | adapter trong `docs/representative_100_benchmark.md` |
+| semantic_selection | `python3` server / `.venv` mô phỏng | adapter trong `docs/longbench_200_benchmark.md` |
 | FlexPrefill | `python3` server / `.venv` mô phỏng | `docs/baselines/flexprefill.md` |
 
 ## Chuẩn bị chung trên server B200
@@ -96,13 +98,52 @@ Mọi script ghi `outputs/<baseline>_*.jsonl` theo schema thống nhất
 - Baseline không sinh text trong smoke probe độc lập (kernel smoke:
   `rocketkv`, `higoe`, `longspec`,
   `magicdec`, `specextend`) không có ROUGE.
+- `sssd` và `fafo` là pipeline upstream tích hợp qua adapter. Do upstream chỉ
+  trả metric aggregate trong mode benchmark, mỗi lần chạy ghi một record
+  aggregate; smoke luôn giới hạn đúng một sample.
 
-## Benchmark baseline có adapter trên representative_100
+## Smoke SSSD và FAFO với Llama 3.1 8B Instruct
 
-Runner + collector strict (tốc độ + ROUGE/BLEU) cho các baseline có adapter đọc
-trực tiếp `data/representative_100`: [docs/representative_100_benchmark.md](representative_100_benchmark.md).
-Các baseline chỉ có kernel/pipeline smoke được tách riêng và không được tính
-vào báo cáo representative nếu chưa có adapter dữ liệu.
+Hai launcher dùng cùng `config/master.path`, cùng interpreter Python 3.12 và
+cùng `DATA_INPUT`. Cấu hình mẫu đã có các namespace `SSSD_*` và `FAFO_*`.
+
+```bash
+export FAST_INFER_MASTER_CONFIG=/workspace/shared_storage/config/fast_infer_master.env
+export MODEL_TARGET=/workspace/shared_storage/model/Llama3.1-8B-Instruct
+export DATA_INPUT=data/representative_100/xsum_representative.jsonl
+export RUN_SAMPLES=1
+export RUN_MAX_NEW_TOKENS=16
+
+bash scripts/run.sh sssd --smoke
+bash scripts/run.sh fafo --smoke
+```
+
+SSSD cần extension native `sssd_speculator`; có thể truyền datastore đã build
+bằng `SSSD_DATASTORE_PATH`. Để chạy SSSD adaptive đặt `SSSD_ADAPTIVE=1`.
+FAFO hỗ trợ `FAFO_KV_METHOD=stream-llm` hoặc `quest`; `FAFO_USE_FLASH=1` chỉ
+dùng khi stack FlashAttention tương thích. Kết quả nằm ở `OUTPUT_FILE` hoặc
+`outputs/<baseline>.jsonl`, còn log/raw result FAFO nằm ở thư mục
+`outputs/fafo_runtime/` tương ứng.
+
+## Benchmark baseline trên bộ canonical LongBench
+
+Schema, lệnh build/validate, prompt task-specific và metric cho bộ 5 task nằm ở
+[`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md). Collector mặc
+định đọc `data/longbench_200`; code-completion dùng exact/edit similarity thay
+cho ROUGE. `data/representative_100` được giữ như dữ liệu legacy để tái hiện
+run cũ.
+
+Runner ma trận chuẩn dùng `scripts/run_longbench_200.sh` và master config:
+
+```bash
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_longbench_200.sh --config /path/to/fast_infer_master.env \
+  --mode smoke --preflight-only
+```
+
+`smoke`, `representative`, `full` tương ứng lần lượt 1 mẫu, 20 mẫu đại diện và
+200 mẫu/dataset; chi tiết output, status và lệnh B200 xem trong
+[`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md).
 
 ## Báo cáo kết quả semantic selection
 

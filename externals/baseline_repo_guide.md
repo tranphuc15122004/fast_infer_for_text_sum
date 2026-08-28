@@ -32,7 +32,9 @@ Document
    └── Long-Context Speculative Decoding
           ├── MagicDec
           ├── LongSpec
-          └── SpecExtend
+          ├── SpecExtend
+          ├── SSSD
+          └── FAFO
 ```
 
 Ngoài ra:
@@ -290,6 +292,29 @@ Draft KV keeps relevant source context
 **Production concern:** cần stress-test batch/concurrency ngoài paper setup.  
 **Priority:** `P0`.
 
+### E4. `SSSD`
+
+**Category:** Model-free retrieval speculative decoding
+**Core idea:** dùng retrieval datastore và speculator native để đề xuất nhánh
+token, sau đó vẫn verify bằng target model.
+
+**Role:** baseline speculative decoding không cần một draft LLM riêng; adapter
+workspace chạy fork SGLang và profile Llama 3.1 8B Instruct một sample.
+**Điều kiện:** CUDA, SGLang fork và extension `sssd_speculator`.
+**Priority:** `P1`.
+
+### E5. `FAFO`
+
+**Category:** Draftless fumble decoding + lossy KV-cache compression
+**Core idea:** giảm KV hoạt động trong quá trình decoding và dùng cơ chế
+draftless của FAFO để tăng throughput.
+
+**Role:** baseline KV/decode orthogonal với EAGLE/DFlash; adapter workspace gọi
+pipeline upstream với `stream-llm` hoặc `quest`.
+**Điều kiện:** CUDA và stack upstream tương thích; profile gốc của repo dùng
+GPU NVIDIA lớn.
+**Priority:** `P1`.
+
 ---
 
 # 3. Infrastructure repository
@@ -348,6 +373,8 @@ Tên nên dùng trong bảng: `Dense AR` hoặc `Full-Context AR`.
 | `MagicDec` | Long-context SD / sparse KV | Decode | Lossless SD | No/light | Very High | P0 |
 | `LongSpec` | Long-context trained SD | Decode | Lossless SD | Yes | Medium–High | P0 |
 | `SpecExtend` | Target-guided long-context SD | Decode | Lossless SD | No | High | P0 |
+| `SSSD` | Retrieval/model-free speculative decoding | Decode | Lossless verification | No draft LLM | High | P1 |
+| `FAFO` | Draftless decoding + lossy KV compression | Decode | Approx./method-specific | No draft LLM | Medium–High | P1 |
 | `SpecForge` | Infrastructure | — | — | — | Infrastructure | — |
 
 ---
@@ -611,13 +638,15 @@ Không giả định gains cộng tuyến tính; phải đo actual E2E interacti
 - [x] SpecExtend
 - [x] SpecForge
 - [x] Speculative Prefill
+- [x] SSSD
+- [x] FAFO
 
 ## Optional additions only if needed
 
 ```text
 FlexPrefill    # second adaptive sparse-attention baseline
 KVTuner        # KV quantization branch
-SSSD/UniSpec   # training-free n-gram SD branch
+UniSpec        # training-free n-gram SD branch khác SSSD
 500xCompressor # learned soft/latent prompt compression
 ```
 
@@ -712,6 +741,7 @@ KV compression                : RocketKV
 Generic learned speculation   : EAGLE
 Alternative parallel drafting : DFlash
 Long-context speculation      : MagicDec, LongSpec, SpecExtend
+Model-free / draftless SD     : SSSD, FAFO
 Infrastructure                : SpecForge
 Production control            : Dense AR (to implement)
 ```

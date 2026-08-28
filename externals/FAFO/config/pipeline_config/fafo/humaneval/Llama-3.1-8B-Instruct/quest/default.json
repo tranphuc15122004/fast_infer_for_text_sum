@@ -1,0 +1,27 @@
+{
+    "pipeline_params": {
+        "fafo": true,
+        "method": "fafo",
+        "kv_cache_method": "quest",
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "cache-dir": "",
+        "level": 9,
+        "window": 25,
+        "num_guesses": 20,
+        "n_new_tokens": 1024,
+        "max_model_len": 128000,
+        "truncation_mode": "middle",
+        "page_size": 32,
+        "top_k": 20,
+        "update_interval": 2,
+        "num_gpus_per_model": 1,
+        "num_gpus_total": 1,
+        "local_rank": 0,
+        "use_tp": false,
+        "use_pp": false,
+        "use_tp_ds": false,
+        "max_gpu_memory": null,
+        "use_flash": false,
+        "do_sample": 0
+    }
+}

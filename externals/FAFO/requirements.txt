@@ -1,0 +1,32 @@
+# Runtime dependencies for FAFO (draftless fumble decoding).
+#
+# 1. Install a PyTorch build matching your CUDA version separately, e.g.
+#      pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+#          --index-url https://download.pytorch.org/whl/cu121
+# 2. Install everything below:
+#      pip install -r requirements.txt
+# 3. Install FastChat and human-eval from source (see README) for the
+#    conversation templates / MT-Bench loading and the HumanEval benchmark.
+
+# --- Core: model + inference ---
+transformers==4.51.3
+tokenizers==0.21.1
+accelerate==0.23.0
+safetensors==0.4.5
+huggingface-hub==0.30.2
+triton==3.1.0
+
+# --- Llama tokenizer ---
+sentencepiece==0.1.99
+protobuf==6.30.2
+
+# --- Data loading ---
+datasets==2.21.0
+numpy==2.0.2
+
+# --- Decoding / flex-attention masking ---
+einops==0.7.0
+
+# --- Utility ---
+tqdm==4.67.1
+shortuuid==1.0.13

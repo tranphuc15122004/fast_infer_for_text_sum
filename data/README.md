@@ -1,5 +1,77 @@
 # Plug-and-play dữ liệu cho các baseline
 
+## Bộ canonical LongBench 1.000 mẫu
+
+Bộ test chính thức của repo nằm ở `data/longbench_200/`, gồm năm file JSONL:
+
+| File | Loại | Số mẫu |
+|---|---|---:|
+| `gov_report.jsonl` | summarization | 200 |
+| `qmsum.jsonl` | summarization/query | 200 |
+| `multi_news.jsonl` | summarization | 200 |
+| `lcc.jsonl` | code completion | 200 |
+| `repobench-p.jsonl` | code completion | 200 |
+
+`manifest.json` lưu seed, tokenizer, source count, token statistics, danh sách
+ID và checksum của từng file. Nguồn LongBench được mirror local; builder không
+tải internet.
+
+Schema chung của mỗi record:
+
+```json
+{
+  "id": "lcc_4e5c...",
+  "dataset": "lcc",
+  "source_split": "test",
+  "source_index": 37,
+  "task_type": "code_completion",
+  "context": "...",
+  "input": "...",
+  "answers": ["..."],
+  "reference_output": "...",
+  "input_tokens": 1234,
+  "length_bin": 3
+}
+```
+
+Prompt chính thức được render từ `scripts/common/longbench_prompts.json` ở lúc load;
+raw record không gắn chết prompt của một baseline. `input_tokens` là độ dài
+prompt sau render bằng tokenizer Llama 3.1 đã dùng để build. LCC và RepoBench-P
+được chọn 40 mẫu trong mỗi 5 bin độ dài.
+
+Build lại từ mirror local:
+
+```bash
+python scripts/build_longbench_200.py \
+  --source-dir /path/to/LongBench \
+  --tokenizer /path/to/Meta-Llama-3.1-8B-Instruct \
+  --output-dir data/longbench_200 \
+  --seed 42
+python scripts/validate_longbench_200.py \
+  --data-dir data/longbench_200 --expected-count 200
+```
+
+Để xem nhanh cấu trúc và nội dung mẫu của cả năm dataset:
+
+```bash
+python scripts/show_longbench_200.py --samples 1
+```
+
+Có thể giới hạn dataset và độ dài preview, ví dụ:
+
+```bash
+python scripts/show_longbench_200.py \
+  --dataset lcc --dataset repobench-p \
+  --samples 2 --context-chars 300 --field-chars 160
+```
+
+Khi đánh giá, dùng `DATA_INPUT=data/longbench_200/<dataset>.jsonl`. Loader
+chung tự render prompt từ `dataset/context/input`; reference chung là
+`reference_output`. Ba task summarization dùng ROUGE/BLEU; hai task code
+completion dùng `code_exact_match` và `code_edit_similarity`, không dùng ROUGE.
+
+## Dữ liệu tùy biến
+
 Để chạy một baseline với **dữ liệu của bạn**, chỉ cần bỏ file jsonl vào thư mục
 này và trỏ `DATA_FILE` trong `config/<baseline>.env` tới file đó:
 
@@ -63,7 +135,8 @@ output_tokens, selector_latency_ms, ttft/e2e_ms, throughput_tok_s, ... + bản
 
 ## Trích tập mẫu đại diện
 
-Sau khi có các file normalized trong `data/normalized/`, có thể trích khoảng
+`data/representative_100/` là bộ legacy 4 dataset, chỉ dùng để tái hiện các run
+cũ. Sau khi có các file normalized trong `data/normalized/`, có thể trích khoảng
 100 mẫu cho mỗi dataset bằng:
 
 ```bash

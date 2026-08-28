@@ -96,47 +96,79 @@ def main() -> None:
         line.strip() for line in stdout.splitlines()
         if line.strip() and "Generated " in line and " tokens in " in line
     ]
-    got_output = bool(result_lines)
-    generated_tokens = None
-    if result_lines:
-        match = re.search(r"Generated\s+(\d+)\s+tokens", result_lines[-1])
+    source_rows = [
+        json.loads(line)
+        for line in input_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    parsed_results: list[tuple[int, float]] = []
+    for line in result_lines:
+        match = re.search(
+            r"Generated\s+(\d+)\s+tokens\s+in\s+([0-9.eE+-]+)s", line
+        )
         if match:
-            generated_tokens = int(match.group(1))
-
+            parsed_results.append((int(match.group(1)), float(match.group(2))))
+    got_output = bool(parsed_results)
     writer = io_util.JsonlWriter(Path(args.output))
-    record = {
-        "method": "specextend_eagle" if args.script == "run_eagle.py"
-        else "specextend_classic",
-        "dataset": Path(args.input_file).name,
-        "model": args.base_model or args.model_name,
-        "draft_model": args.draft_model,
-        "model_name": args.model_name,
-        "script": args.script,
-        "max_input_tokens": args.max_input_tokens,
-        "smoke": args.smoke,
-        "input_tokens": None,
-        "retained_tokens": None,
-        "output_tokens": generated_tokens,
-        "batch_size": 1,
-        "selector_latency_ms": None,
-        "ttft_ms": None,
-        "tpot_ms": None,
-        "e2e_ms": None,
-        "throughput_tok_s": None,
-        "qps": None,
-        "peak_memory_gb": None,
-        "returncode": proc.returncode,
-        "result_lines": result_lines[:3],
-        "log_tail": log[-2000:],
-    }
-    writer.add(record)
+    method = "specextend_eagle" if args.script == "run_eagle.py" else "specextend_classic"
+    for index, (generated_tokens, elapsed_s) in enumerate(parsed_results):
+        source = source_rows[index] if index < len(source_rows) else {}
+        elapsed_ms = round(elapsed_s * 1000.0, 3)
+        writer.add({
+            "method": method,
+            "dataset": Path(args.input_file).stem,
+            "model": args.base_model or args.model_name,
+            "draft_model": args.draft_model,
+            "model_name": args.model_name,
+            "script": args.script,
+            "task_type": source.get("task_type"),
+            "sample_id": source.get("id", index),
+            "reference_output": source.get("reference"),
+            "scope": "sample",
+            "status": "success" if proc.returncode == 0 else "failed",
+            "measurement_scope": "decode_only",
+            "max_input_tokens": args.max_input_tokens,
+            "smoke": args.smoke,
+            "input_tokens": None,
+            "retained_tokens": None,
+            "output_tokens": generated_tokens,
+            "batch_size": 1,
+            "selector_latency_ms": None,
+            "ttft_ms": None,
+            "prefill_ms": None,
+            "decode_ms": elapsed_ms,
+            "tpot_ms": round(elapsed_ms / generated_tokens, 3) if generated_tokens else None,
+            "e2e_ms": None,
+            "throughput_tok_s": round(generated_tokens / elapsed_s, 3) if elapsed_s > 0 else None,
+            "decode_throughput_tok_s": round(generated_tokens / elapsed_s, 3) if elapsed_s > 0 else None,
+            "qps": None,
+            "peak_memory_gb": None,
+            "returncode": proc.returncode,
+            "result_lines": result_lines[index:index + 1],
+            "log_tail": log[-2000:],
+        })
+    if not parsed_results:
+        writer.add({
+            "method": method,
+            "dataset": Path(args.input_file).stem,
+            "model": args.base_model or args.model_name,
+            "draft_model": args.draft_model,
+            "scope": "aggregate",
+            "sample_ids": [row.get("id", index) for index, row in enumerate(source_rows)],
+            "status": "failed",
+            "reason": "SpecExtend emitted no parseable generation timing line",
+            "returncode": proc.returncode,
+            "result_lines": result_lines[:3],
+            "log_tail": log[-2000:],
+        })
 
     checks: list[tuple[bool, str]] = [
         (proc.returncode == 0, f"process exit code = {proc.returncode}"),
         (got_output, f"generated result line(s): {len(result_lines)}"),
     ]
-    summary = {"type": "summary", "method": record["method"],
-               "returncode": proc.returncode, "got_output": got_output}
+    summary = {"type": "summary", "method": method,
+               "returncode": proc.returncode, "got_output": got_output,
+               "num_samples": len(parsed_results)}
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))
     print(f"Saved to: {args.output}")

@@ -1,0 +1,10 @@
+__pycache__
+*.egg-info
+.DS_Store
+output
+.vscode/
+.claude/
+
+# experiment outputs and core dumps
+results/
+core

@@ -138,6 +138,7 @@ def _run_representative(args: argparse.Namespace) -> None:
         record = {
             "method": "longspec",
             "dataset": "data-file",
+            "task_type": sample.get("raw", {}).get("task_type"),
             "model": target_model,
             "draft_model": draft_model,
             "model_name": args.model_name,
@@ -172,7 +173,10 @@ def _run_representative(args: argparse.Namespace) -> None:
             "verified_tokens": int(verified),
             "avg_accept_length": round(float(accepted) / max(int(verified), 1), 4),
         }
-        rouge.add_rouge(record, text, sample.get("reference"))
+        if record["task_type"] == "code_completion":
+            metrics.add_code_completion(record, text, sample.get("reference"))
+        else:
+            rouge.add_rouge(record, text, sample.get("reference"))
         writer.add(record)
         print(
             f"[sample {sample['id']}] longspec={tree_e2e_ms:.1f}ms "
@@ -181,13 +185,18 @@ def _run_representative(args: argparse.Namespace) -> None:
         checks.append(verify.check_new_tokens(n_tok))
         checks.append(verify.check_output_text(text))
 
+    quality = (
+        metrics.aggregate_code_completion(writer.records)
+        if any(r.get("task_type") == "code_completion" for r in writer.records)
+        else rouge.aggregate_rouge(writer.records)
+    )
     summary = {
         "type": "summary",
         "method": "longspec",
         "num_samples": len(records),
         "model_name": args.model_name,
         "speedup": metrics.aggregate_speedup(writer.records),
-        **rouge.aggregate_rouge(writer.records),
+        **quality,
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

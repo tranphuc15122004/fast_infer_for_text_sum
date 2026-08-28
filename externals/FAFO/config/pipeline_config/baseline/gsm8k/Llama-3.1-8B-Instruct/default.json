@@ -1,0 +1,17 @@
+{
+    "pipeline_params": {
+        "fafo": false,
+        "method": "baseline",
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "n_new_tokens": 1024,
+        "num_gpus_per_model": 1,
+        "num_gpus_total": 1,
+        "local_rank": 0,
+        "use_tp": false,
+        "use_pp": false,
+        "use_tp_ds": false,
+        "use_flash": false,
+        "max_gpu_memory": null,
+        "do_sample": 0
+    }
+}

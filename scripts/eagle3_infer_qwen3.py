@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from eagle.model.ea_model import EaModel  # noqa: E402
 from eagle.model.kv_cache import initialize_past_key_values  # noqa: E402
 
-from common import rouge  # noqa: E402
+from common import metrics, rouge  # noqa: E402
 
 
 def load_questions(question_file: Path, begin: int, end: int) -> list[dict]:
@@ -260,6 +260,10 @@ def main() -> None:
                     "choice": choice,
                     "question": prompt,
                     "answer": answer,
+                    "text": answer,
+                    "reference_output": question.get("answer") or question.get("reference"),
+                    "task_type": question.get("task_type"),
+                    "status": "success",
                     "new_tokens": new_tokens,
                     "tree_steps": tree_steps,
                     "accept_length": round(accept_length, 4),
@@ -276,11 +280,11 @@ def main() -> None:
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
                 }
-                # ROUGE-1/2/L vs reference (nếu question file có reference/answer)
-                rouge.add_rouge(
-                    record, answer,
-                    question.get("reference") or question.get("answer"),
-                )
+                reference = question.get("reference") or question.get("answer")
+                if record["task_type"] == "code_completion":
+                    metrics.add_code_completion(record, answer, reference)
+                else:
+                    rouge.add_rouge(record, answer, reference)
                 records.append(record)
                 raw_metrics.append({
                     "eagle_tokens": new_tokens,
@@ -348,6 +352,11 @@ def main() -> None:
     ]
     accept_lengths = [r["accept_length"] for r in raw_metrics]
 
+    quality = (
+        metrics.aggregate_code_completion(records)
+        if any(r.get("task_type") == "code_completion" for r in records)
+        else rouge.aggregate_rouge(records)
+    )
     summary = {
         "type": "summary",
         "num_questions": len(questions),
@@ -367,7 +376,7 @@ def main() -> None:
                         if naive_throughput is not None else None),
         "decoding_speedup": (round(speedup, 3) if speedup is not None else None),
         "mean_speedup": (round(statistics.mean(speedups), 3) if speedups else None),
-        **rouge.aggregate_rouge(records),
+        **quality,
     }
     with output.open("a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Thu thập + tổng hợp toàn bộ metric (tốc độ + semantic) từ các run baseline
-trên data/representative_100.
+"""Thu thập + tổng hợp toàn bộ metric (tốc độ + task-aware quality) từ các run
+baseline trên bộ dữ liệu canonical.
 
-Input : outputs/representative_100/<baseline>_<dataset>.jsonl (schema §13,
-        do scripts/run_representative_100.sh sinh ra; cũng chấp nhận 1 file).
-Data  : data/representative_100/<dataset>_representative.jsonl — join reference
-        theo record id (doc_id/sample_id/question_id/id) để tính metric semantic.
+Input : outputs/longbench_200/<baseline>_<dataset>.jsonl (schema §13,
+        hoặc file output đơn lẻ; vẫn tương thích hậu tố legacy).
+Data  : data/longbench_200/<dataset>.jsonl — join reference/task type theo
+        record id (doc_id/sample_id/question_id/id).
 Output: metrics_summary.json (đầy đủ) + metrics_summary.csv (bảng rộng)
         + metrics_summary.md (báo cáo đọc được) trong --outputs-dir.
 
@@ -20,8 +20,8 @@ Paired speedup (ratio of means, dense/reference divided by method):
   These are emitted only when both sides of the timing pair are present.
 
 Metric semantic (mean, theo từng text key có trong record):
-  ROUGE-1/2/L P/R/F, ROUGE-Lsum, BLEU-1..4, length_ratio
-  (common/metrics.py; "base_" prefix cho dense baseline của GemFilter).
+  ROUGE/BLEU cho summarization; normalized exact match/edit similarity cho
+  code completion (common/metrics.py; "base_" prefix cho dense baseline).
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ from typing import Sequence
 from common import io_util, metrics
 from common.paths import ROOT
 
-DEFAULT_OUTPUTS_DIR = ROOT / "outputs" / "representative_100"
-DEFAULT_DATA_DIR = ROOT / "data" / "representative_100"
+DEFAULT_OUTPUTS_DIR = ROOT / "outputs" / "longbench_200"
+DEFAULT_DATA_DIR = ROOT / "data" / "longbench_200"
 
 # Thứ tự các text key trong record; prefix semantic tương ứng.
 TEXT_KEYS = [
@@ -48,12 +48,98 @@ TEXT_KEYS = [
 ]
 
 
+def _jsonl_records(path: Path) -> list[dict]:
+    """Read JSON objects from one output file, skipping blank lines."""
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
+
+
+def load_run_records(run_dir: Path) -> dict:
+    """Load a nested orchestrator run and report coverage separately.
+
+    A run may contain successful rows, one status row per source sample, and a
+    final summary row.  Status rows are retained for auditability but are never
+    treated as timing observations by :func:`aggregate_run_group`.
+    """
+    run_dir = Path(run_dir)
+    records: list[dict] = []
+    files: list[str] = []
+    coverage = {
+        "success": 0,
+        "preflight_only": 0,
+        "unsupported_cpu": 0,
+        "unsupported_dataset": 0,
+        "missing_dependency": 0,
+        "missing_checkpoint": 0,
+        "failed": 0,
+        "timeout": 0,
+        "other": 0,
+    }
+    for path in sorted(run_dir.rglob("*.jsonl")) if run_dir.is_dir() else [run_dir]:
+        if path.parent.name in {"inputs", "logs"}:
+            continue
+        rows = _jsonl_records(path)
+        if not rows:
+            continue
+        files.append(str(path))
+        for row in rows:
+            if row.get("type") == "summary":
+                continue
+            records.append(row)
+            status = row.get("status")
+            if status is None:
+                status = "success" if row.get("e2e_ms") is not None else "other"
+            if status in coverage:
+                coverage[status] += 1
+            else:
+                coverage["other"] += 1
+    return {"records": records, "coverage": coverage, "files": files}
+
+
+def aggregate_run_group(records: Sequence[dict]) -> dict:
+    """Aggregate one method/dataset group using task-aware quality metrics."""
+    successful = [r for r in records if r.get("status", "success") == "success"]
+    speed = metrics.aggregate_speed(successful)
+    task_types = {r.get("task_type") for r in successful if r.get("task_type")}
+    is_code = "code_completion" in task_types
+    quality_records: list[dict] = []
+    for source in successful:
+        row = dict(source)
+        hypothesis = row.get("text") or row.get("answer")
+        reference = row.get("reference_output") or row.get("reference")
+        if not isinstance(hypothesis, str) or not isinstance(reference, str):
+            continue
+        if is_code:
+            metrics.add_code_completion(row, hypothesis, reference)
+        else:
+            metrics.add_semantic(row, hypothesis, reference)
+        quality_records.append(row)
+    if is_code:
+        quality = metrics.aggregate_code_completion(quality_records)
+    else:
+        quality = metrics.aggregate_semantic(quality_records)
+    return {
+        "num_records": len(records),
+        "successful_records": len(successful),
+        "speed": speed,
+        "quality": quality,
+    }
+
+
 def load_data_index(data_dir: Path) -> tuple[list[str], dict[str, dict]]:
     """{dataset_name: {record_id: {"reference": .., "document": ..}}}."""
     datasets: list[str] = []
     index: dict[str, dict] = {}
-    for f in sorted(data_dir.glob("*_representative.jsonl")):
-        name = f.name.removesuffix("_representative.jsonl")
+    for f in sorted(data_dir.glob("*.jsonl")):
+        name = f.name.removesuffix(".jsonl")
+        if name.endswith("_representative"):
+            name = name.removesuffix("_representative")
         datasets.append(name)
         by_id: dict = {}
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -63,8 +149,14 @@ def load_data_index(data_dir: Path) -> tuple[list[str], dict[str, dict]]:
             rid = rec.get("id")
             if rid is not None:
                 by_id[str(rid)] = {
-                    "reference": rec.get("reference") or rec.get("summary") or rec.get("answer"),
+                    "reference": (
+                        rec.get("reference")
+                        or rec.get("reference_output")
+                        or rec.get("summary")
+                        or rec.get("answer")
+                    ),
                     "document": rec.get("document") or rec.get("text") or "",
+                    "task_type": rec.get("task_type"),
                 }
         index[name] = by_id
     return datasets, index
@@ -105,25 +197,35 @@ def validate_completeness(
     errors: list[str] = []
     for baseline in expected_baselines:
         for dataset in expected_datasets:
-            path = outputs_dir / f"{baseline}_{dataset}.jsonl"
-            if not path.is_file():
-                errors.append(f"missing output: {path.name}")
+            candidates = [outputs_dir / f"{baseline}_{dataset}.jsonl"]
+            if outputs_dir.is_dir():
+                candidates.extend(
+                    path
+                    for path in outputs_dir.rglob(f"{dataset}.jsonl")
+                    if path.parent.name == baseline
+                )
+            paths = list(dict.fromkeys(path for path in candidates if path.is_file()))
+            if not paths:
+                errors.append(f"missing output: {baseline}_{dataset}.jsonl")
                 continue
 
             records = [
-                json.loads(line)
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            records = [
-                r for r in records
-                if r.get("type") not in ("summary", "longspec_full")
+                row
+                for path in paths
+                for row in _jsonl_records(path)
+                if row.get("type") not in ("summary", "longspec_full")
+                and row.get("status", "success") == "success"
             ]
             ids = {rid for r in records if (rid := record_id(r)) is not None}
             observed = len(ids) if ids else len(records)
+            aggregate_coverage = max(
+                (len(r.get("sample_ids", [])) for r in records if r.get("scope") == "aggregate"),
+                default=0,
+            )
+            observed = max(observed, aggregate_coverage)
             if observed != expected_samples:
                 errors.append(
-                    f"{path.name}: {observed}/{expected_samples} unique samples"
+                    f"{paths[0].name}: {observed}/{expected_samples} unique samples"
                 )
     return errors
 
@@ -183,7 +285,11 @@ def normalize_record(record: dict, fallback_method: str) -> dict:
     # fields used by aggregate_speedup().
     if out.get("dense_e2e_ms") is None and out.get("base_time_s") is not None:
         out["dense_e2e_ms"] = float(out["base_time_s"]) * 1000.0
-    if out.get("dense_e2e_ms") is None and out.get("naive_time") is not None:
+    if (
+        out.get("measurement_scope") != "decode_only"
+        and out.get("dense_e2e_ms") is None
+        and out.get("naive_time") is not None
+    ):
         # EAGLE's benchmark is decode-only, so naive_time is its dense decode
         # and end-to-end reference in the same measurement domain.
         out["dense_e2e_ms"] = float(out["naive_time"]) * 1000.0
@@ -192,7 +298,11 @@ def normalize_record(record: dict, fallback_method: str) -> dict:
 
     if out.get("decode_ms") is None and out.get("eagle_time") is not None:
         out["decode_ms"] = float(out["eagle_time"]) * 1000.0
-    if out.get("e2e_ms") is None and out.get("eagle_time") is not None:
+    if (
+        out.get("measurement_scope") != "decode_only"
+        and out.get("e2e_ms") is None
+        and out.get("eagle_time") is not None
+    ):
         out["e2e_ms"] = float(out["eagle_time"]) * 1000.0
     if out.get("output_tokens") is None and out.get("new_tokens") is not None:
         out["output_tokens"] = out["new_tokens"]
@@ -237,22 +347,28 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
     speed = metrics.aggregate_speed(records)
     spec = metrics.aggregate_speculative(records)
     joined = 0
+    code_group = False
     for r in records:
         rid = record_id(r)
-        ref = (
-            data_index.get(rid, {}).get("reference") if rid else None
-        ) or r.get("reference")
+        data_entry = data_index.get(rid, {}) if rid else {}
+        task_type = data_entry.get("task_type") or r.get("task_type")
+        code_group = code_group or task_type == "code_completion"
+        ref = data_entry.get("reference") or r.get("reference")
         if not ref:
             continue
         joined += 1
         for prefix, text in extract_hypotheses(r):
-            metrics.add_semantic(r, text, ref, prefix=prefix)
+            if task_type == "code_completion":
+                metrics.add_code_completion(r, text, ref, prefix=prefix)
+            else:
+                metrics.add_semantic(r, text, ref, prefix=prefix)
 
     semantic: dict = {}
-    for prefix in ("", "base_"):
-        agg = metrics.aggregate_semantic(records, prefix=prefix)
-        if agg:
-            semantic.update(agg)
+    if not code_group:
+        for prefix in ("", "base_"):
+            agg = metrics.aggregate_semantic(records, prefix=prefix)
+            if agg:
+                semantic.update(agg)
 
     group: dict = {
         "num_records": len(records),
@@ -267,6 +383,9 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
         group["speedup"] = speedup
     if semantic:
         group["semantic"] = semantic
+    code_completion = metrics.aggregate_code_completion(records)
+    if code_completion:
+        group["code_completion"] = code_completion
     return group
 
 
@@ -277,19 +396,34 @@ def load_output_files(outputs_dir: Path, datasets: list[str]) -> list[tuple[str,
     đây là nguồn dataset đáng tin cậy hơn record["dataset"] (nhiều baseline
     ghi hằng số "data-file").
     """
-    files = sorted(outputs_dir.glob("*.jsonl")) if outputs_dir.is_dir() else [outputs_dir]
+    if outputs_dir.is_dir():
+        files = sorted(outputs_dir.glob("*.jsonl"))
+        if not files:
+            # New orchestrator layout:
+            # outputs/<run_id>/<baseline>/<dataset>.jsonl.  Conversion inputs
+            # and logs are deliberately excluded.
+            files = sorted(
+                path
+                for path in outputs_dir.rglob("*.jsonl")
+                if path.parent.name not in {"inputs", "logs"}
+                and path.stem in datasets
+            )
+    else:
+        files = [outputs_dir]
     out: list[tuple[str, str, list[dict]]] = []
     for f in files:
-        rows = [
-            json.loads(line)
-            for line in f.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        rows = _jsonl_records(f)
         records = [r for r in rows if r.get("type") not in ("summary", "longspec_full")]
         if not records:
             continue
-        _m, file_ds = detect_method_dataset(f.stem, datasets)
-        out.append((f.stem, file_ds or "", records))
+        if f.stem in datasets and f.parent.name not in {"", outputs_dir.name}:
+            # Nested runner file: its parent is the baseline name.  Include
+            # both names in the synthetic stem for the existing fallback
+            # method/dataset resolution below.
+            out.append((f"{f.parent.name}_{f.stem}", f.stem, records))
+        else:
+            _m, file_ds = detect_method_dataset(f.stem, datasets)
+            out.append((f.stem, file_ds or "", records))
     return out
 
 
@@ -299,7 +433,7 @@ def main() -> None:
                         help="thư mục chứa outputs/<baseline>_<dataset>.jsonl "
                              "(hoặc 1 file jsonl)")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
-                        help="thư mục data/representative_100 (để join reference)")
+                        help="thư mục canonical JSONL (để join reference)")
     parser.add_argument("--out", type=Path, default=None,
                         help="đường dẫn metrics_summary.json "
                              "(mặc định <outputs-dir>/metrics_summary.json)")
@@ -490,7 +624,7 @@ def _fmt(value, key: str = "mean") -> str:
 
 def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
     md: list[str] = [
-        "# Benchmark representative_100 — tổng hợp metric",
+        "# Benchmark LongBench canonical — tổng hợp metric",
         "",
         f"- Outputs: {result['outputs_dir']}",
         f"- Datasets: {', '.join(datasets)}",

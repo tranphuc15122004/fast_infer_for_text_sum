@@ -180,6 +180,80 @@ fast_infer__load_common() {
   fi
 }
 
+fast_infer__load_longbench() {
+  # LongBench deliberately has its own directory namespace.  Do not inherit
+  # DATA_INPUT/OUTPUT_ROOT here: those variables may still point to the legacy
+  # representative_100 experiment and are files/single-run outputs rather
+  # than the canonical LongBench directory.
+  fast_infer_default_from LONG_BENCH_DATA_FILE DATA_INPUT
+  fast_infer_default_from LONG_BENCH_OUTPUT_FILE OUTPUT_FILE
+  fast_infer_default_from LONG_BENCH_OUTPUT_DIR
+  fast_infer_default_from LONG_BENCH_MODEL MODEL_TARGET
+  fast_infer_default_from LONG_BENCH_DEVICE FI_DEVICE
+  fast_infer_default_from LONG_BENCH_GPU_IDS FI_GPU_IDS
+  fast_infer_default_from LONG_BENCH_DTYPE DTYPE
+  fast_infer_default_from LONG_BENCH_BASELINES
+  fast_infer_default_from LONG_BENCH_DATASETS
+  fast_infer_default_from LONG_BENCH_MODE RUN_MODE
+  fast_infer_default_from LONG_BENCH_SMOKE_SAMPLES
+  fast_infer_default_from LONG_BENCH_REPRESENTATIVE_SAMPLES
+  fast_infer_default_from LONG_BENCH_FULL_SAMPLES
+  fast_infer_default_from LONG_BENCH_REPRESENTATIVE_DATASETS
+  fast_infer_default_from LONG_BENCH_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from LONG_BENCH_SMOKE_MAX_NEW_TOKENS
+  fast_infer_default_from LONG_BENCH_TEMPERATURE RUN_TEMPERATURE
+  fast_infer_default_from LONG_BENCH_WARMUP_RUNS
+  fast_infer_default_from LONG_BENCH_SEED SEMANTIC_RANDOM_SEED
+  fast_infer_default_from LONG_BENCH_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS
+  fast_infer_default_from LONG_BENCH_LOCAL_FILES_ONLY
+  fast_infer_default_from LONG_BENCH_TIMEOUT_SECONDS B200_TIMEOUT_SECONDS
+  fast_infer_default_from LONG_BENCH_STRICT
+
+  fast_infer_default_from LONG_BENCH_EAGLE_MODEL MODEL_EAGLE_DRAFT
+  fast_infer_default_from LONG_BENCH_DFLASH_MODEL MODEL_DFLASH_DRAFT
+  fast_infer_default_from LONG_BENCH_LONGSPEC_TARGET_MODEL MODEL_LONGSPEC_TARGET MODEL_TARGET
+  fast_infer_default_from LONG_BENCH_LONGSPEC_DRAFT_MODEL MODEL_LONGSPEC_DRAFT
+  fast_infer_default_from LONG_BENCH_SPECEXTEND_DRAFT_MODEL MODEL_EAGLE_DRAFT MODEL_SPEC_DRAFT
+  fast_infer_default_from LONG_BENCH_SSSD_DATASTORE_PATH SSSD_DATASTORE_PATH
+  fast_infer_default_from LONG_BENCH_MAGICDEC_MODEL_PTH CHECKPOINT_MAGICDEC
+  fast_infer_default_from LONG_BENCH_MAGICDEC_MODEL_NAME MODEL_TARGET MODEL_MAGICDEC_NAME
+  fast_infer_default_from LONG_BENCH_FAFO_KV_METHOD FAFO_KV_METHOD
+  fast_infer_default_from LONG_BENCH_LONGSPEC_MODEL_NAME LONGSPEC_MODEL_NAME
+  fast_infer_default_from LONG_BENCH_SPECEXTEND_MODEL_NAME SPECEXTEND_MODEL_NAME
+  fast_infer_default_from LONG_BENCH_EAGLE_TOTAL_TOKEN EAGLE_TOTAL_TOKENS
+  fast_infer_default_from LONG_BENCH_EAGLE_DEPTH EAGLE_DEPTH
+  fast_infer_default_from LONG_BENCH_EAGLE_TOP_K EAGLE_TOP_K
+
+  fast_infer_default LONG_BENCH_DATA_DIR "data/longbench_200"
+  fast_infer_default LONG_BENCH_OUTPUT_DIR "outputs/longbench_200"
+  fast_infer_default LONG_BENCH_MODEL "${MODEL_TARGET:-}"
+  fast_infer_default LONG_BENCH_DEVICE "${FI_DEVICE:-cuda}"
+  fast_infer_default LONG_BENCH_GPU_IDS "${FI_GPU_IDS:-0}"
+  fast_infer_default LONG_BENCH_DTYPE "bfloat16"
+  fast_infer_default LONG_BENCH_BASELINES "vanilla_hf vanilla_fa magicdec longspec eagle3 dflash specextend sssd fafo"
+  fast_infer_default LONG_BENCH_DATASETS "gov_report qmsum multi_news lcc repobench-p"
+  fast_infer_default LONG_BENCH_MODE "smoke"
+  fast_infer_default LONG_BENCH_SMOKE_SAMPLES "1"
+  fast_infer_default LONG_BENCH_REPRESENTATIVE_SAMPLES "20"
+  fast_infer_default LONG_BENCH_FULL_SAMPLES "200"
+  fast_infer_default LONG_BENCH_REPRESENTATIVE_DATASETS "gov_report lcc"
+  fast_infer_default LONG_BENCH_MAX_NEW_TOKENS "64"
+  fast_infer_default LONG_BENCH_SMOKE_MAX_NEW_TOKENS "8"
+  fast_infer_default LONG_BENCH_TEMPERATURE "0"
+  fast_infer_default LONG_BENCH_WARMUP_RUNS "3"
+  fast_infer_default LONG_BENCH_SEED "42"
+  fast_infer_default LONG_BENCH_MAX_INPUT_TOKENS "0"
+  fast_infer_default LONG_BENCH_LOCAL_FILES_ONLY "1"
+  fast_infer_default LONG_BENCH_TIMEOUT_SECONDS "900"
+  fast_infer_default LONG_BENCH_STRICT "1"
+  fast_infer_default LONG_BENCH_EAGLE_TOTAL_TOKEN "32"
+  fast_infer_default LONG_BENCH_EAGLE_DEPTH "8"
+  fast_infer_default LONG_BENCH_EAGLE_TOP_K "4"
+  fast_infer_default LONG_BENCH_LONGSPEC_MODEL_NAME "llama8b"
+  fast_infer_default LONG_BENCH_SPECEXTEND_MODEL_NAME "llama3_1_8b"
+  fast_infer_default LONG_BENCH_MAGICDEC_MODEL_NAME "${MODEL_TARGET:-}"
+}
+
 fast_infer__load_dflash() {
   fast_infer_default_from TARGET_MODEL MODEL_TARGET
   fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT
@@ -194,6 +268,29 @@ fast_infer__load_dflash() {
   fast_infer_default_from DATASET DFLASH_DATASET
   fast_infer_default_from SMOKE_MAX_SAMPLES DFLASH_SMOKE_SAMPLES
   fast_infer_default_from SMOKE_MAX_NEW_TOKENS DFLASH_SMOKE_NEW_TOKENS
+}
+
+fast_infer__load_sssd() {
+  fast_infer_default_from MODEL SSSD_MODEL MODEL_TARGET
+  fast_infer_default_from DATA_FILE SSSD_DATA_FILE DATA_INPUT
+  fast_infer_default_from DATASTORE_PATH SSSD_DATASTORE_PATH
+  fast_infer_default_from MAX_SAMPLES SSSD_MAX_SAMPLES RUN_SAMPLES
+  fast_infer_default_from MAX_NEW_TOKENS SSSD_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from NUM_DRAFT_TOKENS SSSD_NUM_DRAFT_TOKENS
+  fast_infer_default_from NUM_STEPS SSSD_NUM_STEPS
+  fast_infer_default_from TOPK SSSD_TOPK
+  fast_infer_default_from ADAPTIVE SSSD_ADAPTIVE
+  fast_infer_default_from OUTPUT_FILE SSSD_OUTPUT_FILE
+}
+
+fast_infer__load_fafo() {
+  fast_infer_default_from MODEL FAFO_MODEL MODEL_TARGET
+  fast_infer_default_from DATA_FILE FAFO_DATA_FILE DATA_INPUT
+  fast_infer_default_from MAX_SAMPLES FAFO_MAX_SAMPLES RUN_SAMPLES
+  fast_infer_default_from MAX_NEW_TOKENS FAFO_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from KV_METHOD FAFO_KV_METHOD
+  fast_infer_default_from USE_FLASH FAFO_USE_FLASH
+  fast_infer_default_from OUTPUT_FILE FAFO_OUTPUT_FILE
 }
 
 fast_infer__load_eagle3() {
@@ -382,7 +479,9 @@ fast_infer_load_config() {
   fast_infer_load_master || return 1
 
   case "$baseline" in
+    longbench) fast_infer__load_longbench ;;
     dflash) fast_infer__load_dflash ;;
+    fafo) fast_infer__load_fafo ;;
     eagle3) fast_infer__load_eagle3 ;;
     fastkv) fast_infer__load_fastkv ;;
     flexprefill) fast_infer__load_flexprefill ;;
@@ -395,6 +494,7 @@ fast_infer_load_config() {
     qwen3_long_profile) fast_infer__load_qwen3_long_profile ;;
     rocketkv) fast_infer__load_rocketkv ;;
     semantic_selection) fast_infer__load_semantic_selection ;;
+    sssd) fast_infer__load_sssd ;;
     specextend) fast_infer__load_specextend ;;
     specprefill) fast_infer__load_specprefill ;;
     *)

@@ -1,0 +1,3 @@
+[submodule "sssd_speculator"]
+	path = sssd_speculator
+	url = https://github.com/huawei-csl/sssd_speculator

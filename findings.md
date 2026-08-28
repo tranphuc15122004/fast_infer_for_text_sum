@@ -1,247 +1,68 @@
-# Findings — bổ sung baseline representative_100
+# Findings & Decisions
 
-- `externals/` có các baseline/repo: EAGLE, FastKV, GemFilter, HiGOE,
-  LLMLingua, LongSpec, MInference, MagicDec, RocketKV, Sematic_selection,
-  SpecExtend, SpecForge, dflash, speculative_prefill.
-- Dispatcher hiện đã nối 12 baseline: `eagle3`, `dflash`, `llmlingua`,
-  `fastkv`, `rocketkv`, `gemfilter`, `specprefill`, `minference`, `magicdec`,
-  `longspec`, `specextend`, `higoe`.
-- Runner hiện mặc định chỉ chạy 7 baseline đọc `DATA_FILE`; 5 baseline còn lại
-  chỉ chạy với `--include-unsupported`.
-- `Sematic_selection/infer.py` nhận JSONL `document/reference`, dùng Qwen3-4B,
-  các selector `random lead tfidf textrank mmr`, và tự ghi output JSONL cùng
-  summary JSON.
-- `SpecForge` là infrastructure theo `externals/baseline_repo_guide.md`,
-  không có wrapper inference riêng.
-- DFlash dùng dataset GSM8K trong config gốc, không tương thích trực tiếp với
-  `representative_100` summarization; cần giữ đường chạy smoke riêng hoặc
-  adapter data được xác định rõ.
-- Runner mới mặc định gồm 8 baseline đọc dữ liệu/dataset và 5 baseline smoke-only;
-  tổng cộng 13 tên baseline inference.
-- `SpecForge` vẫn bị loại khỏi runner vì không có wrapper inference độc lập.
-- Collector chuẩn hóa schema semantic-selection: `example_id` → `doc_id`,
-  `original_tokens`/`selected_tokens` → schema input/retained, và nhóm method
-  theo từng selector.
+## Requirements
+- Xây bộ test mới thay cho `data/representative_100`.
+- Các baseline phải dùng cùng một tập request cố định, có ID canonical.
+- Chuẩn hóa dữ liệu về một format chung để thuận tiện đánh giá.
+- Theo tài liệu người dùng cung cấp: 5 task LongBench (`gov_report`, `qmsum`, `multi_news`, `lcc`, `repobench-p`), mỗi task 200 mẫu, tổng 1.000.
+- `lcc` và `repobench-p` lấy stratified theo input-token length: 5 bins × 40 mẫu.
+- Không cố định prompt riêng của một baseline trong raw dataset; prompt renderer xử lý sau.
 
-## Infer 1 sample — context hiện tại
+## Research Findings
+- Repo hiện có `data/normalized/` và `data/representative_100/` cho 4 task summarization, mỗi task 100 mẫu; runner `scripts/run_representative_100.sh` hard-code thư mục và hậu tố `_representative`.
+- Loader chung `scripts/common/data_loader.py` nhận `prompt/question/instruction/document/text/turns`, và reference qua `reference/summary/answer`; chưa có canonical LongBench `context/input/reference_output`.
+- Collector `scripts/collect_metrics.py` cũng hard-code pattern `_representative.jsonl` và `data/representative_100`.
+- Existing runner tự tạo prompt `Summarize the following document...`; cách này chỉ phù hợp summarization, không phù hợp LCC/RepoBench-P.
+- AGENTS yêu cầu server offline, không tự tải model/dataset; local wheel/model/cache phải có sẵn.
+- Source LongBench đã có trong `/home/tuantb/.cache/huggingface/datasets/fast_infer_text_sum/FastKV/data/LongBench`: đúng 200 dòng cho `gov_report`, `qmsum`, `multi_news` và 500 dòng cho `lcc`, `repobench-p`.
+- Prompt config chính thức cho cả 5 task đã vendored ở `externals/RocketKV/eval/longbench_utils/config/dataset2prompt.json` và `externals/GemFilter/eval/LongBench/config/dataset2prompt.json`.
+- Snapshot tokenizer `meta-llama/Meta-Llama-3.1-8B-Instruct` có trong HF cache; builder có thể chạy offline với đường dẫn snapshot.
 
-- Dữ liệu representative có 4 bộ: `cnn_dailymail`, `govreport`, `multinews`,
-  `xsum`; mỗi file có trường `document` và `reference`.
-- Cả 9 model đã có snapshot/weight trong cache local.
-- `scripts/run_representative_100.sh` mặc định chạy 13 baseline inference;
-  nhóm `higoe dflash rocketkv magicdec longspec` chạy smoke riêng vì không
-  nhận trực tiếp `DATA_FILE` summarization theo cùng contract.
-- `config/semantic_selection.env` vẫn trỏ Qwen3-4B, nên nếu chạy theo bộ model
-  đã chốt phải tạo override tạm sang M1, không sửa config gốc trong lượt smoke.
-- `eagle3` và `dflash` cũng còn config Qwen3 cũ; cần override model/cặp draft
-  cho Llama 3.1 khi chạy full.
-- `hf auth whoami` bị lỗi DNS trong sandbox hiện tại, nhưng kiểm tra trực tiếp
-  snapshot cho thấy M1 và M2 đã có `config.json`, các model còn lại có weight
-  đầy đủ.
+## Proposed Canonical Record
+Mỗi record JSONL sẽ có các field ổn định:
 
-## Runtime debug — 2026-08-18
+```json
+{
+  "id": "longbench_lcc_<stable-id>",
+  "dataset": "lcc",
+  "source_split": "test",
+  "source_index": 12,
+  "task_type": "code_completion",
+  "context": "...",
+  "input": "...",
+  "answers": ["..."],
+  "reference_output": "...",
+  "input_tokens": 1234,
+  "length_bin": 2
+}
+```
 
-| Baseline | Trạng thái | Bằng chứng chính |
-|---|---|---|
-| EAGLE-3 | BLOCKED | `EAGLE3 inference requires a visible CUDA GPU` |
-| DFlash | BLOCKED | `torch.cuda.set_device` → `No CUDA GPUs are available` |
-| LLMLingua | PASS | CPU end-to-end, `[LLMLingua] ALL PASS` |
-| FastKV | PASS | TinyLlama/snapkv/sdpa, 1 token/1 run, `[FastKV] ALL PASS` |
-| RocketKV | PASS | CPU kernel smoke, `[RocketKV] ALL PASS` |
-| GemFilter | PASS | TinyLlama, 1 token/1 run, `[GemFilter] ALL PASS` |
-| SpecPrefill | BLOCKED | vLLM `Failed to infer device type` |
-| MInference | BLOCKED | import gọi CUDA → `No CUDA GPUs are available` |
-| MagicDec | BLOCKED | cache JIT đã tách được; sau đó `get_device_capability` fail vì no CUDA |
-| LongSpec | FAIL (GPU) | import pass, Triton forward fail vì no CUDA |
-| SpecExtend | TIMEOUT/BLOCKED | không trả control/không ghi output với fixture ngắn trong 180s |
-| HiGOE | PASS | CPU Contriever smoke, `[HiGOE] ALL PASS` |
-| semantic_selection | PARTIAL | Qwen3-4B CPU load + đủ 6 rows/1 sample; runner exit `124` sau khi ghi output |
+`reference_output` là bản chuẩn hóa từ `answers[0]` (nếu có), còn `answers` được giữ nguyên để evaluator task-specific dùng exact-match/edit similarity hoặc nhiều reference. Các dataset summarization dùng `task_type: summarization`; LCC/RepoBench-P dùng `code_completion`.
 
-### Root causes / notes
+## Open Questions
+- Tokenizer mặc định triển khai là snapshot local của Meta-Llama-3.1-8B-Instruct; CLI vẫn cho phép override.
+- Rollout runner sẽ giữ task-aware metric; baseline không có adapter code-completion không được tính điểm chất lượng cho LCC/RepoBench-P.
+- User đã phê duyệt full-scale trong lượt 2026-08-28; bộ canonical chính thức đã được ghi tại `data/longbench_200`.
 
-- Lượt wrapper đầu tiên của 11 baseline fail trước Python vì wrapper không export `UV_CACHE_DIR`; `uv` cố tạo lock trong cache read-only. Retry dùng cache dưới `/tmp` đã đi vào runtime.
-- Host hiện tại không có NVIDIA driver/GPU, nên các baseline CUDA không thể kết luận pass trên GPU.
-- MagicDec dùng `FLASHINFER_WORKSPACE_BASE` để chuyển cache JIT; sau khi đặt biến đúng, lỗi còn lại là CUDA.
-- Semantic-selection không fail model/inference: log ghi `loaded in 3.20s`, sinh `full` và 5 selector; vấn đề còn lại là process lifecycle/runner timeout.
-- Không dùng artifact cũ append trong `outputs/specextend_smoke.jsonl` để kết luận lượt debug mới.
-- Verification: `bash -n scripts/run.sh scripts/run_*.sh` pass; artifact/schema assertions pass; root env không có `pytest` nên `uv run ... python -m pytest -q tests` không chạy được (`No module named pytest`).
+## Small-scale Analysis (2026-08-28)
+- Output tạm: `/tmp/fast_infer_longbench_small`.
+- Kết quả: 5 file × 20 record = 100 record; validator pass; 100 ID unique; tất cả record có schema chung và reference không rỗng.
+- Bin distribution: `gov_report`, `qmsum`, `multi_news`, `lcc`, `repobench-p` đều có 4 record/bin trong bản partial 20; LCC/RepoBench-P giữ đúng 5 bin.
+- Token stats (Llama 3.1 prompt tokens): GovReport mean 9,547.55 (min 3,493, max 18,608); QMSum mean 13,616.20 (5,962–25,420); Multi-News mean 2,373.40 (791–5,175); LCC mean 2,719.95 (1,366–5,792); RepoBench-P mean 9,974.50 (3,385–19,587).
+- Spot-check: summarization rows render official summary/query prompts; LCC/RepoBench-P rows render code-completion prompts and preserve code references.
+- Determinism ở checkpoint small-scale: focused sampling test pass; một lệnh rebuild dự phòng dừng trước khi ghi RepoBench-P.
 
-## GPU runtime debug — Tesla T4 — 2026-08-18
+## Full-scale Verification (2026-08-28)
+- `data/longbench_200/` có 5 JSONL và `manifest.json`, tổng 1.000 record.
+- `validate_longbench_200.py --expected-count 200` pass; mọi ID unique, schema đầy đủ, checksum manifest đúng.
+- LCC và RepoBench-P đều có length-bin distribution `40/40/40/40/40`.
+- Rebuild độc lập tại `/tmp/fast_infer_longbench_full_repeat_v2` với cùng seed và tokenizer tạo output byte-identical cho cả 5 JSONL và manifest.
+- `pytest -q tests/test_longbench_dataset.py` pass; toàn repo vẫn có collection errors từ test vendored thiếu optional dependencies.
 
-### Infer thật 1 sample đã chạy
-
-| Baseline | Kết quả | Artifact/bằng chứng |
-|---|---|---|
-| LLMLingua | PASS | runner xsum 1 sample, 15s |
-| FastKV | PASS | TinyLlama local, 8 tokens, `FastKV ALL PASS` |
-| GemFilter | PASS | TinyLlama local, 8 tokens, `GemFilter ALL PASS` |
-| SpecPrefill | PASS | TinyLlama target/draft, 8 tokens, `SpeculativePrefill ALL PASS` |
-| MInference | PASS | runner xsum 1 sample, 195s |
-| SpecExtend | PASS | runner xsum 1 sample, 95s |
-| EAGLE-3 | PASS | runner xsum 1 sample, 30s |
-| semantic_selection | PASS | runner xsum 1 sample, 28s |
-| DFlash | PASS | GSM8K 1 sample, baseline 18.63 tok/s, DFlash 7.79 tok/s |
-| MagicDec | PASS | dense benchmark, returncode 0, timing/output lines |
-
-### Baseline còn thiếu text infer thật
-
-- HiGOE: wrapper hiện chỉ thực hiện Contriever retrieval trên dummy docs; full `eval.py` cần dataset, graph hierarchical, trained weights và LLM/API judge, hiện không có trong checkout.
-- RocketKV: wrapper hiện chỉ chạy RocketAttention kernel smoke; upstream full LongBench cần dataset download và model Llama/Mistral local, hiện không có artifact phù hợp.
-- LongSpec: wrapper smoke chỉ import/skip kernel trên T4 `sm75`; full inference cần target/draft LongSpec và GPU class 80GB/sm80+, không thể chạy an toàn trên T4 15GB.
-
-### Lượt runner đầu và retry
-
-- Runner đầu của FastKV/GemFilter/SpecPrefill fail do chọn config model gated/weight chưa cache; retry bằng config T4-safe TinyLlama local đã PASS.
-- Toàn bộ log/output của lượt GPU nằm trong `outputs/gpu_1sample/`.
-
-## 2026-08-21 — chuyển dataset lớn ra cache
-
-- Cache model hiện dùng `HF_HOME`, mặc định `~/.cache/huggingface`.
-- Dữ liệu Git lớn nằm ở `externals/FastKV/data` và `externals/MagicDec/Data`,
-  tổng khoảng 1.014 GiB trong HEAD.
-- Thiết kế đã được người dùng duyệt: lưu ở
-  `${HF_HOME}/datasets/fast_infer_text_sum/{FastKV,MagicDec}/`.
-- Repo đang có thay đổi chưa commit ở các file MagicDec; không được reset hoặc
-  ghi đè các thay đổi này.
-
-## 2026-08-25 — profile Qwen3-4B long-summary
-
-- User chọn Qwen3-4B target đơn trước; chưa profile EAGLE-3/DFlash.
-- GPU mục tiêu: Tesla T4 15,360 MiB; T4 smoke cần dùng FP16 và SDPA.
-- Repo đã có số đo Qwen3-4B FP16 + SDPA: peak khoảng 9,744 MB với mean
-  1,791.9 source tokens và max output 128 token.
-- Các mốc profile dự kiến: 256, 512, 1024, 2048, 3072 từ; mốc cuối có thể
-  bị hạ/bỏ nếu input token thực tế hoặc KV cache gây OOM.
-- Cần phân biệt model load one-time với per-sample latency; tỷ lệ component chỉ
-  tính trên sample path sau warmup.
-
-### Kết quả run trên Tesla T4 — 2026-08-25
-
-- Runtime: Tesla T4 15,360 MiB, PyTorch `2.13.0+cu126`, CUDA available, FP16 + SDPA.
-- Model load one-time: khoảng 10.25 s.
-- Mỗi mốc chạy 3 repeats, lấy median; output tối đa 128 token; không speculative.
-- 5/5 mốc hoàn tất, không OOM. Input thực tế sau chat template là 397 / 746 /
-  1,502 / 2,954 / 3,830 tokens cho 256 / 512 / 1,024 / 2,048 / 3,072 từ.
-- Decode là thành phần lớn nhất: khoảng 95.3% ở 256 từ, giảm còn 67.3% ở 3,072 từ;
-  prefill tăng từ 3.4% lên 31.9%.
-- KV cache tăng từ 55.8 MB lên 538.6 MB; peak allocated tăng từ 7.69 GiB lên
-  12.42 GiB ở 3,072 từ.
-- Artifact canonical: `src/analyze/full_infer/results/{summary.csv,summary.jsonl,metadata.json,*.png}`;
-  bản trong `outputs/qwen3_long_profile/` vẫn được giữ nguyên để tương thích.
-
-## 2026-08-26 — shared Python 3.12 migration
-
-- Runtime hiện tại của workspace là Python 3.13.9; không có Python 3.12 executable và uv chỉ báo bản 3.12 là `download available`.
-- `requirements.txt` là file untracked do người dùng cung cấp; đã bổ sung `sentence-transformers==5.7.0` vì semantic-selection dùng trực tiếp package này. File có local/direct artefact (`deep_ep`, `eviseq`, `vllm`, `mooncake-transfer-engine`).
-- Đã xóa root `.venv` Python 3.11 và các `envs/*/.venv`; giữ manifest/lock legacy vì lớp an toàn chặn xóa toàn bộ env metadata/wheel.
-- Tất cả launcher chính dùng `scripts/common/runtime.sh` và trực tiếp gọi `FAST_INFER_PYTHON`.
-- MagicDec, SpecExtend, LongSpec và representative runner dùng interpreter kế thừa; representative runner dừng đúng khi runtime thiếu.
-- `pytest -q tests`: 46 passed; `bash -n` toàn bộ shell script: pass; compileall scripts/tests: pass.
-- `scripts/check_shared_env.py` chạy import-only/offline, kiểm tra dflash/CUDA và vendored LLMLingua; trên workspace báo Python 3.13, thiếu `vllm`/`flashinfer`/`sentence_transformers` và lỗi ABI `flash_attn`.
-- `scripts/setup_venv.sh --offline` dừng sớm và đúng vì local wheel `deep_ep` dưới `/vllm-workspace` chưa được mount; sau khi path được cung cấp, gate Python 3.12 vẫn sẽ chặn workspace hiện tại.
-- Phát hiện và sửa bug wrapper coi `--smoke` là tên config; sau sửa, sweep 14 baseline đều dừng tại cùng runtime gate với `config_errors=0`.
-- Sửa representative dry-run để không cần venv và không gọi Python khi convert/resolve model; test dry-run EAGLE/SpecExtend pass.
-
-## 2026-08-26 — smoke 1 sample trên workspace hiện tại
-
-- Workspace hiện tại chạy Python 3.13.9, không có Python 3.12 và không có NVIDIA driver/GPU.
-- `scripts/run.sh <baseline> --smoke` dừng đồng nhất ở shared-runtime gate; đây là blocker môi trường, không phải lỗi riêng baseline.
-- Có cache nhiều model HF, nhưng requirements còn cần mount local wheel `/vllm-workspace/...` và các package CUDA/server-specific.
-
-## 2026-08-26 — smoke 1 sample và debug baseline
-
-- Wrapper sweep với `FAST_INFER_PYTHON` mô phỏng Python 3.12 đạt `14/14`, không
-  còn lỗi coi `--smoke` là file config; semantic-selection cũng không còn truyền
-  cờ lạ xuống upstream và dùng `--limit 1`.
-- Smoke thực tế PASS: FastKV trên TinyLlama CPU (modern Llama API), GemFilter trên
-  TinyLlama CPU (modern custom attention), RocketKV kernel CPU, Semantic Selection
-  trên Qwen2.5-0.5B CPU với 1 document.
-- Đã thêm tương thích FastKV cho modern Transformers và Mistral; thêm fallback
-  SDPA/position embeddings/cache API cho GemFilter Llama/Mistral/Phi-3.
-- Đã chuẩn hóa `--smoke` của DFlash/FastKV/GemFilter/LLMLingua/MInference/
-  SpecPrefill/FlexPrefill/SpecExtend/EAGLE-3 thành tối đa đúng 1 sample.
-- Các blocker khi chạy trực tiếp workspace hiện tại: Python 3.13.9 thay vì 3.12,
-  không có NVIDIA driver; thiếu `vllm`, `flashinfer`, `nltk`, `tilelang`,
-  `liger-kernel`, `termcolor`, `faiss`, `dgl`; `flash_attn` lỗi GLIBC ABI.
-- `setup_venv.sh --offline` dừng đúng tại local wheel bắt buộc chưa mount:
-  `/vllm-workspace/ep_kernels/dist/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl`.
-
-## 2026-08-26 — tái tạo uv lock root
-
-- Đã xóa `uv.lock` cũ, đổi `.python-version` từ `3.11` sang `3.12`, và đặt
-  `pyproject.toml` yêu cầu `==3.12.*`.
-- `scripts/setup_venv.sh` hiện tự chạy `uv add --requirements requirements.txt
-  --no-sync --offline --no-python-downloads --python <python3.12>` để tạo/cập nhật
-  lock chung trước khi cài venv.
-- Không thể sinh lock trong workspace hiện tại: uv báo không tìm thấy Python 3.12;
-  sau đó setup cũng sẽ bị chặn bởi local wheel `deep_ep` và editable path server.
-
-## 2026-08-27 — discovery bằng `.venv`
-
-- `.venv/bin/python` là Python 3.12.13.
-- `check_shared_env.py` pass torch 2.11.0+cu130, transformers 5.12.1, vllm 0.24.0,
-  triton 3.6.0, dflash 0.1.0, llmlingua 0.2.2 và sentence_transformers 5.7.0.
-- Preflight fail ở `flashinfer` do cache JIT `/home/tuantb/.cache/flashinfer/...`
-  read-only và `flash_attn` chưa cài; đây là lỗi môi trường, không phải syntax.
-- `bash -n scripts/*.sh scripts/common/*.sh` và `.venv/bin/python -m compileall -q scripts data` pass.
-- Smoke wrapper GemFilter với config TinyLlama ghi được run 0 (dense 71.8s, filtered 74.1s) nhưng timeout ở 300s trước summary; nguyên nhân hiện tại là config `--smoke` luôn ép 2 runs, tổng 4 generation CPU (~>300s), chưa thấy traceback/kernel error.
-- Smoke semantic-selection ban đầu fail `KeyError: Record 0 does not contain document field 'document'`; regression test xác nhận fixture `smoke_long_docs.jsonl` dùng `text`, wrapper đã đổi default sang `data/debug/smoke_real.jsonl` có `document`.
-- DFlash ban đầu fail `ModuleNotFoundError: dflash` vì GSM8K child wrapper thiếu `PYTHONPATH`; sau patch đã vào `dflash.benchmark` và chỉ còn CUDA blocker.
-- RocketKV ban đầu serialize nhầm tensor key vào field `k`; regression test bắt lỗi, sau patch record ghi numeric budget `k=256` và verifier vẫn pass.
-
-### Verification cuối
-
-- Targeted regression tests: `17 passed`; toàn bộ `tests/`: `55 passed`.
-- `bash -n scripts/*.sh scripts/common/*.sh`, `.venv/bin/python -m compileall -q scripts data tests`, `git diff --check`: pass.
-- Output contract: 8 file JSONL chuẩn có record + summary đúng schema; semantic-selection có 6 rows (`full` + 5 selector) và 6 summary groups; RocketKV `k` là số.
-
-## 2026-08-27 — smoke matrix `.venv`, 1 sample
-
-| Baseline | Kết quả lượt này | Bằng chứng / blocker |
-|---|---|---|
-| rocketkv | PASS | CPU kernel, 2 runs, finite/shape checks, `ALL PASS`; rerun sau fix metadata |
-| fastkv | PASS | TinyLlama CPU, 1 document, 2 runs, output 16 token/run, `ALL PASS` |
-| gemfilter | PASS (minimal) | Wrapper budget 300s timeout ở 1/2 run; direct 1 run/1 token PASS, `ALL PASS` |
-| higoe | BLOCKED | Contriever retrieval finite; thiếu `faiss`, `dgl`, verifier exit 1 |
-| semantic_selection | PASS | 1 document, default fixture sau fix, Qwen2.5-0.5B CPU override, output + summary JSON |
-| llmlingua | PASS | 1 document, 101→50 token, keyword retained, 4 output token, `ALL PASS` |
-| eagle3 | BLOCKED | Compatibility 5/5 fields pass; thiếu CUDA |
-| dflash | BLOCKED | PYTHONPATH fix đã xác nhận; `dflash.benchmark` vào runtime rồi thiếu CUDA |
-| specprefill | BLOCKED | Upstream import yêu cầu `vllm.sequence.SequenceData`, không có trong vLLM 0.24.0 |
-| minference | BLOCKED | Thiếu module compiled `kivi_gemv` |
-| magicdec | BLOCKED | Checkpoint local tồn tại; child fail `torch.cuda.get_device_capability()` trên CPU |
-| longspec | BLOCKED | Thiếu `liger_kernel` và CUDA cho Triton forward |
-| specextend | BLOCKED | Child import thiếu `termcolor` |
-| flexprefill | BLOCKED | Baseline yêu cầu visible CUDA GPU |
-
-## 2026-08-27 — clarification về runtime B200
-
-- Production B200 không cần activate hoặc dùng `.venv`; lệnh canonical là
-  `python3` từ PATH của server.
-- `.venv/bin/python` chỉ là runtime mô phỏng trong workspace hiện tại để kiểm
-  tra trước cùng dependency/API contract.
-- B200 readiness phải hỗ trợ cả `FAST_INFER_PYTHON=python3` và đường dẫn tuyệt
-  đối tới `.venv/bin/python`, nhưng không được coi CPU simulation là CUDA pass.
-
-## 2026-08-27 — B200 readiness validation
-
-- Runtime production không còn phụ thuộc việc activate `.venv`: `FAST_INFER_PYTHON`
-  nhận command name như `python3` và resolve thành executable path; local vẫn
-  override bằng `.venv/bin/python`.
-- `config/b200.env` dùng canonical B200 model matrix, writable JIT cache defaults,
-  one-sample/8-token smoke và `B200_DEVICE` (mặc định `cuda`, có thể đặt `cpu`
-  cho CPU-safe simulation).
-- `check_b200_env.py` chạy offline, không load model; báo `hardware_unavailable`
-  trên T4 hiện tại do torch cu130 gặp driver CUDA 12.4. Mock B200 metadata + CUDA
-  tensor probe contract đã pass.
-- `run_b200_smoke.sh --preflight-only` đã chạy đủ 14 baseline bằng command name
-  `python3` resolve vào `.venv/bin/python3`; GPU-only đều BLOCKED đúng reason,
-  CPU-compatible baseline được phân loại riêng.
-- End-to-end runner RocketKV trên `.venv` chạy output PASS của baseline nhưng
-  summary tổng thể BLOCKED vì preflight CUDA không pass; không có false B200 PASS.
-- Semantic-selection overlay chạy được một sample với model Qwen2.5-0.5B CPU
-  override; baseline PASS, tổng thể vẫn BLOCKED do thiếu CUDA. Đây là kiểm tra
-  pipeline/overlay, không phải xác nhận GPU kernel.
-- Validation cuối: toàn bộ `tests/` đạt `68 passed`; `bash -n`, `compileall` và
-  `git diff --check` đều pass. Preflight trên T4/CPU trả `BLOCKED` đúng nguyên
-  nhân `hardware_unavailable`, nên chưa tuyên bố đã xác nhận kernel trên B200.
+## Resources
+- `data/README.md`
+- `scripts/common/data_loader.py`
+- `scripts/run_representative_100.sh`
+- `scripts/collect_metrics.py`
+- `/home/tuantb/.codex/attachments/99b12101-d46d-4dfb-9003-b1d80d684e78/pasted-text.txt`
+- `AGENTS.md`

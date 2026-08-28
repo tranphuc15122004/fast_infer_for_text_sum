@@ -8,3 +8,7 @@ dependencies = []
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["externals", "outputs", "checkpoints"]

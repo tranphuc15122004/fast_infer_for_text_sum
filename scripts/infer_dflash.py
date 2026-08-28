@@ -165,6 +165,7 @@ def main() -> None:
         record = {
             "method": "dflash",
             "dataset": "data-file" if args.data_file else "prompt",
+            "task_type": sample.get("raw", {}).get("task_type"),
             "model": args.target_model,
             "draft_model": args.draft_model,
             "input_tokens": input_len,
@@ -195,7 +196,10 @@ def main() -> None:
             "block_size": block_size,
             "acceptance_lengths": list(result.acceptance_lengths),
         }
-        rouge.add_rouge(record, text, sample.get("reference"))
+        if record["task_type"] == "code_completion":
+            metrics.add_code_completion(record, text, sample.get("reference"))
+        else:
+            rouge.add_rouge(record, text, sample.get("reference"))
         writer.add(record)
         print(
             f"[sample {sample['id']}] dflash={e2e_ms:.1f}ms "
@@ -204,13 +208,18 @@ def main() -> None:
         checks.append(verify.check_new_tokens(n_tok))
         checks.append(verify.check_output_text(text))
 
+    quality = (
+        metrics.aggregate_code_completion(writer.records)
+        if any(r.get("task_type") == "code_completion" for r in writer.records)
+        else rouge.aggregate_rouge(writer.records)
+    )
     summary = {
         "type": "summary",
         "method": "dflash",
         "num_samples": len(prompts),
         "block_size": block_size,
         "speedup": metrics.aggregate_speedup(writer.records),
-        **rouge.aggregate_rouge(writer.records),
+        **quality,
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

@@ -8,7 +8,9 @@ Accepted fields (first match wins):
     {"id": 0, "prompt": "..."}                 # preferred
     {"id": 0, "question": "...", "answer": "..."}
     {"id": 0, "text": "...", "answer": "..."}  # summarization-style docs
-    {"id": 0, "document": "...", "reference": "..."}  # representative_100 summarization format
+    {"id": 0, "document": "...", "reference": "..."}  # legacy summarization format
+    {"id": 0, "dataset": "lcc", "context": "...", "input": "...", "reference_output": "..."}
+        # canonical LongBench format; prompt is rendered from the task template
     {"id": 0, "turns": ["user prompt", ...]}   # EAGLE-style chat turns
     {"id": 0, "instruction": "..."}
 
@@ -41,12 +43,20 @@ def normalize(record: dict, idx: int) -> dict:
     prompt = _get(
         record, "prompt", "question", "instruction", "document", "text", "turns"
     )
+    if prompt is None and record.get("dataset") in {
+        "gov_report", "qmsum", "multi_news", "lcc", "repobench-p"
+    }:
+        from common.benchmark_data import render_prompt
+
+        prompt = render_prompt(record)
     return {
         "id": record.get("id", idx),
         "prompt": str(prompt) if prompt is not None else "",
         "answer": record.get("answer"),
-        # Reference summary dùng để tính ROUGE: nhận cả answer/reference/summary.
-        "reference": _get(record, "reference", "summary", "answer"),
+        # Reference chung; evaluator chọn ROUGE hoặc code metric theo task_type.
+        "reference": _get(
+            record, "reference", "reference_output", "summary", "answer"
+        ),
         "keyword": record.get("keyword"),
         "text": record.get("text"),
         "raw": record,

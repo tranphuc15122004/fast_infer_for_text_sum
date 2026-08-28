@@ -1,4 +1,4 @@
-"""Bộ metric đầy đủ cho benchmark trên data/representative_100.
+"""Bộ metric đầy đủ cho benchmark trên bộ dữ liệu canonical LongBench.
 
 Bổ sung cho common/rouge.py (ROUGE-1/2/L F1): các metric semantic mở rộng
 (ROUGE P/R/F đầy đủ, ROUGE-Lsum, BLEU-1..4, length ratio) + các hàm tổng hợp
@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import re
 import statistics
+from difflib import SequenceMatcher
 from collections import Counter
 from typing import Mapping, Optional, Sequence
 
@@ -244,6 +245,63 @@ def aggregate_semantic(
         if values:
             out[k] = round(mean(values), 4)
     return out
+
+
+# --------------------------------------------------------------------------
+# Code-completion metrics
+# --------------------------------------------------------------------------
+
+def normalize_code_output(text: str) -> str:
+    """Normalize harmless formatting before comparing a code continuation."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = [line.rstrip() for line in lines if not line.strip().startswith("```")]
+    return "\n".join(lines).strip()
+
+
+def code_completion_scores(hyp: str, ref: str) -> dict:
+    """Return exact-match and edit similarity; intentionally no ROUGE keys."""
+    normalized_hyp = normalize_code_output(hyp)
+    normalized_ref = normalize_code_output(ref)
+    return {
+        "code_exact_match": float(normalized_hyp == normalized_ref),
+        "code_edit_similarity": round(
+            SequenceMatcher(None, normalized_hyp, normalized_ref).ratio(), 4
+        ),
+    }
+
+
+def add_code_completion(
+    record: dict,
+    hyp: str,
+    ref: Optional[str],
+    *,
+    prefix: str = "",
+) -> Optional[dict]:
+    if not ref or not str(ref).strip() or not hyp or not str(hyp).strip():
+        return None
+    scores = code_completion_scores(hyp, str(ref))
+    for key, value in scores.items():
+        record[prefix + key] = value
+    return scores
+
+
+def aggregate_code_completion(
+    records: Sequence[Mapping],
+    *,
+    prefix: str = "",
+) -> dict:
+    """Aggregate code-completion scores without mixing in ROUGE metrics."""
+    keys = {
+        key
+        for record in records
+        for key in record
+        if key.startswith(prefix + "code_")
+    }
+    return {
+        key: round(mean([float(record[key]) for record in records if key in record]), 4)
+        for key in sorted(keys)
+        if any(key in record for record in records)
+    }
 
 
 # --------------------------------------------------------------------------

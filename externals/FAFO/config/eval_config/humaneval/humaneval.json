@@ -1,0 +1,17 @@
+{
+    "eval_params": {
+        "dataset": "humaneval",
+        "max_new_tokens": 1024,
+        "eval_metrics": [
+            "throughput",
+            "avg_acceptance_len"
+        ]
+    },
+    "management": {
+        "sub_dir": {
+            "input_config": "input_config/",
+            "raw_results": "raw_results.json",
+            "output_config": "output_config.json"
+        }
+    }
+}
