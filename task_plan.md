@@ -1,95 +1,45 @@
-# Task Plan: Xây dựng bộ dữ liệu LongBench canonical 1.000 mẫu
+# Kế hoạch: kiểm chứng hypothesis GroundSync
 
-## Goal
-Thay thế `data/representative_100` bằng bộ test LongBench cố định 5 task × 200 mẫu, có schema JSONL chung, manifest reproducible và adapter đánh giá không phụ thuộc từng baseline.
+## Mục tiêu
 
-## Next Step
-Bàn giao bộ dữ liệu canonical sau vòng kiểm tra cuối; không commit được trong
-sandbox hiện tại vì `.git/index` chỉ đọc.
+Thực hiện các thí nghiệm kiểm chứng proposal GroundSync bằng một model Qwen3
+đã có/được cache, ghi code và kết quả dưới `src/analyze`, và hoàn thiện báo cáo
+đánh giá có tiêu chí go/no-go rõ ràng cho từng hypothesis.
 
-## Current Phase
-Phase 5
+## Trạng thái
 
-## Phases
+| Pha | Trạng thái | Bằng chứng cần có |
+|---|---|---|
+| 1. Khảo sát repo và dữ liệu | hoàn tất | danh sách code/data/model/runtime hiện có |
+| 2. Thiết kế experiment | hoàn tất | design doc + protocol + validation scope |
+| 3. Pipeline analysis | hoàn tất | unit/synthetic smoke và CLI reproducible |
+| 4. Chạy experiment | hoàn tất controlled mở rộng | Qwen3-4B + Qwen3-0.6B, GovReport 99/100 target + 99 proposals + 10 timing rows, CNN/DailyMail 100/100 target + 100 proposals + 12 timing rows, E0 relocation 3/3 cases, multi-start 396/400 rows |
+| 5. Báo cáo | hoàn tất bản mở rộng, còn giới hạn production E2E và multi-start timing | report H1–H5, E0 relocation, calibration/sensitivity/controls, position-adjusted hazard + document bootstrap, cross-regime/multi-start metrics, timing, limitation và artifact audit |
 
-### Phase 1: Requirements & Discovery
-- [x] Đọc yêu cầu và tài liệu đính kèm
-- [x] Kiểm tra schema dữ liệu, loader, runner và collector hiện tại
-- [x] Ghi nhận ràng buộc offline và khác biệt semantics theo task
-- [x] Chốt thiết kế với người dùng
-- **Status:** complete
+## Ràng buộc đã biết
 
-### Phase 2: Planning & Structure
-- [x] Viết design spec sau khi được duyệt
-- [x] Chọn cấu trúc builder/validator/prompt config
-- [x] Viết implementation plan chi tiết
-- **Status:** complete
-
-### Phase 3: Small-scale TDD & Analysis
-- [x] Tạo fixture local nhỏ, không đụng source cũ
-- [x] Viết test schema/sampling/loader trước implementation
-- [x] Chạy build nhỏ và phân tích count, length, duplicate, spot-check
-- [x] Xin người dùng duyệt kết quả small-scale
-- **Status:** complete
-
-### Phase 4: Full-scale Build & Integration
-- [x] Build bộ canonical 1.000 mẫu từ source LongBench local/cache
-- [x] Cập nhật collector/docs/loader để dùng data set mới
-- [x] Kiểm tra completeness theo 5 dataset và determinism full output
-- **Status:** complete
-
-### Phase 5: Verification & Delivery
-- [x] Chạy focused test suite và validator dữ liệu
-- [x] Kiểm tra diff, manifest, tài liệu và stale references
-- [x] Bàn giao đường dẫn, lệnh build/chạy và giới hạn còn lại
-- **Status:** complete
-
-## Key Questions
-1. Người dùng có duyệt bộ LongBench gồm `gov_report`, `qmsum`, `multi_news`, `lcc`, `repobench-p`, mỗi task 200 mẫu, với source local/cache pinned không?
-2. Runner có cần chạy cả 5 task ngay không, hay chỉ cần dataset canonical + evaluator chung; các baseline không hỗ trợ task sẽ được đánh dấu unsupported?
-3. Tokenizer chuẩn nào đã có sẵn trên server để tính `input_tokens`?
-
-## Decisions Made
-| Decision | Rationale |
-|----------|-----------|
-| Giữ dataset canonical ở thư mục mới, không overwrite `data/representative_100` trong bước đầu | Có thể rollback và so sánh; chỉ đổi default sau khi validation/duyệt full-scale |
-| Dùng JSONL + `manifest.json` | Phù hợp loader hiện tại, dễ stream, dễ audit ID và checksum |
-| Giữ `context`/`input`/`answers`, thêm `reference_output` và metadata | Bảo toàn dữ liệu LongBench nhưng cung cấp field chung cho evaluator |
-| Tính length bằng tokenizer chuẩn, không bằng số từ | Prefill/KV/verification phụ thuộc LLM token length |
-| LCC/RepoBench-P sampling theo 5 length bins, 40 mẫu/bin | Giữ phân phối length thay vì lấy `[:200]` |
-| Prompt render riêng theo task tại runtime | Tránh làm chết prompt LongBench vào raw data và tránh dùng prompt summarization cho code-completion |
+- Code và artifact phân tích phải nằm dưới `src/analyze`.
+- Model được phép: Qwen3-4B, Qwen3-1.7B hoặc Qwen3-0.6B.
+- Không được gọi kết quả “pass” nếu chưa có số liệu và kiểm tra fresh.
+- Dùng một target-only canonical trace để đo source-state và một pipeline
+  speculative/controlled phù hợp với model cache thực tế.
+- Model-backed GPU đã chạy với Qwen3-4B canonical target và Qwen3-0.6B draft
+  bằng `/home/tuantb/miniconda3/bin/python3` ngoài venv trên `cuda:0`; không
+  dùng `.venv` cho thực nghiệm T4.
 
 ## Errors Encountered
-| Error | Attempt | Resolution |
-|-------|---------|------------|
-| Chưa xác định source LongBench local/cache trong repo | 1 | Đã tìm thấy mirror LongBench trong HF cache; builder vẫn nhận explicit `--source-dir` để reproducible |
-| Không thể commit spec vì `.git/index.lock` không tạo được (read-only filesystem) | 1 | Giữ spec trong workspace và tiếp tục kiểm tra/triển khai; không lặp lại thao tác commit trong sandbox hiện tại |
-| Fixture test duplicate thiếu `manifest.json` | 1 | Bổ sung manifest tối thiểu; giữ validator strict với manifest |
-| Rebuild small-scale song song/dự phòng dừng trước RepoBench-P | 1 | Không chạy lặp đồng thời; validator và các file đã hoàn thành vẫn pass, ghi nhận determinism helper thay cho full rebuild comparison ở checkpoint này |
-| Test route code-completion giả định output nested | 1 | Sửa expectation về dict metric phẳng; không thay đổi dữ liệu/collector |
 
-## Notes
-- Theo data-preparation gate, full-scale chỉ được chạy sau khi test + phân tích small-scale pass và người dùng duyệt kết quả.
-- Full output đã được build tại `data/longbench_200/`: 5 × 200 = 1.000 record; validator pass và rebuild độc lập byte-identical.
-- `pytest -q tests` là phạm vi test dự án; `pytest -q` toàn repo còn thu thập test vendored cần package tùy chọn không có trong venv local.
-- `task_plan.md`, `findings.md`, `progress.md` là ledger làm việc; không phải benchmark artifact.
+Chưa có lỗi trong pha khảo sát.
 
-## Phase 7: Server environment bootstrap
+## Next
 
-### Goal
-Tạo một launcher setup có thể chạy trên server, dùng code tại
-`/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum` và
-thư mục dùng chung `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data`
-cho dataset, master config và các artifact ổn định.
-
-### Implementation complete
-- [x] Tạo `scripts/setup_server_env.py` với các chế độ `--check`, `--init` và
-  `--all`.
-- [x] Giữ nguyên `fast_infer_master.env` hiện có; chỉ tạo từ example khi file
-  chưa tồn tại.
-- [x] Tạo symlink dataset từ repo tới thư mục data dùng chung khi target repo
-  chưa tồn tại, không xoá/ghi đè dataset hiện có.
-- [x] Không tạo/activate venv trên server; dùng trực tiếp `python3` hệ thống
-  và kiểm tra Python 3.12 cùng các package đã cài.
-- [x] Viết test contract trước implementation và chạy smoke kiểm thử.
-- **Status:** complete
+Đã hoàn tất design/protocol, core metrics, target trace adapter, controlled
+speculative trace, report và orchestrator theo TDD. Bản mở rộng đã thêm
+calibrated positional prior, chunk/sink sensitivity, E0 position relocation,
+position-adjusted hazard coefficient với 2.000 document bootstrap, negative controls, adaptive/true-cost
+policy, train/dev threshold selection và tách timing khỏi acceptance. Báo cáo
+toàn bộ quy trình đã ghi tại
+`src/analyze/groundsync/verification_report_2026-08-29.md`.
+Kết luận run mở rộng: GovReport H1/H2/H3/H4 `FAIL`, H5 `UNAVAILABLE`; CNN
+H1/H3/H4 `FAIL`, H2 `PASS`, H5 `UNAVAILABLE`. Hai regime chưa cho bằng chứng
+ổn định để xác nhận claim tổng hợp.

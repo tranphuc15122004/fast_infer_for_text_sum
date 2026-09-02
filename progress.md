@@ -1,125 +1,100 @@
-# Progress Log
+# Progress log — GroundSync
 
-## Session: 2026-08-28
+## 2026-08-29
 
-### Phase 1: Requirements & Discovery
-- **Status:** complete
-- **Started:** 2026-08-28
-- Actions taken:
-  - Đọc AGENTS.md và các skill bắt buộc.
-  - Khảo sát tree, schema dữ liệu hiện tại, loader, runner, collector và test contract.
-  - Đọc tài liệu đề xuất LongBench 5 task × 200 mẫu.
-  - Xác định xung đột semantics giữa summarization runner hiện tại và LCC/RepoBench-P code completion.
-  - Xác nhận source LongBench 5 task và tokenizer Llama 3.1 đã có trong cache local.
-  - Hoàn tất design spec sau khi người dùng yêu cầu triển khai.
-  - Hoàn tất implementation plan tại `docs/superpowers/plans/2026-08-28-longbench-200.md`.
-  - Viết helper/config/builder/validator/analyzer và test TDD.
-  - Chạy focused test: `6 passed`.
-  - Build small-scale offline tại `/tmp/fast_infer_longbench_small`: 5 × 20 = 100 record.
-  - Validator pass, schema/duplicate/bin/spot-check pass; ghi lại thống kê token và prompt.
-- Ở Phase 4, build chính thức offline tại `data/longbench_200`: 5 × 200 = 1.000 record.
-- Validator chính thức pass; hai dataset code có đúng 5 length bins × 40 record.
-- Rebuild full-scale độc lập tại `/tmp/fast_infer_longbench_full_repeat_v2` byte-identical với output chính thức, gồm cả manifest.
-- Cập nhật loader, collector, metrics, README và tài liệu benchmark để route code-completion không qua ROUGE.
-- Files created/modified:
-  - `task_plan.md`
-  - `findings.md`
-  - `progress.md`
-  - `docs/superpowers/specs/2026-08-28-longbench-200-design.md`
+- Đọc proposal GroundSync từ shared conversation và xác định mạch H1–H5/E0–E5.
+- Đọc `AGENTS.md`; giữ nguyên quy ước Python/runtime/data của repo.
+- Khảo sát repo: worktree sạch; xác nhận `src/analyze` mới có profiler Qwen3
+  target-only, chưa có implementation GroundSync.
+- Xác nhận các dataset representative/LongBench và các script Qwen3/EAGLE hiện có.
+- Chưa sửa code; đang chờ chốt design experiment theo ML brainstorming gate.
+- Design và implementation plan đã ghi dưới `src/analyze/groundsync/plans/`.
+- Subtask 1: viết core metric tests (RED) và implement `core.py`; fresh result
+  `12 passed in 0.07s`.
+- Subtask 2: viết target adapter tests (RED) và implement `trace_target.py`;
+  fresh result combined core/target `15 passed`, compile pass.
+- Subtask 3: thêm controlled draft/target acceptance, drift, grounding horizon
+  và timing arrays theo `k`; fresh result toàn bộ tests `31 passed`.
+- Subtask 4: thêm document-split predictor, bootstrap CI, H1–H5 aggregation,
+  CSV/PNG/Markdown artifacts; report tests và integration tests nằm trong tổng
+  `31 passed`.
+- Subtask 5: thêm `run_experiment.py`, synthetic fixture và README. Synthetic
+  run `synthetic-20260829-v2` tạo raw JSONL, metrics, CSV, PNG và report.
+- Model-backed local-only smoke `qwen3-local-smoke-20260829` đã thử với
+  Qwen3-1.7B/0.6B trên CPU; snapshot không có trong cache, nên target/draft và
+  H1–H5 đều ghi `UNAVAILABLE`. Không dùng Qwen2.5-VL hay EAGLE head thay thế.
+- Final validation: `34 passed`, `compileall` và `git diff --check` đều pass.
+  Run `synthetic-20260829-audit` có đủ 4 PNG + JSON/CSV/Markdown; run
+  `qwen3-local-smoke-audit` tái hiện rõ 5/5 hypothesis `UNAVAILABLE` vì thiếu
+  Qwen3 snapshot local.
+- Audit continuation: verifier H4 đã được sửa để đo block `k` trong một
+  forward; full test/compile lại pass và run
+  `synthetic-20260829-blocked-audit` chạy thành công. Đã kiểm tra thêm các
+  mount/path hệ thống, không có full Qwen3 snapshot; blocker cần external model
+  state hoặc user cung cấp đường dẫn checkpoint.
+- Cache audit mới: xác nhận full Qwen3-4B canonical target trong Hugging Face
+  cache; Qwen3-4B EAGLE head bị loại vì sai architecture. Qwen3-0.6B đã được
+  tải local và validate bằng config/tokenizer/safetensors.
+- Model smoke mới `qwen3-4b-06b-actual-smoke-20260829` chạy end-to-end trên
+  CPU với target Qwen3-4B + draft/verifier Qwen3-0.6B, gồm timing verifier.
+- Discovery mới `qwen3-4b-cnn10-target-20260829` chạy 10 mẫu CNN/DailyMail:
+  target 10/10, controlled proposal 20/20, report mới cho H1 `FAIL`, H2
+  `FAIL`, H3/H4/H5 `UNAVAILABLE` theo coverage/điều kiện đo; không overclaim
+  hypothesis từ run này.
+- Theo yêu cầu dùng môi trường máy, đã xác minh trực tiếp ngoài sandbox:
+  `/home/tuantb/miniconda3/bin/python3` thấy Tesla T4 và CUDA 12.4; không dùng
+  `.venv` cho thực nghiệm GPU.
+- Discovery GovReport đầu tiên lộ OOM do T4 `sm75` không có native Flash SDP
+  phù hợp với torch cu124. Đã thêm chunked causal prefill (mask bottom-right)
+  cho target, draft và verifier, kèm regression tests; fresh suite sau patch
+  đạt `38 passed`.
+- Run GPU chính `qwen3-4b-gov25-gpu-all-20260829` chạy 25/25 target và 50/50
+  speculative rows, mọi row có timing. Report mới: H1/H2/H4 `FAIL`, H3/H5
+  `UNAVAILABLE`; không có OOM sau patch.
+- Đã viết báo cáo diễn giải toàn bộ quy trình, runtime, cache audit, các lần
+  OOM và sửa chunked prefill, lệnh tái lập, kết quả H1–H5 và giới hạn tại
+  `src/analyze/groundsync/verification_report_2026-08-29.md`.
+- Đã audit lần hai theo yêu cầu: bổ sung protocol-versus-implementation
+  deviations, gate versioning, inventory 18 run directories, cache download
+  event, artifact/log gaps và các metric H1 lag/segment vào báo cáo; không đổi
+  raw result hay status H1–H5.
 
-## Test Results
-| Test | Input | Expected | Actual | Status |
-|------|-------|----------|--------|--------|
-| Repo/source discovery | `rg --files`, `find data` | Xác định source LongBench local | Chưa có source LongBench trong repo | ✓ |
+## Bổ sung protocol và kết quả 2026-08-30
 
-## Error Log
-| Timestamp | Error | Attempt | Resolution |
-|-----------|-------|---------|------------|
-| 2026-08-28 | Không tìm thấy source LongBench local | 1 | Chưa chạy build; yêu cầu source-root/cache explicit trong thiết kế |
-| 2026-08-28 | `.git/index.lock`: Read-only file system khi commit spec | 1 | Không commit trong sandbox; tiếp tục với file spec đã tạo |
-| 2026-08-28 | Test duplicate ID dừng ở thiếu manifest fixture | 1 | Bổ sung manifest tối thiểu vào fixture để kiểm tra đúng nhánh duplicate |
-| 2026-08-28 | Lệnh rebuild dự phòng dừng ở RepoBench-P trước khi ghi output | 1 | Không lặp build đồng thời; giữ output small-scale đầu tiên đã pass và chuyển determinism sang kiểm tra helper/4 file đã ghi |
-| 2026-08-28 | Test collector route giả định metric aggregate nested | 1 | Sửa expectation theo interface flat hiện tại của `aggregate_semantic`/`aggregate_code_completion` |
-
-### Small-scale checkpoint
-- **Status:** complete; user đã phê duyệt full-scale
-- **Output:** `/tmp/fast_infer_longbench_small`
-- **Result:** 100 records, 20/task, validator PASS, 0 duplicate ID, code bins 4/4/4/4/4.
-- **Full-scale result:** `data/longbench_200`, 1.000 records, validator PASS, 0 duplicate ID, LCC/RepoBench-P bins 40/40/40/40/40.
-
-### Final verification
-- **Status:** complete
-- Focused dataset tests và `py_compile` pass.
-- `pytest -q` toàn repo không collection được vì test vendored yêu cầu optional packages (`seaborn`, `flex_prefill`, `llmlingua`, `minference`, `fire`, `yunchang`, `sglang`); đây là giới hạn môi trường local, không liên quan builder canonical.
-
-## 5-Question Reboot Check
-| Question | Answer |
-|----------|--------|
-| Where am I? | Phase 5: Verification & Delivery — complete |
-| Where am I going? | Bàn giao; các run benchmark tiếp theo dùng `data/longbench_200` |
-| What's the goal? | Canonical LongBench 1.000 mẫu, schema chung, manifest reproducible, runner/evaluator tương thích |
-| What have I learned? | Runner/collector hard-code representative_100; LCC/RepoBench-P cần task-specific prompt/metric |
-| What have I done? | Đã tạo/validate dataset chính thức, cập nhật evaluator và ghi nhận giới hạn test vendored |
-
-## Phase 6: LongBench inference matrix
-
-- **Status:** implementation complete; B200 execution pending on the target server.
-- Added the shared `LONG_BENCH_*` master-config namespace and
-  `scripts/run_longbench_200.sh`; all new launchers use the shared Python 3.12
-  runtime and do not create per-baseline virtual environments.
-- Added `scripts/run_longbench_200.py` with `smoke`, `representative` and `full`
-  profiles, deterministic subsets, unique run directories, child timeout,
-  logs, source-manifest hash and `run_manifest.json`.
-- Added registry/converters/preflight in
-  `scripts/common/longbench_adapter.py`; EAGLE3 and SpecExtend preserve source
-  IDs. MagicDec now has a canonical prompt branch using its SnapKV engine and
-  converted `.pth` checkpoint. SSSD/FAFO remain aggregate scope when the
-  upstream runner cannot return per-sample timings.
-- Added synchronized vanilla HF eager and vanilla FA FlashAttention-2
-  inference, including model-load, prefill/TTFT/decode/E2E, TPOT, throughput,
-  QPS, peak-memory and runtime metadata where the backend exposes them.
-- Collector now reads nested run output, tracks coverage/status separately and
-  routes summarization to ROUGE/BLEU versus LCC/RepoBench-P to exact/edit code
-  completion metrics.
-
-### Verification evidence
-
-| Check | Result |
-|---|---|
-| `pytest -q tests` | **108 passed** |
-| `.venv` interpreter | Python **3.12.13** |
-| Canonical CPU smoke | **45/45 cells**, all `unsupported_cpu`, zero timing values |
-| Collector on CPU smoke | `success=0`, `unsupported_cpu=45`, no speed keys |
-| Full profile on CPU without override | correctly exits with CUDA-required error |
-| `.venv` shared-env preflight | torch/transformers/vLLM/triton/dflash/LLMLingua imports pass; local flash-attn missing and flashinfer cache is read-only |
-
-CPU/T4 cannot produce valid GPU benchmark numbers in this environment. On B200,
-copy the master example to the external master path, verify local model and
-draft/checkpoint paths, then run the same launcher with `--mode smoke` before
-`representative`/`full`.
-
-### Server setup bootstrap
-- **Status:** complete.
-- **Requested paths:** repository under `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum`; stable data/config under `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data`.
-- **Actual artifact:** `scripts/setup_server_env.py` with idempotent checks,
-  optional initialization, shared-data symlinks and direct `python3` system
-  runtime validation; server-side venv creation has been removed.
-- **Verification:** `pytest -q tests` → **111 passed**; `py_compile` and
-  `git diff --check` pass.
-
-### Canonical server profile
-- **Status:** complete.
-- Đã ghi repository, shared data, master config, runtime `python3` hệ thống
-  Python 3.12 và lệnh setup/benchmark tại `docs/server_environment.md`.
-- Đã cập nhật `AGENTS.md`, README, tài liệu benchmark active và
-  `config/master.path` theo server path do người dùng cung cấp.
-
-### Runtime compatibility remediation
-- **Status:** complete locally; B200 smoke rerun pending.
-- Đã sửa toàn bộ traceback đã cung cấp cho các adapter DFlash, MagicDec,
-  LongSpec, EAGLE3, SpecExtend và FAFO; bổ sung test hồi quy riêng tại
-  `tests/test_runtime_compat_fixes.py`.
-- Đã cho phép SSSD smoke chạy với datastore rỗng theo contract upstream;
-  benchmark retrieval vẫn yêu cầu `.idx` đúng model/tokenizer.
-- Verification: `pytest -q tests` → **119 passed**, `git diff --check`,
-  `py_compile` và preflight canonical 45 cell đều pass theo giới hạn CPU/T4.
+- Theo TDD, thêm test/implementation cho positional calibration 32-bin,
+  sensitivity chunk 64/128/256, sink 4/8/16, first-rejection hazard theo
+  relative draft position, position-adjusted hazard coefficient với 2.000
+  document-bootstrap resamples, fixed/adaptive/true-cost policy sweep, H3
+  negative controls và H5 threshold selection train/dev. Fresh suite đạt
+  **50 passed**;
+  `compileall` pass.
+- Thêm `start-offset` và `sample-ids` cho speculative runner để không lấy duy
+  nhất position 0 và để tạo timing subset đúng document test; mỗi speculative
+  output có manifest coverage/timing basis.
+- `qwen3-4b-gov100-gpu-protocol-20260830`: 100 GovReport target request,
+  99 `ok`, 1 OOM; 99 draft-only proposals tại start=1, kmax=8; 12 test-ID
+  timing requests, 11 `ok`, lọc còn 10 rows phủ đủ k=8.
+- `qwen3-4b-cnn100-gpu-protocol-20260830`: 100/100 CNN/DailyMail target
+  `ok`, 100 controlled proposals và 12 timing rows phủ đủ k=8; dùng làm
+  cross-regime H1–H5.
+- Kết quả run mở rộng: H1 composite `FAIL` (no-sink CI lower 0,021996 nhưng
+  calibrated 0,018257; CNN CI lower 0,010580); H2 GovReport `FAIL` với
+  coefficient -0,0657 và CI [-0,0664; -0,0535], CNN/DailyMail `PASS` với CI
+  [0,0181; 0,0301]; hai regime không cùng chiều. H3 primary `FAIL` (Gov
+  AUROC gain 0; CNN no-sink gain -0,0267 dù calibrated sensitivity +0,0267);
+  H4 `FAIL` (grounding oracle speed gain -0,4433 Gov/ -0,4386 CNN); H5
+  `UNAVAILABLE` (predictor có metric nhưng grounding oracle chậm hơn fixed,
+  nên oracle-gain recovery không được định nghĩa ở cả hai regime).
+- Báo cáo chính đã cập nhật thành bản mở rộng, giữ run 25 mẫu là lịch sử và
+  link artifact mới; đã ghi thêm hazard coefficient/bootstrap và kết quả
+  cross-regime H2–H5. Chưa claim EAGLE/vLLM production throughput hoặc causal
+  attribution.
+- Đã bổ sung E0 model-backed position-relocation fixture bằng Qwen3-4B trên
+  T4: cùng evidence ở đầu/giữa/cuối, 3/3 case `ok`; raw mass
+  `0,5029/0,1170/0,1929`, no-sink mass `0,5185/0,2297/0,2296`. No-sink giảm
+  nhưng không loại bỏ positional confounder.
+- Đã bổ sung lag-drift history và chạy multi-start draft-only trên 100 target
+  traces mỗi regime, bốn start `1,6,11,16`: GovReport 396 rows, CNN/DailyMail
+  400 rows. H2 giữ cùng pattern theo regime; H3 no-sink gains lần lượt
+  `-0,0053` và `+0,0086`, đều dưới gate `0,02`; thiếu verifier timing nên H4
+  `UNAVAILABLE`, H5 `INCONCLUSIVE` cho các run bổ sung.
