@@ -53,5 +53,4 @@ findings.md
 progress.md
 task_plan.md
 
-src/analyze/groundsync/results/
-src/analyze/groundsync/results/
+src/analyze/**/results/
