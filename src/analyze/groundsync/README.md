@@ -105,3 +105,97 @@ trong `metrics.json`; thiếu model, thiếu class, thiếu timing, thiếu orac
 headroom hoặc coverage thấp không bị chuyển thành pass. H1 composite chỉ PASS
 khi calibrated estimator cũng đạt gate; H5 chỉ tính oracle-gain recovery khi
 oracle nhanh hơn fixed.
+
+## P0 decision experiments — 2026-09-02
+
+Bộ kiểm định corrected H2/H4, oracle ladder, admission và burstiness được triển
+khai trong `p0_decision.py`. Tất cả raw trace, metrics, CSV, biểu đồ và báo cáo
+của P0 nằm dưới `results/`; không dùng venv khi chạy GPU T4.
+
+Analyzer chốt có thể tái lập bằng:
+
+```bash
+python3 -m src.analyze.groundsync.p0_decision \
+  --config src/analyze/groundsync/p0_decision_config_20260902.json \
+  --output src/analyze/groundsync/results/p0-decision-final9-20260902 \
+  --max-k 16 --candidate-ks 0,2,4,8,16 \
+  --horizon-threshold 0.2 --bootstrap-samples 2000
+```
+
+Timing P0 dùng AR cached one-token cho `k=0`, draft decode incremental và
+cached target verification cho `k>0`. Ladder chỉ giữ các row có đủ timing ở
+tất cả `k=0,2,4,8,16`, để mọi policy dùng cùng population. Grounding threshold
+được chọn bằng utility trên train/dev theo document rồi freeze trên test; P0-5
+dùng 9 start/document (`1,4,7,10,13,16,19,22,25`, `max_k=4`) để đo đủ
+round offset `1,2,4,8`. Đây là controlled/discovery evidence, chưa phải throughput EAGLE,
+vLLM hay production serving.
+
+## P1/P2 — predictor, strong drafter và E2E — 2026-09-02
+
+P1 cheap predictor nằm trong `p1_predictor.py`. Nó chỉ đọc bốn tín hiệu tại
+entry, split theo document và chọn policy trước test:
+
+```bash
+python3 -m src.analyze.groundsync.p1_predictor \
+  --gov-timing src/analyze/groundsync/results/p0-gov50-k16-timing-cached-20260902/speculative_traces.jsonl \
+  --gov-timing src/analyze/groundsync/results/p0-gov10-k16-timing-cached-cont-20260902/speculative_traces.jsonl \
+  --cnn-timing src/analyze/groundsync/results/p0-cnn50-k16-timing-cached-20260902/speculative_traces.jsonl \
+  --multinews-timing src/analyze/groundsync/results/p1p0-multinews10-timing-20260902/speculative_traces.jsonl \
+  --output-dir src/analyze/groundsync/results/p1-cheap-admission-20260902
+```
+
+Strong-drafter/P2 direct E2E dùng `p1_strong_drafter.py`, Python miniconda
+ngoài venv và CUDA T4; ví dụ:
+
+```bash
+/home/tuantb/miniconda3/bin/python3 -m src.analyze.groundsync.p1_strong_drafter \
+  --base-model /path/to/Qwen3-4B \
+  --eagle-model /path/to/Qwen3-4B_eagle3 \
+  --dataset data/representative_100/cnn_dailymail_representative.jsonl \
+  --output-dir src/analyze/groundsync/results/p1p2-eagle3-cnn50-20260902 \
+  --max-samples 50 --max-new-tokens 32 --max-input-tokens 1024 \
+  --total-token 16 --depth 4 --top-k 4 --include-naive
+```
+
+Kết quả chính và quyết định cuối được tổng hợp trong
+[`final_decision_report_2026-09-02.md`](final_decision_report_2026-09-02.md).
+Serving preflight nằm tại `results/p2-serving-preflight-20260902/`; nếu không có
+canonical server mount/runtime thì status là `UNAVAILABLE`, không thay bằng
+direct E2E.
+
+## Target-KV Conditioned Block Drafting — 2026-09-03
+
+Nhánh Target-KV độc lập với GroundSync/P0 cũ được triển khai bằng:
+
+- `target_kv_experiments.py`: schema, bucket, quy đổi DFlash fallback, bootstrap
+  document-level và E0 gate.
+- `e0_dflash_failure_map.py`: runner DFlash chính thức với target prefill
+  chunked, selective hidden capture và K=`{4,8,16}`.
+- `target_kv_e1.py` và `e1_representation_probe.py`: interface representation,
+  document-disjoint split, matched-budget probe và negative controls.
+- `e0_report.py`, `e1_report.py`: báo cáo Markdown theo từng run.
+
+Mọi model-backed run dùng Python CUDA ngoài `.venv`, local-only cache, FP16,
+batch 1 và `prefill_chunk_size=128` trên T4. E0 pilot dùng `max_new_tokens=8`
+để mở rộng coverage; mini-confirmation dùng 32 token. E1 giữ feature trung gian
+ở CPU và bọc toàn bộ forward bằng `torch.inference_mode()` để không dựng graph
+autograd trên GPU.
+
+Các artifact đã chạy:
+
+- E0: `results/tkv-e0-pilot-gov-20260903/`,
+  `results/tkv-e0-pilot-multinews-20260903/`,
+  `results/tkv-e0-pilot-cnn-20260903/`;
+- E0 32-token: `results/tkv-e0-confirm32-gov-20260903/` và
+  `results/tkv-e0-confirm32-multinews-20260903/`;
+- E1: `results/tkv-e1-gov-4k-20260903/` và
+  `results/tkv-e1-multinews-20260903/`;
+- đối chiếu runner chính thức: `results/tkv-dflash-official-crosscheck-20260903.jsonl`;
+- tổng hợp quyết định: `target_kv_decision_report_2026-09-03.md`.
+
+E0 pilot cho zero accepted draft token trên cả ba dataset; long-context
+context-drop gate là `INCONCLUSIVE` vì dataset được chạy FP16 an toàn trên T4
+không có bucket dài tự nhiên. E1 Multi-News probe không cho thấy KV vượt
+token-wise hidden. Do đó E2/E3 không được chạy và không được suy diễn thành
+speedup online; xem report master để biết coverage, numerical guardrail và
+giới hạn kết luận.

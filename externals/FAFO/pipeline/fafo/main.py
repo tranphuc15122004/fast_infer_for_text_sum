@@ -14,9 +14,11 @@ from huggingface_hub import login
 #login(token=hf_access_token)
 
 import pipeline.main_utils as main_utils
-from eval_mtbench import eval_mtbench
-from eval_humaneval import eval_humaneval
-from eval_gsm8k import eval_gsm8k
+
+# The three eval modules are imported lazily inside the dataset dispatch below.
+# Each module pulls in task-specific dependencies (human_eval for humaneval,
+# fastchat/mt-bench data for mtbench) that are not required by other tasks and
+# may be absent on offline benchmark servers.
 
 SEED = 42
 main_utils.lock_seed(SEED)
@@ -32,14 +34,17 @@ logger.info(json.dumps(config, indent=4))
 
 
 if config['eval_params']['dataset'] == 'mtbench':
+    from eval_mtbench import eval_mtbench
     processed_results, raw_results = eval_mtbench(config)
     main_utils.register_result(processed_results, raw_results, config)
 
 elif config['eval_params']['dataset'] == 'humaneval':
+    from eval_humaneval import eval_humaneval
     processed_results, raw_results = eval_humaneval(config)
     main_utils.register_result(processed_results, raw_results, config)
 
 elif config['eval_params']['dataset'] == 'gsm8k':
+    from eval_gsm8k import eval_gsm8k
     processed_results, raw_results = eval_gsm8k(config)
     main_utils.register_result(processed_results, raw_results, config)
 

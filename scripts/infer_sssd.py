@@ -10,8 +10,10 @@ plus a summary to the repository schema.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,52 @@ from common.paths import ROOT
 SSSD_ROOT = ROOT / "externals" / "SSSD"
 SSSD_PYTHON = SSSD_ROOT / "python"
 SSSD_SPECULATOR = SSSD_ROOT / "sssd_speculator"
+
+# Standalone stdlib-``json`` implementation of the ``orjson`` API subset the
+# vendored SGLang fork uses.  It is copied to a temp dir as ``orjson.py`` and
+# prepended to the child PYTHONPATH only when the real package is missing.
+ORJSON_COMPAT_SOURCE = ROOT / "scripts" / "common" / "orjson_compat.py"
+
+
+def _child_imports_orjson(python: str) -> bool:
+    """Return True when ``python`` can import the real ``orjson`` package."""
+    try:
+        probe = subprocess.run(
+            [python, "-c", "import orjson"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+@contextlib.contextmanager
+def _with_orjson_compat(python: str, env: dict[str, str]):
+    """Yield ``env``, prepending a stdlib-``json`` ``orjson`` shim when needed.
+
+    The vendored SGLang fork imports ``orjson`` at module scope even for the
+    offline throughput entrypoint, so without a fallback an SSSD run dies with
+    ``ModuleNotFoundError: No module named 'orjson'`` on dependency-light
+    servers.  When the real package is importable this is a no-op.
+    """
+    if not ORJSON_COMPAT_SOURCE.is_file() or _child_imports_orjson(python):
+        yield env
+        return
+    with tempfile.TemporaryDirectory(prefix="orjson-compat-") as tmp_dir:
+        shutil.copyfile(ORJSON_COMPAT_SOURCE, Path(tmp_dir) / "orjson.py")
+        patched = dict(env)
+        entries = [tmp_dir] + [
+            entry
+            for entry in patched.get("PYTHONPATH", "").split(os.pathsep)
+            if entry
+        ]
+        patched["PYTHONPATH"] = os.pathsep.join(entries)
+        print(
+            f"[SSSD] orjson unavailable; using stdlib-json compat module "
+            f"({ORJSON_COMPAT_SOURCE})"
+        )
+        yield patched
 
 
 def build_command(
@@ -196,13 +244,17 @@ def main() -> None:
             context_len=args.max_input_tokens,
         )
         print("+ " + " ".join(command))
-        proc = subprocess.run(
-            command,
-            cwd=SSSD_ROOT,
+        with _with_orjson_compat(
+            python=command[0] if command else sys.executable,
             env=_runtime_env(),
-            capture_output=True,
-            text=True,
-        )
+        ) as child_env:
+            proc = subprocess.run(
+                command,
+                cwd=SSSD_ROOT,
+                env=child_env,
+                capture_output=True,
+                text=True,
+            )
         process_returncode = proc.returncode
         process_log = (proc.stdout or "") + (proc.stderr or "")
         print(process_log[-4000:])

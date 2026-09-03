@@ -1,3 +1,11 @@
+# Chỉ mục báo cáo cập nhật
+
+Các thực nghiệm quyết định P0, P1, strong-drafter và P2 direct E2E chạy sau
+báo cáo lịch sử này được tổng hợp đầy đủ tại
+[`final_decision_report_2026-09-02.md`](final_decision_report_2026-09-02.md).
+File hiện tại giữ nguyên bằng chứng H1–H5/E0–E5 trước đó để truy vết, không phải
+bản kết luận mới nhất.
+
 # Báo cáo toàn bộ quá trình kiểm định giả thiết GroundSync
 
 **Ngày thực hiện:** 29/08/2026 (UTC)  
@@ -828,3 +836,10 @@ Bằng chứng mạnh nhất hiện tại là:
 với nhiều anchor/seed, thêm nhiều start/output positions và timing multi-start
 trên kích thước sample lớn hơn, cùng benchmark serving thực với implementation
 speculative tối ưu nếu claim cuối vẫn là tokens/second.
+# Chỉ mục báo cáo cập nhật
+
+Các thực nghiệm quyết định P0, P1, strong-drafter và P2 direct E2E chạy sau
+báo cáo lịch sử này được tổng hợp đầy đủ tại
+[`final_decision_report_2026-09-02.md`](final_decision_report_2026-09-02.md).
+File hiện tại giữ nguyên bằng chứng H1–H5/E0–E5 trước đó để truy vết, không phải
+bản kết luận mới nhất.

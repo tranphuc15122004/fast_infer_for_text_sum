@@ -21,7 +21,6 @@ from pipeline.fafo.utils import (
     load_model
 )
 from pipeline.fafo.flex_masking.inference_mask import INFERENCE_MASKS
-from human_eval.data import read_problems
 from pipeline.fafo.models.utils import build_prompt
 
 flex_attention = torch.compile(flex_attention)
@@ -224,7 +223,10 @@ def eval_humaneval(config):
         config_fafo(config=pipeline_config, LEVEL=pipeline_config['level'], WINDOW_SIZE=pipeline_config['window'], GUESS_SET_SIZE=pipeline_config['num_guesses'], USE_FLASH=pipeline_config['use_flash'], DIST_WORKERS=len(os.environ.get("CUDA_VISIBLE_DEVICES").split(",")))
         logger.info(f"FAFO activated config: {pipeline.fafo.decoding.CONFIG_MAP}")
 
-    # Load data
+    # Load data.  Imported lazily: the OpenAI HumanEval loader is required only
+    # when the ``humaneval`` task actually runs; it may not be installed on
+    # offline benchmark servers running other datasets.
+    from human_eval.data import read_problems
     questions = read_problems()
     questions = list(questions.values())
     # Load model

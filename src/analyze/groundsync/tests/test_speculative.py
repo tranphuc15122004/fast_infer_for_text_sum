@@ -34,6 +34,12 @@ def test_select_start_positions_is_deterministic_and_bounded() -> None:
     assert select_start_positions(10, max_starts=3, stride=2) == [0, 2, 4]
     assert select_start_positions(3, max_starts=10, stride=2) == [0, 2]
     assert select_start_positions(10, max_starts=2, stride=2, start_offset=1) == [1, 3]
+    assert select_start_positions(
+        10, max_starts=10, stride=2, start_offset=1, max_new_tokens=4
+    ) == [1, 3, 5]
+    assert select_start_positions(
+        3, max_starts=10, stride=1, max_new_tokens=4
+    ) == []
     with pytest.raises(ValueError, match="stride"):
         select_start_positions(10, max_starts=2, stride=0)
     with pytest.raises(ValueError, match="max_starts"):
@@ -88,10 +94,11 @@ def test_controlled_trace_records_timing_by_block_length_when_verifier_exists() 
     assert rows[0]["fully_accepted"] is True
     assert len(rows[0]["draft_time_by_k_ms"]) == 2
     assert len(rows[0]["verification_time_by_k_ms"]) == 2
+    assert rows[0]["autoregressive_time_ms"] is not None
     assert rows[0]["timing_basis"] == "measured_cached_target_check"
     # The target verifier sees a speculative block of length k in one forward,
     # rather than k sequential one-token forwards.
-    assert [call.shape[1] for call in verifier.seen_inputs[1:]] == [1, 2]
+    assert [call.shape[1] for call in verifier.seen_inputs[1:3]] == [1, 2]
 
 
 def test_draft_prefill_accepts_long_context_chunking() -> None:

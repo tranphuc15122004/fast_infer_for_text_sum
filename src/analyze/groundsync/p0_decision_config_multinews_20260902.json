@@ -1,0 +1,11 @@
+[
+  {
+    "name": "multinews",
+    "target": "src/analyze/groundsync/results/p1p0-multinews50-target-20260902/target_traces.jsonl",
+    "speculative": "src/analyze/groundsync/results/p1p0-multinews50-spec-20260902/speculative_traces.jsonl",
+    "timing": [
+      "src/analyze/groundsync/results/p1p0-multinews10-timing-20260902/speculative_traces.jsonl"
+    ],
+    "multistart": "src/analyze/groundsync/results/p1p0-multinews50-multistart-20260902/speculative_traces.jsonl"
+  }
+]

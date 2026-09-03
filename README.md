@@ -36,7 +36,7 @@ export HF_TOKEN=hf_xxx
 bash scripts/run.sh <baseline>        # eagle3 dflash llmlingua fastkv rocketkv
                                       # gemfilter specprefill minference magicdec
                                       # longspec specextend higoe semantic_selection
-                                      # flexprefill
+                                      # flexprefill syncspec
 ```
 
 Sau khi sửa master một lần trên server, các lần cập nhật code không cần copy
@@ -46,6 +46,18 @@ Smoke toàn bộ 14 baseline trên B200 (mỗi baseline một sample):
 
 ```bash
 bash scripts/run_b200_smoke.sh
+```
+
+SyncSpec-v1 có preflight riêng vì cần drafter checkpoint đã train:
+
+```bash
+python3 scripts/check_syncspec_b200.py --strict
+bash scripts/run_syncspec_b200_smoke.sh
+# Smoke Stage 0 → train joint → infer:
+bash scripts/run_syncspec_b200_train_smoke.sh
+# Smoke toàn chuỗi CPU deterministic (dùng example master local):
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 Mô phỏng local bằng `.venv`:

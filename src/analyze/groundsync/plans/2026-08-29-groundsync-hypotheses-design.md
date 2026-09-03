@@ -230,3 +230,167 @@ predictable; otherwise the report recommends the exact stopping point.
   verifier standalone để tái sử dụng target trace.
 - Subtask 5: model-backed validation đã chạy trên T4; report phải giữ các
   `FAIL`/`UNAVAILABLE` của discovery, không diễn giải thành kết luận tổng quát.
+
+## P0 decision experiments — 2026-09-02
+
+Theo quyết định nghiên cứu mới, giai đoạn tiếp theo không triển khai thêm
+GroundSync/BurstSpec mà kiểm tra trực tiếp headroom và cơ chế admission.
+Artifact của giai đoạn này vẫn nằm trong `src/analyze/groundsync/`.
+
+### P0-1 — corrected within-block transition H2
+
+Với proposal bắt đầu tại `t`, tạo risk-set row cho từng relative position `j`
+(`1..Kmax`) nếu proposal còn sống tại vị trí đó. Predictor chính là
+`d_transition[t,j] = JS(g[t+j-1], g[t+j])`; controls gồm target entropy tại
+`t+j`, draft confidence tại `j`, relative position và output position. Fit
+regularized logistic discrete-hazard model và document-bootstrap CI. Không dùng
+`drift_at_start` cho quyết định chính. Gate: lower 95% CI của hệ số transition
+phải lớn hơn 0 và cùng dấu trên GovReport/CNN-DM; nếu không, transition H2
+fail.
+
+### P0-2 — corrected Grounding Oracle H4
+
+Horizon không thấy transition trong `Kmax` bước được mã hóa là `Kmax`, không
+phải `1`. Threshold được chọn trên train/dev documents bằng utility khi có
+timing, sau đó freeze trước test. So sánh best fixed, entropy/history adaptive
+và corrected Grounding Oracle. Oracle chỉ được gọi utility oracle khi có timing
+đo riêng; acceptance-only được ghi riêng.
+
+### P0-3/P0-4 — oracle ladder và admission oracle
+
+Ladder sử dụng `k={0,2,4,8,16}`. `k=0` là AR một token với chi phí đo
+`autoregressive_time_ms`; `k>0` dùng draft + cached target verification. True-cost
+hindsight oracle được tính trên toàn ladder. First-token admission oracle chỉ
+dùng bit `accepted_len > 0`, không dùng accepted length đầy đủ; báo cáo recovery
+so với best fixed và true-cost oracle.
+
+### P0-5 — burstiness
+
+Within-block hazard báo cáo `h_j=P(R=j|R>=j)` và tỷ số `h_1/mean(h[j>1])`.
+Across-round persistence dùng `S_t=1[accepted_len>0]`, sắp theo document và
+start position, đo `P(S[t+delta]=1|S[t]=1)` so với marginal tại
+`delta={1,2,4,8}`. Multi-start acceptance traces được dùng để tránh suy luận từ
+một start/document.
+
+### Coverage và quyết định
+
+Chạy `max_k=16` trên tối đa 100 documents/dataset cho acceptance; chạy timing
+trên tối đa 50 documents/dataset nếu runtime chịu được. Mọi run ghi manifest,
+status từng document, model/runtime, seed và command. Corrected GroundOracle
+beat best generic adaptive baseline tối thiểu 5–8% là ngưỡng tiếp tục GroundSync;
+entry oracle recovery trên 40–50% gap là tín hiệu pivot BurstSpec. Nếu entry
+oracle yếu, dừng adaptive speculation direction. Đây là discovery/controlled
+evidence, chưa phải production E2E.
+
+## P1/P2 execution extension — 2026-09-02
+
+Sau P0, bổ sung ba kiểm tra có điều kiện nhưng vẫn chạy đầy đủ để tránh dừng
+ở ceiling oracle: predictor admission rẻ, strong drafter replication và direct
+E2E. Predictor chỉ dùng feature tại thời điểm proposal (`target_entropy_at_start`,
+confidence token đầu, acceptance history quá khứ và output position), split theo
+document, chọn `k`/threshold trước test, rồi đánh giá bằng measured
+committed-tokens/ms. Strong drafter dùng cache EAGLE-3 Qwen3-4B ghép canonical
+Qwen3-4B; acceptance list của EAGLE được chuẩn hóa bằng cách trừ target fallback
+token. P2 đo paired greedy output/timing trên cùng prompt và chỉ gọi là direct
+E2E, không gọi là vLLM/API serving.
+
+Multi-News được thêm như regime confirmatory: 50 target traces, 50 controlled
+acceptance rows, 10 timing rows cho ladder và 9 starts/document cho persistence.
+Thiếu timing hoặc thiếu class được ghi `UNAVAILABLE`/`INCONCLUSIVE`; không nội
+suy từ CNN/GovReport.
+
+## Impact on Plan
+
+- Subtask 1–9: giữ nguyên kết quả và artifact; không thay đổi gate P0.
+- New Subtask 10: cheap admission predictor trên timing rows, document-disjoint
+  train/dev/test, metric classification và realized utility.
+- New Subtask 11: EAGLE-3 strong-drafter replication và persistence analysis trên
+  GovReport/CNN-DM (thêm Multi-News nếu runtime cho phép).
+- New Subtask 12: paired direct E2E benchmark; vLLM/API chỉ được ghi
+  `UNAVAILABLE` nếu package/server không có, không dùng proxy thay thế.
+- Validation scope: thêm smoke EAGLE, exact-match guardrail và fresh report audit;
+  L0/L1 training Validation Pyramid không áp dụng vì đây là evaluation pipeline.
+
+## Target-KV Conditioned Block Drafting — approved revision 2026-09-03
+
+Phần này là revision tiếp theo của kế hoạch, theo proposal Target-KV
+Conditioned Block Drafting. Không thay thế kết quả GroundSync/P0/P1/P2 trước đó;
+đây là nhánh thí nghiệm mới dùng cùng thư mục artifact.
+
+### Phạm vi và cặp model
+
+E0/E1 dùng cặp local-only chính thức:
+
+- target: Qwen3-4B snapshot trong cache Hugging Face;
+- drafter E0: `z-lab/Qwen3-4B-DFlash-b16` snapshot trong cache;
+- dtype: FP16 trên Tesla T4 (không dùng BF16 native);
+- batch size: 1; inference ngoài `.venv` bằng Python system/Miniconda có CUDA.
+
+Không dùng chain Qwen3-0.6B cho E0 vì đó là weak-drafter artifact khác với
+hypothesis Target-KV. Không tải model qua mạng; thiếu cache được ghi
+`UNAVAILABLE`.
+
+### E0 — baseline failure map
+
+Chạy K=`{4,8,16}`, `max_new_tokens=32`, greedy/temperature 0. DFlash loader
+nhận `block_size` độc lập với native `block_size=16`, nên ba K được chạy trực
+tiếp trên cùng checkpoint. Mỗi row lưu prompt/document id, input length, K,
+acceptance length từng vòng, first rejection, prefill/decode/draft/verify
+timing, peak VRAM và status.
+
+Tập chính là `data/longbench_200/gov_report.jsonl` và
+`data/longbench_200/multi_news.jsonl`; CNN/DailyMail chỉ là short/easy control.
+Main result không padding nhân tạo. Mẫu vượt `max_position_embeddings=40960`
+được loại có lý do; mẫu Multi-News dài bất thường cũng không được cắt im lặng.
+Bucket được báo theo dữ liệu tự nhiên, kèm `n` và CI; bucket có ít mẫu không
+được dùng cho claim tổng quát.
+
+Metrics chính:
+
+```text
+S_L(j) = P(A >= j | context bucket L)
+MAT = mean(A)
+first-rejection distribution
+draft/verify latency
+committed tokens/s
+```
+
+Kill gate E0: cần thấy survival tại K=8/16 giảm theo context một cách có CI
+hoặc interaction context × depth có ý nghĩa. Nếu không, dừng động lực
+"long-context KV advantage" và không mở rộng E2/E3.
+
+### E1 — representation sufficiency probe
+
+Target frozen. Tạo feature cache theo anchor/document-disjoint split, không cho
+future target tokens lọt vào representation. So sánh cùng một lightweight block
+predictor và cùng ngân sách trainable parameters:
+
+- R1: target hidden hiện tại `h_t`;
+- R2: token-wise hidden sequence `{h_i}`;
+- R3: multi-layer hidden sequence;
+- R4: target KV `{K_i,V_i}` ở số layer tương ứng R3.
+
+Các representation được đưa qua interface dimension chung; số tham số adapter
+và predictor được ghi vào manifest, nếu không equal được thì dùng frozen
+projection chung và báo cáo parameter audit. Probe dự đoán 16 token target,
+đánh giá CE, Acc@1, Acc@5 và `P(A>=j)` theo `j=1..16`, context bucket và
+dataset. Có negative controls shuffled-KV, wrong-document-KV, recent-only-KV và
+source-only-KV.
+
+Kill gate E1: KV phải hơn token-wise hidden (không chỉ hơn `h_t`) ở ít nhất hai
+regime hoặc có CI rõ ràng, và hiệu ứng phải tăng theo `j` hoặc context. Nếu
+R4 chỉ hơn R1 nhưng xấp xỉ R2, kết luận là memory sequence đủ, không ủng hộ
+claim KV-specific.
+
+### Validation, quy mô và chuyển pha
+
+Trước model run: unit/schema tests, document split/leakage test, feature shape,
+finite-value và parameter-budget audit. Sau đó chạy GPU smoke một mẫu ngắn và
+một mẫu 8K trước pilot. Pilot mục tiêu E0 là tối đa 200 GovReport + 200
+Multi-News + 100 CNN/DailyMail; E1 bắt đầu 5.000 anchors/dataset, chỉ tăng khi
+smoke và coverage đạt. Mọi kết quả dùng document bootstrap CI và ghi rõ bucket
+thưa.
+
+Chỉ mở E2 factorial sau khi cả E0 và E1 pass gate. E3 DFlash-KV adapter chỉ
+được chạy adapter-only ở context mà T4 xác nhận không OOM; full fine-tuning và
+claim 32–40K cần GPU lớn hơn.

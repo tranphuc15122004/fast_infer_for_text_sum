@@ -1,0 +1,36 @@
+{
+  "schema_version": "groundsync.final.artifact_manifest.v1",
+  "date": "2026-09-02",
+  "experiment_root": "src/analyze/groundsync",
+  "reports": [
+    "final_decision_report_2026-09-02.md",
+    "p0_final_report_2026-09-02.md",
+    "verification_report_2026-08-29.md"
+  ],
+  "p0": {
+    "govreport_cnn_dailymail": "results/p0-decision-final9-20260902",
+    "multinews": "results/p0-decision-multinews-20260902",
+    "config_govreport_cnn_dailymail": "p0_decision_config_20260902.json",
+    "config_multinews": "p0_decision_config_multinews_20260902.json"
+  },
+  "p1": {
+    "cheap_admission": "results/p1-cheap-admission-20260902",
+    "strong_drafter_govreport": "results/p1p2-eagle3-gov50-20260902",
+    "strong_drafter_cnn_dailymail": "results/p1p2-eagle3-cnn50-20260902",
+    "strong_drafter_multinews": "results/p1p2-eagle3-multinews50-20260902"
+  },
+  "p2": {
+    "direct_e2e_runs": [
+      "results/p1p2-eagle3-gov50-20260902",
+      "results/p1p2-eagle3-cnn50-20260902",
+      "results/p1p2-eagle3-multinews50-20260902"
+    ],
+    "serving_preflight": "results/p2-serving-preflight-20260902"
+  },
+  "decisions": {
+    "groundsync_general": "NO_GO",
+    "burst_spec_general": "NO_GO",
+    "oracle_headroom": "PRESENT_CEILING_ONLY",
+    "serving_api": "UNAVAILABLE"
+  }
+}

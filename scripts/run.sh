@@ -33,9 +33,10 @@ case "$BASELINE" in
   higoe)       WRAPPER="scripts/run_higoe.sh" ;;
   semantic_selection) WRAPPER="scripts/run_semantic_selection.sh" ;;
   flexprefill)     WRAPPER="scripts/run_flexprefill.sh" ;;
+  syncspec)        WRAPPER="scripts/run_syncspec.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill" >&2
+    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
     exit 1
     ;;
 esac

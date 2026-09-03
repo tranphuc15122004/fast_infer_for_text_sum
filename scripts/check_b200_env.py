@@ -34,6 +34,7 @@ BASELINES = (
     "higoe",
     "semantic_selection",
     "flexprefill",
+    "syncspec",
 )
 
 GPU_ONLY = {
@@ -45,6 +46,7 @@ GPU_ONLY = {
     "longspec",
     "specextend",
     "flexprefill",
+    "syncspec",
 }
 
 BASELINE_IMPORTS = {
@@ -62,6 +64,7 @@ BASELINE_IMPORTS = {
     "higoe": ("torch", "sentence_transformers", "faiss", "dgl"),
     "semantic_selection": ("torch", "transformers", "sentence_transformers"),
     "flexprefill": ("torch", "triton"),
+    "syncspec": ("torch", "transformers"),
 }
 
 ASSET_ENV = {
@@ -77,6 +80,7 @@ ASSET_ENV = {
     "specextend": ("BASE_MODEL", "DRAFT_MODEL", "INPUT_FILE"),
     "semantic_selection": ("MODEL", "EMBEDDING_MODEL", "INPUT_FILE"),
     "flexprefill": ("MODEL", "DATA_FILE"),
+    "syncspec": ("TARGET_MODEL", "DRAFTER_CHECKPOINT", "DATA_FILE"),
 }
 
 PROFILE_ASSET_ENV = {
@@ -116,6 +120,11 @@ PROFILE_ASSET_ENV = {
         "INPUT_FILE": "B200_DATA_FILE",
     },
     "flexprefill": {"MODEL": "B200_TARGET_MODEL", "DATA_FILE": "B200_DATA_FILE"},
+    "syncspec": {
+        "TARGET_MODEL": "B200_TARGET_MODEL",
+        "DRAFTER_CHECKPOINT": "B200_SYNCSPEC_DRAFTER_CHECKPOINT",
+        "DATA_FILE": "B200_DATA_FILE",
+    },
 }
 
 CACHE_ENV = (

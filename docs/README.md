@@ -28,6 +28,7 @@ server. Thông tin path/runtime canonical: [`docs/server_environment.md`](server
 | HiGOE | `python3` server / `.venv` mô phỏng | `docs/baselines/higoe.md` |
 | semantic_selection | `python3` server / `.venv` mô phỏng | adapter trong `docs/longbench_200_benchmark.md` |
 | FlexPrefill | `python3` server / `.venv` mô phỏng | `docs/baselines/flexprefill.md` |
+| SyncSpec-v1 | `python3` server / `.venv` mô phỏng | `docs/baselines/syncspec.md` |
 
 ## Chuẩn bị chung trên server B200
 
@@ -94,6 +95,18 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 ```bash
 bash scripts/run.sh <baseline> [args...]
+```
+
+SyncSpec có thêm preflight/smoke riêng vì cần checkpoint drafter đã train:
+
+```bash
+python3 scripts/check_syncspec_b200.py --strict
+bash scripts/run_syncspec_b200_smoke.sh
+# Smoke toàn chuỗi train + infer (tạo drafter checkpoint mới):
+bash scripts/run_syncspec_b200_train_smoke.sh
+# Smoke toàn chuỗi CPU deterministic:
+FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
+  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 Mọi baseline đọc cùng một master shell-env. Pointer mặc định là

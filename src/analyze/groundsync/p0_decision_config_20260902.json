@@ -1,0 +1,19 @@
+[
+  {
+    "name": "govreport",
+    "target": "src/analyze/groundsync/results/qwen3-4b-gov100-gpu-protocol-20260830/target_traces.jsonl",
+    "speculative": "src/analyze/groundsync/results/p0-gov100-k16-20260902/speculative_traces.jsonl",
+    "timing": [
+      "src/analyze/groundsync/results/p0-gov50-k16-timing-cached-20260902/speculative_traces.jsonl",
+      "src/analyze/groundsync/results/p0-gov10-k16-timing-cached-cont-20260902/speculative_traces.jsonl"
+    ],
+    "multistart": "src/analyze/groundsync/results/p0-gov100-multistart9-k4-20260902/speculative_traces.jsonl"
+  },
+  {
+    "name": "cnn_dailymail",
+    "target": "src/analyze/groundsync/results/qwen3-4b-cnn100-gpu-protocol-20260830/target_traces.jsonl",
+    "speculative": "src/analyze/groundsync/results/p0-cnn100-k16-20260902/speculative_traces.jsonl",
+    "timing": "src/analyze/groundsync/results/p0-cnn50-k16-timing-cached-20260902/speculative_traces.jsonl",
+    "multistart": "src/analyze/groundsync/results/p0-cnn100-multistart9-k4-20260902/speculative_traces.jsonl"
+  }
+]

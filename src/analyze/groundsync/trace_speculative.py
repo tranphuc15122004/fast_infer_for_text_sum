@@ -50,8 +50,9 @@ def select_start_positions(
     max_starts: int,
     stride: int,
     start_offset: int = 0,
+    max_new_tokens: int | None = None,
 ) -> list[int]:
-    """Choose deterministic target-prefix positions for controlled proposals."""
+    """Choose deterministic positions whose requested continuation is complete."""
 
     if output_length < 0:
         raise ValueError("output_length must be non-negative")
@@ -61,7 +62,12 @@ def select_start_positions(
         raise ValueError("stride must be positive")
     if start_offset < 0:
         raise ValueError("start_offset must be non-negative")
-    return list(range(start_offset, output_length, stride))[:max_starts]
+    if max_new_tokens is not None and max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    last_start = output_length - max_new_tokens if max_new_tokens is not None else output_length - 1
+    if last_start < start_offset:
+        return []
+    return list(range(start_offset, last_start + 1, stride))[:max_starts]
 
 
 def _model_call(model: Any, **kwargs: Any) -> Any:
@@ -87,18 +93,34 @@ def generate_draft_proposal(
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
     prefix_ids = prefix_ids.to(device)
-    started = time.perf_counter()
+    prefill_started = time.perf_counter()
     proposed: list[int] = []
     confidences: list[float] = []
     elapsed_by_k: list[float] = []
     with torch.inference_mode():
+        # Keep timing semantics aligned with the target AR measurement and
+        # target block verifier: prefix prefill is outside the per-round cost.
+        # The final prefix token is then an incremental draft query producing
+        # the first proposed token; subsequent proposed tokens are cached
+        # one-token forwards.
         outputs = _chunked_prefill(
             model,
-            prefix_ids,
+            prefix_ids[:, :-1],
             prefill_chunk_size=prefill_chunk_size,
         )
         past_key_values = outputs.past_key_values
+        decode_started = time.perf_counter()
+        outputs = _model_call(
+            model,
+            input_ids=prefix_ids[:, -1:],
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
         logits = outputs.logits[:, -1, :].float()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         for _ in range(max_new_tokens):
             probabilities = torch.softmax(logits, dim=-1)
             confidence, next_token = probabilities.max(dim=-1, keepdim=True)
@@ -107,7 +129,7 @@ def generate_draft_proposal(
             confidences.append(float(confidence[0, 0].item()))
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            elapsed_by_k.append((time.perf_counter() - started) * 1000.0)
+            elapsed_by_k.append((time.perf_counter() - decode_started) * 1000.0)
             if eos_token_id is not None and token_id == int(eos_token_id):
                 break
             outputs = _model_call(
@@ -119,7 +141,7 @@ def generate_draft_proposal(
             )
             past_key_values = outputs.past_key_values
             logits = outputs.logits[:, -1, :].float()
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    elapsed_ms = (time.perf_counter() - prefill_started) * 1000.0
     return proposed, confidences, elapsed_ms, elapsed_by_k
 
 
@@ -169,6 +191,41 @@ def _measure_verification_by_k(
     return result
 
 
+def _measure_autoregressive_time(
+    model: Any,
+    prefix_ids: torch.Tensor,
+    *,
+    device: torch.device,
+    prefill_chunk_size: int = 512,
+) -> float:
+    """Measure the cached one-token target check used by the ``k=0`` policy."""
+
+    prefix_ids = prefix_ids.to(device)
+    if prefix_ids.shape[1] < 2:
+        raise ValueError("prefix must contain at least two tokens")
+    with torch.inference_mode():
+        prefill = _chunked_prefill(
+            model,
+            prefix_ids[:, :-1],
+            prefill_chunk_size=prefill_chunk_size,
+        )
+        started = time.perf_counter()
+        _model_call(
+            model,
+            input_ids=prefix_ids[:, -1:],
+            past_key_values=prefill.past_key_values,
+            use_cache=True,
+            return_dict=True,
+            output_attentions=False,
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    elapsed = (time.perf_counter() - started) * 1000.0
+    if elapsed <= 0.0 or not torch.isfinite(torch.tensor(elapsed)):
+        raise ValueError("autoregressive timing is non-positive or non-finite")
+    return elapsed
+
+
 def run_one_speculative_trace(
     model: Any,
     tokenizer: Any,
@@ -194,7 +251,7 @@ def run_one_speculative_trace(
         raise ValueError("target row has no generated_token_ids")
     starts = select_start_positions(
         len(canonical), max_starts=max_starts, stride=stride,
-        start_offset=start_offset,
+        start_offset=start_offset, max_new_tokens=max_k,
     )
     results: list[dict[str, Any]] = []
     eos_id = getattr(tokenizer, "eos_token_id", None)
@@ -217,6 +274,7 @@ def run_one_speculative_trace(
             prefill_chunk_size=prefill_chunk_size,
         )
         verification_time_by_k = None
+        autoregressive_time_ms = None
         if verification_model is not None and verification_rendered is not None:
             verification_prefix_ids = torch.cat(
                 [
@@ -229,6 +287,12 @@ def run_one_speculative_trace(
                 verification_model,
                 verification_prefix_ids,
                 proposed,
+                device=verification_device or device,
+                prefill_chunk_size=prefill_chunk_size,
+            )
+            autoregressive_time_ms = _measure_autoregressive_time(
+                verification_model,
+                verification_prefix_ids,
                 device=verification_device or device,
                 prefill_chunk_size=prefill_chunk_size,
             )
@@ -263,6 +327,7 @@ def run_one_speculative_trace(
             "draft_time_ms": draft_ms,
             "draft_time_by_k_ms": draft_time_by_k,
             "verification_time_by_k_ms": verification_time_by_k,
+            "autoregressive_time_ms": autoregressive_time_ms,
             "verification_time_ms": (
                 verification_time_by_k[-1] if verification_time_by_k else None
             ),

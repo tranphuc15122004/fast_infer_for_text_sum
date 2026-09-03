@@ -473,6 +473,29 @@ fast_infer__load_specprefill() {
   fast_infer_default_from OUTPUT_FILE SPECPREFILL_OUTPUT_FILE
 }
 
+fast_infer__load_syncspec() {
+  fast_infer_default_from TARGET_MODEL SYNCSPEC_TARGET_MODEL MODEL_TARGET
+  fast_infer_default_from DRAFTER_CHECKPOINT SYNCSPEC_DRAFTER_CHECKPOINT
+  fast_infer_default_from SELECTOR_CHECKPOINT SYNCSPEC_SELECTOR_CHECKPOINT
+  fast_infer_default_from SURVIVAL_CHECKPOINT SYNCSPEC_SURVIVAL_CHECKPOINT
+  fast_infer_default_from DATA_FILE SYNCSPEC_DATA_FILE DATA_INPUT
+  fast_infer_default_from OUTPUT_FILE SYNCSPEC_OUTPUT_FILE
+  fast_infer_default_from DEVICE SYNCSPEC_DEVICE FI_DEVICE
+  fast_infer_default_from DTYPE SYNCSPEC_DTYPE DTYPE
+  fast_infer_default_from PROFILE SYNCSPEC_PROFILE
+  fast_infer_default_from GATE_TABLE SYNCSPEC_GATE_TABLE
+  fast_infer_default_from BACKEND SYNCSPEC_BACKEND
+  fast_infer_default_from MAX_SAMPLES SYNCSPEC_MAX_SAMPLES RUN_SAMPLES
+  fast_infer_default_from BATCH_SIZE SYNCSPEC_BATCH_SIZE
+  fast_infer_default_from KD SYNCSPEC_KD
+  fast_infer_default_from KV SYNCSPEC_KV
+  fast_infer_default_from BUDGET_PROFILES SYNCSPEC_BUDGET_PROFILES
+  fast_infer_default_from MAX_NEW_TOKENS SYNCSPEC_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from MAX_INPUT_TOKENS SYNCSPEC_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS
+  fast_infer_default_from STOCHASTIC SYNCSPEC_STOCHASTIC
+  fast_infer_default_from LOCAL_FILES_ONLY SYNCSPEC_LOCAL_FILES_ONLY
+}
+
 fast_infer_load_config() {
   local baseline="${1:-}"
 
@@ -497,6 +520,7 @@ fast_infer_load_config() {
     sssd) fast_infer__load_sssd ;;
     specextend) fast_infer__load_specextend ;;
     specprefill) fast_infer__load_specprefill ;;
+    syncspec) fast_infer__load_syncspec ;;
     *)
       echo "fast-infer: unsupported baseline in master config loader: $baseline" >&2
       return 1

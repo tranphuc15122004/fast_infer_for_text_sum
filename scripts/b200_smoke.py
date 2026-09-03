@@ -195,6 +195,22 @@ def _run_env_values(
         )
     elif baseline == "flexprefill":
         values.update({"MODEL": target, "DATA_FILE": data_file})
+    elif baseline == "syncspec":
+        values.update(
+            {
+                "TARGET_MODEL": target,
+                "DRAFTER_CHECKPOINT": env.get("SYNCSPEC_DRAFTER_CHECKPOINT")
+                or env.get("B200_SYNCSPEC_DRAFTER_CHECKPOINT", ""),
+                "SELECTOR_CHECKPOINT": env.get("SYNCSPEC_SELECTOR_CHECKPOINT")
+                or env.get("B200_SYNCSPEC_SELECTOR_CHECKPOINT", ""),
+                "SURVIVAL_CHECKPOINT": env.get("SYNCSPEC_SURVIVAL_CHECKPOINT")
+                or env.get("B200_SYNCSPEC_SURVIVAL_CHECKPOINT", ""),
+                "PROFILE": env.get("SYNCSPEC_PROFILE") or env.get("B200_SYNCSPEC_PROFILE", ""),
+                "DATA_FILE": data_file,
+                "DEVICE": device,
+                "DTYPE": env.get("SYNCSPEC_DTYPE", "bfloat16"),
+            }
+        )
     return values
 
 
