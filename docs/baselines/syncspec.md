@@ -48,16 +48,34 @@ và correctness, không dùng timing CPU để kết luận speedup B200.
 
 ## Stage 0 → train drafter → inference
 
+SyncSpec dùng cùng semantics block với DFlash: `kd` vẫn là số proposal đưa
+qua selector/verifier, nhưng input vật lý của drafter có `kd + 1` slot. Slot
+đầu là token cuối cùng đã được target commit (thường là bonus token sau một
+block được accept hoàn toàn, hoặc correction token khi block bị reject), các
+slot còn lại là mask. Target hidden và recent-hidden sau commit được dùng làm
+điều kiện cho block kế tiếp. Slot anchor không được đưa vào candidate lattice
+hoặc diffusion loss.
+
 ```bash
 python3 scripts/build_syncspec_trajectories.py \
   --backend transformers --target-model "$MODEL_TARGET" \
   --input data/your_records.jsonl --output /tmp/syncspec-trajectories.jsonl \
   --device cuda --local-files-only --include-target-features \
-  --include-source-memory --source-chunk-size 128 --seed 42 --resume
+  --include-source-memory --source-chunk-size 128 --num-anchors 512 \
+  --seed 42 --resume
 python3 scripts/train_syncspec.py --stage diffusion \
   --data /tmp/syncspec-trajectories.jsonl --output-dir checkpoints/syncspec \
   --target-model "$MODEL_TARGET" --device cuda --kd 16 --steps 1000 \
-  --train-batch-size 1 --seed 42
+  --train-batch-size 1 --num-anchors 512 --position-decay 7 \
+  --attention-backend flash --seed 42
+# Training ghi loss, step time và token throughput vào
+# checkpoints/syncspec/training_steps.jsonl.
+# Mỗi forward chọn ngẫu nhiên tối đa 512 eligible anchors từ mỗi trajectory;
+# anchor thiếu đủ suffix ``kd`` hoặc vượt physical positional capacity bị loại.
+# Nếu toàn bộ trajectory bị cắt bởi EOS trước ``kd``, pipeline dùng fallback
+# loss-mask cho phần suffix còn lại và ghi ``truncated_suffix_fallback``.
+# ``flash`` ép ưu tiên FlashAttention qua SDPA dispatcher; nếu kernel không
+# khả dụng thì tự động fallback sang efficient/math SDPA.
 # Với cache torch binary, dùng output path kết thúc bằng `.pt` và truyền cùng
 # path đó cho mọi training stage; fingerprint/resume được kiểm tra như nhau.
 # Ví dụ: --output /tmp/syncspec-trajectories.pt và --data /tmp/syncspec-trajectories.pt
@@ -192,7 +210,8 @@ Với `--strict`, preflight trả exit `0` khi `PASS`, `2` khi môi trường b�
 `BLOCKED` (có thể retry trên server đúng), và `1` khi cấu hình/asset `FAIL`.
 
 Stage 1 dùng Anchor-Offset: mỗi anchor được truyền vào drafter với vị trí
-tuyệt đối `prompt_len + anchor`, để backbone thấy đúng vị trí decode khi chạy
+tuyệt đối `prompt_len - 1 + anchor`, vì block vật lý bắt đầu tại token anchor
+đã commit, để backbone thấy đúng vị trí decode khi chạy
 long-context. Batch có thể dùng offset khác nhau theo từng dòng. Các slot
 `[MASK]` dùng một sentinel embedding học được riêng; `mask_token_id` chỉ là ID
 placeholder trong tensor, không làm thay đổi embedding/LM head frozen của

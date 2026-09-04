@@ -24,6 +24,9 @@ from SyncSpec.training import (  # noqa: E402
     survival_loss,
     calibration_metrics,
     _source_memory_batch,
+    build_stage1_batch,
+    dflash_position_weights,
+    _sample_random_anchor_rows,
 )
 from SyncSpec.model import SyncSpecDrafter, SyncSpecDrafterConfig  # noqa: E402
 from SyncSpec.selector import SourceCoherentSelector  # noqa: E402
@@ -104,6 +107,180 @@ def test_torch_trajectory_cache_round_trip_and_fingerprint(tmp_path: Path) -> No
     second = TrajectoryRecord(sample_id="second", source_ids=[5], target_ids=[6])
     cache.write([record, second], append=True)
     assert [item.sample_id for item in cache.read()] == ["torch-cache", "second"]
+
+
+def test_stage1_batch_uses_explicit_anchor_and_excludes_anchor_loss() -> None:
+    record = TrajectoryRecord(
+        sample_id="dflash-anchor",
+        source_ids=[10, 11],
+        target_ids=[20, 21, 22, 23],
+        anchors=[0, 1],
+        anchor_token_ids=[11, 20],
+    )
+
+    masked, targets, valid = build_stage1_batch(
+        [record], kd=2, mask_token_id=99, device="cpu", anchor_indices=[1],
+    )
+
+    assert masked.tolist() == [[20, 99, 99]]
+    assert targets.tolist() == [[20, 21, 22]]
+    assert valid.tolist() == [[False, True, True]]
+
+
+def test_dflash_position_weights_prioritize_earlier_future_slots() -> None:
+    weights = dflash_position_weights(4, gamma=7.0, device="cpu")
+
+    assert weights.shape == (4,)
+    assert torch.allclose(weights, torch.exp(-torch.arange(4, dtype=torch.float32) / 7.0))
+    assert torch.all(weights[:-1] >= weights[1:])
+
+
+def test_random_anchor_sampler_is_reproducible_fresh_and_capacity_aware() -> None:
+    record = TrajectoryRecord(
+        sample_id="random-anchors",
+        source_ids=[1, 2, 3],
+        target_ids=list(range(4, 704)),
+        anchors=list(range(700)),
+        anchor_token_ids=[3] + list(range(4, 703)),
+        metadata={
+            "context_length": 3,
+            "anchor_token_positions": list(range(700)),
+        },
+    )
+    first_generator = torch.Generator(device="cpu").manual_seed(123)
+    second_generator = torch.Generator(device="cpu").manual_seed(123)
+
+    first = _sample_random_anchor_rows(
+        [record], kd=2, max_positions=4096, num_anchors=8,
+        generator=first_generator,
+    )
+    second = _sample_random_anchor_rows(
+        [record], kd=2, max_positions=4096, num_anchors=8,
+        generator=first_generator,
+    )
+    replay = _sample_random_anchor_rows(
+        [record], kd=2, max_positions=4096, num_anchors=8,
+        generator=second_generator,
+    )
+
+    assert [anchor for _, anchor in first] == [anchor for _, anchor in replay]
+    assert [anchor for _, anchor in first] != [anchor for _, anchor in second]
+    assert len(first) == 8
+    assert len({anchor for _, anchor in first}) == 8
+    assert all(0 <= anchor < 700 for _, anchor in first)
+
+    capacity_limited = _sample_random_anchor_rows(
+        [record], kd=2, max_positions=5, num_anchors=8,
+        generator=torch.Generator(device="cpu").manual_seed(9),
+    )
+    assert [anchor for _, anchor in capacity_limited] == [0]
+
+
+def test_diffusion_training_samples_fresh_anchor_batch_each_forward() -> None:
+    class RecordingDrafter(SyncSpecDrafter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.anchor_batches = []
+
+        def forward(self, masked_ids, *args, **kwargs):
+            self.anchor_batches.append(masked_ids[:, 0].detach().clone())
+            return super().forward(masked_ids, *args, **kwargs)
+
+    record = TrajectoryRecord(
+        sample_id="per-forward",
+        source_ids=[1, 2],
+        target_ids=list(range(3, 35)),
+        anchors=list(range(32)),
+        anchor_token_ids=[2] + list(range(3, 34)),
+        metadata={"context_length": 2, "anchor_token_positions": list(range(32))},
+    )
+    model = RecordingDrafter(SyncSpecDrafterConfig(
+        vocab_size=64, hidden_size=8, layers=1, heads=2, groups=2,
+    ))
+
+    SyncSpecTrainer(model, device="cpu", learning_rate=1e-3, seed=123).fit_diffusion(
+        [record], kd=2, mask_token_id=63, steps=3, batch_size=1, num_anchors=4,
+    )
+
+    assert len(model.anchor_batches) == 3
+    assert len({tuple(batch.tolist()) for batch in model.anchor_batches}) >= 2
+
+
+def test_stage1_passes_cached_recent_hidden_to_the_drafter() -> None:
+    class RecordingDrafter(SyncSpecDrafter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.seen = {}
+
+        def forward(self, masked_ids, *args, **kwargs):
+            self.seen["masked_ids"] = masked_ids.detach().clone()
+            self.seen["recent_hidden"] = kwargs.get("recent_hidden")
+            return super().forward(masked_ids, *args, **kwargs)
+
+    record = TrajectoryRecord(
+        sample_id="recent-state",
+        source_ids=[10, 11], target_ids=[20, 21, 22], anchors=[0],
+        anchor_token_ids=[11], target_features=[[0.0] * 8],
+        target_recent_hidden=[[[0.1] * 8, [0.2] * 8]],
+        metadata={"target_feature_positions": [0], "recent_hidden_positions": [0]},
+    )
+    model = RecordingDrafter(SyncSpecDrafterConfig(
+        vocab_size=32, hidden_size=8, layers=1, heads=2, groups=2,
+    ))
+
+    summary = SyncSpecTrainer(model, device="cpu", learning_rate=1e-3).fit_diffusion(
+        [record], kd=2, mask_token_id=31, steps=1,
+    )
+
+    assert model.seen["masked_ids"].tolist() == [[11, 31, 31]]
+    assert model.seen["recent_hidden"].shape == (1, 2, 8)
+    assert summary["physical_block_size"] == 3
+    assert summary["recent_hidden_available"] is True
+
+
+def test_diffusion_training_filters_anchors_beyond_physical_position_capacity() -> None:
+    record = TrajectoryRecord(
+        sample_id="capacity",
+        source_ids=[1, 2, 3],
+        target_ids=[4, 5, 6, 7],
+        anchors=[0, 1, 2, 3],
+        anchor_token_ids=[3, 4, 5, 6],
+        metadata={"context_length": 3, "anchor_token_positions": [0, 1, 2, 3]},
+    )
+    model = SyncSpecDrafter(SyncSpecDrafterConfig(
+        vocab_size=16, hidden_size=8, layers=1, heads=2, groups=2,
+        max_positions=5,
+    ))
+
+    summary = SyncSpecTrainer(model, device="cpu", learning_rate=1e-3).fit_diffusion(
+        [record], kd=2, mask_token_id=15, steps=1,
+    )
+
+    assert summary["anchor_count"] == 1
+
+
+def test_trainer_writes_loss_and_step_speed_log(tmp_path: Path) -> None:
+    record = TrajectoryRecord(
+        sample_id="logged",
+        source_ids=[10, 11], target_ids=[20, 21, 22], anchors=[0],
+        anchor_token_ids=[11], target_features=[[0.0] * 8],
+    )
+    model = SyncSpecDrafter(SyncSpecDrafterConfig(
+        vocab_size=32, hidden_size=8, layers=1, heads=2, groups=2,
+    ))
+    log_path = tmp_path / "training_steps.jsonl"
+    trainer = SyncSpecTrainer(
+        model, device="cpu", learning_rate=1e-3, log_path=log_path,
+    )
+
+    trainer.fit_diffusion([record], kd=2, mask_token_id=31, steps=2)
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 2
+    assert all(row["phase"] == "diffusion" for row in rows)
+    assert all(row["loss"] >= 0.0 for row in rows)
+    assert all(row["step_time_s"] > 0.0 for row in rows)
+    assert all(row["throughput_tokens_per_s"] > 0.0 for row in rows)
 
 
 def test_artifact_fingerprint_changes_when_local_model_manifest_changes(tmp_path: Path) -> None:

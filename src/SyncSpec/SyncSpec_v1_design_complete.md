@@ -568,10 +568,13 @@ Use one consistent anchor convention for both training and inference.
 Recommended initial setting:
 
 ```text
-sample_from_anchor = False
+sample_from_anchor = True
 ```
 
-to stay close to the conventional DFlash setup.
+The physical block has \(K_d+1\) slots: the first slot is the last committed
+target token and the remaining \(K_d\) slots are masked future positions. The
+public drafter output removes slot zero, so \(K_d\) remains the number of
+proposal tokens exposed to selector/verifier.
 
 ---
 
@@ -2760,7 +2763,7 @@ A single draft block receives:
 \[
 H^{(0)}
 \in
-\mathbb R^{B\times K_d\times d_D}.
+\mathbb R^{B\times (K_d+1)\times d_D}.
 \]
 
 Its context memory is:
@@ -2794,7 +2797,7 @@ Input H_l
   │
   ├─ RMSNorm
   │
-  ├─ Bidirectional block self-attention over K_d slots
+  ├─ Bidirectional block self-attention over K_d+1 physical slots
   │
   ├─ residual
   │
@@ -2965,7 +2968,11 @@ e([MASK]_{K_d})
 ].
 \]
 
-With `sample_from_anchor=False`, the anchor is context and the model predicts the masked future slots.
+Here \(y_t\) is the last committed target token (the source prompt's final
+token for the first block). The target hidden state at \(y_t\), together with
+the recent target-hidden ring buffer, is passed as context. The model runs on
+all \(K_d+1\) physical slots, but slot zero is an anchor and is removed from
+the public output and all future-token losses.
 
 The drafter returns:
 
@@ -3506,7 +3513,8 @@ while EOS not reached:
 
     7. Retrieve R source-memory chunks.
 
-    8. Run ONE block-parallel diffusion forward for K_d slots.
+    8. Run ONE block-parallel diffusion forward for one anchor plus K_d masked
+       future slots.
 
     9. Keep Top-M unary candidates at every position.
 
@@ -3532,7 +3540,8 @@ while EOS not reached:
            OR
            stochastic rejection/residual correction.
 
-   15. Commit accepted tokens + target correction/bonus token.
+    15. Commit accepted tokens + target correction/bonus token; the resulting
+        final committed token becomes the next block's physical anchor.
 
    16. Roll back all uncommitted speculative target KV entries.
 
@@ -3582,7 +3591,8 @@ for each source document X:
     2. run frozen target with the final intended decoding setup;
     3. save target-generated Y^T;
     4. save source token IDs and source boundaries;
-    5. save selected target hidden states for configured layers;
+    5. save selected target anchor hidden states, recent-hidden windows, and
+       the committed anchor token for each generation state;
     6. optionally save target logits / top-logits;
     7. build source n-gram metadata;
     8. generate random anchor indices for downstream training.
@@ -3602,13 +3612,17 @@ Important:
 ```text
 Algorithm 3: Diffusion Backbone Training
 
-for each target trajectory (X, Y^T):
-    sample anchor a
+for each optimizer forward:
+    select trajectory rows
+    for each selected trajectory, sample up to N_a random eligible anchors
+      (current + K_d future targets supervised and physical block fits)
     sample block budget K_d
-    obtain target context features at anchor
+    obtain the committed anchor token and target hidden/recent-hidden state
     obtain / retrieve source memory
     construct anchor + masked future block
-    run block-parallel drafter
+    run block-parallel drafter with FlashAttention-first SDPA dispatch
+      and efficient/math SDPA fallback
+    exclude the physical anchor slot from supervision
     compute KL/CE target-alignment loss
     optionally compute Top-M rank-margin loss
     apply position weighting
@@ -4814,5 +4828,3 @@ A future revision should update the following fields explicitly:
 ```
 
 This makes `SyncSpec_v1_design.md` a true living research specification rather than a static proposal.
-
-

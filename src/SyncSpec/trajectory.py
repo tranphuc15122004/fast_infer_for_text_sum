@@ -16,14 +16,17 @@ from .verifier import VerificationResult
 class TargetTrajectoryBuilder:
     def __init__(
         self, target, seed: int = 42, metadata: dict | None = None,
-        source_chunk_size: int = 128,
+        source_chunk_size: int = 128, num_anchors: int = 512,
     ):
         self.target = target
         self.seed = int(seed)
         self.metadata = dict(metadata or {})
         self.source_chunk_size = int(source_chunk_size)
+        self.num_anchors = int(num_anchors)
         if self.source_chunk_size <= 0:
             raise ValueError("source_chunk_size must be positive")
+        if self.num_anchors <= 0:
+            raise ValueError("num_anchors must be positive")
 
     def build_record(
         self, sample_id: str, source_ids: torch.Tensor, max_new_tokens: int,
@@ -40,8 +43,11 @@ class TargetTrajectoryBuilder:
             if remaining is not None:
                 limit = min(limit, max(0, int(remaining)))
         generated: list[int] = []
+        anchor_token_ids: list[int] = []
         logits_rows: list[list[float]] = []
         target_features: list[list[float]] = []
+        recent_hidden_rows: list[list[list[float]]] = []
+        recent_hidden_complete = True
         source_memory = None
         source_memory_bank = None
         source_hidden = getattr(state, "source_hidden", None)
@@ -52,6 +58,9 @@ class TargetTrajectoryBuilder:
             )
             source_memory = source_memory_bank.descriptors.detach().float().cpu().tolist()
         for _ in range(limit):
+            anchor_token_ids.append(
+                generated[-1] if generated else int(source_ids.flatten()[-1].item())
+            )
             logits = self.target.next_logits(state).detach()
             token = int(logits.argmax().item())
             generated.append(token)
@@ -59,6 +68,17 @@ class TargetTrajectoryBuilder:
                 logits_rows.append(logits.float().cpu().tolist())
             if include_target_features and hasattr(state, "anchor_hidden"):
                 target_features.append(state.anchor_hidden.detach().float().cpu().flatten().tolist())
+            if include_target_features:
+                recent_hidden = getattr(state, "recent_hidden", None)
+                if recent_hidden is None:
+                    recent_hidden_complete = False
+                else:
+                    recent_tensor = recent_hidden.detach().float().cpu()
+                    if recent_tensor.ndim == 1:
+                        recent_tensor = recent_tensor.unsqueeze(0)
+                    if recent_tensor.ndim != 2:
+                        raise ValueError("target recent_hidden must have shape [R, D]")
+                    recent_hidden_rows.append(recent_tensor.tolist())
             self.target.commit(
                 state,
                 VerificationResult(torch.tensor([token], device=logits.device), 0),
@@ -68,7 +88,7 @@ class TargetTrajectoryBuilder:
                 break
         stable_id = int.from_bytes(hashlib.sha256(str(sample_id).encode()).digest()[:8], "big")
         random_state = random.Random(self.seed ^ stable_id)
-        anchor_count = min(4, len(generated))
+        anchor_count = min(self.num_anchors, len(generated))
         anchors = sorted(random_state.sample(range(len(generated)), anchor_count)) if anchor_count else []
         metadata = {
             "target_generated": True,
@@ -78,9 +98,17 @@ class TargetTrajectoryBuilder:
             "seed": self.seed,
             "eos_token_id": getattr(self.target, "eos_token_id", None),
             "decoding": {"strategy": "greedy", "max_new_tokens": limit},
+            "trajectory_contract_version": 2,
+            "trajectory_contract": "dflash-anchor-state-v2",
+            "num_anchors_requested": self.num_anchors,
+            "anchor_token_positions": [int(anchor) for anchor in anchors],
         }
+        # The physical DFlash block starts at the position of the committed
+        # anchor token.  For target suffix index ``a``, that position is the
+        # prompt's last position plus ``a``.
         metadata["anchor_position_offsets"] = [
-            int(source_ids.numel()) + int(anchor) for anchor in anchors
+            max(0, int(source_ids.numel()) - 1) + int(anchor)
+            for anchor in anchors
         ]
         if include_source_memory:
             if source_memory_bank is None:
@@ -107,16 +135,30 @@ class TargetTrajectoryBuilder:
                 # than fabricating features for anchors the target did not
                 # expose.
                 stored_target_features = target_features
+        stored_recent_hidden = None
+        if (
+            include_target_features
+            and recent_hidden_complete
+            and len(recent_hidden_rows) == len(generated)
+        ):
+            stored_recent_hidden = [recent_hidden_rows[anchor] for anchor in anchors]
+            metadata["recent_hidden_positions"] = [int(anchor) for anchor in anchors]
+            metadata["recent_hidden_available"] = True
+        elif include_target_features:
+            metadata["recent_hidden_available"] = False
         metadata.update(self.metadata)
         return TrajectoryRecord(
             sample_id=str(sample_id),
             source_ids=source_ids.detach().cpu().flatten().tolist(),
             target_ids=generated,
             anchors=anchors,
+            anchor_token_ids=[anchor_token_ids[anchor] for anchor in anchors],
             target_logits=logits_rows if include_logits else None,
             target_features=stored_target_features,
+            target_recent_hidden=stored_recent_hidden,
             source_memory=source_memory,
             metadata=metadata,
+            contract_version=2,
         )
 
     def build_records(

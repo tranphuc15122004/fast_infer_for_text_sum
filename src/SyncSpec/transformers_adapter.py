@@ -491,7 +491,13 @@ class NativeDrafterAdapter:
 
     def draft(self, state: TransformersTargetState, kd: int, source_memory=None, **_) -> DraftOutput:
         anchor_token = state.input_ids[-1].reshape(1)
-        ids = build_masked_block(anchor_token, kd, self.mask_token_id)
+        # DFlash uses the last committed token as the first physical block
+        # slot.  ``kd`` remains the number of proposal tokens exposed to the
+        # verifier, so the model receives one anchor slot plus ``kd`` masks.
+        ids = build_masked_block(
+            anchor_token, int(kd) + 1, self.mask_token_id,
+            sample_from_anchor=True,
+        )
         if source_memory is None:
             source = None
         else:
@@ -503,10 +509,14 @@ class NativeDrafterAdapter:
                 target_anchor=state.anchor_hidden.unsqueeze(0),
                 recent_hidden=state.recent_hidden.unsqueeze(0),
                 source_memory=source,
-                position_offset=int(state.input_ids.numel()),
+                position_offset=max(0, int(state.input_ids.numel()) - 1),
             )
-        candidate_ids, candidate_logits = top_m_candidates(output.logits[0], self.model.config.top_m)
-        return DraftOutput(candidate_ids, candidate_logits, output.hidden[0])
+        future_logits = output.logits[:, 1:]
+        future_hidden = output.hidden[:, 1:]
+        candidate_ids, candidate_logits = top_m_candidates(
+            future_logits[0], self.model.config.top_m,
+        )
+        return DraftOutput(candidate_ids, candidate_logits, future_hidden[0])
 
     def draft_batch(
         self, states: list[TransformersTargetState], source_memories: list[Any] | None = None,
@@ -541,17 +551,20 @@ class NativeDrafterAdapter:
             if len(retrieved) != len(states) or len({tuple(value.shape) for value in retrieved}) != 1:
                 raise ValueError("batched drafting requires equal source-memory descriptor shapes")
             source_memory = torch.stack(retrieved)
-        ids = build_masked_block(anchor_ids, int(kd), self.mask_token_id)
+        ids = build_masked_block(
+            anchor_ids, int(kd) + 1, self.mask_token_id,
+            sample_from_anchor=True,
+        )
         with torch.inference_mode():
             output = self.model(
                 ids, target_anchor=target_anchor, recent_hidden=recent_hidden,
                 source_memory=source_memory,
-                position_offset=next(iter(context_lengths)),
+                position_offset=max(0, next(iter(context_lengths)) - 1),
             )
         return [
             DraftOutput(
-                *top_m_candidates(output.logits[row], self.model.config.top_m),
-                output.hidden[row],
+                *top_m_candidates(output.logits[row, 1:], self.model.config.top_m),
+                output.hidden[row, 1:],
             )
             for row in range(len(states))
         ]

@@ -30,7 +30,9 @@ from SyncSpec.training import (  # noqa: E402
     cache_fingerprint,
     collect_on_policy_survival_examples,
     _target_anchor_batch,
+    _target_recent_hidden_batch,
     _source_memory_batch,
+    _expand_anchor_rows,
 )
 from SyncSpec.transformers_adapter import (  # noqa: E402
     NativeDrafterAdapter,
@@ -80,14 +82,31 @@ def _train_selector_stage(
     trainer: SyncSpecTrainer, model: SyncSpecDrafter, records, args,
     vocab_size: int, hidden_size: int, mask_id: int,
 ) -> tuple[SourceCoherentSelector, dict]:
+    records = list(records)
     # Every stored target-generation anchor is a distinct serving state.  Keep
     # the true Top-M lattice for all of them so selector training does not
     # collapse to the first output position of each document.
+    expanded_rows = _expand_anchor_rows(
+        records, kd=args.kd, max_positions=model.config.max_positions,
+    )
+    if not expanded_rows:
+        # Keep selector training usable for trajectories truncated by EOS.
+        # The lattice carries a valid mask for the available prefix, while
+        # normal/full trajectories still use strict DFlash eligibility.
+        expanded_rows = [
+            (record, anchor) for record in records
+            for _, anchor in _expand_anchor_rows(
+                [record], kd=None, max_positions=model.config.max_positions,
+            ) if int(anchor) < len(record.target_ids)
+        ]
     expanded = [
         replace(record, anchors=[int(anchor)])
-        for record in records
-        for anchor in (record.anchors or [0])
+        for record, anchor in expanded_rows
     ]
+    if not expanded:
+        raise ValueError(
+            "selector training has no anchor with enough drafter positional headroom"
+        )
     hidden_chunks = []
     candidate_id_chunks = []
     candidate_logit_chunks = []
@@ -103,6 +122,9 @@ def _train_selector_stage(
         anchor_tensor = _target_anchor_batch(
             chunk, anchor_indices, hidden_size, args.device,
         )
+        recent_hidden = _target_recent_hidden_batch(
+            chunk, anchor_indices, hidden_size, args.device,
+        )
         position_offsets = anchor_position_offsets(chunk, anchor_indices, args.device)
         source_memory = _source_memory_batch(
             model, chunk, anchor_tensor, args.device,
@@ -110,14 +132,18 @@ def _train_selector_stage(
         with torch.no_grad():
             output = model(
                 masked, target_anchor=anchor_tensor, source_memory=source_memory,
-                position_offset=position_offsets,
+                recent_hidden=recent_hidden, position_offset=position_offsets,
             )
-        top_ids, top_values = top_m_candidates(output.logits, max(2, min(16, vocab_size)))
-        hidden_chunks.append(output.hidden.detach().cpu())
+        future_logits = output.logits[:, 1:]
+        future_hidden = output.hidden[:, 1:]
+        top_ids, top_values = top_m_candidates(
+            future_logits, max(2, min(16, vocab_size)),
+        )
+        hidden_chunks.append(future_hidden.detach().cpu())
         candidate_id_chunks.append(top_ids.detach().cpu())
         candidate_logit_chunks.append(top_values.detach().cpu())
-        target_chunks.append(target_ids.detach().cpu())
-        valid_chunks.append(valid.detach().cpu())
+        target_chunks.append(target_ids[:, 1:].detach().cpu())
+        valid_chunks.append(valid[:, 1:].detach().cpu())
     hidden = torch.cat(hidden_chunks, dim=0)
     top_ids = torch.cat(candidate_id_chunks, dim=0)
     top_values = torch.cat(candidate_logit_chunks, dim=0)
@@ -137,6 +163,7 @@ def _train_selector_stage(
             for record in expanded
         ], valid_mask=valid,
         steps=args.steps, batch_size=batch_size,
+        randomize_batches=True,
     )
     summary["anchor_count"] = len(expanded)
     torch.save(selector.state_dict(), args.output_dir / "selector.pt")
@@ -208,8 +235,16 @@ def main() -> int:
     )
     parser.add_argument("--kd", type=int, default=16)
     parser.add_argument(
-        "--position-decay", type=float, default=0.0,
-        help="optional exponential position weighting gamma; 0 keeps uniform CE",
+        "--position-decay", type=float, default=7.0,
+        help="DFlash exponential position-weighting gamma; 0 keeps uniform CE",
+    )
+    parser.add_argument(
+        "--num-anchors", type=int, default=512,
+        help="eligible DFlash anchors sampled per trajectory on every training forward",
+    )
+    parser.add_argument(
+        "--attention-backend", choices=("flash", "sdpa"), default=None,
+        help="prefer FlashAttention through SDPA; use portable SDPA when unavailable",
     )
     parser.add_argument("--kl-weight", type=float, default=0.0,
                         help="optional cached-teacher KL weight (requires Stage-0 logits)")
@@ -250,6 +285,10 @@ def main() -> int:
                         help="default: 0.1 * --learning-rate")
     parser.add_argument("--joint-selector-weight", type=float, default=0.1)
     parser.add_argument("--joint-survival-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--log-file", type=Path, default=None,
+        help="per-step JSONL metrics; default: <output-dir>/training_steps.jsonl",
+    )
     args = parser.parse_args()
 
     if args.joint_finetune and args.stage != "joint":
@@ -266,6 +305,8 @@ def main() -> int:
         raise SystemExit("position/teacher/rank loss weights must be non-negative")
     if args.rank_top_m <= 0:
         raise SystemExit("--rank-top-m must be positive")
+    if args.num_anchors <= 0:
+        raise SystemExit("--num-anchors must be positive")
     if args.max_positions < 0:
         raise SystemExit("--max-positions must be positive when provided")
     if args.train_batch_size <= 0:
@@ -328,23 +369,22 @@ def main() -> int:
             vocab_size=vocab_size, hidden_size=hidden_size, layers=args.layers,
             heads=args.heads, groups=args.groups, max_positions=max_positions,
             mask_token_id=mask_id,
+            attention_backend=args.attention_backend or "flash",
         )
         model = SyncSpecDrafter(config)
+    elif args.attention_backend is not None:
+        model.set_attention_backend(args.attention_backend)
     if target is not None:
         model.tie_target_weights(target_embedding, target_head)
     trainer = SyncSpecTrainer(
         model, device=args.device, learning_rate=args.learning_rate,
         grad_accumulation_steps=args.grad_accumulation_steps,
         grad_clip_norm=args.grad_clip_norm, amp=args.amp, seed=args.seed,
+        log_path=args.log_file or (args.output_dir / "training_steps.jsonl"),
     )
     if args.init_checkpoint and args.stage in {"diffusion", "joint"}:
         trainer.load_training_state(args.init_checkpoint)
     position_weight = None
-    if args.position_decay > 0:
-        position_weight = torch.exp(
-            -torch.arange(args.kd, dtype=torch.float32, device=args.device)
-            / float(args.position_decay)
-        )
     selector_checkpoint = None
     if args.selector_checkpoint:
         selector_checkpoint = _load_selector_checkpoint(
@@ -357,6 +397,7 @@ def main() -> int:
             position_weight=position_weight, kl_weight=args.kl_weight,
             rank_margin=args.rank_margin, rank_weight=args.rank_weight,
             rank_top_m=args.rank_top_m, batch_size=args.train_batch_size,
+            loss_decay_gamma=args.position_decay, num_anchors=args.num_anchors,
         )
     elif args.stage == "selector":
         _, summary = _train_selector_stage(
@@ -373,6 +414,7 @@ def main() -> int:
             position_weight=position_weight, kl_weight=args.kl_weight,
             rank_margin=args.rank_margin, rank_weight=args.rank_weight,
             rank_top_m=args.rank_top_m, batch_size=args.train_batch_size,
+            loss_decay_gamma=args.position_decay, num_anchors=args.num_anchors,
         )
         selector, selector_summary = _train_selector_stage(
             trainer, model, records, args, vocab_size, hidden_size, mask_id,
@@ -395,6 +437,7 @@ def main() -> int:
                 learning_rate=(args.joint_learning_rate or args.learning_rate * 0.1),
                 grad_accumulation_steps=args.grad_accumulation_steps,
                 grad_clip_norm=args.grad_clip_norm, amp=args.amp, seed=args.seed,
+                log_path=args.log_file or (args.output_dir / "training_steps.jsonl"),
             )
             joint_summary = joint_trainer.fit_joint(
                 records, args.kd, mask_id, selector=selector,
@@ -403,6 +446,8 @@ def main() -> int:
                 selector_weight=args.joint_selector_weight,
                 survival_weight=args.joint_survival_weight,
                 batch_size=args.train_batch_size,
+                loss_decay_gamma=args.position_decay,
+                num_anchors=args.num_anchors,
             )
             summary["joint_finetune"] = joint_summary
             torch.save(selector.state_dict(), args.output_dir / "selector.pt")
@@ -416,6 +461,9 @@ def main() -> int:
         "seed": args.seed, "amp": trainer.amp,
         "grad_accumulation_steps": trainer.grad_accumulation_steps,
         "grad_clip_norm": trainer.grad_clip_norm,
+        "attention_backend": model.config.attention_backend,
+        "num_anchors": int(args.num_anchors),
+        "training_log": str(args.log_file or (args.output_dir / "training_steps.jsonl")),
     })
     (args.output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary))

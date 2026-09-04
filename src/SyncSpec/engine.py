@@ -168,6 +168,13 @@ class SyncSpecEngine:
         self, kd: int, batch_size: int, context_length: int,
         max_kv: int | None = None,
     ) -> bool:
+        # Native SyncSpec receives the last committed token plus ``kd`` masks.
+        # The physical block therefore occupies positions
+        # ``context_length - 1 .. context_length + kd - 1``.
+        drafter_config = getattr(getattr(self.drafter, "model", self.drafter), "config", None)
+        max_positions = getattr(drafter_config, "max_positions", None)
+        if max_positions is not None and int(context_length) + int(kd) > int(max_positions):
+            return False
         if not self.config.require_measured_profile:
             return True
         costs = self._profile_costs(kd, kd, batch_size, context_length)
@@ -658,7 +665,7 @@ class SyncSpecEngine:
                 index: dict(timings[index]) for index in active
             }
             # Equal current context and source lengths are sufficient for the
-            # native drafter's [B,K_d] inputs and avoid ragged source-memory
+            # native drafter's [B,K_d+1] physical inputs and avoid ragged source-memory
             # descriptor tensors.  Verification only needs current length,
             # and is regrouped below after K_v is selected.
             draft_groups: defaultdict[tuple[int, int], list[int]] = defaultdict(list)

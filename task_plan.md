@@ -521,3 +521,16 @@ The current T4 host has CUDA unavailable, so strict B200 preflight remains
 - [x] Full regression `277 passed, 5 skipped, 25 warnings`.
 - [ ] External handoff: chạy GPU smoke và train/profile/infer thật trên
   canonical B200.
+
+### Fresh local smoke verification — 2026-09-03
+
+- [x] Full regression fresh trên worktree hiện tại: `277 passed, 5 skipped,
+  25 warnings`.
+- [x] CPU full-chain fresh: Stage 0 → joint train → measured multi-profile →
+  batch inference; `status=ok`, `records=2`, `exactness_failures=0`.
+- [x] CUDA smoke trên host dev không giả lập GPU: `BLOCKED`, exit `2`,
+  `reason=cuda_unavailable`.
+- [x] Strict B200 preflight trên host dev: `BLOCKED`, exit `2`; thiếu CUDA và
+  canonical target/checkpoint/data/profile đúng như thiết kế fail-fast.
+- [ ] External handoff: chạy GPU smoke và train/profile/infer thật trên
+  canonical B200.

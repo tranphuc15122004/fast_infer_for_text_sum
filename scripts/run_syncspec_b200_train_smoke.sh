@@ -88,6 +88,12 @@ fi
 if [[ -n "${SYNCSPEC_TRAIN_POSITION_DECAY:-}" ]]; then
   TRAIN_ARGS+=(--position-decay "$SYNCSPEC_TRAIN_POSITION_DECAY")
 fi
+if [[ -n "${SYNCSPEC_TRAIN_NUM_ANCHORS:-}" ]]; then
+  TRAIN_ARGS+=(--num-anchors "$SYNCSPEC_TRAIN_NUM_ANCHORS")
+fi
+if [[ -n "${SYNCSPEC_TRAIN_ATTENTION_BACKEND:-}" ]]; then
+  TRAIN_ARGS+=(--attention-backend "$SYNCSPEC_TRAIN_ATTENTION_BACKEND")
+fi
 if [[ -n "${SYNCSPEC_TRAIN_KL_WEIGHT:-}" ]]; then
   TRAIN_ARGS+=(--kl-weight "$SYNCSPEC_TRAIN_KL_WEIGHT")
 fi

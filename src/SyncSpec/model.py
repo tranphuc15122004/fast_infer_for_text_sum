@@ -7,13 +7,22 @@ same module remains small enough for CPU contract tests and B200 profiling.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+try:
+    # PyTorch's SDPA dispatcher is the common interface for FlashAttention,
+    # efficient attention, and the math fallback.  Keep an import fallback so
+    # compact checkpoints remain loadable on older PyTorch environments.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:  # pragma: no cover - exercised only on old PyTorch
+    SDPBackend = None
+    sdpa_kernel = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,7 @@ class SyncSpecDrafterConfig:
     max_positions: int = 4096
     top_m: int = 16
     mask_token_id: int | None = None
+    attention_backend: str = "flash"
 
     def __post_init__(self) -> None:
         if self.vocab_size <= 0 or self.hidden_size <= 0:
@@ -47,6 +57,8 @@ class SyncSpecDrafterConfig:
             raise ValueError("hidden_size must be divisible by groups")
         if self.layers <= 0 or self.kernel_size <= 0:
             raise ValueError("layers and kernel_size must be positive")
+        if self.attention_backend not in {"flash", "sdpa"}:
+            raise ValueError("attention_backend must be 'flash' or 'sdpa'")
 
 
 @dataclass
@@ -58,7 +70,12 @@ class DrafterOutput:
 def build_masked_block(
     anchor_ids: torch.Tensor, kd: int, mask_token_id: int, sample_from_anchor: bool = False
 ) -> torch.Tensor:
-    """Build `[B,K_d]` masked future slots from the current target anchor."""
+    """Build a physical block, optionally placing the committed anchor at slot 0.
+
+    DFlash-compatible callers pass ``kd + 1`` for ``kd`` future proposal
+    slots and set ``sample_from_anchor=True``.  The public proposal tensor is
+    obtained by removing slot zero after the drafter forward.
+    """
     anchors = anchor_ids.to(torch.long).flatten()
     if kd <= 0:
         return torch.empty((anchors.shape[0], 0), dtype=torch.long, device=anchors.device)
@@ -84,6 +101,7 @@ class _DrafterBlock(nn.Module):
         d = config.hidden_size
         self.self_attn = nn.MultiheadAttention(d, config.heads, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(d, config.heads, batch_first=True)
+        self.attention_backend = config.attention_backend
         self.conv = nn.Conv1d(
             d, d, kernel_size=config.kernel_size, groups=config.groups,
             padding=config.kernel_size - 1,
@@ -95,8 +113,47 @@ class _DrafterBlock(nn.Module):
         self.norm4 = nn.LayerNorm(d)
         self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.SiLU(), nn.Linear(4 * d, d))
 
+    def _attention(
+        self, module: nn.MultiheadAttention,
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run MHA through FlashAttention-first SDPA dispatch.
+
+        ``MultiheadAttention`` is retained as the parameterized wrapper so
+        existing SyncSpec checkpoints keep their state-dict names.  Its
+        forward path delegates the actual dot-product kernel to SDPA.
+        """
+        def call() -> torch.Tensor:
+            return module(query, key, value, need_weights=False)[0]
+
+        if (
+            self.attention_backend == "flash"
+            and sdpa_kernel is not None
+            and SDPBackend is not None
+        ):
+            try:
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    return call()
+            except (RuntimeError, NotImplementedError):
+                # FlashAttention is unavailable for some dtype/shape/device
+                # combinations (notably CPU).  Fall through to portable SDPA.
+                pass
+
+        if sdpa_kernel is not None and SDPBackend is not None:
+            try:
+                with sdpa_kernel([
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]):
+                    return call()
+            except (RuntimeError, NotImplementedError):
+                # Very old/limited builds may not expose an SDPA backend list.
+                # The regular MHA call remains the final compatibility path.
+                pass
+        return call()
+
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        attn, _ = self.self_attn(x, x, x, need_weights=False)
+        attn = self._attention(self.self_attn, x, x, x)
         x = self.norm1(x + attn)
         # Causal convolution sees previous block slots only. Self-attention is
         # intentionally bidirectional within the draft block.
@@ -122,7 +179,7 @@ class _DrafterBlock(nn.Module):
         ).reshape(x.shape[0], x.shape[1], x.shape[-1])
         conv = conv + dynamic
         x = self.norm2(x + conv)
-        cross, _ = self.cross_attn(x, context, context, need_weights=False)
+        cross = self._attention(self.cross_attn, x, context, context)
         x = self.norm3(x + cross)
         return self.norm4(x + self.mlp(x))
 
@@ -143,6 +200,14 @@ class SyncSpecDrafter(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self._tied_embedding = False
         self._requires_target_tie = False
+
+    def set_attention_backend(self, backend: str) -> None:
+        """Switch the SDPA policy without changing checkpoint parameters."""
+        if backend not in {"flash", "sdpa"}:
+            raise ValueError("attention_backend must be 'flash' or 'sdpa'")
+        self.config = replace(self.config, attention_backend=backend)
+        for layer in self.layers:
+            layer.attention_backend = backend
 
     def tie_target_weights(self, embedding: nn.Embedding, lm_head: nn.Linear) -> None:
         if embedding.weight.shape != self.embedding.weight.shape:

@@ -66,10 +66,17 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--max-input-tokens", type=int, default=0)
     parser.add_argument("--source-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--num-anchors", type=int, default=512,
+        help="maximum selected target states per sample (use 512 for DFlash-style coverage)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--include-logits", action="store_true")
-    parser.add_argument("--include-target-features", action="store_true")
+    parser.add_argument(
+        "--include-target-features", action="store_true",
+        help="cache serving-equivalent target anchor and recent hidden states",
+    )
     parser.add_argument(
         "--include-source-memory", action="store_true",
         help="cache target final-hidden source chunk descriptors for training",
@@ -84,6 +91,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.source_chunk_size <= 0:
         raise SystemExit("--source-chunk-size must be positive")
+    if args.num_anchors <= 0:
+        raise SystemExit("--num-anchors must be positive")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit(
             "CUDA requested but unavailable; run trajectory smoke with --device cpu "
@@ -111,7 +120,8 @@ def main() -> int:
         str(args.max_new_tokens), str(args.max_input_tokens),
         str(args.include_logits), str(args.include_target_features),
         str(args.include_source_memory), str(args.source_chunk_size),
-        str(args.seed), tokenizer_fingerprint, target_artifact_fingerprint,
+        str(args.num_anchors), str(args.seed), tokenizer_fingerprint,
+        target_artifact_fingerprint,
         "summarize-v1",
     )
     cache = TrajectoryCache(args.output, fingerprint)
@@ -119,12 +129,14 @@ def main() -> int:
         existing_ids = {record.sample_id for record in cache.read()}
         samples = [sample for sample in samples if str(sample[0]) not in existing_ids]
     records = TargetTrajectoryBuilder(
-        target, seed=args.seed, source_chunk_size=args.source_chunk_size, metadata={
+        target, seed=args.seed, source_chunk_size=args.source_chunk_size,
+        num_anchors=args.num_anchors, metadata={
             "target_model": str(args.target_model or "synthetic"),
             "tokenizer_fingerprint": tokenizer_fingerprint,
             "target_artifact_fingerprint": target_artifact_fingerprint,
             "dtype": str(args.dtype),
             "source_chunk_size": int(args.source_chunk_size),
+            "num_anchors": int(args.num_anchors),
         },
     ).build_records(
         samples, max_new_tokens=args.max_new_tokens, include_logits=args.include_logits,

@@ -18,6 +18,74 @@ from SyncSpec.transformers_adapter import NativeDrafterAdapter, TransformersTarg
 from test_syncspec_transformers import TinyCausalLM  # noqa: E402
 
 
+class RecordingDrafter(SyncSpecDrafter):
+    """Capture physical draft blocks for the runtime anchor contract."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen_blocks: list[torch.Tensor] = []
+        self.seen_offsets: list[torch.Tensor | int] = []
+
+    def forward(self, masked_ids, *args, **kwargs):
+        self.seen_blocks.append(masked_ids.detach().clone())
+        offset = kwargs.get("position_offset")
+        self.seen_offsets.append(offset.detach().clone() if torch.is_tensor(offset) else offset)
+        return super().forward(masked_ids, *args, **kwargs)
+
+
+def _recording_model(vocab_size: int = 16, hidden_size: int = 8) -> RecordingDrafter:
+    return RecordingDrafter(SyncSpecDrafterConfig(
+        vocab_size=vocab_size, hidden_size=hidden_size, layers=1, heads=2,
+        groups=2, top_m=4, mask_token_id=vocab_size - 1,
+    ))
+
+
+def test_native_drafter_uses_last_committed_token_as_physical_anchor() -> None:
+    target = TransformersTargetAdapter(
+        TinyCausalLM(vocab_size=16, hidden_size=8), device="cpu", eos_token_id=15,
+    )
+    model = _recording_model()
+    model.tie_target_weights(target.model.get_input_embeddings(), target.model.get_output_embeddings())
+    state = target.prefill(torch.tensor([1, 2]))
+
+    output = NativeDrafterAdapter(model, target).draft(state, kd=3)
+
+    assert model.seen_blocks[-1].tolist() == [[2, 15, 15, 15]]
+    assert model.seen_offsets[-1] == 1
+    assert output.candidate_ids.shape == (3, 4)
+    assert output.hidden.shape == (3, 8)
+
+
+def test_native_drafter_uses_verification_commit_as_next_anchor() -> None:
+    target = TransformersTargetAdapter(
+        TinyCausalLM(vocab_size=16, hidden_size=8), device="cpu", eos_token_id=15,
+    )
+    model = _recording_model()
+    model.tie_target_weights(target.model.get_input_embeddings(), target.model.get_output_embeddings())
+    state = target.prefill(torch.tensor([1, 2]))
+    target.commit(state, type("R", (), {"committed_ids": torch.tensor([5])})())
+
+    NativeDrafterAdapter(model, target).draft(state, kd=2)
+
+    assert model.seen_blocks[-1].tolist() == [[5, 15, 15]]
+    assert model.seen_offsets[-1] == 2
+
+
+def test_native_drafter_batch_uses_each_last_committed_token_as_anchor() -> None:
+    target = TransformersTargetAdapter(
+        TinyCausalLM(vocab_size=16, hidden_size=8), device="cpu", eos_token_id=15,
+    )
+    model = _recording_model()
+    model.tie_target_weights(target.model.get_input_embeddings(), target.model.get_output_embeddings())
+    states = [target.prefill(torch.tensor([1, 2])), target.prefill(torch.tensor([3, 4]))]
+
+    outputs = NativeDrafterAdapter(model, target).draft_batch(states, [None, None], kd=2)
+
+    assert model.seen_blocks[-1].tolist() == [[2, 15, 15], [4, 15, 15]]
+    assert model.seen_offsets[-1] == 1
+    assert all(output.candidate_ids.shape == (2, 4) for output in outputs)
+
+
 def test_native_drafter_and_transformers_target_share_engine_contract() -> None:
     target = TransformersTargetAdapter(TinyCausalLM(vocab_size=8, hidden_size=4), device="cpu", eos_token_id=7)
     model = SyncSpecDrafter(SyncSpecDrafterConfig(

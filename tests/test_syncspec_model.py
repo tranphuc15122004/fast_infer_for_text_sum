@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,65 @@ def test_drafter_block_forward_and_backward_cpu() -> None:
     loss = output.logits.square().mean()
     loss.backward()
     assert any(p.grad is not None for p in model.parameters())
+
+
+def test_drafter_attention_uses_scaled_dot_product_attention(monkeypatch) -> None:
+    calls = []
+    original = torch.nn.functional.scaled_dot_product_attention
+
+    def recording_attention(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape, args[2].shape))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recording_attention)
+    model = SyncSpecDrafter(SyncSpecDrafterConfig(
+        vocab_size=17, hidden_size=8, layers=1, heads=2, groups=2,
+    ))
+
+    model(torch.full((1, 3), 16, dtype=torch.long))
+
+    assert len(calls) == 2
+    assert all(tuple(query[:2]) == (1, 2) for query, _, _ in calls)
+
+
+def test_drafter_prefers_flash_attention_backend() -> None:
+    model = SyncSpecDrafter(SyncSpecDrafterConfig(
+        vocab_size=17, hidden_size=8, layers=1, heads=2, groups=2,
+        attention_backend="flash",
+    ))
+
+    assert model.config.attention_backend == "flash"
+
+
+def test_flash_attention_falls_back_to_sdpa(monkeypatch) -> None:
+    import SyncSpec.model as model_module
+
+    calls = []
+
+    def fake_kernel(backends):
+        calls.append(backends)
+        if backends == model_module.SDPBackend.FLASH_ATTENTION:
+            class FailingContext:
+                def __enter__(self):
+                    raise RuntimeError("flash unavailable in test")
+
+                def __exit__(self, *_args):
+                    return False
+
+            return FailingContext()
+        return nullcontext()
+
+    monkeypatch.setattr(model_module, "sdpa_kernel", fake_kernel)
+    model = SyncSpecDrafter(SyncSpecDrafterConfig(
+        vocab_size=17, hidden_size=8, layers=1, heads=2, groups=2,
+        attention_backend="flash",
+    ))
+
+    output = model(torch.full((1, 3), 16, dtype=torch.long))
+
+    assert output.logits.shape == (1, 3, 17)
+    assert calls[0] == model_module.SDPBackend.FLASH_ATTENTION
+    assert any(call != model_module.SDPBackend.FLASH_ATTENTION for call in calls)
 
 
 def test_mask_slots_use_learned_sentinel_after_target_tying() -> None:

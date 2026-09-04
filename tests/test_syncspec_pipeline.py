@@ -19,6 +19,8 @@ from SyncSpec.selector import SourceCoherentSelector  # noqa: E402
 from SyncSpec.survival import SurvivalHead  # noqa: E402
 from SyncSpec.training import (  # noqa: E402
     SyncSpecTrainer,
+    TrajectoryCache,
+    TrajectoryRecord,
     _target_anchor_batch,
     anchor_position_offsets,
     build_stage1_batch,
@@ -40,7 +42,7 @@ def test_stage0_builder_generates_target_owned_trajectories(tmp_path: Path) -> N
     assert records[0].metadata["decoding"]["strategy"] == "greedy"
     assert records[0].anchors
     assert records[0].metadata["anchor_position_offsets"] == [
-        records[0].metadata["context_length"] + anchor for anchor in records[0].anchors
+        records[0].metadata["context_length"] - 1 + anchor for anchor in records[0].anchors
     ]
 
 
@@ -103,6 +105,99 @@ def test_stage0_stores_only_selected_anchor_features() -> None:
     assert selected[0, 0].item() == record.target_features[-1][0]
 
 
+def test_stage0_anchor_token_and_recent_hidden_match_selected_target_states(
+    tmp_path: Path,
+) -> None:
+    class DFlashStateTarget(SyntheticTarget):
+        def prefill(self, source_ids):
+            state = super().prefill(source_ids)
+            state.anchor_hidden = torch.tensor([30.0, 0.0])
+            state.recent_hidden = torch.tensor([[20.0, 0.0], [30.0, 0.0]])
+            return state
+
+        def commit(self, state, result):
+            super().commit(state, result)
+            token = int(result.committed_ids[-1].item())
+            state.anchor_hidden = torch.tensor([float(token), float(len(state.generated))])
+            state.recent_hidden = torch.cat(
+                [state.recent_hidden, state.anchor_hidden.unsqueeze(0)], dim=0,
+            )[-3:]
+
+    record = TargetTrajectoryBuilder(
+        DFlashStateTarget(vocab_size=32), seed=3, num_anchors=8,
+    ).build_record(
+        "dflash-state", torch.tensor([2, 3]), max_new_tokens=3,
+        include_target_features=True,
+    )
+
+    assert record.anchors == [0, 1, 2]
+    assert record.anchor_token_ids == [3, record.target_ids[0], record.target_ids[1]]
+    assert record.target_features == [[30.0, 0.0], [4.0, 1.0], [5.0, 2.0]]
+    assert record.target_recent_hidden == [
+        [[20.0, 0.0], [30.0, 0.0]],
+        [[20.0, 0.0], [30.0, 0.0], [4.0, 1.0]],
+        [[30.0, 0.0], [4.0, 1.0], [5.0, 2.0]],
+    ]
+    assert record.metadata["anchor_token_positions"] == record.anchors
+    assert record.metadata["recent_hidden_positions"] == record.anchors
+    assert record.metadata["trajectory_contract_version"] == 2
+
+    cache = TrajectoryCache(tmp_path / "dflash-state.jsonl", fingerprint="contract-v2")
+    cache.write([record])
+    assert list(cache.read()) == [record]
+
+
+def test_stage0_configurable_anchor_count_limits_selected_states() -> None:
+    record = TargetTrajectoryBuilder(
+        SyntheticTarget(vocab_size=32), seed=11, num_anchors=2,
+    ).build_record("two-anchors", torch.tensor([1, 2]), max_new_tokens=7)
+
+    assert len(record.anchors) == 2
+    assert len(record.anchor_token_ids) == 2
+    assert record.metadata["num_anchors_requested"] == 2
+
+
+def test_stage0_anchor_token_contract_handles_eos_and_empty_suffix() -> None:
+    eos_record = TargetTrajectoryBuilder(
+        SyntheticTarget(vocab_size=16, eos_token_id=5), num_anchors=4,
+    ).build_record("eos", torch.tensor([3, 4]), max_new_tokens=8)
+    empty_record = TargetTrajectoryBuilder(
+        SyntheticTarget(vocab_size=16), num_anchors=4,
+    ).build_record("empty-contract", torch.tensor([3, 4]), max_new_tokens=0)
+
+    assert eos_record.target_ids == [5]
+    assert eos_record.anchors == [0]
+    assert eos_record.anchor_token_ids == [4]
+    assert empty_record.target_ids == []
+    assert empty_record.anchors == []
+    assert empty_record.anchor_token_ids == []
+
+
+def test_legacy_anchor_token_cache_loads_with_explicit_warning() -> None:
+    raw = {
+        "sample_id": "legacy",
+        "source_ids": [1, 2],
+        "target_ids": [3, 4],
+        "anchors": [0],
+        "target_features": [[0.1, 0.2]],
+        "metadata": {"target_feature_positions": [0]},
+    }
+
+    with pytest.warns(UserWarning, match="legacy trajectory contract"):
+        record = TrajectoryRecord.from_json(raw)
+
+    assert record.contract_version == 1
+    assert record.anchor_token_ids is None
+    assert record.target_recent_hidden is None
+    with pytest.warns(UserWarning, match="deriving anchor token"):
+        masked, targets, valid = build_stage1_batch(
+            [record], kd=2, mask_token_id=31, anchor_indices=[1],
+        )
+    assert masked.tolist() == [[3, 31, 31]]
+    assert targets.tolist() == [[3, 4, 0]]
+    assert valid.tolist() == [[False, True, False]]
+
+
 def test_stage0_can_cache_target_derived_source_memory_descriptors() -> None:
     class MemoryTarget(SyntheticTarget):
         def prefill(self, source_ids):
@@ -143,8 +238,10 @@ def test_stage1_batch_and_short_cpu_train_step(tmp_path: Path) -> None:
     )
     records[0].anchors = [0]
     masked, targets, valid = build_stage1_batch(records, kd=4, mask_token_id=23)
-    assert masked.shape == targets.shape == valid.shape == (1, 4)
-    assert valid.all()
+    assert masked.shape == targets.shape == valid.shape == (1, 5)
+    assert masked.tolist() == [[3, 23, 23, 23, 23]]
+    assert targets.tolist() == [[3, *records[0].target_ids[:4]]]
+    assert valid.tolist() == [[False, True, True, True, True]]
 
     model = SyncSpecDrafter(SyncSpecDrafterConfig(
         vocab_size=24, hidden_size=8, layers=1, heads=2, groups=2, top_m=4
@@ -174,8 +271,10 @@ def test_stage1_batch_supports_explicit_anchor_selection() -> None:
     _, targets, valid = build_stage1_batch(
         [record], kd=2, mask_token_id=31, anchor_indices=[2],
     )
-    assert targets.tolist() == [[record.target_ids[2], record.target_ids[3]]]
-    assert valid.tolist() == [[True, True]]
+    assert targets.tolist() == [[
+        record.target_ids[1], record.target_ids[2], record.target_ids[3],
+    ]]
+    assert valid.tolist() == [[False, True, True]]
 
 
 def test_stage1_anchor_offsets_use_real_target_context_position() -> None:
@@ -188,7 +287,7 @@ def test_stage1_anchor_offsets_use_real_target_context_position() -> None:
         ),
     ]
     offsets = anchor_position_offsets(records, [2, 1])
-    assert offsets.tolist() == [5, 3]
+    assert offsets.tolist() == [4, 2]
 
 
 def test_anchor_offsets_fall_back_when_anchor_metadata_was_rebound() -> None:
@@ -269,12 +368,15 @@ def test_full_syncspec_pipeline_smoke_on_cuda() -> None:
     masked, targets, valid = build_stage1_batch(records, 4, 23, device=device)
     with torch.no_grad():
         draft = model(masked)
-    candidate_ids, candidate_logits = top_m_candidates(draft.logits, 4)
+    proposal_hidden = draft.hidden[:, 1:]
+    proposal_targets = targets[:, 1:]
+    proposal_valid = valid[:, 1:]
+    candidate_ids, candidate_logits = top_m_candidates(draft.logits[:, 1:], 4)
     selector = SourceCoherentSelector(hidden_size=8, rank=4, ngram_dim=6)
     trainer.fit_selector_module(
-        selector, draft.hidden, candidate_ids, candidate_logits, targets,
+        selector, proposal_hidden, candidate_ids, candidate_logits, proposal_targets,
         [SourceNgramIndex(records[0].source_ids)], history=[records[0].source_ids],
-        valid_mask=valid, steps=1,
+        valid_mask=proposal_valid, steps=1,
     )
     survival = SurvivalHead(8, hidden_size=8)
     features = torch.rand((4, 8), device=device)

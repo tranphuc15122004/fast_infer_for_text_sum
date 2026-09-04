@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import pytest
@@ -36,6 +37,30 @@ def test_cpu_engine_is_greedy_lossless_against_vanilla_ar() -> None:
     assert accelerated.timing_ms["verify"] >= 0.0
     assert accelerated.runtime_feedback["rounds"] >= 1
     assert 0.0 <= accelerated.runtime_feedback["acceptance_ema"] <= 1.0
+
+
+def test_engine_falls_back_before_physical_block_exceeds_drafter_capacity() -> None:
+    class CapacityLimitedDrafter:
+        model = SimpleNamespace(
+            config=SimpleNamespace(hidden_size=16, max_positions=4),
+        )
+
+        def draft(self, *_args, **_kwargs):
+            raise AssertionError("drafter must not run without physical block headroom")
+
+    target = SyntheticTarget(vocab_size=32)
+    engine = SyncSpecEngine(
+        target, CapacityLimitedDrafter(),
+        SyncSpecConfig(
+            vocab_size=32, hidden_size=16, top_m=4,
+            budget_profiles=((0, 0), (4, 4)), predicted_spec_gain=0.2,
+        ),
+    )
+
+    result = engine.generate(torch.tensor([1, 2, 3]), max_new_tokens=1)
+
+    assert result.token_ids.numel() == 1
+    assert result.fallback_rounds == 1
 
 
 def test_engine_honors_zero_max_new_tokens() -> None:
