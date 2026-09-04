@@ -20,6 +20,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import is_flash_attn_2_available, logging
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
+from rope_compat import config_rope_theta
+
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
 except ImportError:
@@ -268,7 +270,7 @@ class Qwen2Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config_rope_theta(config)
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
 

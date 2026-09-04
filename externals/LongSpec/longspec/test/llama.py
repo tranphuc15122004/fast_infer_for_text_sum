@@ -41,6 +41,8 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
+from rope_compat import config_rope_theta
+
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
 except ImportError:
@@ -76,7 +78,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config_rope_theta(config)
         self.is_causal = True
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)

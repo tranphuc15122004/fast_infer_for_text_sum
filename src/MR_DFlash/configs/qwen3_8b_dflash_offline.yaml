@@ -1,0 +1,39 @@
+# Example config train DFlash offline (Qwen3-8B) — MR-DFlash
+# Chạy: cd src && python -m MR_DFlash.run_train --config MR_DFlash/configs/qwen3_8b_dflash_offline.yaml
+run_id: mr-dflash-qwen3-8b-offline
+output_dir: outputs/mr-dflash-qwen3-8b
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  # số draft layer; 1 = mặc định DFlash. target_layer_ids tự sinh nếu không đặt.
+  draft_num_hidden_layers: 1
+  block_size: 16
+  mask_token_id: 151669          # token trong vocab Qwen3 (reserved token)
+  init_draft_from_target: false  # bật nếu muốn copy weight từ target layers
+  draft_checkpoint_path: null    # warm-start weights-only nếu có
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: ./data/user_prompts.jsonl
+  hidden_states_path: null       # null → run_train tự capture vào output_dir/captured_features
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  accumulation_steps: 1
+  learning_rate: 0.0006          # legacy DFlash
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa        # sdpa (CPU-safe) | flex (B200, hiệu quả)
+  loss_type: dflash
+  save_interval: 1000
+  log_interval: 10
+  seed: 42

@@ -54,6 +54,7 @@ except ImportError:
         return False
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.generation import GenerationMixin
 
 from pipeline.fafo.kv_cache_managers.utils import KV_CACHE_MANAGERS
 
@@ -1471,7 +1472,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel):
+class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):

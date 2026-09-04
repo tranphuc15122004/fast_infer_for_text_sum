@@ -19,6 +19,7 @@ from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 from qwen2 import Qwen2ForCausalLM, Qwen2RotaryEmbedding, Qwen2RMSNorm, Qwen2MLP, apply_rotary_pos_emb
 from triton_tree_attn import attention as tree_attention
+from rope_compat import config_rope_theta
 
 
 @dataclass
@@ -43,7 +44,7 @@ class GlideAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config_rope_theta(config)
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
 

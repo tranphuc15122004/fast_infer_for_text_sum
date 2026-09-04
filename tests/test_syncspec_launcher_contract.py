@@ -97,3 +97,36 @@ def test_syncspec_cpu_smoke_covers_stage0_train_profile_and_infer() -> None:
     assert "pytorch_model.bin" in runner
     assert "selector.pt" in runner
     assert "survival.pt" in runner
+
+
+def test_train_launcher_help_and_master_config_contract() -> None:
+    launcher = ROOT / "scripts/train.sh"
+    assert launcher.is_file()
+    proc = subprocess.run(
+        ["bash", str(launcher), "--help"],
+        cwd=ROOT, text=True, capture_output=True,
+    )
+    assert proc.returncode == 0
+    assert "--mode" in proc.stdout
+    assert "smoke" in proc.stdout
+    assert "full" in proc.stdout
+
+    source = launcher.read_text(encoding="utf-8")
+    for fragment in (
+        "FAST_INFER_MASTER_CONFIG",
+        "fast_infer_load_config syncspec",
+        "check_syncspec_b200.py",
+        "build_syncspec_trajectories.py",
+        "train_syncspec.py",
+        "profile_syncspec.py",
+        "infer_syncspec.py",
+        "--resume",
+        "pytorch_model.bin",
+        "selector.pt",
+        "survival.pt",
+        "SYNCSPEC_TRAIN_FULL_STEPS",
+        "SYNCSPEC_TRAIN_FULL_MAX_SAMPLES",
+        "SYNCSPEC_TRAIN_FULL_OUTPUT_DIR",
+        "pipeline_status",
+    ):
+        assert fragment in source
