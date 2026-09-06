@@ -76,6 +76,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 - **Định dạng dữ liệu plug-and-play**: [`data/README.md`](data/README.md)
 - **Cấu trúc env / portability**: [`envs/README.md`](envs/README.md)
 - **Thiết kế thí nghiệm / taxonomy baseline**: [`externals/baseline_repo_guide.md`](externals/baseline_repo_guide.md)
+- **Bối cảnh workspace MR-DFlash**: [`docs/mr_dflash.md`](docs/mr_dflash.md)
 
 ## Nguyên tắc
 

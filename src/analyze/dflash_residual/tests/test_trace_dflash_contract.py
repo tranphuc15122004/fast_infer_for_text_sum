@@ -54,6 +54,89 @@ def test_build_position_rows_records_rank_and_never_changes_candidate_ids() -> N
     assert rows[0]["candidate_token_ids"] == [10, 11, 12]
 
 
+def test_build_position_rows_can_record_target_logits_aligned_to_candidates() -> None:
+    rows = build_position_rows(
+        run_id="r1",
+        sample_id="s1",
+        document_id="d1",
+        dataset="gov_report",
+        context_length=1024,
+        round_index=0,
+        candidates=torch.tensor([[[10, 11], [20, 21]]]),
+        candidate_logits=torch.tensor([[[3.0, 2.0], [4.0, 3.0]]]),
+        target_candidate_logits=torch.tensor([[[2.5, 2.0], [3.5, 3.0]]]),
+        target_tokens=torch.tensor([[11, 20]]),
+        dflash_selected=torch.tensor([[10, 20]]),
+        accepted_draft_len=1,
+        block_size=3,
+        native_block_size=3,
+    )
+    assert rows[0]["target_candidate_logits"] == [2.5, 2.0]
+    assert rows[1]["target_candidate_logits"] == [3.5, 3.0]
+
+
+def test_build_position_rows_can_record_target_entropy_scalars() -> None:
+    rows = build_position_rows(
+        run_id="r1",
+        sample_id="s1",
+        document_id="d1",
+        dataset="cnn_dailymail",
+        context_length=1024,
+        round_index=0,
+        candidates=torch.tensor([[[10, 11], [20, 21]]]),
+        candidate_logits=torch.tensor([[[3.0, 2.0], [4.0, 3.0]]]),
+        target_tokens=torch.tensor([[11, 20]]),
+        dflash_selected=torch.tensor([[10, 20]]),
+        accepted_draft_len=1,
+        block_size=3,
+        native_block_size=3,
+        target_entropy=torch.tensor([[1.25, 2.5]]),
+        target_top1_probability=torch.tensor([[0.8, 0.6]]),
+    )
+    assert rows[0]["target_entropy"] == 1.25
+    assert rows[1]["target_top1_probability"] == pytest.approx(0.6)
+
+
+def test_build_position_rows_rejects_misaligned_entropy() -> None:
+    with pytest.raises(ValueError, match="target_entropy shape"):
+        build_position_rows(
+            run_id="r1",
+            sample_id="s1",
+            document_id="d1",
+            dataset="cnn_dailymail",
+            context_length=1024,
+            round_index=0,
+            candidates=torch.tensor([[[10, 11], [20, 21]]]),
+            candidate_logits=torch.tensor([[[3.0, 2.0], [4.0, 3.0]]]),
+            target_tokens=torch.tensor([[11, 20]]),
+            dflash_selected=torch.tensor([[10, 20]]),
+            accepted_draft_len=1,
+            block_size=3,
+            native_block_size=3,
+            target_entropy=torch.tensor([[1.25]]),
+        )
+
+
+def test_build_position_rows_rejects_misaligned_target_logits() -> None:
+    with pytest.raises(ValueError, match="shape"):
+        build_position_rows(
+            run_id="r1",
+            sample_id="s1",
+            document_id="d1",
+            dataset="gov_report",
+            context_length=1024,
+            round_index=0,
+            candidates=torch.tensor([[[10, 11]]]),
+            candidate_logits=torch.tensor([[[3.0, 2.0]]]),
+            target_candidate_logits=torch.tensor([[[2.5]]]),
+            target_tokens=torch.tensor([[11]]),
+            dflash_selected=torch.tensor([[10]]),
+            accepted_draft_len=0,
+            block_size=3,
+            native_block_size=3,
+        )
+
+
 def test_collector_parser_is_model_lazy_and_exposes_context_sweep() -> None:
     args = build_parser().parse_args([
         "--target-model", "target",

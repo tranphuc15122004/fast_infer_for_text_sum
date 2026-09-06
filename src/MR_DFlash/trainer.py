@@ -28,6 +28,12 @@ from .checkpoint import (
 )
 from .config import RunConfig
 from .data import DFlashFeatureDataset
+from .distributed import (
+    all_reduce_sum,
+    barrier,
+    current_context,
+    rank_shard_indices,
+)
 from .schedule import (
     build_cosine_with_warmup,
     current_lr,
@@ -52,19 +58,42 @@ class Trainer:
         self.run_cfg = run_cfg
         self.strategy = strategy
         self.dataset = dataset
-        self.model: nn.Module = strategy.trainable_module()
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self.dist = current_context(self.device)
+        self.base_model: nn.Module = strategy.model
+        self.base_model.to(self.device)
+        self.model: nn.Module = strategy.trainable_module()
 
         tcfg = run_cfg.training
-        if tcfg.dp_world_size != 1:
+        if tcfg.dp_world_size > 1 and tcfg.dp_world_size != self.dist.world_size:
             raise NotImplementedError(
-                "MR-DFlash chưa hỗ trợ dp_world_size>1; dùng 1 GPU trước."
+                "training.dp_world_size phải bằng WORLD_SIZE thực tế khi dùng DDP: "
+                f"config={tcfg.dp_world_size}, actual={self.dist.world_size}"
             )
+        if self.dist.world_size > 1 and tcfg.dp_world_size not in {1, self.dist.world_size}:
+            raise ValueError(
+                "WORLD_SIZE hiện tại không khớp training.dp_world_size: "
+                f"{self.dist.world_size} vs {tcfg.dp_world_size}"
+            )
+        self.global_batch_size = tcfg.batch_size * self.dist.world_size
+        self.distributed_model: Optional[nn.Module] = None
+        if self.dist.is_distributed:
+            from torch.nn.parallel import DistributedDataParallel
+
+            device_ids = [self.dist.device.index] if self.dist.device.type == "cuda" else None
+            self.distributed_model = DistributedDataParallel(
+                self.base_model,
+                device_ids=device_ids,
+                output_device=self.dist.device.index if device_ids else None,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+            self.strategy.set_forward_model(self.distributed_model)
         validate_fixed_accumulation_plan(
             num_samples=len(dataset),
-            batch_size=tcfg.batch_size,
+            batch_size=self.global_batch_size,
             accumulation_steps=tcfg.accumulation_steps,
             num_epochs=tcfg.num_epochs,
             max_steps=tcfg.max_steps,
@@ -73,7 +102,7 @@ class Trainer:
             total_steps=None,
             max_steps=tcfg.max_steps,
             num_samples=len(dataset),
-            batch_size=tcfg.batch_size,
+            batch_size=self.global_batch_size,
             accumulation_steps=tcfg.accumulation_steps,
             num_epochs=tcfg.num_epochs,
         )
@@ -106,7 +135,13 @@ class Trainer:
 
     def _resume(self, path: str) -> None:
         state = load_training_checkpoint(path)
-        self.model.load_state_dict(state["draft_state_dict"], strict=False)
+        draft_state = state["draft_state_dict"]
+        if draft_state and all(key.startswith("draft_model.") for key in draft_state):
+            draft_state = {
+                key[len("draft_model.") :]: value
+                for key, value in draft_state.items()
+            }
+        self.model.load_state_dict(draft_state, strict=False)
         if "optimizer_state" in state:
             self.optimizer.load_state_dict(state["optimizer_state"])
         if "scheduler_state" in state:
@@ -130,38 +165,68 @@ class Trainer:
     # Batch lặp
     # ------------------------------------------------------------------ #
 
-    def _iter_batches(self) -> Iterable[TrainBatch]:
-        """Lặp theo epoch; mỗi epoch shuffle (seed cố định) và bỏ batch lẻ."""
+    def _iter_batches(
+        self,
+        dataset: DFlashFeatureDataset,
+        *,
+        shuffle: bool,
+        repeat: bool = True,
+    ) -> Iterable[TrainBatch]:
+        """Lặp batch theo rank, bỏ global tail để mọi rank cùng số update."""
         tcfg = self.run_cfg.training
         batch_size = tcfg.batch_size
-        n = len(self.dataset)
-        micros_per_epoch = n // batch_size
+        n = len(dataset)
+        micros_per_epoch = n // self.global_batch_size
         if micros_per_epoch == 0:
             raise ValueError(
-                f"dataset ({n}) nhỏ hơn batch_size ({batch_size}); "
+                f"dataset ({n}) nhỏ hơn global_batch_size ({self.global_batch_size}); "
                 "không có micro-batch nào"
             )
         while True:
             indices = list(range(n))
-            self._train_rng.shuffle(indices)
-            for start in range(0, micros_per_epoch * batch_size, batch_size):
-                batch_indices = indices[start : start + batch_size]
-                features = [self.dataset[i] for i in batch_indices]
-                tensors = self.dataset.collate(features)
+            if shuffle:
+                self._train_rng.shuffle(indices)
+            usable = micros_per_epoch * self.global_batch_size
+            rank_indices = indices[:usable][self.dist.rank:usable:self.dist.world_size]
+            batches = [
+                rank_indices[start : start + batch_size]
+                for start in range(0, len(rank_indices), batch_size)
+            ]
+            from torch.utils.data import DataLoader
+
+            data_cfg = self.run_cfg.data
+            loader_kwargs = {
+                "batch_sampler": batches,
+                "collate_fn": dataset.collate,
+                "num_workers": data_cfg.num_workers,
+                "pin_memory": bool(data_cfg.pin_memory and self.device.type == "cuda"),
+            }
+            if data_cfg.num_workers > 0:
+                loader_kwargs["prefetch_factor"] = data_cfg.prefetch_factor
+                loader_kwargs["persistent_workers"] = data_cfg.persistent_workers
+            loader = DataLoader(dataset, **loader_kwargs)
+            for tensors in loader:
                 yield TrainBatch(tensors=tensors)
+            if not repeat:
+                break
 
     # ------------------------------------------------------------------ #
     # Vòng huấn luyện
     # ------------------------------------------------------------------ #
 
-    def fit(self) -> Dict[str, object]:
-        """Chạy toàn bộ lịch train; trả summary metrics."""
+    def fit(
+        self,
+        *,
+        eval_dataset: Optional[DFlashFeatureDataset] = None,
+    ) -> Dict[str, object]:
+        """Chạy toàn bộ lịch train; có thể evaluate split offline sau/định kỳ."""
         tcfg = self.run_cfg.training
         acc_steps = tcfg.accumulation_steps
         log_every = max(1, tcfg.log_interval)
         save_every = tcfg.save_interval
 
-        self.model.to(self.device)
+        self.base_model.to(self.device)
+        self.base_model.train()
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -173,7 +238,7 @@ class Trainer:
         start_wall = time.time()
 
         ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
-        batches = self._iter_batches()
+        batches = self._iter_batches(self.dataset, shuffle=True)
         summary: Dict[str, object] = {}
 
         for batch in batches:
@@ -211,17 +276,27 @@ class Trainer:
                     global_step=self.global_step, total_steps=self.total_steps
                 )
 
+                # DDP gradient đã được average, nên log cũng cần aggregate
+                # để rank 0 phản ánh global batch thay vì local batch.
+                metric_totals = torch.tensor(
+                    [window_loss, window_acc_num, window_acc_den, window_tokens],
+                    device=self.device,
+                    dtype=torch.float64,
+                )
+                all_reduce_sum(metric_totals)
+                global_micros = max(1, window_micros * self.dist.world_size)
+                global_acc_den = float(metric_totals[2].item())
                 metrics = {
                     "global_step": self.global_step,
-                    "loss": window_loss / max(1, window_micros),
+                    "loss": float(metric_totals[0].item()) / global_micros,
                     "acc": (
-                        window_acc_num / window_acc_den
-                        if window_acc_den > 0
+                        float(metric_totals[1].item()) / global_acc_den
+                        if global_acc_den > 0
                         else float("nan")
                     ),
                     "lr": current_lr(self.optimizer),
                     "grad_norm": float(grad_norm.detach()),
-                    "tokens_per_step": window_tokens,
+                    "tokens_per_step": int(round(metric_totals[3].item())),
                     "elapsed_s": round(time.time() - start_wall, 2),
                 }
                 self._log(metrics)
@@ -233,6 +308,12 @@ class Trainer:
 
                 if save_every and self.global_step % save_every == 0:
                     self._save_checkpoint(f"step_{self.global_step}")
+                if (
+                    eval_dataset is not None
+                    and tcfg.eval_interval > 0
+                    and self.global_step % tcfg.eval_interval == 0
+                ):
+                    self.evaluate(eval_dataset)
                 if self.global_step >= self.total_steps:
                     break
 
@@ -245,13 +326,75 @@ class Trainer:
 
         self._save_checkpoint("final")
         summary["global_step"] = self.global_step
+        summary["world_size"] = self.dist.world_size
         summary["elapsed_s"] = round(time.time() - start_wall, 2)
         summary["output_dir"] = str(self.output_dir)
+        if eval_dataset is not None:
+            summary["eval"] = self.evaluate(eval_dataset)
         print(
             f"[trainer] xong: global_step={self.global_step}, "
-            f"elapsed={summary['elapsed_s']}s"
+            f"world_size={self.dist.world_size}, elapsed={summary['elapsed_s']}s"
         )
         return summary
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        dataset: DFlashFeatureDataset,
+        *,
+        max_batches: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Đánh giá DFlash loss/accuracy trên feature validation set."""
+        self.base_model.eval()
+        self.model.eval()
+        loss_num = torch.zeros((), device=self.device, dtype=torch.float64)
+        loss_den = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_num = torch.zeros((), device=self.device, dtype=torch.float64)
+        acc_den = torch.zeros((), device=self.device, dtype=torch.float64)
+        batches = 0
+        for batch in self._iter_batches(dataset, shuffle=False, repeat=False):
+            out: StepOutput = self.strategy.forward_loss(
+                batch,
+                StepContext(global_step=self.global_step, total_steps=self.total_steps),
+            )
+            if out.loss_terms is not None:
+                num, den = out.loss_terms
+                loss_num += num.detach().to(dtype=torch.float64)
+                loss_den += den.detach().to(dtype=torch.float64)
+            else:
+                loss_num += out.loss.detach().to(dtype=torch.float64)
+                loss_den += 1.0
+            acc = out.ratio_metrics.get("acc")
+            if acc is not None:
+                acc_num += torch.as_tensor(acc[0], device=self.device).sum().double()
+                acc_den += torch.as_tensor(acc[1], device=self.device).sum().double()
+            batches += 1
+            if max_batches is not None and batches >= max_batches:
+                break
+
+        all_reduce_sum(loss_num)
+        all_reduce_sum(loss_den)
+        all_reduce_sum(acc_num)
+        all_reduce_sum(acc_den)
+        result: Dict[str, object] = {
+            "eval_loss": float((loss_num / loss_den.clamp_min(1e-12)).cpu()),
+            "eval_acc": float((acc_num / acc_den.clamp_min(1e-12)).cpu()),
+            "eval_batches": batches,
+            "global_step": self.global_step,
+        }
+        if self.dist.is_main:
+            eval_path = self.output_dir / "eval_metrics.json"
+            eval_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"[eval] step={self.global_step} loss={result['eval_loss']:.4f} "
+                f"acc={result['eval_acc']:.4f}"
+            )
+        self.base_model.train()
+        self.model.train()
+        return result
 
     # ------------------------------------------------------------------ #
     # Checkpoint + logging
@@ -264,6 +407,9 @@ class Trainer:
 
     def _save_checkpoint(self, tag: str) -> str:
         path = str(self.output_dir / f"checkpoint_{tag}.pt")
+        if not self.dist.is_main:
+            barrier()
+            return path
         save_training_checkpoint(
             path,
             draft_state_dict=self._draft_state_dict(),
@@ -279,9 +425,12 @@ class Trainer:
             self._draft_state_dict(),
         )
         print(f"[trainer] đã lưu checkpoint tại {path} (step {self.global_step})")
+        barrier()
         return path
 
     def _log(self, metrics: Dict[str, object]) -> None:
+        if not self.dist.is_main:
+            return
         line = json.dumps(metrics, ensure_ascii=False, sort_keys=True)
         with open(self.metrics_path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")

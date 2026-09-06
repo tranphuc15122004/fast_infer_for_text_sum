@@ -4,6 +4,11 @@ Note này chốt model phục vụ đánh giá thực tế trong benchmark long-
 text summarization. Mục tiêu là dùng một target model chung nhiều nhất có thể,
 đồng thời giữ đúng cặp target/draft bắt buộc của từng baseline.
 
+`MR_DFlash` không phải một baseline trong ma trận này. `DFlash` ở các bảng dưới
+đây là đường inference benchmark với cặp target/draft đã chốt; còn
+`src/MR_DFlash` hiện chỉ là workspace train bản sao DFlash để phát triển ý
+tưởng mới, chưa có model hoặc kết quả MR-DFlash riêng.
+
 ## 1. Bộ model đã chốt
 
 | ID | Model | Vai trò chính |

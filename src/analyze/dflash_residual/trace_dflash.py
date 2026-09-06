@@ -77,6 +77,10 @@ def build_position_rows(
     block_size: int,
     native_block_size: int,
     target_token_source: str = "verifier_posterior",
+    state_mode: str = "on_policy",
+    target_candidate_logits: torch.Tensor | None = None,
+    target_entropy: torch.Tensor | None = None,
+    target_top1_probability: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Convert one block's tensors to JSON-safe per-position rows."""
 
@@ -86,6 +90,14 @@ def build_position_rows(
         raise ValueError("candidate_logits shape must match candidates")
     if target_tokens.shape[0] != 1 or dflash_selected.shape[0] != 1:
         raise ValueError("target/dflash tokens must have batch dimension 1")
+    if target_candidate_logits is not None and target_candidate_logits.shape != candidate_logits.shape:
+        raise ValueError("target_candidate_logits shape must match candidate_logits")
+    for name, value in (
+        ("target_entropy", target_entropy),
+        ("target_top1_probability", target_top1_probability),
+    ):
+        if value is not None and value.shape != target_tokens.shape:
+            raise ValueError(f"{name} shape must match target_tokens")
     rows: list[dict[str, Any]] = []
     depth = candidates.shape[1]
     for index in range(depth):
@@ -106,6 +118,7 @@ def build_position_rows(
             "max_depth": depth,
             "target_token_id": target,
             "target_token_source": target_token_source,
+            "state_mode": state_mode,
             "candidate_token_ids": candidate_ids,
             "candidate_logits": [float(value) for value in candidate_logits[0, index].detach().cpu().tolist()],
             "dflash_selected_token_id": int(dflash_selected[0, index].item()),
@@ -116,6 +129,16 @@ def build_position_rows(
             "target_rank": _target_rank(candidate_ids, target),
             "target_in_top16": target in candidate_ids[:16],
         }
+        if target_candidate_logits is not None:
+            row["target_candidate_logits"] = [
+                float(value) for value in target_candidate_logits[0, index].detach().cpu().tolist()
+            ]
+        if target_entropy is not None:
+            row["target_entropy"] = float(target_entropy[0, index].detach().cpu().item())
+        if target_top1_probability is not None:
+            row["target_top1_probability"] = float(
+                target_top1_probability[0, index].detach().cpu().item()
+            )
         rows.append(row)
     return rows
 
@@ -142,6 +165,9 @@ def collect_one(
     block_size: int | None = None,
     max_new_tokens: int = 32,
     stop_token_ids: Sequence[int] | None = None,
+    record_target_candidate_logits: bool = False,
+    record_target_entropy: bool = False,
+    state_mode: str = "on_policy",
 ) -> list[dict[str, Any]]:
     """Collect one deterministic DFlash run, including every verified block."""
 
@@ -200,7 +226,20 @@ def collect_one(
                 use_cache=True,
                 is_causal=False,
             )
+            if not torch.isfinite(draft_hidden).all():
+                raise RuntimeError(
+                    "DFlash draft hidden contains non-finite values; "
+                    f"target_hidden_finite={bool(torch.isfinite(target_hidden).all())}, "
+                    f"noise_embedding_finite={bool(torch.isfinite(noise_embedding).all())}, "
+                    f"draft_hidden_shape={tuple(draft_hidden.shape)}"
+                )
             draft_logits = target.lm_head(draft_hidden[:, 1 - physical_block_size:, :])
+            if not torch.isfinite(draft_logits).all():
+                raise RuntimeError(
+                    "DFlash draft logits contain non-finite values; "
+                    f"draft_hidden_finite={bool(torch.isfinite(draft_hidden).all())}, "
+                    f"draft_logits_shape={tuple(draft_logits.shape)}"
+                )
             past_draft.crop(start)
             candidate_logits, candidate_ids = torch.topk(
                 draft_logits.float(), k=min(top_m, draft_logits.shape[-1]), dim=-1
@@ -217,6 +256,24 @@ def collect_one(
             posterior = torch.argmax(output.logits, dim=-1)
             proposed = block_output_ids[:, 1:]
             target_tokens = posterior[:, :-1]
+            target_candidate_logits = None
+            target_entropy = None
+            target_top1_probability = None
+            verifier_logits = output.logits[:, :-1, :]
+            if record_target_candidate_logits:
+                if verifier_logits.shape[1] != candidate_ids.shape[1]:
+                    raise ValueError(
+                        "target verifier logits depth does not match DFlash candidate depth: "
+                        f"{verifier_logits.shape[1]} != {candidate_ids.shape[1]}"
+                    )
+                target_candidate_logits = torch.gather(
+                    verifier_logits.float(), dim=-1, index=candidate_ids.long()
+                )
+            if record_target_entropy:
+                log_probs = torch.log_softmax(verifier_logits.float(), dim=-1)
+                probs = log_probs.exp()
+                target_entropy = -(probs * log_probs).sum(dim=-1)
+                target_top1_probability = log_probs.max(dim=-1).values.exp()
             accepted = acceptance_length_from_tokens(proposed, posterior)
             rows.extend(build_position_rows(
                 run_id=run_id,
@@ -232,6 +289,11 @@ def collect_one(
                 accepted_draft_len=accepted,
                 block_size=physical_block_size,
                 native_block_size=native_block_size or physical_block_size,
+                target_candidate_logits=target_candidate_logits,
+                target_entropy=target_entropy,
+                target_top1_probability=target_top1_probability,
+                target_token_source="verifier_posterior",
+                state_mode=state_mode,
             ))
             output_ids[:, start:start + accepted + 1] = block_output_ids[:, :accepted + 1]
             output_ids[:, start + accepted + 1] = posterior[:, accepted]
@@ -268,8 +330,10 @@ def _prompt(row: Mapping[str, Any]) -> str:
     return ""
 
 
-def _encode(tokenizer: Any, prompt: str) -> torch.Tensor:
+def _encode(tokenizer: Any, prompt: str, reference: str | None = None) -> torch.Tensor:
     messages = [{"role": "user", "content": prompt}]
+    if reference:
+        messages.append({"role": "assistant", "content": reference})
     if getattr(tokenizer, "chat_template", None):
         try:
             encoded = tokenizer.apply_chat_template(
@@ -310,6 +374,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16"), default="auto")
     parser.add_argument("--attn-implementation", choices=("auto", "sdpa", "flash_attention_2"), default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--record-target-candidate-logits", action="store_true")
+    parser.add_argument("--record-target-entropy", action="store_true")
+    parser.add_argument("--state-mode", choices=("on_policy", "reference"), default="on_policy")
+    parser.add_argument("--reference-field", default="reference")
     return parser
 
 
@@ -332,7 +400,10 @@ def run(args: argparse.Namespace) -> int:
     elif args.dtype == "bfloat16":
         dtype = torch.bfloat16
     else:
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        # DFlash checkpoints are calibrated in bfloat16.  On T4, float16 can
+        # overflow inside the non-causal draft attention and silently produce
+        # NaN candidate logits; bfloat16 remains finite (albeit slower).
+        dtype = torch.bfloat16
     if args.attn_implementation == "auto":
         try:
             import flash_attn  # noqa: F401
@@ -361,7 +432,10 @@ def run(args: argparse.Namespace) -> int:
     output_rows: list[dict[str, Any]] = []
     started = time.perf_counter()
     for record in records:
-        full_ids = _encode(tokenizer, _prompt(record))
+        reference = str(record.get(args.reference_field, "")) if args.state_mode == "reference" else None
+        if args.state_mode == "reference" and not reference:
+            raise ValueError(f"record {record.get('id')} has no reference in field {args.reference_field!r}")
+        full_ids = _encode(tokenizer, _prompt(record), reference=reference)
         for cap in caps:
             input_ids = full_ids if cap is None else truncate_input_ids(full_ids, cap, side=args.truncate_side)
             input_ids = input_ids.to(args.device)
@@ -377,6 +451,9 @@ def run(args: argparse.Namespace) -> int:
                     block_size=args.block_size,
                     max_new_tokens=args.max_new_tokens,
                     stop_token_ids=[int(tokenizer.eos_token_id)] if tokenizer.eos_token_id is not None else None,
+                    record_target_candidate_logits=args.record_target_candidate_logits,
+                    record_target_entropy=args.record_target_entropy,
+                    state_mode=args.state_mode,
                 )
                 for row in rows:
                     row["context_cap"] = cap
@@ -412,7 +489,12 @@ def run(args: argparse.Namespace) -> int:
         "error_rows": sum(row.get("status") != "ok" for row in output_rows),
         "elapsed_s": time.perf_counter() - started,
         "seed": args.seed,
+        "dtype": str(dtype).replace("torch.", ""),
         "attn_implementation": attn_implementation,
+        "record_target_candidate_logits": args.record_target_candidate_logits,
+        "record_target_entropy": args.record_target_entropy,
+        "state_mode": args.state_mode,
+        "reference_field": args.reference_field if args.state_mode == "reference" else None,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 

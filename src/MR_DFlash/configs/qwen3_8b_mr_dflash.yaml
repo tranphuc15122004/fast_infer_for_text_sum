@@ -1,0 +1,52 @@
+# Config train MR-DFlash V1 trên Qwen3-8B.
+# Chạy: cd src && python -m MR_DFlash.run_train --config MR_DFlash/configs/qwen3_8b_mr_dflash.yaml
+run_id: mr-dflash-qwen3-8b-offline
+output_dir: outputs/mr-dflash-qwen3-8b
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  architecture: mr_dflash
+  # Giữ quy mô draft gốc DFlash; MR-specific stage nằm ở memory path.
+  draft_num_hidden_layers: 1
+  block_size: 16
+  mask_token_id: 151669
+  init_draft_from_target: false
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+  # MR feature schema tách khỏi layer dùng để warm-start draft.
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  draft_init_layer_ids: [18]
+  mr_num_stages: 2
+  hca_compression_ratio: 128
+  csa_compression_ratio: 4
+  memory_local_window: 128
+  csa_top_k: 64
+  indexer_dim: null
+
+data:
+  train_data_path: ./data/user_prompts.jsonl
+  hidden_states_path: null
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: mr_dflash
+  # Các hyperparameter DFlash gốc giữ nguyên để so sánh công bằng.
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  save_interval: 1000
+  log_interval: 10
+  eval_interval: 0
+  dp_world_size: 1
+  seed: 42

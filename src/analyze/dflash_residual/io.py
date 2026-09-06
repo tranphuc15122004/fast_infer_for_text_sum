@@ -10,7 +10,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from .schema import SCHEMA_VERSION, normalize_trace_row
 
 
-def read_trace_jsonl(path: str | Path, *, strict: bool = False) -> list[dict[str, Any]]:
+def read_trace_jsonl(
+    path: str | Path,
+    *,
+    strict: bool = False,
+    dataset_filter: str | None = None,
+) -> list[dict[str, Any]]:
     """Read v1 trace rows; malformed rows become explicit errors by default."""
 
     path = Path(path)
@@ -22,6 +27,10 @@ def read_trace_jsonl(path: str | Path, *, strict: bool = False) -> list[dict[str
             raw = json.loads(line)
             if not isinstance(raw, dict):
                 raise ValueError("row must be a JSON object")
+            if dataset_filter is not None:
+                dataset = str(raw.get("task_regime", raw.get("dataset", ""))).lower()
+                if dataset != str(dataset_filter).lower():
+                    continue
             rows.append(normalize_trace_row(raw))
         except Exception as exc:
             if strict:

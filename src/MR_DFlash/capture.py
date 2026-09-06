@@ -21,12 +21,18 @@ của target (chúng được nạp ở bước train).
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 
-from .data import build_sample, iter_jsonl, save_feature_file
+from .data import (
+    build_sample,
+    iter_jsonl,
+    save_feature_file,
+    save_feature_manifest,
+)
 
 
 def resolve_layer_ids(layer_ids: Optional[List[int]], num_layers: int) -> List[int]:
@@ -64,6 +70,7 @@ class HFTargetCapture:
         trust_remote_code: bool = False,
         torch_dtype: str = "bfloat16",
         device: str = "auto",
+        local_files_only: Optional[bool] = None,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -75,17 +82,25 @@ class HFTargetCapture:
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
+        self.target_model_path = target_model_path
+        self.torch_dtype = torch_dtype
+        if local_files_only is None:
+            local_files_only = os.environ.get("FI_OFFLINE", "0").lower() in {
+                "1", "true", "yes", "on"
+            }
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             target_model_path,
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             target_model_path,
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
             torch_dtype=dtype,
+            local_files_only=local_files_only,
         ).to(self.device)
         self.model.eval()
 
@@ -94,6 +109,33 @@ class HFTargetCapture:
         self.context_feature_dim = len(self.layer_ids) * int(
             self.model.config.hidden_size
         )
+        self._captured_layers: Dict[int, torch.Tensor] = {}
+        self._hooks = []
+        target_layers = getattr(getattr(self.model, "model", None), "layers", None)
+        if target_layers is not None:
+            for layer_id in self.layer_ids:
+                self._hooks.append(
+                    target_layers[layer_id].register_forward_hook(
+                        self._make_capture_hook(layer_id)
+                    )
+                )
+
+    def _make_capture_hook(self, layer_id: int):
+        def capture_hook(_module, _inputs, output):
+            value = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"hidden output layer {layer_id} không phải Tensor: {type(value)!r}"
+                )
+            self._captured_layers[layer_id] = value
+
+        return capture_hook
+
+    def close(self) -> None:
+        """Gỡ hook để target model có thể được giải phóng sạch."""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
 
     def capture_one(
         self,
@@ -101,13 +143,25 @@ class HFTargetCapture:
     ) -> torch.Tensor:
         """Chạy target trên toàn chuỗi → hidden concat (1, seq, feat)."""
         ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-        with torch.no_grad():
+        self._captured_layers.clear()
+        with torch.inference_mode():
             outputs = self.model(
                 input_ids=ids,
-                output_hidden_states=True,
+                output_hidden_states=not self._hooks,
                 use_cache=False,
             )
-        features = _extract_context_feature(outputs.hidden_states, self.layer_ids)
+        if self._hooks:
+            if len(self._captured_layers) != len(self.layer_ids):
+                raise RuntimeError(
+                    "capture hook thiếu layer: "
+                    f"expected={self.layer_ids}, got={sorted(self._captured_layers)}"
+                )
+            features = torch.cat(
+                [self._captured_layers[layer_id] for layer_id in self.layer_ids],
+                dim=-1,
+            )
+        else:
+            features = _extract_context_feature(outputs.hidden_states, self.layer_ids)
         return features.float().cpu() if self.device.type == "cpu" else features.cpu()
 
 
@@ -123,6 +177,7 @@ def capture_dataset(
     trust_remote_code: bool = False,
     torch_dtype: str = "bfloat16",
     device: str = "auto",
+    local_files_only: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Capture toàn bộ dataset → các file ``.ckpt`` dưới ``output_path``.
 
@@ -135,11 +190,13 @@ def capture_dataset(
         trust_remote_code=trust_remote_code,
         torch_dtype=torch_dtype,
         device=device,
+        local_files_only=local_files_only,
     )
     out_dir = Path(output_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {"captured": 0, "skipped_invalid": 0, "skipped_no_consecutive": 0}
+    stored_dtype: Optional[str] = None
     for index, row in enumerate(iter_jsonl(data_path)):
         if num_samples is not None and stats["captured"] >= num_samples:
             break
@@ -171,9 +228,25 @@ def capture_dataset(
             "hidden_states": features[0],
         }
         save_feature_file(str(out_dir / f"sample_{index:08d}.ckpt"), tensors)
+        if stored_dtype is None:
+            stored_dtype = str(tensors["hidden_states"].dtype).replace("torch.", "")
         stats["captured"] += 1
         if stats["captured"] % 25 == 0:
             print(f"[capture] {stats['captured']} mẫu ...")
+    save_feature_manifest(
+        str(out_dir),
+        {
+            "target_model_path": target_model_path,
+            "feature_layer_ids": list(capturer.layer_ids),
+            "hidden_size": int(capturer.model.config.hidden_size),
+            "feature_width": int(capturer.context_feature_dim),
+            "requested_torch_dtype": torch_dtype,
+            "stored_feature_dtype": stored_dtype,
+            "max_length": int(max_length),
+            "stats": stats,
+        },
+    )
+    capturer.close()
     return stats
 
 
@@ -191,6 +264,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--local-files-only", action="store_true", default=None)
     return parser.parse_args(argv)
 
 
@@ -207,6 +281,7 @@ def main(argv=None) -> None:
         trust_remote_code=args.trust_remote_code,
         torch_dtype=args.torch_dtype,
         device=args.device,
+        local_files_only=args.local_files_only,
     )
     print(f"[capture] xong: {stats}")
 

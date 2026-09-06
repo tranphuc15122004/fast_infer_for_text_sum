@@ -106,6 +106,26 @@ def validate_trace_row(row: Mapping[str, Any]) -> list[str]:
             for value in logits
         ):
             problems.append("candidate_logits must be a finite numeric list or null")
+    if "target_candidate_logits" in row and row["target_candidate_logits"] is not None:
+        logits = row["target_candidate_logits"]
+        if not isinstance(logits, list) or any(
+            not isinstance(value, (int, float)) or not math.isfinite(float(value))
+            for value in logits
+        ):
+            problems.append("target_candidate_logits must be a finite numeric list or null")
+        elif isinstance(row.get("candidate_token_ids"), list) and len(logits) != len(row["candidate_token_ids"]):
+            problems.append("target_candidate_logits must align with candidate_token_ids")
+    for field in ("target_entropy", "target_top1_probability"):
+        if field in row and row[field] is not None:
+            value = row[field]
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                problems.append(f"{field} must be a finite number or null")
+    if "target_entropy" in row and row["target_entropy"] is not None and float(row["target_entropy"]) < 0:
+        problems.append("target_entropy must be non-negative")
+    if "target_top1_probability" in row and row["target_top1_probability"] is not None:
+        probability = float(row["target_top1_probability"])
+        if probability < 0 or probability > 1:
+            problems.append("target_top1_probability must be in [0, 1]")
     return problems
 
 

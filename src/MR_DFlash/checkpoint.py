@@ -86,8 +86,9 @@ def warm_start_draft_model(
             loadable[key] = value
     current = model.state_dict()
     missing_required = [k for k in current if k not in loadable and "fc." not in k and "hidden_norm." not in k]
-    result, unexpected = model.load_state_dict(loadable, strict=False)
-    missing = list(result.missing_keys)
+    incompatible = model.load_state_dict(loadable, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
     if missing_required and strategy_name:
         # fc/hidden_norm có thể vắng ở checkpoint cũ; không báo lỗi.
         missing = [k for k in missing if "fc." not in k and "hidden_norm." not in k]

@@ -92,6 +92,26 @@ def test_report_marks_missing_selection_unavailable_without_positive_claim() -> 
     assert "PASS" not in report
 
 
+def test_prefix_gap_report_exposes_oracle_and_ambiguity_summary() -> None:
+    e2_report = render_markdown_report(
+        "e2",
+        {
+            "status": "ok",
+            "rows": 12,
+            "groups": {
+                "cnn_dm|0-2k": {
+                    "documents": 2,
+                    "blocks": 4,
+                    "mat_d": 1.0,
+                    "k_values": {"16": {"mat_oracle": 3.0, "joint_survival": {"1": 1.0}}},
+                },
+            },
+        },
+    )
+    assert "Top-K prefix" in e2_report
+    assert "MAT_O16" in e2_report
+
+
 def test_write_metrics_bundle_is_deterministic_and_writes_csv(tmp_path) -> None:
     paths = write_metrics_bundle(
         tmp_path,

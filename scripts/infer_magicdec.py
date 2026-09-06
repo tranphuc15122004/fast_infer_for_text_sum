@@ -30,6 +30,24 @@ if str(MAGICDEC_PARENT) not in sys.path:
 
 
 def _canonical_next_token(logits, temperature: float):
+    """Return one token from either MagicDec IDs or raw model logits.
+
+    The vendored MagicDec model applies argmax over the vocabulary and returns
+    token IDs with shape ``[batch, sequence]``. Other model adapters may
+    return raw logits with shape ``[batch, sequence, vocab]``.
+    """
+    if logits.ndim == 2:
+        if temperature > 0:
+            raise ValueError(
+                "MagicDec returned token IDs, so temperature sampling "
+                "requires a backend that exposes raw logits"
+            )
+        return logits[:, -1:]
+    if logits.ndim != 3:
+        raise ValueError(
+            f"Expected MagicDec output rank 2 or raw logits rank 3; got rank {logits.ndim}"
+        )
+
     scores = logits[:, -1, :]
     if temperature > 0:
         return torch.multinomial(torch.softmax(scores / temperature, dim=-1), 1)

@@ -161,6 +161,70 @@ def iter_jsonl(path: str) -> Iterator[Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 _FEATURE_SUFFIXES = (".ckpt", ".ckpt.gz")
+FEATURE_MANIFEST_FILENAME = "manifest.json"
+FEATURE_SCHEMA_VERSION = "mr_dflash_feature_v1"
+
+
+def _manifest_path(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.suffix == ".json":
+        return candidate
+    if candidate.is_file():
+        return candidate.parent / FEATURE_MANIFEST_FILENAME
+    return candidate / FEATURE_MANIFEST_FILENAME
+
+
+def save_feature_manifest(path: str, manifest: Dict[str, Any]) -> None:
+    """Lưu provenance/schema của một feature store.
+
+    Manifest là backward-compatible: các feature store cũ không có file này
+    vẫn đọc được, nhưng cache mới luôn ghi metadata để tránh dùng nhầm target
+    model/layer/dtype.
+    """
+    target = _manifest_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(manifest)
+    payload.setdefault("schema_version", FEATURE_SCHEMA_VERSION)
+    with target.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def load_feature_manifest(path: str) -> Dict[str, Any]:
+    """Đọc manifest feature store."""
+    target = _manifest_path(path)
+    with target.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError(f"manifest phải là JSON object: {target}")
+    return payload
+
+
+def validate_feature_manifest(
+    manifest: Dict[str, Any],
+    *,
+    expected_feature_width: Optional[int] = None,
+    expected_feature_layer_ids: Optional[Sequence[int]] = None,
+) -> None:
+    """Validate các invariant cache biết chắc ở thời điểm dựng dataset."""
+    if manifest.get("schema_version") != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            "feature manifest không tương thích: "
+            f"{manifest.get('schema_version')!r} != {FEATURE_SCHEMA_VERSION!r}"
+        )
+    if expected_feature_width is not None and int(manifest.get("feature_width", -1)) != int(expected_feature_width):
+        raise ValueError(
+            "feature_width trong manifest không khớp model: "
+            f"{manifest.get('feature_width')} != {expected_feature_width}"
+        )
+    if expected_feature_layer_ids is not None:
+        actual = [int(value) for value in manifest.get("feature_layer_ids", [])]
+        expected = [int(value) for value in expected_feature_layer_ids]
+        if actual != expected:
+            raise ValueError(
+                "feature_layer_ids trong manifest không khớp model: "
+                f"{actual} != {expected}"
+            )
 
 
 def list_feature_files(path: str) -> List[str]:
@@ -168,10 +232,11 @@ def list_feature_files(path: str) -> List[str]:
     if Path(path).is_file():
         return [str(Path(path).resolve())]
     files: List[str] = []
-    for root, _dirs, names in Path(path).walk():
-        for name in names:
-            if name.endswith(_FEATURE_SUFFIXES):
-                files.append(str((root / name).resolve()))
+    # ``Path.walk`` is only available in Python 3.12; the external T4 Conda
+    # runtime is Python 3.11, so keep the feature-store reader portable.
+    for candidate in Path(path).rglob("*"):
+        if candidate.is_file() and candidate.name.endswith(_FEATURE_SUFFIXES):
+            files.append(str(candidate.resolve()))
     files.sort()
     return files
 
@@ -212,7 +277,12 @@ def read_feature_refs(hidden_states_path: str, run_id: str = "offline") -> List[
 # Normalizer + collator DFlash-family
 # --------------------------------------------------------------------------- #
 
-def normalize_offline_sample(raw: Dict[str, torch.Tensor], max_len: int) -> Dict[str, torch.Tensor]:
+def normalize_offline_sample(
+    raw: Dict[str, torch.Tensor],
+    max_len: int,
+    *,
+    expected_feature_width: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
     """Chuẩn hoá một sample feature: truncate theo max_len + kiểm tra thẳng hàng."""
     input_ids = raw["input_ids"][:max_len].unsqueeze(0) if raw["input_ids"].dim() == 1 else raw["input_ids"][:, :max_len]
     loss_mask = raw["loss_mask"][:max_len].unsqueeze(0) if raw["loss_mask"].dim() == 1 else raw["loss_mask"][:, :max_len]
@@ -226,6 +296,11 @@ def normalize_offline_sample(raw: Dict[str, torch.Tensor], max_len: int) -> Dict
         hidden = hidden.squeeze(0)
     if hidden.dim() != 2:
         raise ValueError(f"hidden_states offline phải 2D/3D, got {tuple(hidden.shape)}")
+    if expected_feature_width is not None and hidden.shape[-1] != expected_feature_width:
+        raise ValueError(
+            "feature_width của sample không khớp model: "
+            f"{hidden.shape[-1]} != {expected_feature_width}"
+        )
     hidden_states = hidden[:max_len].unsqueeze(0)
 
     lengths = {input_ids.shape[1], loss_mask.shape[1], hidden_states.shape[1]}
@@ -318,18 +393,34 @@ class DFlashFeatureDataset:
         max_len: int = 3072,
         run_id: str = "offline",
         sample_limit: Optional[int] = None,
+        expected_feature_width: Optional[int] = None,
+        expected_feature_layer_ids: Optional[Sequence[int]] = None,
     ) -> None:
         self.refs = read_feature_refs(hidden_states_path, run_id=run_id)
         if sample_limit is not None:
             self.refs = self.refs[:sample_limit]
         self.max_len = max_len
+        self.expected_feature_width = expected_feature_width
+        self.manifest: Optional[Dict[str, Any]] = None
+        manifest_path = _manifest_path(hidden_states_path)
+        if manifest_path.exists():
+            self.manifest = load_feature_manifest(str(manifest_path))
+            validate_feature_manifest(
+                self.manifest,
+                expected_feature_width=expected_feature_width,
+                expected_feature_layer_ids=expected_feature_layer_ids,
+            )
 
     def __len__(self) -> int:
         return len(self.refs)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         raw = load_feature_file(self.refs[index].path)
-        return normalize_offline_sample(raw, self.max_len)
+        return normalize_offline_sample(
+            raw,
+            self.max_len,
+            expected_feature_width=self.expected_feature_width,
+        )
 
     def collate(self, features) -> Dict[str, torch.Tensor]:
         return build_dflash_collator()(features)
@@ -345,6 +436,11 @@ __all__ = [
     "list_feature_files",
     "save_feature_file",
     "load_feature_file",
+    "FEATURE_MANIFEST_FILENAME",
+    "FEATURE_SCHEMA_VERSION",
+    "save_feature_manifest",
+    "load_feature_manifest",
+    "validate_feature_manifest",
     "read_feature_refs",
     "normalize_offline_sample",
     "pad_and_concatenate_features",

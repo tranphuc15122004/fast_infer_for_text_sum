@@ -117,6 +117,7 @@ def get_model_answers(
                     temperature=temperature,
                     max_new_tokens=pipeline_config['n_new_tokens'],
                     top_k=0.0, top_p=1.0,
+                    return_dict_in_generate=False,
                     config=pipeline_config
                 )
             else:
@@ -125,7 +126,8 @@ def get_model_answers(
                     do_sample=do_sample,
                     temperature=temperature,
                     max_new_tokens=pipeline_config['n_new_tokens'],
-                    top_k=0.0, top_p=1.0
+                    top_k=0.0, top_p=1.0,
+                    return_dict_in_generate=False
                 )
             end_time = time.time()
             gap_time = end_time - start_time 

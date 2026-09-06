@@ -74,3 +74,44 @@ def test_missing_trace_writes_unavailable_report_for_every_requested_phase(tmp_p
     assert set(metrics["phases"]) == {"p1", "p2", "p3", "p4"}
     assert all(item["status"] == "unavailable" for item in metrics["phases"].values())
     assert "--trace is required" in metrics["phases"]["p1"]["reason"]
+
+
+def test_parser_supports_prefix_gap_phases() -> None:
+    for phase in ("e1", "e2", "e3", "next"):
+        args = build_parser().parse_args([
+            "--phase", phase,
+            "--trace", "trace.jsonl",
+            "--output", "/tmp/prefix-gap",
+        ])
+        assert args.phase == phase
+
+
+def test_parser_supports_prefix_context_filter() -> None:
+    args = build_parser().parse_args([
+        "--phase", "e2",
+        "--trace", "trace.jsonl",
+        "--output", "/tmp/prefix-gap",
+        "--prefix-context-cap", "1024",
+    ])
+    assert args.prefix_context_cap == 1024
+
+
+def test_prefix_gap_next_writes_e2_and_e3_artifacts(tmp_path) -> None:
+    input_path = tmp_path / "synthetic.jsonl"
+    run_synthetic(input_path, documents=6)
+    output_dir = tmp_path / "prefix-gap"
+    args = build_parser().parse_args([
+        "--phase", "next",
+        "--trace", str(input_path),
+        "--output", str(output_dir),
+        "--bootstrap-samples", "10",
+        "--min-documents", "5",
+    ])
+    assert run(args) == 0
+    metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert set(metrics["phases"]) == {"e1", "e2", "e3"}
+    assert metrics["phases"]["e1"]["status"] == "ok"
+    assert metrics["phases"]["e2"]["status"] == "ok"
+    assert metrics["phases"]["e3"]["status"] == "ok"
+    assert (output_dir / "e2" / "prefix_oracle.csv").is_file()
+    assert (output_dir / "e3" / "rank_distribution.csv").is_file()

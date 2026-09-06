@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from .chunking import checkpointed_chunk_reduce
 from .model import DFlashDraftModel, DraftSpec
+from .mr_model import MRDFlashDraftModel, MRDraftSpec
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -519,6 +520,73 @@ class OnlineDFlashModel(nn.Module):
         return loss, accuracy, metrics
 
 
+class OnlineMRDFlashModel(OnlineDFlashModel):
+    """Online wrapper MR-DFlash, giữ nguyên anchor và DFlash objective.
+
+    Khác biệt duy nhất với ``OnlineDFlashModel`` là target feature được build
+    thành ``MRMemoryState`` trước khi chạy draft. Noise embedding, label,
+    weight mask và loss vẫn dùng chính implementation DFlash bên trên.
+    """
+
+    draft_model: MRDFlashDraftModel
+
+    def __init__(
+        self,
+        draft_model: MRDFlashDraftModel,
+        target_lm_head: nn.Module,
+        target_embed_tokens: nn.Module,
+        mask_token_id: int,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            draft_model,
+            target_lm_head,
+            target_embed_tokens,
+            mask_token_id,
+            **kwargs,
+        )
+
+    def _forward_draft_blocks(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device
+        )
+        n_blocks = anchor_positions.shape[1]
+        noise_embedding = self._create_noise_embed(
+            input_ids, anchor_positions, block_keep_mask
+        )
+        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        draft_position_ids = (
+            anchor_positions.unsqueeze(-1)
+            + torch.arange(self.block_size, device=device).view(1, 1, -1)
+        ).reshape(bsz, -1)
+        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        memory = self.draft_model.build_memory(hidden_states)
+
+        dtype = next(self.draft_model.parameters()).dtype
+        full_mask = build_dflash_additive_mask(
+            anchor_positions,
+            block_keep_mask,
+            seq_len,
+            self.block_size,
+            device,
+            dtype,
+        )
+        output_hidden = self.draft_model(
+            noise_embedding=noise_embedding,
+            memory=memory,
+            position_ids=full_position_ids,
+            attention_mask=full_mask,
+        )
+        return anchor_positions, block_keep_mask, output_hidden, n_blocks
+
+
 # --------------------------------------------------------------------------- #
 # Batch + StepOutput + Strategy (cầu nối vào trainer spine)
 # --------------------------------------------------------------------------- #
@@ -562,9 +630,14 @@ class DFlashTrainStrategy:
 
     def __init__(self, model: OnlineDFlashModel) -> None:
         self.model = model
+        self._forward_model: nn.Module = model
 
     def trainable_module(self) -> nn.Module:
         return self.model.trainable_module()
+
+    def set_forward_model(self, model: nn.Module) -> None:
+        """Đặt wrapper forward (DDP) nhưng giữ draft làm optimizer module."""
+        self._forward_model = model
 
     def validate_batch(self, batch: TrainBatch) -> None:
         missing = {
@@ -582,9 +655,10 @@ class DFlashTrainStrategy:
         del ctx
         self.validate_batch(batch)
         t = batch.tensors
-        device = next(self.model.parameters()).device
-        dtype = next(self.model.parameters()).dtype
-        loss, accuracy, model_metrics = self.model(
+        trainable = self.trainable_module()
+        device = next(trainable.parameters()).device
+        dtype = next(trainable.parameters()).dtype
+        loss, accuracy, model_metrics = self._forward_model(
             input_ids=t["input_ids"].to(device=device, dtype=torch.long),
             hidden_states=t["hidden_states"].to(device=device, dtype=dtype),
             loss_mask=t["loss_mask"].to(device=device, dtype=dtype),
@@ -664,13 +738,62 @@ def build_draft_spec_from_target_config(
     )
 
 
+class MRDFlashTrainStrategy(DFlashTrainStrategy):
+    """Strategy MR-DFlash dùng cùng feature contract với DFlash."""
+
+    name = "mr_dflash"
+
+    def __init__(self, model: OnlineMRDFlashModel) -> None:
+        super().__init__(model)
+
+
+def build_mr_draft_spec_from_target_config(
+    target_config: Any,
+    *,
+    draft_num_hidden_layers: int,
+    block_size: int,
+    target_layer_ids: Optional[list] = None,
+    layer_types: Optional[list] = None,
+    sliding_window: Optional[int] = None,
+    mask_token_id: Optional[int] = None,
+    num_stages: int = 2,
+    hca_compression_ratio: int = 128,
+    csa_compression_ratio: int = 4,
+    local_window: int = 128,
+    csa_top_k: int = 64,
+    indexer_dim: Optional[int] = None,
+) -> MRDraftSpec:
+    """Dựng MRDraftSpec từ HF config, kế thừa toàn bộ DFlash knobs."""
+    base = build_draft_spec_from_target_config(
+        target_config,
+        draft_num_hidden_layers=draft_num_hidden_layers,
+        block_size=block_size,
+        target_layer_ids=target_layer_ids,
+        layer_types=layer_types,
+        sliding_window=sliding_window,
+        mask_token_id=mask_token_id,
+    )
+    return MRDraftSpec.from_dflash(
+        base,
+        num_stages=num_stages,
+        hca_compression_ratio=hca_compression_ratio,
+        csa_compression_ratio=csa_compression_ratio,
+        local_window=local_window,
+        csa_top_k=csa_top_k,
+        indexer_dim=indexer_dim,
+    )
+
+
 __all__ = [
     "OnlineDFlashModel",
+    "OnlineMRDFlashModel",
     "DFlashTrainStrategy",
+    "MRDFlashTrainStrategy",
     "TrainBatch",
     "StepOutput",
     "StepContext",
     "build_dflash_additive_mask",
     "build_dflash_flex_block_mask",
     "build_draft_spec_from_target_config",
+    "build_mr_draft_spec_from_target_config",
 ]

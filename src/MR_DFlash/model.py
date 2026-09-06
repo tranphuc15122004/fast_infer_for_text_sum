@@ -427,12 +427,16 @@ class DFlashDraftModel(nn.Module):
             )
         return self.norm(hidden)
 
-    def init_from_target(self, target_model: nn.Module) -> List[str]:
-        """[MR hook] Copy weight draft layer i từ target layer target_layer_ids[i].
+    def init_from_target(
+        self,
+        target_model: nn.Module,
+        target_layer_ids: Optional[List[int]] = None,
+    ) -> List[str]:
+        """Copy weight draft layer i từ layout layer được chỉ định.
 
         Chỉ copy các key trùng tên (q/k/v/o_proj, gate/up/down_proj,
         input_layernorm, post_attention_layernorm). fc/hidden_norm/norm vẫn
-        random. Trả về danh sách key đã copy.
+        random. ``target_layer_ids=None`` giữ hành vi legacy.
         """
         copied: List[str] = []
         try:
@@ -443,9 +447,13 @@ class DFlashDraftModel(nn.Module):
             raise ValueError(
                 "target model không có .model.layers — không init_from_target được"
             )
-        for i, (layer, target_id) in enumerate(
-            zip(self.layers, self.target_layer_ids)
-        ):
+        source_layer_ids = target_layer_ids or self.target_layer_ids[: len(self.layers)]
+        if len(source_layer_ids) != len(self.layers):
+            raise ValueError(
+                "target_layer_ids cho init phải có đúng số draft layer: "
+                f"{len(source_layer_ids)} != {len(self.layers)}"
+            )
+        for i, (layer, target_id) in enumerate(zip(self.layers, source_layer_ids)):
             if target_id >= len(target_layers):
                 raise ValueError(
                     f"target_layer_ids[{i}]={target_id} vượt số layer target "

@@ -30,6 +30,12 @@ server. Thông tin path/runtime canonical: [`docs/server_environment.md`](server
 | FlexPrefill | `python3` server / `.venv` mô phỏng | `docs/baselines/flexprefill.md` |
 | SyncSpec-v1 | `python3` server / `.venv` mô phỏng | `docs/baselines/syncspec.md` |
 
+`MR_DFlash` không nằm trong bảng baseline trên: đây là workspace phát triển
+thuật toán train mới, hiện chỉ là bản sao quy trình/model DFlash để làm gốc.
+Xem [bối cảnh MR-DFlash](mr_dflash.md) và
+[`src/MR_DFlash/README.md`](../src/MR_DFlash/README.md). Nó chưa có launcher
+benchmark inference hay kết quả riêng.
+
 ## Chuẩn bị chung trên server B200
 
 ```bash

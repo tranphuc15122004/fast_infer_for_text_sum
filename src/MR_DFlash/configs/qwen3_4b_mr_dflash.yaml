@@ -1,0 +1,59 @@
+# Config train MR-DFlash trên Qwen3-4B cho server B200.
+# Dùng feature layer layout MR rõ ràng; draft init layout tách riêng.
+run_id: mr-dflash-qwen3-4b-b200
+output_dir: outputs/mr-dflash-qwen3-4b-b200
+
+model:
+  target_model_path: Qwen/Qwen3-4B
+  architecture: mr_dflash
+  draft_num_hidden_layers: 1
+  block_size: 16
+  mask_token_id: 151669
+  init_draft_from_target: true
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+  # MR feature views: [layer + 1] hidden states are concatenated.
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  # DFlash draft has one layer; initialize it from the middle target layer.
+  draft_init_layer_ids: [18]
+  mr_num_stages: 2
+  hca_compression_ratio: 128
+  csa_compression_ratio: 4
+  memory_local_window: 128
+  csa_top_k: 64
+  indexer_dim: null
+
+data:
+  train_data_path: ./data/user_prompts.jsonl
+  eval_data_path: null
+  hidden_states_path: null
+  eval_hidden_states_path: null
+  max_length: 3072
+  cache_dir: ./cache
+  # Mỗi process 4 worker; giảm về 0 nếu feature store nằm trên filesystem chậm.
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: mr_dflash
+  num_epochs: 6
+  max_steps: 10000
+  # Mặc định 1 GPU: global batch = 4, đúng DFlash gốc.
+  # Khi chạy 2 GPU dùng --batch-size 2 để global batch vẫn = 4.
+  batch_size: 4
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  save_interval: 1000
+  log_interval: 10
+  eval_interval: 0
+  dp_world_size: 1
+  seed: 42

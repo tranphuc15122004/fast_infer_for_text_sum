@@ -25,6 +25,14 @@ Cấu hình trong master: `DFLASH_MODE=gsm8k`, `DFLASH_BACKEND`
 `DFLASH_MAX_NEW_TOKENS`, `DFLASH_BLOCK_SIZE`. Dùng
 `DFLASH_MODE=representative` để chạy JSONL của repo.
 
+## Phân biệt với MR-DFlash
+
+Doc này mô tả **DFlash inference baseline** ở `externals/dflash`. Nó độc lập
+với workspace train [`src/MR_DFlash`](../../src/MR_DFlash/README.md), nơi hiện
+chỉ giữ bản sao quy trình/model DFlash để làm gốc cho một ý tưởng mới. Chưa có
+thay đổi thuật toán MR-DFlash nào và chưa được dùng như một baseline benchmark
+riêng. Xem [bối cảnh MR-DFlash](../mr_dflash.md).
+
 ## Dữ liệu của bạn
 
 ⚠️ DFlash benchmark **chỉ hỗ trợ dataset builtin**: `gsm8k | math500 | humaneval |

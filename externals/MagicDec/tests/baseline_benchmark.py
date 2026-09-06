@@ -78,7 +78,10 @@ for step, batch in tqdm(enumerate(dataloader), total=num_eval_steps):
     terminate = False
     output = input_ids.clone()
 
-    next_tokens = engine.encode(input_ids=input_ids)[:,-1:]
+    next_token = engine.encode(input_ids)[:, -1:]
+
+    for _ in range(...):
+        next_token = engine.inference(next_token)
     output = torch.cat((output, next_tokens),dim=-1)
     torch.cuda.synchronize()
     t1 = time.perf_counter()

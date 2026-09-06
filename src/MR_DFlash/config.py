@@ -49,6 +49,45 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
+def resolve_feature_layer_ids(model_config: object) -> Optional[List[int]]:
+    """Resolve feature layers, ưu tiên field mới và giữ alias legacy."""
+    feature = getattr(model_config, "feature_layer_ids", None)
+    legacy = getattr(model_config, "target_layer_ids", None)
+    if feature is not None and legacy is not None and list(feature) != list(legacy):
+        raise ValueError(
+            "target_layer_ids và feature_layer_ids phải giống nhau; "
+            "dùng feature_layer_ids cho config mới"
+        )
+    resolved = feature if feature is not None else legacy
+    return None if resolved is None else [int(value) for value in resolved]
+
+
+def resolve_draft_init_layer_ids(
+    model_config: object,
+    *,
+    num_target_layers: int,
+) -> List[int]:
+    """Resolve layer copy cho draft, độc lập với feature layer layout."""
+    explicit = getattr(model_config, "draft_init_layer_ids", None)
+    num_draft_layers = int(getattr(model_config, "draft_num_hidden_layers"))
+    values = (
+        [int(value) for value in explicit]
+        if explicit is not None
+        else build_target_layer_ids(num_target_layers, num_draft_layers)
+    )
+    if len(values) != num_draft_layers:
+        raise ValueError(
+            "draft_init_layer_ids phải có đúng số draft layer: "
+            f"{len(values)} != {num_draft_layers}"
+        )
+    if any(value < 0 or value >= num_target_layers for value in values):
+        raise ValueError(
+            "draft_init_layer_ids chứa layer ngoài target: "
+            f"values={values}, num_target_layers={num_target_layers}"
+        )
+    return values
+
+
 def resolve_dflash_attention_layout(
     layer_types: List[str],
     num_hidden_layers: int,
@@ -75,16 +114,23 @@ def resolve_dflash_attention_layout(
 
 @dataclass
 class ModelConfig:
-    """Cấu hình model target + draft DFlash."""
+    """Cấu hình model target + draft DFlash/MR-DFlash."""
 
     #: Target model (HF path) — nguồn feature/embedding/lm_head/labels.
     target_model_path: str = "Qwen/Qwen3-8B"
+    #: dflash giữ baseline; mr_dflash bật memory đa phân giải.
+    architecture: str = "dflash"
     #: Số layer của draft model.
     draft_num_hidden_layers: int = 1
     #: Số layer của target (tự nạp từ target config nếu để None).
     num_target_layers: Optional[int] = None
-    #: Các layer target được capture làm context feature (concat).
+    #: Legacy alias cho feature_layer_ids; giữ để đọc config cũ.
     target_layer_ids: Optional[List[int]] = None
+    #: Các layer target được capture làm context feature (concat).
+    feature_layer_ids: Optional[List[int]] = None
+    #: Các layer target dùng để copy weight vào draft khi init.
+    #: None = tự sinh layout DFlash theo số draft layer.
+    draft_init_layer_ids: Optional[List[int]] = None
     #: Độ dài 1 block dự đoán song song.
     block_size: int = 16
     #: Loại attention từng draft layer: full_attention | sliding_attention.
@@ -101,8 +147,24 @@ class ModelConfig:
     init_draft_from_target: bool = False
     #: dtype huấn luyện.
     torch_dtype: str = "bfloat16"
+    #: Số stage target attention của MR-DFlash (HCA rồi CSA).
+    mr_num_stages: int = 2
+    #: Tỉ lệ nén token cho memory HCA.
+    hca_compression_ratio: int = 128
+    #: Tỉ lệ nén token cho memory CSA.
+    csa_compression_ratio: int = 4
+    #: Số token target raw luôn giữ ở local memory.
+    memory_local_window: int = 128
+    #: Số CSA slot tối đa mỗi draft query.
+    csa_top_k: int = 64
+    #: Chiều projection Q/K indexer; null = hidden_size.
+    indexer_dim: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if self.architecture not in {"dflash", "mr_dflash"}:
+            raise ValueError(
+                f"architecture chỉ hỗ trợ dflash|mr_dflash, got {self.architecture}"
+            )
         if self.block_size < 2:
             raise ValueError(f"block_size phải >= 2, got {self.block_size}")
         if self.draft_num_hidden_layers < 1:
@@ -111,6 +173,33 @@ class ModelConfig:
             )
         if self.torch_dtype not in {"float32", "bfloat16", "float16"}:
             raise ValueError(f"torch_dtype không hợp lệ: {self.torch_dtype}")
+        if (
+            self.target_layer_ids is not None
+            and self.feature_layer_ids is not None
+            and list(self.target_layer_ids) != list(self.feature_layer_ids)
+        ):
+            raise ValueError(
+                "target_layer_ids và feature_layer_ids phải giống nhau; "
+                "dùng feature_layer_ids cho config mới"
+            )
+        for name in ("target_layer_ids", "feature_layer_ids", "draft_init_layer_ids"):
+            values = getattr(self, name)
+            if values is not None and (
+                not values or any(int(value) < 0 for value in values)
+            ):
+                raise ValueError(f"{name} phải là list layer id không âm và không rỗng")
+        if self.mr_num_stages < 2:
+            raise ValueError("mr_num_stages phải >= 2 (HCA + CSA)")
+        for name in (
+            "hca_compression_ratio",
+            "csa_compression_ratio",
+            "memory_local_window",
+            "csa_top_k",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} phải >= 1")
+        if self.indexer_dim is not None and self.indexer_dim < 1:
+            raise ValueError("indexer_dim phải dương hoặc null")
 
 
 @dataclass
@@ -134,6 +223,19 @@ class DataConfig:
     cache_dir: str = "./cache"
     #: Số worker dùng khi build dataset.
     build_dataset_num_proc: int = 8
+    #: DataLoader worker/prefetch khi chuyển feature lên GPU.
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = True
+
+    def __post_init__(self) -> None:
+        if self.num_workers < 0:
+            raise ValueError("data.num_workers phải >= 0")
+        if self.prefetch_factor < 1:
+            raise ValueError("data.prefetch_factor phải >= 1")
+    #: Cache feature validation set; None = tự sinh dưới output_dir.
+    eval_hidden_states_path: Optional[str] = None
 
 
 @dataclass
@@ -159,13 +261,17 @@ class TrainingConfig:
     loss_type: str = "dflash"
     save_interval: int = 1000
     log_interval: int = 10
+    #: 0 = evaluate cuối run; >0 evaluate định kỳ theo optimizer step.
+    eval_interval: int = 0
     seed: int = 42
     #: FSDP không bắt buộc; nếu >1 dùng DDP đơn giản qua torch.distributed.
     dp_world_size: int = 1
 
     def __post_init__(self) -> None:
-        if self.strategy != "dflash":
-            raise ValueError(f"MR-DFlash hiện chỉ hỗ trợ strategy=dflash, got {self.strategy}")
+        if self.strategy not in {"dflash", "mr_dflash"}:
+            raise ValueError(
+                f"strategy chỉ hỗ trợ dflash|mr_dflash, got {self.strategy}"
+            )
         if self.attention_backend not in {"sdpa", "flex"}:
             raise ValueError(
                 f"attention_backend chỉ hỗ trợ sdpa|flex, got {self.attention_backend}"
@@ -174,6 +280,8 @@ class TrainingConfig:
             raise ValueError(f"loss_type không hợp lệ: {self.loss_type}")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError(f"warmup_ratio phải thuộc [0,1], got {self.warmup_ratio}")
+        if self.eval_interval < 0:
+            raise ValueError("eval_interval phải >= 0")
 
 
 @dataclass
@@ -218,5 +326,7 @@ __all__ = [
     "TrainingConfig",
     "RunConfig",
     "build_target_layer_ids",
+    "resolve_feature_layer_ids",
+    "resolve_draft_init_layer_ids",
     "resolve_dflash_attention_layout",
 ]

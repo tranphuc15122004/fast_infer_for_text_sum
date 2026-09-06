@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -70,6 +71,33 @@ def test_sssd_command_uses_the_forked_sglang_entrypoint():
     assert command[command.index("--model-path") + 1] == "/models/llama"
     assert command[command.index("--dataset-name") + 1] == "custom"
     assert "--speculative-adaptive" in command
+
+
+def test_sssd_native_kernel_is_declared_for_the_server_runtime():
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "sglang-kernel==0.4.1" in requirements
+
+
+def test_fafo_custom_generate_calls_return_tensors():
+    """FAFO's patched decoder returns a tensor, not a GenerateOutput object."""
+    for name in ("eval_gsm8k.py", "eval_mtbench.py", "eval_humaneval.py"):
+        path = ROOT / "externals/FAFO/pipeline/fafo" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        generate_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "generate"
+        ]
+        assert generate_calls, f"no model.generate call found in {path}"
+        for call in generate_calls:
+            assert any(
+                keyword.arg == "return_dict_in_generate"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is False
+                for keyword in call.keywords
+            ), f"{path}:{call.lineno} must request tensor output"
 
 
 def test_fafo_command_uses_upstream_main_and_single_sample_configs():

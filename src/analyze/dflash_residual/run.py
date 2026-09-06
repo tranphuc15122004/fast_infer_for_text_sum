@@ -14,9 +14,20 @@ from .p1_task_regime import analyze_task_regimes
 from .p2_coverage import analyze_coverage
 from .p3_headroom import analyze_headroom
 from .p4_interaction import analyze_interaction
+from .prefix_gap import analyze_matched_context, analyze_prefix_oracle, analyze_rank_ambiguity
 from .plotting import plot_coverage_heatmap, plot_recovery_by_context
 from .report import render_markdown_report
 from .schema import SCHEMA_VERSION
+from .source_disambiguation import (
+    analyze_leave_one_dataset_out,
+    analyze_leave_one_dataset_out_from_ladder_metrics,
+    analyze_source_ladder,
+    analyze_source_strata,
+    analyze_target_near_ties,
+    annotate_source_rows,
+    annotate_source_phrase_rows,
+    build_source_index,
+)
 
 
 def _write_manifest(output_dir: Path, manifest: Mapping[str, Any]) -> None:
@@ -34,18 +45,124 @@ def _unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
 
 
-def _load_base_rows(path: str | Path) -> list[dict[str, Any]]:
-    return [row for row in read_trace_jsonl(path) if row.get("status") == "ok"]
+def _prefix_tables(phase: str, metrics: Mapping[str, Any]) -> dict[str, Sequence[Mapping[str, Any]]]:
+    if phase == "e1":
+        rows: list[dict[str, Any]] = []
+        for regime, comparison in metrics.get("pairwise", {}).items():
+            rows.append({"comparison": regime, **comparison})
+        return {"matched_context": rows}
+    if phase == "e2":
+        rows = []
+        for group, group_metrics in metrics.get("groups", {}).items():
+            for k, values in group_metrics.get("k_values", {}).items():
+                rows.append({
+                    "group": group,
+                    "k": int(k),
+                    "documents": group_metrics.get("documents"),
+                    "blocks": group_metrics.get("blocks"),
+                    "mat_d": group_metrics.get("mat_d"),
+                    "mat_oracle": values.get("mat_oracle"),
+                    "oracle_headroom_over_dflash": values.get("oracle_headroom_over_dflash"),
+                })
+        return {"prefix_oracle": rows}
+    if phase == "e3":
+        rows = []
+        for regime, regime_metrics in metrics.get("regimes", {}).items():
+            histogram = regime_metrics.get("rank_histogram", {})
+            for rank in range(1, 17):
+                rows.append({
+                    "regime": regime,
+                    "rank": rank,
+                    "count": histogram.get(str(rank), 0),
+                    "rows": regime_metrics.get("rows"),
+                    "top16_hit_rows": regime_metrics.get("top16_hit_rows"),
+                })
+        return {"rank_distribution": rows}
+    return {}
+
+
+def _load_base_rows(path: str | Path, *, dataset_filter: str | None = None) -> list[dict[str, Any]]:
+    return [
+        row for row in read_trace_jsonl(path, dataset_filter=dataset_filter)
+        if row.get("status") == "ok"
+    ]
 
 
 def _prepare_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     if not args.trace:
         raise ValueError("--trace is required for this phase")
-    rows = _load_base_rows(args.trace)
+    rows = _load_base_rows(args.trace, dataset_filter=args.dataset_filter)
     if args.dflash2_selection:
         selections = read_selection_jsonl(args.dflash2_selection)
         rows = join_selection_trace(rows, selections)
     return rows
+
+
+def _load_source_records(paths: Sequence[str]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for value in paths:
+        path = Path(value)
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"source record at {path}:{line_number} is not an object")
+            records.append(record)
+    return records
+
+
+def _load_ladder_metrics(paths: Sequence[str]) -> dict[str, Mapping[str, Any]]:
+    """Load either compact E7 bundles or their single-dataset inner metrics."""
+
+    ladder_metrics: dict[str, Mapping[str, Any]] = {}
+    for path in paths:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        dataset_name = str(payload.get("dataset", Path(path).parent.name))
+        if dataset_name not in {"cnn_dm", "govreport", "multi_news"}:
+            for known_name in ("cnn_dm", "govreport", "multi_news"):
+                if known_name in str(path):
+                    dataset_name = known_name
+                    break
+        if "mat_d" not in payload:
+            datasets = payload.get("datasets", {})
+            if isinstance(datasets, Mapping) and len(datasets) == 1:
+                inner_name, inner_payload = next(iter(datasets.items()))
+                if isinstance(inner_payload, Mapping):
+                    payload = dict(inner_payload)
+                    dataset_name = str(payload.get("dataset", dataset_name or inner_name))
+        ladder_metrics[dataset_name] = payload
+    return ladder_metrics
+
+
+def _prepare_source_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not args.source_jsonl:
+        raise ValueError("--source-jsonl is required for source-conditioned phases")
+    if not args.tokenizer:
+        raise ValueError("--tokenizer is required for source-conditioned phases")
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        raise RuntimeError("transformers is required to tokenize source records") from exc
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
+    relevant_tokens: dict[str, set[int]] = {}
+    for row in rows:
+        sample_id = str(row.get("sample_id"))
+        token_set = relevant_tokens.setdefault(sample_id, set())
+        token_set.add(int(row["target_token_id"]))
+        token_set.update(int(token) for token in row.get("candidate_token_ids", []))
+    records = _load_source_records(args.source_jsonl)
+    records = [
+        record for record in records
+        if str(record.get("id", record.get("sample_id", record.get("document_id")))) in relevant_tokens
+    ]
+    source_index = build_source_index(
+        records,
+        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"],
+        token_filter_by_sample=relevant_tokens,
+    )
+    annotated = annotate_source_rows(rows, source_index, copy_rows=False)
+    return annotate_source_phrase_rows(annotated, source_index)
 
 
 def _write_phase(
@@ -155,7 +272,12 @@ def run(args: argparse.Namespace) -> int:
         try:
             rows = _prepare_rows(args)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            requested = ("p1", "p2", "p3", "p4") if args.phase == "all" else (args.phase,)
+            requested = (
+                ("p1", "p2", "p3", "p4") if args.phase == "all"
+                else ("e1", "e2", "e3") if args.phase == "next"
+                else ("e6", "e7", "e8", "e9", "e10") if args.phase == "source-next"
+                else (args.phase,)
+            )
             for phase in requested:
                 phases[phase] = _unavailable(str(exc))
                 _write_phase(output_dir, phase, phases[phase])
@@ -192,6 +314,85 @@ def run(args: argparse.Namespace) -> int:
                 min_documents=args.min_documents,
             )
             _write_phase(output_dir, "p4", phases["p4"])
+        if rows is not None and args.phase in {"e1", "next"}:
+            phases["e1"] = analyze_matched_context(
+                rows,
+                context_cap=args.matched_context_cap,
+                relative_drop_gate=args.matched_drop_gate,
+                bootstrap_samples=args.bootstrap_samples,
+                seed=args.seed,
+                min_documents=args.min_documents,
+            )
+            _write_phase(output_dir, "e1", phases["e1"], tables=_prefix_tables("e1", phases["e1"]))
+        if rows is not None and args.phase in {"e2", "next"}:
+            prefix_rows = rows
+            if args.prefix_context_cap is not None:
+                prefix_rows = [
+                    row for row in rows
+                    if int(row.get("context_cap", row.get("context_length", -1))) == args.prefix_context_cap
+                ]
+            phases["e2"] = analyze_prefix_oracle(
+                prefix_rows,
+                k_values=args.prefix_k_values,
+                min_documents=args.min_documents,
+                context_cap=args.prefix_context_cap,
+            )
+            _write_phase(output_dir, "e2", phases["e2"], tables=_prefix_tables("e2", phases["e2"]))
+        if rows is not None and args.phase in {"e3", "next"}:
+            phases["e3"] = analyze_rank_ambiguity(
+                rows,
+                context_cap=args.matched_context_cap,
+            )
+            _write_phase(output_dir, "e3", phases["e3"], tables=_prefix_tables("e3", phases["e3"]))
+        # E10 can consume compact E7 artifacts directly; do not force a
+        # second source-tokenization pass when --ladder-metrics is provided.
+        if rows is not None and args.phase == "e10" and args.ladder_metrics:
+            ladder_metrics = _load_ladder_metrics(args.ladder_metrics)
+            phases["e10"] = analyze_leave_one_dataset_out_from_ladder_metrics(
+                ladder_metrics,
+                lambda_values=args.source_lambda_values,
+            )
+            _write_phase(output_dir, "e10", phases["e10"])
+        elif rows is not None and args.phase in {"e6", "e7", "e8", "e9", "e10", "source-next"}:
+            try:
+                source_rows = _prepare_source_rows(args, rows)
+            except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+                requested = ("e6", "e7", "e8", "e9", "e10") if args.phase == "source-next" else (args.phase,)
+                for phase in requested:
+                    phases[phase] = _unavailable(str(exc))
+                    _write_phase(output_dir, phase, phases[phase])
+                source_rows = None
+            if source_rows is not None:
+                if args.phase in {"e6", "source-next"}:
+                    phases["e6"] = analyze_source_strata(source_rows)
+                    _write_phase(output_dir, "e6", phases["e6"])
+                if args.phase in {"e7", "source-next"}:
+                    phases["e7"] = analyze_source_ladder(source_rows, lambda_values=args.source_lambda_values)
+                    if args.dataset_filter:
+                        phases["e7"]["dataset"] = args.dataset_filter
+                    _write_phase(output_dir, "e7", phases["e7"])
+                if args.phase in {"e8", "source-next"}:
+                    phases["e8"] = analyze_source_ladder(source_rows, lambda_values=args.source_lambda_values)
+                    phases["e8"]["experiment"] = "E8"
+                    if args.dataset_filter:
+                        phases["e8"]["dataset"] = args.dataset_filter
+                    _write_phase(output_dir, "e8", phases["e8"])
+                if args.phase in {"e9", "source-next"}:
+                    phases["e9"] = analyze_target_near_ties(source_rows, near_tie_margin=args.near_tie_margin)
+                    _write_phase(output_dir, "e9", phases["e9"])
+                if args.phase in {"e10", "source-next"}:
+                    if args.ladder_metrics:
+                        ladder_metrics = _load_ladder_metrics(args.ladder_metrics)
+                        phases["e10"] = analyze_leave_one_dataset_out_from_ladder_metrics(
+                            ladder_metrics,
+                            lambda_values=args.source_lambda_values,
+                        )
+                    else:
+                        phases["e10"] = analyze_leave_one_dataset_out(
+                            source_rows,
+                            lambda_values=args.source_lambda_values,
+                        )
+                    _write_phase(output_dir, "e10", phases["e10"])
     status_values = [_phase_status(metrics) for metrics in phases.values()]
     overall = "ok" if any(status == "ok" or status == "pass" for status in status_values) else "unavailable"
     bundle_status = phases["p0"].get("status", overall) if args.phase == "p0" else overall
@@ -222,7 +423,11 @@ def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("p0", "p1", "p2", "p3", "p4", "all"), required=True)
+    parser.add_argument(
+        "--phase",
+        choices=("p0", "p1", "p2", "p3", "p4", "e1", "e2", "e3", "e6", "e7", "e8", "e9", "e10", "next", "source-next", "all"),
+        required=True,
+    )
     parser.add_argument("--trace", default=None)
     parser.add_argument("--official", default=None)
     parser.add_argument("--custom", default=None)
@@ -237,6 +442,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-samples", type=int, default=500)
     parser.add_argument("--min-documents", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--matched-context-cap", type=int, default=1024)
+    parser.add_argument("--matched-drop-gate", type=float, default=0.20)
+    parser.add_argument("--prefix-context-cap", type=int, default=None)
+    parser.add_argument("--prefix-k-values", type=lambda value: tuple(int(item.strip()) for item in value.split(",") if item.strip()), default=(1, 4, 8, 16))
+    parser.add_argument("--source-jsonl", action="append", default=[])
+    parser.add_argument("--tokenizer", default=None)
+    parser.add_argument("--source-lambda-values", type=lambda value: tuple(float(item.strip()) for item in value.split(",") if item.strip()), default=(0.0, 0.25, 0.5, 1.0, 2.0))
+    parser.add_argument("--near-tie-margin", type=float, default=0.5)
+    parser.add_argument("--dataset-filter", default=None)
+    parser.add_argument("--ladder-metrics", action="append", default=[])
     return parser
 
 
