@@ -162,17 +162,23 @@ Expected: all model tests pass and compilation produces no output or errors.
 
 Use small CPU tensors and deterministic seeds. The tests must assert actual DFlash semantics rather than only compatible shapes:
 
-    def test_sdpa_mask_is_strict_context_and_same_block_causal():
+    def test_sdpa_full_mask_is_strict_context_and_same_block_noncausal():
         anchors = torch.tensor([[2, 6]])
         keep = torch.tensor([[True, True]])
         mask = create_dflash_sdpa_mask(anchors, keep, S=8, block_size=4,
                                        device=torch.device('cpu'))
         allowed = mask[0, 0, 1].bool()
         assert allowed[0] and allowed[1]
-        assert not allowed[2]
-        assert allowed[8] and allowed[9]
-        assert not allowed[10]
+        assert allowed[2] and allowed[3]
+        assert allowed[8] and allowed[9] and allowed[10] and allowed[11]
         assert not allowed[12]
+
+        sliding = create_dflash_sdpa_mask(
+            anchors, keep, S=8, block_size=4,
+            device=torch.device('cpu'), sliding_window=4)
+        sliding_allowed = sliding[0, 0, 1].bool()
+        assert sliding_allowed[8] and sliding_allowed[9]
+        assert not sliding_allowed[10] and not sliding_allowed[11]
 
     def test_dflash_loss_excludes_anchor_and_uses_loss_mask():
         model = tiny_online_dflash(loss_decay_gamma=None)
@@ -218,7 +224,7 @@ Port the upstream DFlash-only sections and preserve these invariants:
 
 - valid anchors require both loss_mask[t] and loss_mask[t+1];
 - block offset 0 receives the anchor embedding but never contributes to the loss;
-- query context uses strict kv_idx < anchor_pos and draft visibility is same-block causal;
+- query context uses strict kv_idx < anchor_pos and draft visibility is limited to the same block; full-attention layers allow all draft offsets in that block, while sliding-attention layers apply causal offset visibility (`kv_offset <= q_offset`), matching SpecForge;
 - labels are same-position input_ids[anchor + offset], masked by bounds and original loss_mask;
 - default loss_type='dflash' is hard-label cross entropy with optional exponential positional decay;
 - target embedding/LM head remain requires_grad=False and the strategy optimizer owns only draft_model;

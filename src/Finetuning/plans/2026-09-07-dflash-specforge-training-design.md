@@ -130,8 +130,10 @@ Với một batch sequence độ dài `S`:
    được supervise; số anchor tối đa là `num_anchors`.
 2. Mỗi anchor tạo một block dài `block_size`: offset 0 dùng embedding token
    anchor, các offset còn lại dùng embedding `mask_token` của target.
-3. Draft query được attend context thật trước anchor và các draft token trước
-   đó trong cùng block; không attend sang block khác.
+3. Draft query được attend context thật trước anchor và draft token trong cùng
+   block; không attend sang block khác. Ở layer `full_attention`, mọi draft
+   offset trong cùng block đều visible; ở layer `sliding_attention`, draft
+   visibility vẫn causal theo offset (`kv_offset <= q_offset`).
 4. Offset `k` dự đoán token thật tại `anchor + k`; offset 0 bị loại khỏi loss.
    Weight còn chịu bounds, block validity, `loss_mask` và positional decay
    `exp(-(k-1)/loss_decay_gamma)` nếu bật.
