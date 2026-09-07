@@ -157,3 +157,15 @@ route; không phụ thuộc vào default CLI khác với lúc train.
   mask/scale và lưu resolved config trong checkpoint.
 - Task test phải thêm indexer gradient, mask parity, checkpoint reconstruction,
   verifier EOS/bonus và build-vs-append parity.
+- Fair experiment phải dùng cùng `feature_layer_ids=[1,9,17,25,33]` cho
+  DFlash-1L, DFlash-2L và MR; DFlash-2L là depth control, không mặc định là
+  exact parameter-count match.
+- Với target Llama 3.1 8B Instruct (32 decoder layers), ma trận
+  parameter-budget dùng cùng `feature_layer_ids=[1,8,15,22,29]` và draft MLP
+  12288 theo DFlash checkpoint gốc: DFlash-5L có 1,048,626,432 trainable
+  params; MR 4-stage với `indexer_dim=4096` có 1,040,786,432 (-0.75%) là run
+  chính; `indexer_dim=5120` có 1,049,175,040 (+0.052%) là ablation khớp tham
+  số chặt nhưng retrieval đắt hơn.
+- Indexer V1 cố định scale theo `head_dim`, chạy main với một head; ablation
+  nhiều head chỉ sau pilot. Metrics train phải có timing/tokens/s và peak CUDA
+  memory để kiểm tra khả năng chạy trước serious training.

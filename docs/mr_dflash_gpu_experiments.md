@@ -11,9 +11,9 @@ riêng. Agent không tự chọn GPU hay chiếm GPU của job khác; người c
 - Python runtime hiện tại dùng `torch 2.11.0+cu130` nhưng báo
   `torch.cuda.is_available()=False` và `torch.cuda.device_count()=0`, kèm cảnh
   báo không khởi tạo được NVML.
-- Kiểm tra lại ở lượt refactor này: `nvidia-smi` trong runtime workspace không
-  giao tiếp được với NVIDIA driver; vì vậy không được xem máy hiện tại là GPU
-  smoke host dù lịch sử preflight có thấy T4.
+- Preflight lại lúc `2026-09-07 08:50 UTC`: `nvidia-smi` chạy được và GPU vẫn
+  trống, nhưng runtime PyTorch không expose CUDA do mismatch driver/cu130; máy
+  này không được xem là GPU smoke host.
 - Vì runtime T4 hiện tại không expose CUDA cho PyTorch, GPU smoke B200 chưa
   được thực hiện tại workspace này; không xem kết quả CPU là bằng chứng GPU.
 - CPU simulation bằng `.venv/bin/python` (Python `3.12.13`) chạy được toàn bộ
@@ -81,6 +81,28 @@ Sau functional smoke, run train thật dùng `--batch-size 4` trên 1 GPU hoặc
 DFlash gốc. Có thể tăng `--num-workers 4` sau khi xác nhận feature store nằm
 trên local NVMe.
 
+Các smoke config tương ứng cũng phải được kiểm tra để phát hiện mismatch
+feature width/depth trước khi train pilot:
+
+```bash
+python3 -m MR_DFlash.run_train \
+  --config src/MR_DFlash/configs/qwen3_4b_dflash_1l.yaml \
+  --device cuda --max-steps 2 --batch-size 1 --num-anchors 8 \
+  --num-workers 0 --output-dir "$MR_RUN_ROOT/dflash-1l-smoke"
+```
+
+```bash
+python3 -m MR_DFlash.run_train \
+  --config src/MR_DFlash/configs/qwen3_4b_dflash_2l.yaml \
+  --device cuda --max-steps 2 --batch-size 1 --num-anchors 8 \
+  --num-workers 0 --output-dir "$MR_RUN_ROOT/dflash-2l-smoke"
+```
+
+Mỗi `metrics.jsonl` phải có `loss`, `acc`, `step_time_s` và
+`tokens_per_second`; trên CUDA phải có thêm `peak_memory_allocated_mb` và
+`peak_memory_reserved_mb`. Đây là các số đo pilot, không phải kết luận
+speedup.
+
 ## Rung 2 — Inference correctness
 
 Sau khi có `draft_final.pt`, chạy greedy generation cùng prompt cố định:
@@ -93,22 +115,30 @@ PYTHONPATH=src python3 -m MR_DFlash.inference \
   --mask-token-id 151669 \
   --device cuda \
   --max-new-tokens 64 \
-  --local-files-only
+  --local-files-only \
+  --timing-json
 ```
 
-So sánh output với target greedy decode cùng `max_new_tokens`, ghi
-`accepted_proposal_tokens`, số vòng verify và output token ids. Bản reference
-hiện chỉ hỗ trợ greedy; sampling cần experiment card riêng.
+CLI vẫn in decoded text; dòng JSON cuối có `accepted_proposal_tokens`, số vòng
+verify, `generated_tokens` và `timings_s={prefill_s,draft_s,verify_s,total_s}`.
+So sánh output với target greedy decode cùng `max_new_tokens` và lưu cả token
+ids. Bản reference hiện chỉ hỗ trợ greedy; sampling cần experiment card riêng.
 
 ## Rung 3 — Baseline/variant benchmark
 
 Giữ cố định target, data split, prompt order, seed và `max_new_tokens`. Chạy
-DFlash và MR-DFlash với các tham số DFlash giống nhau:
+đủ ba cấu hình Qwen3-4B sau; không so MR 2-stage chỉ với DFlash 1-layer:
 
-| Nhóm | Kiến trúc | Block | Anchor | LR | Loss decay |
-|---|---|---:|---:|---:|---:|
-| Baseline | DFlash | 16 | 512 | 6e-4 | 7.0 |
-| Variant | MR-DFlash | 16 | 512 | 6e-4 | 7.0 |
+| Nhóm | Config | Feature layers | Draft depth | Vai trò |
+|---|---|---|---:|---|
+| DFlash-1L | `qwen3_4b_dflash_1l.yaml` | `[1,9,17,25,33]` | 1 | baseline |
+| DFlash-2L | `qwen3_4b_dflash_2l.yaml` | `[1,9,17,25,33]` | 2 | depth/capacity control |
+| MR-HCA+CSA | `qwen3_4b_mr_dflash.yaml` | `[1,9,17,25,33]` | 2 stage | variant |
+
+Tất cả cùng block `16`, anchors `512`, LR `6e-4`, loss decay `7.0`,
+`max_length=3072`, seed `42` và init policy tương ứng. DFlash-2L là
+depth-matched, không phải parameter-count matched tuyệt đối; ghi
+`trainable_parameter_count` và peak VRAM của cả ba run.
 
 MR-specific values cố định ở V1: HCA `128`, CSA `4`, local `128`, Top-k `64`,
 2 stages, indexer dense warm-up `1000` optimizer steps rồi hard Top-k,
@@ -125,6 +155,67 @@ chưa xem đây là benchmark kernel tối ưu. Có thể chạy thêm ablation
 Không dùng Rung 1 hoặc CPU smoke để kết luận MR-DFlash nhanh hơn hay tốt hơn
 DFlash; chúng chỉ xác nhận pipeline hoạt động. Rung 3 mới là benchmark có
 ý nghĩa, và phải chạy cùng prompt/seed/token budget/cache target.
+
+### Ma trận Llama 3.1 8B Instruct theo ngân sách DFlash-5L
+
+Khi benchmark target `meta-llama/Meta-Llama-3.1-8B-Instruct`, dùng cùng năm
+feature layers `[1,8,15,22,29]` cho mọi draft. Ma trận tối thiểu:
+
+| Nhóm | Config | Draft | Trainable params | Vai trò |
+|---|---|---|---:|---|
+| DFlash-5L | `llama3_1_8b_dflash_5l.yaml` | 5 DFlash layers, MLP 12288 | 1,048,626,432 | baseline |
+| MR-4S | `llama3_1_8b_mr_dflash.yaml` | 4 MR stages, indexer 4096, MLP 12288 | 1,040,786,432 (-0.75%) | run chính |
+| MR-4S exact | `llama3_1_8b_mr_dflash_exact_params.yaml` | 4 MR stages, indexer 5120, MLP 12288 | 1,049,175,040 (+0.052%) | parameter ablation |
+
+`MR-4S` được khuyến nghị cho pilot và latency vì giữ indexer cùng chiều rộng
+hidden; `MR-4S exact` kiểm soát số tham số chặt hơn nhưng có retrieval width
+lớn hơn 25%, nên phải báo overhead này riêng. Parameter count chỉ là draft
+trainable parameters, không tính target Llama bị freeze. Không gộp ba run này
+với ma trận Qwen3; feature cache, tokenizer và manifest phải được capture riêng
+cho Llama.
+
+Config đặt `mask_token_id: 128002` explicit và khóa `block_size: 16` theo
+protocol benchmark chung; checkpoint DFlash Llama gốc dùng block 10 nhưng ta
+đang train lại với block 16 để mọi baseline cùng draft budget. Trước
+capture/train thật, xác nhận token ID với tokenizer snapshot local. Nếu dùng
+đường dẫn local trên B200, truyền `--target-model-path "$MODEL_TARGET"` và lưu
+config/manifest thực tế cùng output.
+
+Lệnh smoke/pilot dùng cấu hình chính như sau (baseline DFlash-5L thay tên YAML
+và `--output-dir` tương ứng):
+
+```bash
+export CUDA_VISIBLE_DEVICES=<ALLOCATED_GPU>
+export MODEL_TARGET=/path/to/Llama-3.1-8B-Instruct
+export LLAMA_RUN_ROOT="outputs/mr-dflash-llama3-1-8b-$(date +%Y%m%d-%H%M%S)"
+FI_OFFLINE=1 PYTHONPATH=src python3 -m MR_DFlash.run_train \
+  --config src/MR_DFlash/configs/llama3_1_8b_mr_dflash.yaml \
+  --target-model-path "$MODEL_TARGET" --device cuda \
+  --max-steps 2 --batch-size 1 --num-anchors 8 --num-workers 0 \
+  --output-dir "$LLAMA_RUN_ROOT/smoke"
+```
+
+Chỉ sau khi smoke pass mới chạy pilot `50–100` steps bằng cách bỏ
+`--max-steps 2`, đặt output riêng và giữ feature cache/seed cố định. Chạy
+`llama3_1_8b_dflash_5l.yaml` trước hoặc sau MR không ảnh hưởng, nhưng không
+được dùng chung output directory giữa các architecture.
+
+### Pilot ngắn trước serious training
+
+Sau khi ba config smoke đều pass, chạy mỗi cấu hình `50–100` optimizer steps
+trên cùng feature store. Mục tiêu là phát hiện OOM, loss không hữu hạn và
+chênh lệch overhead trước khi tăng lên `10k` steps. Thu thập:
+
+```text
+train: loss, acc, grad_norm, step_time_s, tokens_per_second
+memory: peak_memory_allocated_mb, peak_memory_reserved_mb
+inference: prefill_s, draft_s, verify_s, total_s, accepted_proposal_tokens,
+           generated_tokens, rounds
+```
+
+Nếu pilot ổn định ở 3K, serious long-context phải chạy curriculum riêng:
+`3072 → 8192 → 16384` với checkpoint/seed được ghi rõ. Không gộp kết quả 3K
+với kết luận về 8K/16K+.
 
 ## Rung 0 — kiểm tra trước khi cấp GPU
 

@@ -1,0 +1,55 @@
+run_id: pilot-qwen3-4b-dflash-5l-8k
+output_dir: outputs/mr_dflash_pilot/dflash_5l_8k
+
+model:
+  target_model_path: Qwen/Qwen3-4B
+  architecture: dflash
+  draft_num_hidden_layers: 5
+  draft_intermediate_size: 9728
+  block_size: 16
+  mask_token_id: 151669
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  draft_init_layer_ids: [1, 9, 17, 25, 33]
+  init_draft_from_target: false
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+
+data:
+  feature_mode: online
+  train_data_path: data/mr_dflash_pilot/regenerated/train.jsonl
+  eval_data_path: data/mr_dflash_pilot/regenerated/val.jsonl
+  tokenized_data_path: data/mr_dflash_pilot/tokenized/train
+  eval_tokenized_data_path: data/mr_dflash_pilot/tokenized/val
+  hidden_states_path: null
+  eval_hidden_states_path: null
+  supervision_mode: last_assistant
+  max_length: 8192
+  cache_dir: ./cache
+  num_samples: null
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  max_steps: null
+  batch_size: 1
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  indexer_train_mode: schedule
+  indexer_dense_steps: 1000
+  save_interval: 1000
+  log_interval: 10
+  eval_interval: 500
+  dp_world_size: 1
+  seed: 42

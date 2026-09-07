@@ -158,6 +158,9 @@ class ModelConfig:
     draft_num_hidden_layers: int = 1
     #: Số layer của target (tự nạp từ target config nếu để None).
     num_target_layers: Optional[int] = None
+    #: MLP width của draft; None = dùng width của target.
+    #: DFlash Llama 3.1 checkpoint gốc dùng 12288 dù target dùng 14336.
+    draft_intermediate_size: Optional[int] = None
     #: Legacy alias cho feature_layer_ids; giữ để đọc config cũ.
     target_layer_ids: Optional[List[int]] = None
     #: Các layer target được capture làm context feature (concat).
@@ -209,6 +212,8 @@ class ModelConfig:
             raise ValueError(
                 f"draft_num_hidden_layers phải >= 1, got {self.draft_num_hidden_layers}"
             )
+        if self.draft_intermediate_size is not None and self.draft_intermediate_size < 1:
+            raise ValueError("draft_intermediate_size phải dương hoặc null")
         if self.torch_dtype not in {"float32", "bfloat16", "float16"}:
             raise ValueError(f"torch_dtype không hợp lệ: {self.torch_dtype}")
         if (
@@ -249,12 +254,23 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    """Dữ liệu huấn luyện: jsonl hội thoại → capture → feature offline."""
+    """Dữ liệu huấn luyện offline hoặc online.
+
+    ``offline`` giữ contract feature-store cũ. ``online`` đọc các sample đã
+    tokenize và lấy hidden feature từ target frozen trong training loop.
+    """
+
+    #: offline = đọc hidden cache; online = target forward trong trainer.
+    feature_mode: str = "offline"
 
     #: jsonl huấn luyện (conversation hoặc pre-formatted text).
     train_data_path: str = ""
     #: jsonl eval (optional).
     eval_data_path: Optional[str] = ""
+    #: Dataset tokenized shard dùng cho online mode.
+    tokenized_data_path: Optional[str] = None
+    #: Eval tokenized shard dùng cho online mode.
+    eval_tokenized_data_path: Optional[str] = None
     #: Thư mục feature offline đã capture (đầu ra của capture / đầu vào train).
     hidden_states_path: Optional[str] = None
     #: Giới hạn mẫu dùng (None = tất cả).
@@ -263,6 +279,8 @@ class DataConfig:
     max_length: int = 3072
     #: Chat template dùng để render + xác định span assistant cho loss_mask.
     chat_template: str = "qwen"
+    #: all_assistant (legacy) hoặc chỉ assistant cuối cùng (pilot).
+    supervision_mode: str = "all_assistant"
     #: True nếu mỗi dòng jsonl đã là text được template sẵn.
     is_preformatted: bool = False
     cache_dir: str = "./cache"
@@ -273,16 +291,26 @@ class DataConfig:
     prefetch_factor: int = 2
     pin_memory: bool = True
     persistent_workers: bool = True
+    #: Cache feature validation set; None = tự sinh dưới output_dir.
+    eval_hidden_states_path: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.feature_mode not in {"offline", "online"}:
+            raise ValueError(
+                "data.feature_mode phải là offline hoặc online, "
+                f"got {self.feature_mode!r}"
+            )
+        if self.supervision_mode not in {"all_assistant", "last_assistant"}:
+            raise ValueError(
+                "data.supervision_mode phải là all_assistant hoặc last_assistant, "
+                f"got {self.supervision_mode!r}"
+            )
+        if self.max_length < 1:
+            raise ValueError("data.max_length phải >= 1")
         if self.num_workers < 0:
             raise ValueError("data.num_workers phải >= 0")
         if self.prefetch_factor < 1:
             raise ValueError("data.prefetch_factor phải >= 1")
-    #: Cache feature validation set; None = tự sinh dưới output_dir.
-    eval_hidden_states_path: Optional[str] = None
-
-
 @dataclass
 class TrainingConfig:
     """Các siêu tham số + thuật toán DFlash (legacy defaults)."""

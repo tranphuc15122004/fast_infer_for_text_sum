@@ -73,6 +73,8 @@ def render_conversation(
     conversation: List[Dict[str, str]],
     tokenizer: Any,
     max_length: int,
+    *,
+    supervision_mode: str = "all_assistant",
 ) -> Tuple[List[int], List[int]]:
     """Render hội thoại → (input_ids, assistant_mask).
 
@@ -82,10 +84,14 @@ def render_conversation(
     (``add_special_tokens=False``). Không tìm thấy → fallback đánh dấu cả đoạn
     chênh lệch (trừ token đóng template cuối).
     """
+    if supervision_mode not in {"all_assistant", "last_assistant"}:
+        raise ValueError(
+            "supervision_mode phải là all_assistant hoặc last_assistant"
+        )
     ids: List[int] = []
     mask: List[int] = []
+    assistant_spans: List[Tuple[int, int]] = []
     prev_conv: List[Dict[str, str]] = []
-    assistant_idx = 0
     for idx, msg in enumerate(conversation):
         role = str(msg.get("role", "")).strip().lower()
         if role not in ("user", "assistant", "system", "tool"):
@@ -111,17 +117,26 @@ def render_conversation(
             else:
                 lo, hi = window
             base = len(ids)
-            assistant_mask = [0] * len(next_ids)
-            for pos in range(base + lo, base + hi):
+            # Giữ mask của các assistant turn trước; chỉ thêm span của turn
+            # hiện tại. Đây là điều kiện cần cho supervision_mode=all_assistant.
+            assistant_mask = mask + [0] * (len(next_ids) - len(mask))
+            span = (base + lo, base + hi)
+            assistant_spans.append(span)
+            for pos in range(*span):
                 assistant_mask[pos] = 1
             ids = next_ids
             mask = assistant_mask
-            assistant_idx += 1
         else:
             ids = next_ids
             mask = mask + [0] * (len(next_ids) - len(mask))
         prev_conv = next_conv
 
+    if supervision_mode == "last_assistant" and assistant_spans:
+        last_lo, last_hi = assistant_spans[-1]
+        mask = [
+            int(last_lo <= pos < last_hi)
+            for pos in range(len(ids))
+        ]
     if len(ids) > max_length:
         ids = ids[:max_length]
         mask = mask[:max_length]
@@ -132,6 +147,8 @@ def build_sample(
     row: Dict[str, Any],
     tokenizer: Any,
     max_length: int,
+    *,
+    supervision_mode: str = "all_assistant",
 ) -> Optional[Dict[str, Any]]:
     """Chuyển một dòng jsonl → dict sample (hoặc None nếu không hợp lệ)."""
     sample_id = str(row.get("id", ""))
@@ -139,7 +156,12 @@ def build_sample(
     if not conversations:
         return None
     try:
-        input_ids, mask = render_conversation(conversations, tokenizer, max_length)
+        input_ids, mask = render_conversation(
+            conversations,
+            tokenizer,
+            max_length,
+            supervision_mode=supervision_mode,
+        )
     except Exception:
         return None
     if len(input_ids) < 3 or not has_consecutive_supervised_tokens(mask):

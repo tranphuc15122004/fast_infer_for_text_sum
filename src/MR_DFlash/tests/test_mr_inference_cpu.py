@@ -8,7 +8,11 @@ import torch
 
 from MR_DFlash.checkpoint import save_draft_weights
 from MR_DFlash.config import ModelConfig, RunConfig
-from MR_DFlash.inference import MRDFlashInferenceEngine, _load_checkpoint_model_config
+from MR_DFlash.inference import (
+    MRDFlashInferenceEngine,
+    _load_checkpoint_model_config,
+    _parse_args,
+)
 from MR_DFlash.mr_model import MRDFlashDraftModel
 from MR_DFlash.training import build_dflash_additive_mask, build_mr_draft_spec_from_target_config
 
@@ -30,6 +34,22 @@ def _target():
             attention_bias=False,
         )
     ).eval()
+
+
+def test_inference_cli_parser_accepts_timing_flag() -> None:
+    args = _parse_args(
+        [
+            "--target-model-path",
+            "target",
+            "--draft-checkpoint-path",
+            "draft.pt",
+            "--prompt",
+            "prompt",
+            "--timing-json",
+        ]
+    )
+    assert args.timing_json is True
+    assert args.target_layer_ids is None
 
 
 def test_prefill_draft_verify_updates_only_accepted_tokens_cpu() -> None:
@@ -79,6 +99,9 @@ def test_prefill_draft_verify_updates_only_accepted_tokens_cpu() -> None:
     assert generated.input_ids.shape[1] >= prefix.shape[1] + 2
     assert generated.input_ids.shape[0] == 1
     assert generated.accepted_proposal_tokens >= 0
+    assert generated.rounds >= 1
+    for key in ("prefill_s", "draft_s", "verify_s", "total_s"):
+        assert generated.timings_s[key] > 0.0
 
 
 def test_inference_block_mask_matches_default_training_mask_cpu() -> None:

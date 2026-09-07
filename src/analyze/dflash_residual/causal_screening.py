@@ -216,6 +216,7 @@ def collect_fixed_block(
     reveal_tokens: Sequence[int],
     top_m: int,
     prepared_context: tuple[torch.Tensor, torch.Tensor, Any] | None = None,
+    timing: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect one native block at a fixed state.
 
@@ -256,6 +257,9 @@ def collect_fixed_block(
     # independent copy of the same prefilled context cache.
     past_target = copy.deepcopy(context_cache)
     past_draft = DynamicCache()
+    if timing is not None and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    draft_started = time.perf_counter()
     with torch.inference_mode():
         noise_embedding = target.model.embed_tokens(block)
         draft_hidden = draft(
@@ -277,6 +281,12 @@ def collect_fixed_block(
         if reveal_count:
             proposed[:, :reveal_count] = reveal[:, 1:reveal_count + 1]
         block[:, 1:] = proposed
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        timing["draft_s"] = time.perf_counter() - draft_started
+    verify_started = time.perf_counter()
+    with torch.inference_mode():
         verifier_output = target(
             block,
             position_ids=position_ids[:, input_length:input_length + block_size],
@@ -318,6 +328,11 @@ def collect_fixed_block(
             target_token_source="verifier_posterior",
             state_mode=state_mode,
         )
+    if timing is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        timing["verify_s"] = time.perf_counter() - verify_started
+        timing["total_s"] = timing["draft_s"] + timing["verify_s"]
     for row in rows:
         row.update({
             "fixed_state_id": fixed_state_id,

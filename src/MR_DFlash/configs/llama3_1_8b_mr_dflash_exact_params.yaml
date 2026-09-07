@@ -1,30 +1,29 @@
-# Config train MR-DFlash trên Qwen3-4B cho server B200.
-# Dùng feature layer layout MR rõ ràng; draft init layout tách riêng.
-run_id: mr-dflash-qwen3-4b-b200
-output_dir: outputs/mr-dflash-qwen3-4b-b200
+# MR-DFlash strict parameter-count control cho Llama 3.1 8B.
+# Khác config chính chỉ ở indexer_dim=5120 để match DFlash-5L gần tuyệt đối;
+# retrieval width tăng 25%.
+run_id: mr-dflash-llama3-1-8b-4stage-exact-params
+output_dir: outputs/mr-dflash-llama3-1-8b-4stage-exact-params
 
 model:
-  target_model_path: Qwen/Qwen3-4B
+  target_model_path: meta-llama/Meta-Llama-3.1-8B-Instruct
   architecture: mr_dflash
   draft_num_hidden_layers: 1
   block_size: 16
-  mask_token_id: 151669
-  init_draft_from_target: true
+  mask_token_id: 128002
+  draft_intermediate_size: 12288
+  init_draft_from_target: false
   draft_checkpoint_path: null
   torch_dtype: bfloat16
-  # DFlash Qwen3-4B gốc dùng MLP draft width 9728.
-  draft_intermediate_size: 9728
-  # MR feature views: [layer + 1] hidden states are concatenated.
-  feature_layer_ids: [1, 9, 17, 25, 33]
-  # Legacy DFlash init layout (dùng khi architecture=dflash).
-  draft_init_layer_ids: [18]
-  mr_stage_init_layer_ids: [17, 18]
-  mr_num_stages: 2
+  feature_layer_ids: [1, 8, 15, 22, 29]
+  draft_init_layer_ids: [16]
+  mr_stage_init_layer_ids: [1, 10, 20, 29]
+  mr_num_stages: 4
   hca_compression_ratio: 128
   csa_compression_ratio: 4
   memory_local_window: 128
   csa_top_k: 64
-  indexer_dim: null
+  # 1,049,175,040 params, gần DFlash-5L 1,048,626,432 params.
+  indexer_dim: 5120
   indexer_num_heads: 1
 
 data:
@@ -33,8 +32,8 @@ data:
   hidden_states_path: null
   eval_hidden_states_path: null
   max_length: 3072
+  chat_template: llama
   cache_dir: ./cache
-  # Mỗi process 4 worker; giảm về 0 nếu feature store nằm trên filesystem chậm.
   num_workers: 4
   prefetch_factor: 2
   pin_memory: true
@@ -44,8 +43,6 @@ training:
   strategy: mr_dflash
   num_epochs: 6
   max_steps: 10000
-  # Mặc định 1 GPU: global batch = 4, đúng DFlash gốc.
-  # Khi chạy 2 GPU dùng --batch-size 2 để global batch vẫn = 4.
   batch_size: 4
   accumulation_steps: 1
   learning_rate: 0.0006

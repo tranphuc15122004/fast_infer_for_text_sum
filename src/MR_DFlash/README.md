@@ -176,6 +176,54 @@ YAML mẫu hiện bật `architecture: mr_dflash` và `strategy: mr_dflash`; cá
 tham số DFlash (`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`,
 `block_size=16`, scheduler, accumulation, checkpoint) được giữ nguyên.
 
+Để comparison công bằng trên Qwen3-4B, dùng cùng
+`feature_layer_ids: [1, 9, 17, 25, 33]` cho ba config:
+
+- `configs/qwen3_4b_dflash_1l.yaml`: DFlash-1L baseline;
+- `configs/qwen3_4b_dflash_2l.yaml`: DFlash-2L depth/capacity control;
+- `configs/qwen3_4b_mr_dflash.yaml`: MR-HCA+CSA 2-stage.
+
+DFlash-2L kiểm soát số draft layer, nhưng không phải parameter-count matching
+tuyệt đối vì MR có thêm compressor/indexer. Cần ghi parameter count và peak
+VRAM của từng run trước khi kết luận gain. Các config Qwen3-8B cũng dùng cùng
+5 feature layers; `qwen3_8b_dflash_2l.yaml` là control tương ứng.
+
+Với target Llama 3.1 8B Instruct, dùng ma trận theo ngân sách DFlash 5 layer:
+
+| Run | Config | Feature layers | MR stages / indexer | Trainable params |
+|---|---|---|---|---:|
+| DFlash-5L | `configs/llama3_1_8b_dflash_5l.yaml` | `[1,8,15,22,29]` | 5 DFlash layers, MLP 12288 | 1,048,626,432 |
+| MR-4S | `configs/llama3_1_8b_mr_dflash.yaml` | `[1,8,15,22,29]` | 4 / 4096, MLP 12288 | 1,040,786,432 |
+| MR-4S exact | `configs/llama3_1_8b_mr_dflash_exact_params.yaml` | `[1,8,15,22,29]` | 4 / 5120, MLP 12288 | 1,049,175,040 |
+
+`MR-4S` là cấu hình chính vì thấp hơn DFlash-5L 0.75% và không nhân đôi
+chiều rộng Indexer. `MR-4S exact` chỉ dùng làm ablation parameter-control
+(chênh +0.052%); `indexer_dim=5120` làm tăng chi phí retrieval nên không dùng
+nó làm headline latency duy nhất. Các số chỉ tính draft parameters; target
+Llama 3.1 8B được freeze và không tính vào ngân sách. Cả ba config dùng cùng
+feature contract và DFlash objective để loại confound do số layer feature.
+
+Trên server, target thường là snapshot local. Có thể dùng trực tiếp các YAML
+trên nếu model ID đã được cache, hoặc override:
+
+```bash
+PYTHONPATH=src python3 -m MR_DFlash.run_train \
+  --config src/MR_DFlash/configs/llama3_1_8b_mr_dflash.yaml \
+  --target-model-path "$MODEL_TARGET" \
+  --device cuda
+```
+
+Phải capture lại feature với `feature_layer_ids=[1,8,15,22,29]`,
+`block_size=16` và kiểm tra
+manifest trước khi train; cache Qwen3 hoặc cache Llama khác layer list không
+tương thích. `mask_token_id=128002` đã được đặt explicit nhưng vẫn cần xác
+nhận lại với tokenizer snapshot local trước run thật.
+
+Cache feature đã capture theo một layer phải được capture lại; manifest và
+feature width phải khớp năm layer trên. Dataset loader có kiểm tra
+`feature_layer_ids`/target provenance để chặn việc trộn cache cũ vào baseline
+mới.
+
 Trên B200, target bị freeze và draft/head/embed được replicate trên mỗi GPU;
 2 GPU dùng DDP data-parallel. `training.batch_size` là batch **mỗi GPU**,
 nhưng scheduler/horizon vẫn tính theo global batch. Với config Qwen3-4B mẫu:
@@ -221,10 +269,14 @@ checkpoint cũ không có metadata.
 Reference engine ưu tiên kiểm chứng semantics và hiện verify bằng full prefix;
 không dùng lệnh này để kết luận latency GPU trước khi hoàn thành protocol trong
 [`docs/mr_dflash_gpu_experiments.md`](../../docs/mr_dflash_gpu_experiments.md).
+Thêm `--timing-json` để CLI xuất phân rã `prefill_s/draft_s/verify_s/total_s`,
+số vòng và số token proposal được accept cho pilot latency.
 
 ### 5. Kết quả
 
-- `metrics.jsonl` — loss/acc/lr/grad_norm theo từng optimizer step.
+- `metrics.jsonl` — loss/acc/lr/grad_norm, trainable parameter count,
+  `step_time_s` và `tokens_per_second` theo từng optimizer step; CUDA bổ sung
+  peak memory allocated/reserved để kiểm tra pilot.
 - `checkpoint_step_*.pt` + `checkpoint_final.pt` — full state (draft weights +
   optimizer/scheduler + config) để resume (`--resume-from`).
 - `draft_*.pt` — weights-only, tiện warm-start/export.
@@ -240,6 +292,10 @@ không dùng lệnh này để kết luận latency GPU trước khi hoàn thàn
   `mr_stage_init_layer_ids` có một layer target cho mỗi MR stage; ba layout
   này độc lập. `init_draft_from_target=True` dùng một lần nạp target để giảm
   memory/time peak.
+- `CSAIndexer` dùng scale `1/sqrt(head_dim)` khi score theo nhiều head. V1
+  mặc định `indexer_num_heads=1` và đưa score vào attention bias để hard Top-k
+  vẫn có gradient; 4/8 head chỉ là ablation, không gọi là Lightning Indexer
+  faithful.
 - Feature `hidden_states` capture bằng HF = toàn chuỗi (kể cả prompt). Nếu muốn
   tiết kiệm, chỉ capture prefix tới cuối assistant cần thiết.
 
@@ -258,3 +314,10 @@ không dùng lệnh này để kết luận latency GPU trước khi hoàn thàn
 Các giới hạn còn lại được ghi ở [`docs/mr_dflash.md`](../../docs/mr_dflash.md)
 và protocol GPU deferred ở
 [`docs/mr_dflash_gpu_experiments.md`](../../docs/mr_dflash_gpu_experiments.md).
+## Pilot data/online training
+
+Pipeline thực nghiệm đã khóa cho câu hỏi MR-DFlash trên long context nằm tại
+[`docs/mr_dflash_pilot_pipeline.md`](../../docs/mr_dflash_pilot_pipeline.md).
+Pipeline dùng tokenized shard + online hidden features; feature cache offline
+chỉ giữ cho smoke/debug. Ba config công bằng là DFlash-2L, MR-DFlash-2S và
+DFlash-5L trong `configs/pilot_qwen3_4b/`.

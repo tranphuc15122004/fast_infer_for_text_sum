@@ -16,7 +16,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 from torch import nn
@@ -50,14 +50,18 @@ class Trainer:
         self,
         run_cfg: RunConfig,
         strategy: DFlashTrainStrategy,
-        dataset: DFlashFeatureDataset,
+        dataset: Any,
         *,
         device: Optional[torch.device] = None,
         resume_from: Optional[str] = None,
+        feature_provider: Optional[Any] = None,
+        batch_sampler: Optional[Any] = None,
     ) -> None:
         self.run_cfg = run_cfg
         self.strategy = strategy
         self.dataset = dataset
+        self.feature_provider = feature_provider
+        self.batch_sampler = batch_sampler
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -78,6 +82,11 @@ class Trainer:
                 f"{self.dist.world_size} vs {tcfg.dp_world_size}"
             )
         self.global_batch_size = tcfg.batch_size * self.dist.world_size
+        self.trainable_parameter_count = sum(
+            parameter.numel()
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        )
         self.distributed_model: Optional[nn.Module] = None
         if self.dist.is_distributed:
             from torch.nn.parallel import DistributedDataParallel
@@ -125,6 +134,7 @@ class Trainer:
         self.output_dir = run_cfg.resolved_output_dir()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "metrics.jsonl"
+        self.best_eval_loss = float("inf")
 
         if resume_from:
             self._resume(resume_from)
@@ -167,7 +177,7 @@ class Trainer:
 
     def _iter_batches(
         self,
-        dataset: DFlashFeatureDataset,
+        dataset: Any,
         *,
         shuffle: bool,
         repeat: bool = True,
@@ -183,15 +193,27 @@ class Trainer:
                 "không có micro-batch nào"
             )
         while True:
-            indices = list(range(n))
-            if shuffle:
-                self._train_rng.shuffle(indices)
-            usable = micros_per_epoch * self.global_batch_size
-            rank_indices = indices[:usable][self.dist.rank:usable:self.dist.world_size]
-            batches = [
-                rank_indices[start : start + batch_size]
-                for start in range(0, len(rank_indices), batch_size)
-            ]
+            sampler = None
+            if dataset is self.dataset and self.batch_sampler is not None:
+                sampler = self.batch_sampler
+                sampler.set_epoch(getattr(sampler, "epoch", 0) + 1)
+            if sampler is not None:
+                batches = list(iter(sampler))
+                if not batches:
+                    raise ValueError(
+                        "length-bucket sampler không tạo được batch; "
+                        "giảm batch_size hoặc thêm sample"
+                    )
+            else:
+                indices = list(range(n))
+                if shuffle:
+                    self._train_rng.shuffle(indices)
+                usable = micros_per_epoch * self.global_batch_size
+                rank_indices = indices[:usable][self.dist.rank:usable:self.dist.world_size]
+                batches = [
+                    rank_indices[start : start + batch_size]
+                    for start in range(0, len(rank_indices), batch_size)
+                ]
             from torch.utils.data import DataLoader
 
             data_cfg = self.run_cfg.data
@@ -214,6 +236,20 @@ class Trainer:
     # Vòng huấn luyện
     # ------------------------------------------------------------------ #
 
+    def _prepare_batch(self, batch: TrainBatch) -> TrainBatch:
+        """Bổ sung hidden feature online ngay trước objective.
+
+        Target provider chạy inference-mode và không được đưa vào optimizer;
+        các dataset offline đã có ``hidden_states`` nên đi qua nguyên trạng.
+        """
+        if "hidden_states" not in batch.tensors and self.feature_provider is not None:
+            tensors = dict(batch.tensors)
+            tensors["hidden_states"] = self.feature_provider(
+                tensors["input_ids"], tensors.get("attention_mask")
+            ).detach()
+            return TrainBatch(tensors=tensors, metadata=batch.metadata)
+        return batch
+
     def fit(
         self,
         *,
@@ -229,13 +265,17 @@ class Trainer:
         self.base_model.train()
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
 
         window_loss = 0.0
         window_acc_num = 0.0
         window_acc_den = 0.0
+        window_extra: Dict[str, List[torch.Tensor]] = {}
         window_micros = 0
         window_tokens = 0
         start_wall = time.time()
+        step_start_wall: Optional[float] = None
 
         ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
         batches = self._iter_batches(self.dataset, shuffle=True)
@@ -244,6 +284,9 @@ class Trainer:
         for batch in batches:
             if self.global_step >= self.total_steps:
                 break
+            batch = self._prepare_batch(batch)
+            if window_micros == 0:
+                step_start_wall = time.perf_counter()
             out: StepOutput = self.strategy.forward_loss(batch, ctx)
             scalar = out.loss
             acc_num, acc_den = out.ratio_metrics.get(
@@ -255,6 +298,17 @@ class Trainer:
             window_loss += float(scalar.detach())
             window_acc_num += float(torch.as_tensor(acc_num).float().sum())
             window_acc_den += float(torch.as_tensor(acc_den).float().sum())
+            for name, pair in out.ratio_metrics.items():
+                if name == "acc":
+                    continue
+                numerator, denominator = pair
+                if name not in window_extra:
+                    window_extra[name] = [
+                        torch.zeros_like(torch.as_tensor(numerator, device=self.device).detach(), dtype=torch.float64),
+                        torch.zeros_like(torch.as_tensor(denominator, device=self.device).detach(), dtype=torch.float64),
+                    ]
+                window_extra[name][0] += torch.as_tensor(numerator, device=self.device).detach().double()
+                window_extra[name][1] += torch.as_tensor(denominator, device=self.device).detach().double()
             window_micros += 1
             window_tokens += int(batch.tensors["input_ids"].numel())
 
@@ -275,6 +329,12 @@ class Trainer:
                 ctx = StepContext(
                     global_step=self.global_step, total_steps=self.total_steps
                 )
+                if self.device.type == "cuda":
+                    # CUDA kernels are asynchronous; synchronize only at the
+                    # measurement boundary so pilot timing is meaningful.
+                    torch.cuda.synchronize(self.device)
+                step_started_at = step_start_wall or time.perf_counter()
+                step_time_s = time.perf_counter() - step_started_at
 
                 # DDP gradient đã được average, nên log cũng cần aggregate
                 # để rank 0 phản ánh global batch thay vì local batch.
@@ -296,15 +356,50 @@ class Trainer:
                     ),
                     "lr": current_lr(self.optimizer),
                     "grad_norm": float(grad_norm.detach()),
+                    "trainable_parameter_count": self.trainable_parameter_count,
                     "tokens_per_step": int(round(metric_totals[3].item())),
+                    "step_time_s": round(max(step_time_s, 1e-9), 4),
+                    "tokens_per_second": round(
+                        float(metric_totals[3].item()) / max(step_time_s, 1e-9), 2
+                    ),
                     "elapsed_s": round(time.time() - start_wall, 2),
                 }
+                if self.device.type == "cuda":
+                    metrics.update(
+                        {
+                            "peak_memory_allocated_mb": round(
+                                torch.cuda.max_memory_allocated(self.device)
+                                / (1024 * 1024),
+                                2,
+                            ),
+                            "peak_memory_reserved_mb": round(
+                                torch.cuda.max_memory_reserved(self.device)
+                                / (1024 * 1024),
+                                2,
+                            ),
+                        }
+                    )
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                for name, (numerator, denominator) in window_extra.items():
+                    totals = torch.stack([numerator, denominator], dim=0)
+                    all_reduce_sum(totals)
+                    ratios = totals[0] / totals[1].clamp_min(1e-12)
+                    if name == "acc_pos":
+                        prefix = "acc_at"
+                    elif name == "accept_ge":
+                        prefix = "accept_ge"
+                    else:
+                        prefix = name
+                    for offset, value in enumerate(ratios.detach().cpu().tolist(), 1):
+                        metrics[f"{prefix}_{offset}"] = float(value)
                 self._log(metrics)
                 window_loss = 0.0
                 window_acc_num = 0.0
                 window_acc_den = 0.0
                 window_micros = 0
                 window_tokens = 0
+                window_extra = {}
+                step_start_wall = None
 
                 if save_every and self.global_step % save_every == 0:
                     self._save_checkpoint(f"step_{self.global_step}")
@@ -327,10 +422,12 @@ class Trainer:
         self._save_checkpoint("final")
         summary["global_step"] = self.global_step
         summary["world_size"] = self.dist.world_size
+        summary["trainable_parameter_count"] = self.trainable_parameter_count
         summary["elapsed_s"] = round(time.time() - start_wall, 2)
         summary["output_dir"] = str(self.output_dir)
         if eval_dataset is not None:
             summary["eval"] = self.evaluate(eval_dataset)
+            summary["best_eval_loss"] = self.best_eval_loss
         print(
             f"[trainer] xong: global_step={self.global_step}, "
             f"world_size={self.dist.world_size}, elapsed={summary['elapsed_s']}s"
@@ -340,7 +437,7 @@ class Trainer:
     @torch.no_grad()
     def evaluate(
         self,
-        dataset: DFlashFeatureDataset,
+        dataset: Any,
         *,
         max_batches: Optional[int] = None,
     ) -> Dict[str, object]:
@@ -351,8 +448,10 @@ class Trainer:
         loss_den = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_num = torch.zeros((), device=self.device, dtype=torch.float64)
         acc_den = torch.zeros((), device=self.device, dtype=torch.float64)
+        extra: Dict[str, List[torch.Tensor]] = {}
         batches = 0
         for batch in self._iter_batches(dataset, shuffle=False, repeat=False):
+            batch = self._prepare_batch(batch)
             out: StepOutput = self.strategy.forward_loss(
                 batch,
                 StepContext(global_step=self.global_step, total_steps=self.total_steps),
@@ -368,6 +467,17 @@ class Trainer:
             if acc is not None:
                 acc_num += torch.as_tensor(acc[0], device=self.device).sum().double()
                 acc_den += torch.as_tensor(acc[1], device=self.device).sum().double()
+            for name, pair in out.ratio_metrics.items():
+                if name == "acc":
+                    continue
+                numerator, denominator = pair
+                if name not in extra:
+                    extra[name] = [
+                        torch.zeros_like(torch.as_tensor(numerator, device=self.device), dtype=torch.float64),
+                        torch.zeros_like(torch.as_tensor(denominator, device=self.device), dtype=torch.float64),
+                    ]
+                extra[name][0] += torch.as_tensor(numerator, device=self.device).double()
+                extra[name][1] += torch.as_tensor(denominator, device=self.device).double()
             batches += 1
             if max_batches is not None and batches >= max_batches:
                 break
@@ -382,6 +492,13 @@ class Trainer:
             "eval_batches": batches,
             "global_step": self.global_step,
         }
+        for name, (numerator, denominator) in extra.items():
+            totals = torch.stack([numerator, denominator], dim=0)
+            all_reduce_sum(totals)
+            ratios = totals[0] / totals[1].clamp_min(1e-12)
+            prefix = "eval_acc_at" if name == "acc_pos" else "eval_accept_ge" if name == "accept_ge" else f"eval_{name}"
+            for offset, value in enumerate(ratios.detach().cpu().tolist(), 1):
+                result[f"{prefix}_{offset}"] = float(value)
         if self.dist.is_main:
             eval_path = self.output_dir / "eval_metrics.json"
             eval_path.write_text(
@@ -392,6 +509,10 @@ class Trainer:
                 f"[eval] step={self.global_step} loss={result['eval_loss']:.4f} "
                 f"acc={result['eval_acc']:.4f}"
             )
+        current_eval_loss = float(result["eval_loss"])
+        if current_eval_loss < self.best_eval_loss:
+            self.best_eval_loss = current_eval_loss
+            self._save_checkpoint("best_eval")
         self.base_model.train()
         self.model.train()
         return result

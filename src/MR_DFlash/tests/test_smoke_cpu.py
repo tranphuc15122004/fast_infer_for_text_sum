@@ -164,6 +164,9 @@ def test_train_smoke():
             m = json.loads(line)
             assert m["loss"] == m["loss"] and m["loss"] < 1e6
             assert 0.0 <= m["acc"] <= 1.0
+            assert m["trainable_parameter_count"] > 0
+            assert m["step_time_s"] > 0.0
+            assert m["tokens_per_second"] > 0.0
 
         # --- run 2: accumulation_steps=2 + warmup (kiểm tra nhánh accumulation) ---
         cfg2 = RunConfig(

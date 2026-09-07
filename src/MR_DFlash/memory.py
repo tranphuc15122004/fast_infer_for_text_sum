@@ -230,7 +230,9 @@ class CSAIndexer(nn.Module):
         self.weight_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
         with torch.no_grad():
             self.weight_proj.weight.zero_()
-        self.scale = self.indexer_dim ** -0.5
+        # Scores are computed per indexer head.  Use the per-head dimension
+        # so score-bias magnitude stays stable when ``num_heads`` changes.
+        self.scale = self.head_dim ** -0.5
 
     def select(
         self,

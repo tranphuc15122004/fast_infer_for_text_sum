@@ -1,0 +1,49 @@
+# DFlash-2L capacity-control baseline cho comparison MR-DFlash trên Qwen3-4B.
+# Cùng target features, loss và draft depth với MR 2-stage; khác memory route.
+run_id: dflash-qwen3-4b-5features-2l
+output_dir: outputs/dflash-qwen3-4b-5features-2l
+
+model:
+  target_model_path: Qwen/Qwen3-4B
+  architecture: dflash
+  draft_num_hidden_layers: 2
+  block_size: 16
+  mask_token_id: 151669
+  init_draft_from_target: true
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+  draft_intermediate_size: 9728
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  draft_init_layer_ids: [17, 18]
+
+data:
+  train_data_path: ./data/user_prompts.jsonl
+  eval_data_path: null
+  hidden_states_path: null
+  eval_hidden_states_path: null
+  max_length: 3072
+  cache_dir: ./cache
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  save_interval: 1000
+  log_interval: 10
+  eval_interval: 0
+  dp_world_size: 1
+  seed: 42

@@ -36,6 +36,10 @@ Xem [bối cảnh MR-DFlash](mr_dflash.md) và
 [`src/MR_DFlash/README.md`](../src/MR_DFlash/README.md). Nó chưa có launcher
 benchmark inference hay kết quả riêng.
 
+Quy trình pilot train/eval với target feature online, tokenized shard và ma
+trận DFlash-2L/MR-2S/DFlash-5L nằm tại
+[`docs/mr_dflash_pilot_pipeline.md`](mr_dflash_pilot_pipeline.md).
+
 ## Chuẩn bị chung trên server B200
 
 ```bash

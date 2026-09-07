@@ -421,7 +421,12 @@ class OnlineDFlashModel(nn.Module):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
-        """Trả (loss_num, loss_den, correct_num, accuracy_den) cho 1 lát block."""
+        """Tính loss và các ratio metrics cho một lát block.
+
+        Ngoài accuracy aggregate, ``acc_pos`` đo accuracy tại từng offset và
+        ``accept_ge`` đo proxy ``P(A >= j)`` (mọi token từ offset 1 tới j
+        đúng). Các tensor này đều là detached metrics ở phía caller.
+        """
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
@@ -460,11 +465,34 @@ class OnlineDFlashModel(nn.Module):
 
         with torch.no_grad():
             predicted_ids = logits.argmax(dim=-1)
+            valid = weight_mask > 0.5
+            correct = predicted_ids.eq(target_ids)
             correct_num = (
-                ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
+                (correct & valid).sum().float()
             )
             accuracy_den = weight_mask.sum()
-        return loss_num, loss_den, correct_num, accuracy_den
+            # Offset 0 là token anchor dùng làm input, không phải proposal.
+            position_correct = (correct & valid).sum(dim=(0, 1)).float()[1:]
+            position_den = valid.sum(dim=(0, 1)).float()[1:]
+            step_correct = correct[..., 1:]
+            step_valid = valid[..., 1:]
+            prefix_valid = torch.cumprod(step_valid.float(), dim=-1)
+            prefix_correct = (
+                torch.cumprod((step_correct & step_valid).float(), dim=-1)
+                * prefix_valid
+            )
+            accept_num = prefix_correct.sum(dim=(0, 1))
+            accept_den = prefix_valid.sum(dim=(0, 1))
+        return (
+            loss_num,
+            loss_den,
+            correct_num,
+            accuracy_den,
+            position_correct,
+            position_den,
+            accept_num,
+            accept_den,
+        )
 
     def _dpace_weight(
         self,
@@ -538,7 +566,16 @@ class OnlineDFlashModel(nn.Module):
         weight_mask = weight_mask * original_loss_mask
 
         hidden_4d = output_hidden.reshape(bsz, n_blocks, self.block_size, -1)
-        loss_num, loss_den, correct_num, accuracy_denom = checkpointed_chunk_reduce(
+        (
+            loss_num,
+            loss_den,
+            correct_num,
+            accuracy_denom,
+            position_correct,
+            position_den,
+            accept_num,
+            accept_den,
+        ) = checkpointed_chunk_reduce(
             self._objective_chunk_terms,
             hidden_4d,
             target_ids,
@@ -549,6 +586,8 @@ class OnlineDFlashModel(nn.Module):
 
         ratio_metrics = {
             "acc": (correct_num.detach(), accuracy_denom.detach()),
+            "acc_pos": (position_correct.detach(), position_den.detach()),
+            "accept_ge": (accept_num.detach(), accept_den.detach()),
         }
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
@@ -753,6 +792,7 @@ def build_draft_spec_from_target_config(
     *,
     draft_num_hidden_layers: int,
     block_size: int,
+    draft_intermediate_size: Optional[int] = None,
     target_layer_ids: Optional[list] = None,
     layer_types: Optional[list] = None,
     sliding_window: Optional[int] = None,
@@ -766,7 +806,7 @@ def build_draft_spec_from_target_config(
     hidden_size = int(tc.hidden_size)
     num_heads = int(tc.num_attention_heads)
     kv_heads = int(getattr(tc, "num_key_value_heads", num_heads))
-    intermediate = int(tc.intermediate_size)
+    intermediate = int(draft_intermediate_size or tc.intermediate_size)
     head_dim = getattr(tc, "head_dim", None)
     num_layers = int(tc.num_hidden_layers)
 
@@ -818,6 +858,7 @@ def build_mr_draft_spec_from_target_config(
     *,
     draft_num_hidden_layers: int,
     block_size: int,
+    draft_intermediate_size: Optional[int] = None,
     target_layer_ids: Optional[list] = None,
     layer_types: Optional[list] = None,
     sliding_window: Optional[int] = None,
@@ -835,6 +876,7 @@ def build_mr_draft_spec_from_target_config(
         target_config,
         draft_num_hidden_layers=draft_num_hidden_layers,
         block_size=block_size,
+        draft_intermediate_size=draft_intermediate_size,
         target_layer_ids=target_layer_ids,
         layer_types=layer_types,
         sliding_window=sliding_window,

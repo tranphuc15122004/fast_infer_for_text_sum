@@ -1,11 +1,13 @@
-"""Entry point train DFlash offline: ``python -m MR_DFlash.run_train [flags]``.
+"""Entry point train DFlash/MR-DFlash offline hoặc online.
+
+``python -m MR_DFlash.run_train [flags]``
 
 Tương ứng ``specforge train --config <yaml>`` nhưng tự đóng gói:
 
 1. Đọc config (mặc định dataclass hoặc file YAML khớp cây
    ``model/data/training``).
-2. Nếu chưa có feature offline (``data.hidden_states_path``) → chạy capture
-   bằng HF (``capture.capture_dataset``).
+2. Offline: nếu chưa có feature (``data.hidden_states_path``) → chạy capture
+   bằng HF. Online: đọc tokenized shard và lấy feature từ target frozen.
 3. Nạp target parts (embed_tokens + lm_head, frozen) và dựng draft model +
    ``OnlineDFlashModel``.
 4. Chạy ``Trainer.fit()`` (accumulation, cosine+warmup, checkpoint).
@@ -109,6 +111,7 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "target_model_path": (cfg.model, "target_model_path"),
         "architecture": (cfg.model, "architecture"),
         "draft_num_hidden_layers": (cfg.model, "draft_num_hidden_layers"),
+        "draft_intermediate_size": (cfg.model, "draft_intermediate_size"),
         "target_layer_ids": (cfg.model, "target_layer_ids"),
         "feature_layer_ids": (cfg.model, "feature_layer_ids"),
         "draft_init_layer_ids": (cfg.model, "draft_init_layer_ids"),
@@ -127,6 +130,10 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "indexer_num_heads": (cfg.model, "indexer_num_heads"),
         "train_data_path": (cfg.data, "train_data_path"),
         "eval_data_path": (cfg.data, "eval_data_path"),
+        "feature_mode": (cfg.data, "feature_mode"),
+        "tokenized_data_path": (cfg.data, "tokenized_data_path"),
+        "eval_tokenized_data_path": (cfg.data, "eval_tokenized_data_path"),
+        "supervision_mode": (cfg.data, "supervision_mode"),
         "eval_hidden_states_path": (cfg.data, "eval_hidden_states_path"),
         "hidden_states_path": (cfg.data, "hidden_states_path"),
         "max_length": (cfg.data, "max_length"),
@@ -174,6 +181,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--target-model-path", type=str, default=None)
     parser.add_argument("--architecture", type=str, choices=["dflash", "mr_dflash"], default=None)
     parser.add_argument("--draft-num-hidden-layers", type=int, default=None)
+    parser.add_argument("--draft-intermediate-size", type=int, default=None)
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--feature-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--draft-init-layer-ids", type=int, nargs="+", default=None)
@@ -192,6 +200,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--indexer-num-heads", type=int, default=None)
     parser.add_argument("--train-data-path", type=str, default=None)
     parser.add_argument("--eval-data-path", type=str, default=None)
+    parser.add_argument("--feature-mode", choices=["offline", "online"], default=None)
+    parser.add_argument("--tokenized-data-path", type=str, default=None)
+    parser.add_argument("--eval-tokenized-data-path", type=str, default=None)
+    parser.add_argument(
+        "--supervision-mode",
+        choices=["all_assistant", "last_assistant"],
+        default=None,
+    )
     parser.add_argument("--eval-hidden-states-path", type=str, default=None)
     parser.add_argument("--hidden-states-path", type=str, default=None)
     parser.add_argument("--max-length", type=int, default=None)
@@ -335,6 +351,7 @@ def build_online_model(
             target_config,
             draft_num_hidden_layers=mcfg.draft_num_hidden_layers,
             block_size=mcfg.block_size,
+            draft_intermediate_size=mcfg.draft_intermediate_size,
             target_layer_ids=feature_layer_ids,
             layer_types=mcfg.layer_types,
             sliding_window=mcfg.sliding_window,
@@ -353,6 +370,7 @@ def build_online_model(
             target_config,
             draft_num_hidden_layers=mcfg.draft_num_hidden_layers,
             block_size=mcfg.block_size,
+            draft_intermediate_size=mcfg.draft_intermediate_size,
             target_layer_ids=feature_layer_ids,
             layer_types=mcfg.layer_types,
             sliding_window=mcfg.sliding_window,
@@ -396,6 +414,9 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
     from .capture import capture_dataset
     from .checkpoint import warm_start_draft_model
     from .data import DFlashFeatureDataset, list_feature_files
+    from .online_features import OnlineTargetFeatureProvider
+    from .sampler import LengthBucketBatchSampler
+    from .tokenized_data import TokenizedDFlashDataset
     from .trainer import Trainer
 
     dist_ctx = current_context(device)
@@ -438,6 +459,7 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
                     torch_dtype=cfg.model.torch_dtype,
                     device="cuda" if device.type == "cuda" else "cpu",
                     local_files_only=local_files_only,
+                    supervision_mode=cfg.data.supervision_mode,
                 )
                 print(f"[run] capture xong: {stats}")
                 if stats["captured"] == 0:
@@ -457,24 +479,28 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         barrier()
         return str(features)
 
-    features_path = cfg.data.hidden_states_path
-    features_path = ensure_capture(
-        features_path,
-        cfg.data.train_data_path,
-        "captured_features",
-        sample_limit=cfg.data.num_samples,
-    )
-    if features_path is None:
-        raise ValueError(
-            "cần data.hidden_states_path (đã capture) hoặc data.train_data_path"
+    online_mode = cfg.data.feature_mode == "online"
+    features_path: Optional[str] = None
+    eval_features_path: Optional[str] = None
+    if not online_mode:
+        features_path = ensure_capture(
+            cfg.data.hidden_states_path,
+            cfg.data.train_data_path,
+            "captured_features",
+            sample_limit=cfg.data.num_samples,
         )
-
-    eval_features_path = ensure_capture(
-        cfg.data.eval_hidden_states_path,
-        cfg.data.eval_data_path or None,
-        "captured_eval_features",
-        sample_limit=None,
-    )
+        if features_path is None:
+            raise ValueError(
+                "offline mode cần data.hidden_states_path hoặc data.train_data_path"
+            )
+        eval_features_path = ensure_capture(
+            cfg.data.eval_hidden_states_path,
+            cfg.data.eval_data_path or None,
+            "captured_eval_features",
+            sample_limit=None,
+        )
+    elif not cfg.data.tokenized_data_path:
+        raise ValueError("online mode cần data.tokenized_data_path")
 
     target_for_init = None
     loaded_target = load_target_parts(
@@ -483,9 +509,9 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         torch_dtype=cfg.model.torch_dtype,
         device=device,
         local_files_only=local_files_only,
-        keep_target_model=cfg.model.init_draft_from_target,
+        keep_target_model=(online_mode or cfg.model.init_draft_from_target),
     )
-    if cfg.model.init_draft_from_target:
+    if online_mode or cfg.model.init_draft_from_target:
         tokenizer, target_config, embed_tokens, lm_head, target_for_init = loaded_target
     else:
         tokenizer, target_config, embed_tokens, lm_head = loaded_target
@@ -514,10 +540,11 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
             target_for_init,
             target_layer_ids=draft_init_layer_ids,
         )
-        del target_for_init
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not online_mode:
+            del target_for_init
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         print(f"[run] đã copy {len(copied)} tham số từ target")
 
     if cfg.model.draft_checkpoint_path:
@@ -534,15 +561,47 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         strategy = MRDFlashTrainStrategy(model)  # type: ignore[arg-type]
     else:
         strategy = DFlashTrainStrategy(model)
-    dataset = DFlashFeatureDataset(
-        features_path,
-        max_len=cfg.data.max_length,
-        run_id=cfg.run_id,
-        sample_limit=cfg.data.num_samples,
-        expected_feature_width=model.draft_model.spec.context_feature_dim,
-        expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
-        expected_target_model_path=cfg.model.target_model_path,
-    )
+    feature_provider = None
+    batch_sampler = None
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", 0) or 0
+    if online_mode:
+        dataset = TokenizedDFlashDataset(
+            str(cfg.data.tokenized_data_path),
+            sample_limit=cfg.data.num_samples,
+            pad_token_id=int(pad_token_id),
+            expected_target_model=cfg.model.target_model_path,
+            expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
+            expected_max_length=cfg.data.max_length,
+            expected_supervision_mode=cfg.data.supervision_mode,
+        )
+        feature_provider = OnlineTargetFeatureProvider(
+            target_for_init,
+            resolve_feature_layer_ids(cfg.model),
+            dtype={
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+            }[cfg.model.torch_dtype],
+        )
+        batch_sampler = LengthBucketBatchSampler(
+            dataset.lengths,
+            cfg.training.batch_size,
+            seed=cfg.training.seed,
+            rank=dist_ctx.rank,
+            world_size=dist_ctx.world_size,
+        )
+    else:
+        dataset = DFlashFeatureDataset(
+            features_path,
+            max_len=cfg.data.max_length,
+            run_id=cfg.run_id,
+            sample_limit=cfg.data.num_samples,
+            expected_feature_width=model.draft_model.spec.context_feature_dim,
+            expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
+            expected_target_model_path=cfg.model.target_model_path,
+        )
     print(
         f"[run] dataset: {len(dataset)} mẫu, max_len={cfg.data.max_length}, "
         f"block_size={model.block_size}, anchors={cfg.training.num_anchors}"
@@ -551,7 +610,18 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         raise RuntimeError("dataset rỗng — kiểm tra feature/capture")
 
     eval_dataset = None
-    if eval_features_path is not None:
+    if online_mode and cfg.data.eval_tokenized_data_path:
+        eval_dataset = TokenizedDFlashDataset(
+            str(cfg.data.eval_tokenized_data_path),
+            pad_token_id=int(pad_token_id),
+            expected_target_model=cfg.model.target_model_path,
+            expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
+            expected_max_length=cfg.data.max_length,
+            expected_supervision_mode=cfg.data.supervision_mode,
+        )
+        if len(eval_dataset) == 0:
+            raise RuntimeError("online eval dataset rỗng")
+    elif eval_features_path is not None:
         eval_dataset = DFlashFeatureDataset(
             eval_features_path,
             max_len=cfg.data.max_length,
@@ -569,8 +639,14 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         dataset,
         device=device,
         resume_from=resume_from,
+        feature_provider=feature_provider,
+        batch_sampler=batch_sampler,
     )
-    return trainer.fit(eval_dataset=eval_dataset)
+    try:
+        return trainer.fit(eval_dataset=eval_dataset)
+    finally:
+        if feature_provider is not None and hasattr(feature_provider, "close"):
+            feature_provider.close()
 
 
 def main(argv=None) -> None:

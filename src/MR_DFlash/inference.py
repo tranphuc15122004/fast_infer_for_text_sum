@@ -8,16 +8,20 @@ reject; backend KV/paged-attention có thể thay ở benchmark GPU sau.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from dataclasses import dataclass
-from typing import Any, List, Optional
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from .checkpoint import load_training_checkpoint, warm_start_draft_model
 from .memory import MRMemoryState
+from .model import DFlashDraftModel
 from .mr_model import MRDFlashDraftModel
 from .training import build_dflash_additive_mask, build_mr_draft_spec_from_target_config
+from .training import build_draft_spec_from_target_config
 
 
 @dataclass
@@ -37,15 +41,17 @@ class DraftOutput:
 class VerifyOutput:
     accepted_proposal_count: int
     accepted_ids: torch.Tensor
-    memory: MRMemoryState
+    memory: Any
     target_logits: torch.Tensor
 
 
 @dataclass
 class GenerationOutput:
     input_ids: torch.Tensor
-    memory: MRMemoryState
+    memory: Any
     accepted_proposal_tokens: int
+    timings_s: Dict[str, float] = field(default_factory=dict)
+    rounds: int = 0
 
 
 class MRDFlashInferenceEngine:
@@ -250,22 +256,39 @@ class MRDFlashInferenceEngine:
     ) -> GenerationOutput:
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens phải >= 1")
-        prefill = self.prefill(input_ids)
+        def timed(callable_, *args, **kwargs):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+            value = callable_(*args, **kwargs)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return value, time.perf_counter() - started
+
+        total_started = time.perf_counter()
+        prefill, prefill_s = timed(self.prefill, input_ids)
         current = prefill.input_ids
         memory = prefill.memory
         generated = 0
         accepted_proposal_tokens = 0
+        draft_s = 0.0
+        verify_s = 0.0
+        rounds = 0
         while generated < max_new_tokens:
-            draft = self.draft_block(current, memory)
+            rounds += 1
+            draft, elapsed = timed(self.draft_block, current, memory)
+            draft_s += elapsed
             remaining = max_new_tokens - generated
             proposals = draft.proposed_ids[:, :remaining]
-            verified = self.verify(
+            verified, elapsed = timed(
+                self.verify,
                 current,
                 proposals,
                 memory,
                 max_append_tokens=remaining,
                 eos_token_id=eos_token_id,
             )
+            verify_s += elapsed
             accepted_proposal_tokens += verified.accepted_proposal_count
             current = torch.cat([current, verified.accepted_ids], dim=1)
             memory = verified.memory
@@ -276,6 +299,229 @@ class MRDFlashInferenceEngine:
             input_ids=current,
             memory=memory,
             accepted_proposal_tokens=accepted_proposal_tokens,
+            timings_s={
+                "prefill_s": prefill_s,
+                "draft_s": draft_s,
+                "verify_s": verify_s,
+                "total_s": time.perf_counter() - total_started,
+            },
+            rounds=rounds,
+        )
+
+
+@dataclass
+class DFlashPrefillOutput:
+    input_ids: torch.Tensor
+    target_features: torch.Tensor
+    target_logits: torch.Tensor
+
+
+@dataclass
+class DFlashGenerationOutput:
+    input_ids: torch.Tensor
+    accepted_proposal_tokens: int
+    timings_s: Dict[str, float] = field(default_factory=dict)
+    rounds: int = 0
+
+
+class DFlashInferenceEngine:
+    """Reference verifier cho baseline DFlash cùng target trajectory.
+
+    Đây là counterpart của ``MRDFlashInferenceEngine``: target feature concat
+    được giữ nguyên (không nén), còn draft/verify semantics và bonus token
+    giống hệt MR engine. Cả hai đều cố ý dùng target full-prefix để ưu tiên
+    exactness trong pilot trước khi tối ưu kernel.
+    """
+
+    def __init__(
+        self,
+        target_model: torch.nn.Module,
+        draft_model: DFlashDraftModel,
+        *,
+        mask_token_id: int,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.device = device or next(target_model.parameters()).device
+        self.mask_token_id = int(mask_token_id)
+        self.embed_tokens = target_model.get_input_embeddings()
+        self.lm_head = target_model.get_output_embeddings()
+        if self.embed_tokens is None or self.lm_head is None:
+            raise ValueError("target model phải có input embedding và output head")
+        self.target_model.to(self.device).eval()
+        self.draft_model.to(self.device).eval()
+        for parameter in self.target_model.parameters():
+            parameter.requires_grad_(False)
+
+    def _extract_features(self, outputs: Any) -> torch.Tensor:
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            raise ValueError("target output thiếu hidden_states")
+        return torch.cat(
+            [hidden_states[layer_id + 1] for layer_id in self.draft_model.spec.target_layer_ids],
+            dim=-1,
+        )
+
+    @torch.no_grad()
+    def _target_forward(self, input_ids: torch.Tensor) -> Any:
+        return self.target_model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+
+    @torch.no_grad()
+    def prefill(self, input_ids: torch.Tensor) -> DFlashPrefillOutput:
+        ids = input_ids.to(device=self.device, dtype=torch.long)
+        if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] < 1:
+            raise ValueError("reference inference DFlash cần input_ids [1,S], S>=1")
+        outputs = self._target_forward(ids)
+        return DFlashPrefillOutput(
+            input_ids=ids,
+            target_features=self._extract_features(outputs),
+            target_logits=outputs.logits[:, -1],
+        )
+
+    def _block_mask(self, context_length: int, block_length: int, dtype: torch.dtype) -> torch.Tensor:
+        return build_dflash_additive_mask(
+            torch.tensor([[context_length]], device=self.device, dtype=torch.long),
+            torch.ones((1, 1), device=self.device, dtype=torch.bool),
+            S=context_length,
+            block_size=block_length,
+            device=self.device,
+            dtype=dtype,
+        )
+
+    @torch.no_grad()
+    def draft_block(self, input_ids: torch.Tensor, target_features: torch.Tensor) -> DraftOutput:
+        ids = input_ids.to(device=self.device, dtype=torch.long)
+        if ids.ndim != 2 or ids.shape[0] != 1:
+            raise ValueError("reference inference DFlash hiện chỉ hỗ trợ batch=1")
+        context_length = ids.shape[1]
+        block_length = self.draft_model.block_size
+        noise_ids = torch.full(
+            (1, block_length), self.mask_token_id, device=self.device, dtype=torch.long
+        )
+        noise_ids[:, 0] = ids[:, -1]
+        noise_embedding = self.embed_tokens(noise_ids)
+        positions = torch.arange(context_length - 1, context_length - 1 + block_length, device=self.device).unsqueeze(0)
+        context_positions = torch.arange(context_length, device=self.device).unsqueeze(0)
+        position_ids = torch.cat([context_positions, positions], dim=1)
+        dtype = next(self.draft_model.parameters()).dtype
+        hidden = self.draft_model(
+            noise_embedding=noise_embedding,
+            target_hidden=target_features,
+            position_ids=position_ids,
+            attention_mask=self._block_mask(context_length, block_length, dtype),
+        )
+        logits = self.lm_head(hidden)[:, 1:]
+        return DraftOutput(proposed_ids=logits.argmax(dim=-1), logits=logits)
+
+    @torch.no_grad()
+    def verify(
+        self,
+        input_ids: torch.Tensor,
+        proposed_ids: torch.Tensor,
+        target_features: torch.Tensor,
+        *,
+        max_append_tokens: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+    ) -> VerifyOutput:
+        prefix = input_ids.to(device=self.device, dtype=torch.long)
+        proposals = proposed_ids.to(device=self.device, dtype=torch.long)
+        if prefix.shape[0] != 1 or proposals.shape[0] != 1 or proposals.shape[1] < 1:
+            raise ValueError("DFlash verify cần prefix/proposals batch=1 và proposal không rỗng")
+        prefix_len = prefix.shape[1]
+        candidate = torch.cat([prefix, proposals], dim=1)
+        outputs = self._target_forward(candidate)
+        choices = outputs.logits[:, prefix_len - 1 : prefix_len - 1 + proposals.shape[1]].argmax(dim=-1)
+        equal = choices.eq(proposals)
+        accepted_count = 0
+        while accepted_count < proposals.shape[1] and bool(equal[0, accepted_count]):
+            accepted_count += 1
+        if accepted_count == proposals.shape[1] and (
+            max_append_tokens is None or max_append_tokens > proposals.shape[1]
+        ):
+            accepted_ids = torch.cat([proposals, outputs.logits[:, -1:].argmax(dim=-1)], dim=1)
+        elif accepted_count == proposals.shape[1]:
+            accepted_ids = proposals[:, :max_append_tokens]
+        else:
+            replacement = choices[:, accepted_count : accepted_count + 1]
+            accepted_ids = torch.cat([proposals[:, :accepted_count], replacement], dim=1)
+        if max_append_tokens is not None:
+            accepted_ids = accepted_ids[:, :max_append_tokens]
+        new_ids = torch.cat([prefix, accepted_ids], dim=1)
+        if eos_token_id is not None:
+            eos_hits = accepted_ids.eq(int(eos_token_id))[0].nonzero(as_tuple=False)
+            if eos_hits.numel():
+                accepted_ids = accepted_ids[:, : int(eos_hits[0].item()) + 1]
+                new_ids = torch.cat([prefix, accepted_ids], dim=1)
+        new_outputs = self._target_forward(new_ids)
+        return VerifyOutput(
+            accepted_proposal_count=min(accepted_count, accepted_ids.shape[1]),
+            accepted_ids=accepted_ids,
+            memory=None,
+            target_logits=new_outputs.logits[:, -1],
+        )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_new_tokens: int,
+        eos_token_id: Optional[int] = None,
+    ) -> DFlashGenerationOutput:
+        current = input_ids.to(device=self.device, dtype=torch.long)
+
+        def timed(callable_, *args, **kwargs):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+            value = callable_(*args, **kwargs)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return value, time.perf_counter() - started
+
+        total_started = time.perf_counter()
+        prefill, prefill_s = timed(self.prefill, current)
+        generated = 0
+        accepted_proposal_tokens = 0
+        rounds = 0
+        draft_s = 0.0
+        verify_s = 0.0
+        while generated < max_new_tokens:
+            rounds += 1
+            proposal, elapsed = timed(self.draft_block, current, prefill.target_features)
+            draft_s += elapsed
+            verified, elapsed = timed(
+                self.verify,
+                current,
+                proposal.proposed_ids,
+                prefill.target_features,
+                max_append_tokens=max_new_tokens - generated,
+                eos_token_id=eos_token_id,
+            )
+            verify_s += elapsed
+            current = torch.cat([current, verified.accepted_ids], dim=1)
+            generated += int(verified.accepted_ids.shape[1])
+            accepted_proposal_tokens += verified.accepted_proposal_count
+            if eos_token_id is not None and bool(verified.accepted_ids.eq(int(eos_token_id)).any()):
+                break
+            prefill, elapsed = timed(self.prefill, current)
+            prefill_s += elapsed
+        return DFlashGenerationOutput(
+            input_ids=current,
+            accepted_proposal_tokens=accepted_proposal_tokens,
+            timings_s={
+                "prefill_s": prefill_s,
+                "draft_s": draft_s,
+                "verify_s": verify_s,
+                "total_s": time.perf_counter() - total_started,
+            },
+            rounds=rounds,
         )
 
 
@@ -287,6 +533,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mask-token-id", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--draft-intermediate-size", type=int, default=None)
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--hca-compression-ratio", type=int, default=None)
     parser.add_argument("--csa-compression-ratio", type=int, default=None)
@@ -296,6 +543,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--indexer-dim", type=int, default=None)
     parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default=None)
     parser.add_argument("--local-files-only", action="store_true", default=None)
+    parser.add_argument(
+        "--timing-json",
+        action="store_true",
+        help="In thêm một JSON record latency/acceptance sau output decode.",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args(argv)
 
@@ -370,6 +622,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         target.config,
         draft_num_hidden_layers=int(setting("draft_num_hidden_layers", 1)),
         block_size=int(setting("block_size", 16)),
+        draft_intermediate_size=setting("draft_intermediate_size", None),
         target_layer_ids=target_layer_ids,
         mask_token_id=int(mask_token_id),
         num_stages=int(setting("mr_num_stages", 2)),
@@ -394,6 +647,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         eos_token_id=getattr(tokenizer, "eos_token_id", None),
     )
     print(tokenizer.decode(result.input_ids[0], skip_special_tokens=True))
+    if args.timing_json:
+        print(
+            json.dumps(
+                {
+                    "generated_tokens": int(result.input_ids.shape[1] - encoded["input_ids"].shape[1]),
+                    "accepted_proposal_tokens": result.accepted_proposal_tokens,
+                    "rounds": result.rounds,
+                    "timings_s": result.timings_s,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
 
 if __name__ == "__main__":
@@ -402,6 +668,8 @@ if __name__ == "__main__":
 
 __all__ = [
     "DraftOutput",
+    "DFlashGenerationOutput",
+    "DFlashInferenceEngine",
     "GenerationOutput",
     "MRDFlashInferenceEngine",
     "PrefillOutput",

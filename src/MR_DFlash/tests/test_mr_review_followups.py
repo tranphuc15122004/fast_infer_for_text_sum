@@ -65,6 +65,24 @@ def test_indexer_uses_relu_of_head_dot_product() -> None:
     assert torch.allclose(scores, expected)
 
 
+def test_multihead_indexer_scales_by_head_dimension() -> None:
+    indexer = CSAIndexer(hidden_size=4, indexer_dim=4, num_heads=2).float()
+    with torch.no_grad():
+        indexer.q_proj.weight.copy_(torch.eye(4))
+        indexer.k_proj.weight.copy_(torch.eye(4))
+        indexer.weight_proj.weight.zero_()
+
+    query = torch.tensor([[[1.0, 0.0, 1.0, 0.0]]])
+    memory = torch.tensor([[[1.0, 0.0, 1.0, 0.0]]])
+    scores = indexer.score(query, memory)
+
+    # Hai head đều có dot=1; scale phải là 1/sqrt(head_dim), không phải
+    # 1/sqrt(indexer_dim), vì score bias đi trực tiếp vào attention logits.
+    expected = torch.tensor([[[2.0 / (2.0 ** 0.5)]]])
+    assert indexer.scale == pytest.approx(2.0 ** -0.5)
+    assert torch.allclose(scores, expected)
+
+
 def test_mr_training_flattens_anchors_into_block_batch() -> None:
     torch.manual_seed(1)
     draft = MRDFlashDraftModel(_spec()).float()

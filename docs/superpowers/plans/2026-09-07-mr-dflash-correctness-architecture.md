@@ -183,3 +183,63 @@ module được giữ trong phạm vi V1 và ghi thành ablation/deferred work.
 - [x] Cập nhật B200 runbook; không tự chạy GPU khi chưa có allocation riêng.
 - [x] Chạy review tests và toàn bộ `src/MR_DFlash/tests`; giữ real Qwen smoke
   cho validation cuối cùng trước claim pilot.
+
+## Follow-up review — fair experimental validity and pilot observability (2026-09-07)
+
+Review mới xác nhận core MR-DFlash đã đủ sạch để pilot functional, nhưng chỉ
+được kết luận hypothesis sau khi loại hai confound: số feature target và draft
+depth. Phần GPU vẫn deferred vì runtime hiện tại không expose CUDA.
+
+### Task 10: Fair baseline matrix và multi-head Indexer scale
+
+**Files:** `src/MR_DFlash/memory.py`, `src/MR_DFlash/configs/`,
+`src/MR_DFlash/tests/test_mr_review_followups.py`,
+`src/MR_DFlash/tests/test_b200_training_design.py`
+
+- [x] Thêm regression test chứng minh Indexer score scale theo
+  `head_dim ** -0.5` khi `indexer_num_heads > 1`.
+- [x] Sửa `CSAIndexer.scale`; giữ `indexer_num_heads=1` cho V1 và để 4/8 là
+  ablation sau pilot.
+- [x] Tạo DFlash-1L và DFlash-2L config Qwen3-4B dùng cùng
+  `feature_layer_ids=[1,9,17,25,33]` và DFlash hyperparameters với MR.
+- [x] Cập nhật DFlash Qwen3-8B config hiện có để không còn auto-select một
+  feature layer; thêm DFlash-2L control tương ứng.
+- [x] Test load config và kiểm tra feature/depth/init/loss controls của ma
+  trận 4B.
+- [x] Thêm ma trận Llama 3.1 8B Instruct theo ngân sách DFlash-5L: DFlash-5L,
+  MR 4-stage gần tương đương và biến thể khớp tham số bằng `indexer_dim=8192`;
+  thêm meta-parameter-count regression test.
+
+### Task 11: Pilot training observability [INTEGRATION]
+
+**Hypothesis:** Sau khi giữ cố định feature contract và draft depth, MR-HCA+CSA
+có thể cải thiện acceptance/quality mà không gây overhead hoặc peak VRAM bất
+thường so với DFlash-2L.
+
+**Components consumed:** DFlash/MR training wrappers, `Trainer`, three YAML
+configs của Task 10 và reference inference engine.
+
+**Implementation:** metrics train phải ghi `step_time_s`,
+`tokens_per_second`, loss/accuracy/grad norm và peak CUDA allocated/reserved
+memory; inference API/CLI phải xuất được latency decomposition; B200 runbook
+phải định nghĩa functional smoke, pilot 50–100 steps, acceptance/latency
+decomposition và curriculum `3072 → 8192 → 16384`.
+
+**Integration Tests:** CPU train smoke kiểm tra metric timing; GPU validation
+chỉ thực hiện sau khi user cấp riêng device và xác nhận preflight CUDA.
+
+**Validation Pyramid:** L0 static + L1 runtime trên B200 khi có allocation;
+trước mắt chỉ CPU contract và không claim GPU metric. Artifact tối thiểu là
+`metrics.jsonl`, checkpoint/config dump, feature manifest, GPU id và output
+acceptance/latency cố định.
+
+- [x] Thêm timing/tokens-per-second vào `Trainer.metrics.jsonl`.
+- [x] Thêm peak CUDA memory fields theo optimizer step, reset ở boundary để
+  số đo không bị cộng dồn giữa các step.
+- [x] Thêm timing `prefill_s/draft_s/verify_s/total_s`, số vòng và cờ
+  `--timing-json` cho reference inference.
+- [x] Cập nhật README/runbook với field schema, pilot 50–100 steps và
+  curriculum context.
+- [ ] Chạy ba config functional smoke trên GPU B200 sau khi có allocation.
+- [ ] Chạy pilot so sánh DFlash-1L/DFlash-2L/MR và ghi kết luận riêng cho
+  acceptance, quality, VRAM và latency; chưa tự động kết luận thay user.

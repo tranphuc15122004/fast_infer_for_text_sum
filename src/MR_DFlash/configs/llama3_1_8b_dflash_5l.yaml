@@ -1,0 +1,57 @@
+# DFlash-5L baseline để đối chiếu parameter budget với MR-DFlash.
+# Target benchmark: meta-llama/Meta-Llama-3.1-8B-Instruct.
+# Khi server dùng snapshot local, override --target-model-path bằng MODEL_TARGET.
+run_id: dflash-llama3-1-8b-5l
+output_dir: outputs/dflash-llama3-1-8b-5l
+
+model:
+  target_model_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+  architecture: dflash
+  draft_num_hidden_layers: 5
+  # Giữ đúng cấu hình DFlash Llama 3.1 đã phát hành.
+  # Protocol benchmark chung của repo: draft block = 16.
+  block_size: 16
+  mask_token_id: 128002
+  # Draft gốc có MLP 12288, khác target Llama MLP 14336.
+  draft_intermediate_size: 12288
+  # Không copy MLP target vì width draft/target khác nhau.
+  init_draft_from_target: false
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+  # DFlash gốc trích 5 layer từ target Llama có 32 decoder layers.
+  feature_layer_ids: [1, 8, 15, 22, 29]
+  draft_init_layer_ids: [1, 8, 15, 22, 29]
+
+data:
+  train_data_path: ./data/user_prompts.jsonl
+  eval_data_path: null
+  hidden_states_path: null
+  eval_hidden_states_path: null
+  max_length: 3072
+  chat_template: llama
+  cache_dir: ./cache
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  # Giữ sdpa để so sánh backend với MR-DFlash V1.
+  attention_backend: sdpa
+  loss_type: dflash
+  save_interval: 1000
+  log_interval: 10
+  eval_interval: 0
+  dp_world_size: 1
+  seed: 42

@@ -178,6 +178,7 @@ def capture_dataset(
     torch_dtype: str = "bfloat16",
     device: str = "auto",
     local_files_only: Optional[bool] = None,
+    supervision_mode: str = "all_assistant",
 ) -> Dict[str, int]:
     """Capture toàn bộ dataset → các file ``.ckpt`` dưới ``output_path``.
 
@@ -200,7 +201,12 @@ def capture_dataset(
     for index, row in enumerate(iter_jsonl(data_path)):
         if num_samples is not None and stats["captured"] >= num_samples:
             break
-        sample = build_sample(row, capturer.tokenizer, max_length)
+        sample = build_sample(
+            row,
+            capturer.tokenizer,
+            max_length,
+            supervision_mode=supervision_mode,
+        )
         if sample is None:
             stats["skipped_invalid"] += 1
             continue
@@ -265,6 +271,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--local-files-only", action="store_true", default=None)
+    parser.add_argument(
+        "--supervision-mode",
+        choices=["all_assistant", "last_assistant"],
+        default="all_assistant",
+    )
     return parser.parse_args(argv)
 
 
@@ -282,6 +293,7 @@ def main(argv=None) -> None:
         torch_dtype=args.torch_dtype,
         device=args.device,
         local_files_only=args.local_files_only,
+        supervision_mode=args.supervision_mode,
     )
     print(f"[capture] xong: {stats}")
 
