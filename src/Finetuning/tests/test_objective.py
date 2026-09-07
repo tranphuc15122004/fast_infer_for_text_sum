@@ -5,12 +5,14 @@ import math
 import pytest
 import torch
 from torch import nn
+from torch.utils import checkpoint as checkpoint_utils
 from transformers import Qwen3Config
 
 try:
     from Finetuning.dflash_family_model import (
         FLEX_ATTENTION_AVAILABLE,
         OnlineDFlashModel,
+        _sum_chunk_terms,
         compute_accept_len,
         create_dflash_block_mask,
         create_dflash_sdpa_mask,
@@ -87,49 +89,102 @@ def test_compute_accept_len_respects_ragged_block_validity() -> None:
     assert torch.equal(result, torch.tensor([[2.0, 0.0]]))
 
 
-def test_sdpa_mask_is_strict_context_and_same_block_causal() -> None:
+def test_sdpa_mask_distinguishes_full_and_sliding_attention() -> None:
     _require_objective_api()
     anchors = torch.tensor([[2, 6]])
     keep = torch.tensor([[True, True]])
-    mask = create_dflash_sdpa_mask(
+    full_mask = create_dflash_sdpa_mask(
         anchors,
         keep,
         S=8,
         block_size=4,
         device=torch.device("cpu"),
     )
+    sliding_mask = create_dflash_sdpa_mask(
+        anchors,
+        keep,
+        S=8,
+        block_size=4,
+        device=torch.device("cpu"),
+        sliding_window=4,
+    )
 
-    first_block_offset_one = mask[0, 0, 1].bool()
-    second_block_offset_two = mask[0, 0, 6].bool()
-    assert first_block_offset_one[0] and first_block_offset_one[1]
-    assert not first_block_offset_one[2]
-    assert first_block_offset_one[8] and first_block_offset_one[9]
-    assert not first_block_offset_one[10]
-    assert not first_block_offset_one[12]
-    assert second_block_offset_two[0]
-    assert not second_block_offset_two[6]
-    assert second_block_offset_two[14]
-    assert not second_block_offset_two[15]
+    full_row = full_mask[0, 0, 1].bool()
+    sliding_row = sliding_mask[0, 0, 1].bool()
+    assert full_row[0] and full_row[1]
+    assert not full_row[2]
+    assert full_row[8] and full_row[9] and full_row[10] and full_row[11]
+    assert not full_row[12]
+    assert sliding_row[0] and sliding_row[1]
+    assert not sliding_row[2]
+    assert sliding_row[8] and sliding_row[9]
+    assert not sliding_row[10] and not sliding_row[11]
+    assert not sliding_row[12]
 
 
 @pytest.mark.skipif(not FLEX_ATTENTION_AVAILABLE, reason="flex_attention unavailable")
-def test_flex_block_mask_uses_the_same_strict_context_rule() -> None:
+def test_flex_block_mask_distinguishes_full_and_sliding_attention() -> None:
     _require_objective_api()
-    mask = create_dflash_block_mask(
+    full_mask = create_dflash_block_mask(
         torch.tensor([[2, 6]]),
         torch.tensor([[True, True]]),
         S=8,
         block_size=4,
         device=torch.device("cpu"),
     )
+    sliding_mask = create_dflash_block_mask(
+        torch.tensor([[2, 6]]),
+        torch.tensor([[True, True]]),
+        S=8,
+        block_size=4,
+        device=torch.device("cpu"),
+        sliding_window=4,
+    )
     # CPU Flex BlockMask uses implementation-defined block metadata; its
     # callable mask modifier is the stable semantic contract.
     scalar = lambda value: torch.tensor(value)
-    assert mask.mask_mod(scalar(0), scalar(0), scalar(1), scalar(0))
-    assert mask.mask_mod(scalar(0), scalar(0), scalar(1), scalar(1))
-    assert not mask.mask_mod(scalar(0), scalar(0), scalar(1), scalar(2))
-    assert mask.mask_mod(scalar(0), scalar(0), scalar(1), scalar(8))
-    assert not mask.mask_mod(scalar(0), scalar(0), scalar(1), scalar(10))
+    args = (scalar(0), scalar(0), scalar(1))
+    assert full_mask.mask_mod(*args, scalar(0))
+    assert full_mask.mask_mod(*args, scalar(1))
+    assert not full_mask.mask_mod(*args, scalar(2))
+    assert full_mask.mask_mod(*args, scalar(8))
+    assert full_mask.mask_mod(*args, scalar(10))
+    assert sliding_mask.mask_mod(*args, scalar(8))
+    assert sliding_mask.mask_mod(*args, scalar(9))
+    assert not sliding_mask.mask_mod(*args, scalar(10))
+
+
+def test_chunk_reduction_checkpoints_only_grad_enabled_chunks(monkeypatch) -> None:
+    _require_objective_api()
+    calls = []
+    real_checkpoint = checkpoint_utils.checkpoint
+
+    def recording_checkpoint(function, *args, **kwargs):
+        calls.append(kwargs.get("use_reentrant"))
+        return real_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint_utils, "checkpoint", recording_checkpoint)
+
+    base = torch.arange(6.0, requires_grad=True)
+    values = base.reshape(2, 3)
+
+    def terms(chunk):
+        return chunk.square().sum(), chunk.sum()
+
+    chunked = _sum_chunk_terms(terms, (values,), chunk_size=1)
+    assert calls == [False, False, False]
+    chunked[0].backward()
+    assert torch.equal(base.grad, 2 * base.detach())
+
+    calls.clear()
+    with torch.no_grad():
+        _sum_chunk_terms(terms, (values,), chunk_size=1)
+    assert calls == []
+
+    calls.clear()
+    unchunked = _sum_chunk_terms(terms, (values,), chunk_size=0)
+    assert calls == []
+    assert torch.isfinite(unchunked[0])
 
 
 def test_anchor_sampling_requires_consecutive_supervised_tokens_and_caps_width() -> None:

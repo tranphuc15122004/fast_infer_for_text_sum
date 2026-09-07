@@ -58,8 +58,9 @@ def create_dflash_sdpa_mask(
 
     The first ``S`` key/value positions are the real context. The remaining
     positions are parallel draft blocks. Context visibility is strict
-    (``kv_idx < anchor``), while draft visibility is causal only within the
-    query's own block.
+    (``kv_idx < anchor``). Full-attention layers allow every draft offset in
+    the query's own block; sliding-window layers additionally use causal draft
+    offsets and a bounded context window.
     """
 
     batch_size, num_blocks = anchor_positions.shape
@@ -84,8 +85,9 @@ def create_dflash_sdpa_mask(
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
-    kv_block_offsets = (kv_indices - S) % block_size
-    mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
+    if sliding_window is not None:
+        kv_block_offsets = (kv_indices - S) % block_size
+        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
 
     valid_block = block_keep_mask.view(batch_size, 1, num_blocks, 1)
     valid_block = valid_block.repeat_interleave(block_size, dim=2)
@@ -128,8 +130,9 @@ def create_dflash_block_mask(
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        kv_block_offset = (kv_idx - S) % block_size
-        mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
+        if sliding_window is not None:
+            kv_block_offset = (kv_idx - S) % block_size
+            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < num_blocks
@@ -147,26 +150,71 @@ def create_dflash_block_mask(
 
 def _sum_chunk_terms(
     term_fn: Callable[..., Tuple[torch.Tensor, ...]],
-    args: Tuple[torch.Tensor, ...],
+    args: Tuple[Optional[torch.Tensor], ...],
     chunk_size: int,
 ) -> Tuple[torch.Tensor, ...]:
-    """Reduce additive objective terms over block chunks without losing grads."""
+    """Sum aligned objective terms with upstream checkpointing semantics."""
 
-    num_blocks = args[0].shape[1]
-    if chunk_size <= 0 or chunk_size >= num_blocks:
-        return term_fn(*args)
+    if chunk_size < 0:
+        raise ValueError(f"chunk_size must be >= 0, got {chunk_size}")
+    tensors = tuple(value for value in args if value is not None)
+    if not tensors:
+        raise ValueError("chunked reduction requires at least one tensor")
 
-    chunks = []
-    for start in range(0, num_blocks, chunk_size):
-        end = min(start + chunk_size, num_blocks)
-        chunks.append(
-            term_fn(*(value[:, start:end] for value in args))
+    first = tensors[0]
+    if first.ndim <= 1:
+        raise ValueError("DFlash chunk reduction requires a block dimension at dim 1")
+    num_blocks = first.shape[1]
+    if num_blocks == 0:
+        raise ValueError("chunked reduction received an empty dimension")
+    for tensor in tensors[1:]:
+        if tensor.ndim <= 1:
+            raise ValueError(
+                "DFlash chunk reduction requires a block dimension at dim 1"
+            )
+        if tensor.shape[1] != num_blocks:
+            raise ValueError(
+                "chunked reduction inputs must be aligned: "
+                f"expected dimension length {num_blocks}, got {tensor.shape[1]}"
+            )
+
+    effective_chunk_size = chunk_size or num_blocks
+    totals: Optional[Tuple[torch.Tensor, ...]] = None
+    for start in range(0, num_blocks, effective_chunk_size):
+        width = min(effective_chunk_size, num_blocks - start)
+        chunk_args = tuple(
+            value.narrow(1, start, width) if value is not None else None
+            for value in args
         )
+        should_checkpoint = (
+            chunk_size > 0
+            and torch.is_grad_enabled()
+            and any(value is not None and value.requires_grad for value in chunk_args)
+        )
+        if should_checkpoint:
+            from torch.utils.checkpoint import checkpoint
 
-    return tuple(
-        torch.stack([terms[index] for terms in chunks]).sum(dim=0)
-        for index in range(len(chunks[0]))
-    )
+            chunk_terms = checkpoint(
+                term_fn,
+                *chunk_args,
+                use_reentrant=False,
+            )
+        else:
+            chunk_terms = term_fn(*chunk_args)
+
+        if not isinstance(chunk_terms, tuple) or not all(
+            isinstance(term, torch.Tensor) for term in chunk_terms
+        ):
+            raise TypeError("chunk function must return a tuple of tensors")
+        if totals is None:
+            totals = chunk_terms
+            continue
+        if len(totals) != len(chunk_terms):
+            raise ValueError("chunk function returned a different number of terms")
+        totals = tuple(left + right for left, right in zip(totals, chunk_terms))
+
+    assert totals is not None
+    return totals
 
 
 class OnlineDFlashModel(nn.Module):
