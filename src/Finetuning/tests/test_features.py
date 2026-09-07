@@ -240,6 +240,29 @@ def test_offline_dataset_requires_manifest_before_loading(tmp_path) -> None:
         OfflineFeatureDataset(tmp_path)
 
 
+def test_offline_dataset_rejects_internal_and_record_symlinks(tmp_path) -> None:
+    _require_feature_api()
+    manifest = tiny_manifest()
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**manifest.to_dict(), "generation_dir": "active"}),
+        encoding="utf-8",
+    )
+    outside = tmp_path.parent / "outside_features"
+    outside.mkdir()
+    (outside / "feature_00000000.pt").write_bytes(b"not a tensor")
+    (tmp_path / "active").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        OfflineFeatureDataset(tmp_path)
+
+    (tmp_path / "active").unlink()
+    (tmp_path / "active").mkdir()
+    (tmp_path / "active" / "feature_00000000.pt").symlink_to(
+        outside / "feature_00000000.pt"
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        OfflineFeatureDataset(tmp_path)
+
+
 class FakeTargetModel(nn.Module):
     def __init__(self, *, bad_width: bool = False) -> None:
         super().__init__()

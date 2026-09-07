@@ -266,7 +266,7 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         manifest: FeatureManifest | Mapping[str, Any] | None = None,
     ) -> None:
         self.root = Path(root)
-        if not self.root.is_dir():
+        if self.root.is_symlink() or not self.root.is_dir():
             raise FileNotFoundError(f"offline feature directory not found: {self.root}")
         manifest_path = self.root / FEATURE_MANIFEST_FILENAME
         if manifest is None:
@@ -286,8 +286,17 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         self.manifest = manifest
         self.record_root = self.root
         if manifest.generation_dir is not None:
+            raw_record_root = self.root / manifest.generation_dir
+            cursor = self.root
+            for part in Path(manifest.generation_dir).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError(
+                        "feature manifest generation_dir contains a symlink: "
+                        f"{manifest.generation_dir!r}"
+                    )
             root_resolved = self.root.resolve()
-            record_root = (self.root / manifest.generation_dir).resolve()
+            record_root = raw_record_root.resolve()
             if root_resolved not in record_root.parents or not record_root.is_dir():
                 raise ValueError(
                     "feature manifest generation_dir must name a directory inside root: "
@@ -299,10 +308,19 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
             (
                 path
                 for path in self.record_root.rglob("*")
-                if path.is_file() and path.name.endswith(suffixes)
+                if (
+                    (not path.is_symlink())
+                    and path.is_file()
+                    and path.name.endswith(suffixes)
+                )
             ),
             key=lambda path: path.relative_to(self.root).as_posix(),
         )
+        for path in self.record_root.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(
+                    "offline feature directory cannot contain symlinks: " f"{path}"
+                )
         if not self._paths:
             raise ValueError(f"offline feature directory has no tensor records: {self.root}")
         # Validate at construction so a loader never starts with a bad width,

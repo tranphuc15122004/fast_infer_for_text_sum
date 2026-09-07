@@ -80,6 +80,10 @@ def _validate_feature_output_dir(destination: Path) -> None:
         raise ValueError(f"feature output path is not a directory: {destination}")
     allowed_suffixes = (".pt", ".pth", ".ckpt", ".ckpt.gz")
     for path in destination.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(
+                "refusing to use feature output containing a symlink: " f"{path}"
+            )
         if path.is_file() and path.name != FEATURE_MANIFEST_FILENAME and not path.name.endswith(allowed_suffixes):
             raise ValueError(
                 "refusing to replace feature output containing unrelated file: "
