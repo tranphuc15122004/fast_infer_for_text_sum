@@ -1,6 +1,9 @@
 """Self-contained SpecForge-compatible DFlash training components."""
 
+from .config import DataConfig, ModelConfig, RunConfig, TrainingConfig
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+from .dflash_family_model import OnlineDFlashModel
+from .evaluation import Evaluator
 from .model import (
     DFlashDraftModel,
     Qwen3DFlashAttention,
@@ -12,11 +15,24 @@ from .model import (
     resolve_dflash_attention_layout,
     sample,
 )
+from .strategy import DFlashTrainStrategy, StepContext, StepOutput, TrainBatch
+from .trainer import Trainer
 
 __all__ = [
     "DEFAULT_DFLASH_KERNELS",
+    "DataConfig",
     "DFlashKernels",
     "DFlashDraftModel",
+    "DFlashTrainStrategy",
+    "Evaluator",
+    "ModelConfig",
+    "OnlineDFlashModel",
+    "RunConfig",
+    "StepContext",
+    "StepOutput",
+    "Trainer",
+    "TrainBatch",
+    "TrainingConfig",
     "Qwen3DFlashAttention",
     "Qwen3DFlashDecoderLayer",
     "apply_rotary_pos_emb",

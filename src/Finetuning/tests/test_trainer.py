@@ -130,3 +130,54 @@ def test_trainer_rejects_empty_validation_before_training(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="empty validation"):
         trainer.fit()
+
+
+def test_trainer_always_saves_final_checkpoint_and_can_resume(tmp_path) -> None:
+    _require_api()
+    first = Trainer(
+        strategy=_CountingStrategy(),
+        train_dataloader=_train_loader(),
+        output_dir=tmp_path,
+        run_id="resume",
+        batch_size=1,
+        accumulation_steps=1,
+        num_epochs=1,
+        max_steps=1,
+        save_interval=100,
+        learning_rate=0.1,
+    )
+    assert first.fit() == 1
+    checkpoint = first.checkpoint_manager.latest_dir()
+
+    resumed = Trainer(
+        strategy=_CountingStrategy(),
+        train_dataloader=_train_loader(),
+        output_dir=tmp_path,
+        run_id="resume-continued",
+        batch_size=1,
+        accumulation_steps=1,
+        num_epochs=1,
+        max_steps=2,
+        save_interval=100,
+        learning_rate=0.1,
+        resume_from=checkpoint,
+    )
+    assert resumed.fit() == 2
+
+
+def test_trainer_reports_mfu_only_when_peak_is_configured(tmp_path) -> None:
+    _require_api()
+    trainer = Trainer(
+        strategy=_CountingStrategy(),
+        train_dataloader=_train_loader(),
+        output_dir=tmp_path,
+        run_id="mfu",
+        batch_size=1,
+        accumulation_steps=1,
+        num_epochs=1,
+        max_steps=1,
+        hardware_peak_tflops=100.0,
+    )
+    trainer.fit()
+    record = json.loads((tmp_path / "metrics.jsonl").read_text().splitlines()[0])
+    assert record["mfu"] == 0.0

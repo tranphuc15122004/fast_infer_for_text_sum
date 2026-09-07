@@ -39,6 +39,8 @@ benchmark inference hay kết quả riêng.
 Quy trình pilot train/eval với target feature online, tokenized shard và ma
 trận DFlash-2L/MR-2S/DFlash-5L nằm tại
 [`docs/mr_dflash_pilot_pipeline.md`](mr_dflash_pilot_pipeline.md).
+Profile VRAM và lệnh chạy dành cho B200 100 GB nằm tại
+[`docs/mr_dflash_b200_profile.md`](mr_dflash_b200_profile.md).
 
 ## Chuẩn bị chung trên server B200
 

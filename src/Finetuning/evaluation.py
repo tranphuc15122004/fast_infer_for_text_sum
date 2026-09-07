@@ -68,12 +68,13 @@ class Evaluator:
         manager = CheckpointManager(root.parent, root.name.rsplit("-step", 1)[0])
         state = manager.load(root, map_location=device)
         state_dict = state["draft_state_dict"]
-        if hasattr(model, "checkpoint_state_filter"):
-            # The persisted state is already filtered; strategy wrappers that
-            # strip a namespace load it into their trainable module directly.
-            module.load_state_dict(state_dict, strict=False)
-        else:
-            module.load_state_dict(state_dict, strict=False)
+        load_module = module
+        # DFlash checkpoints intentionally contain draft-local keys while the
+        # optimizer owns the wrapper.  Generic strategies keep their own
+        # state-dict contract and load directly.
+        if hasattr(model, "dflash_model"):
+            load_module = model.dflash_model.draft_model
+        load_module.load_state_dict(state_dict, strict=False)
         module.to(device)
         return self.evaluate_in_memory(model, dataloader_factory(), device)
 

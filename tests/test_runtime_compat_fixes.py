@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -91,6 +92,37 @@ def test_eagle_draft_attention_accepts_llama31_rope_schema():
     assert output.shape == (1, 2, 64)
 
 
+def test_eagle_llama_target_inherits_generation_mixin():
+    if str(ROOT / "externals" / "EAGLE") not in sys.path:
+        sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+
+    from eagle.model.modeling_llama_kv import LlamaForCausalLM
+    from transformers.generation import GenerationMixin
+
+    assert issubclass(LlamaForCausalLM, GenerationMixin)
+
+
+def test_eagle_llama_forward_does_not_read_deprecated_use_return_dict():
+    if str(ROOT / "externals" / "EAGLE") not in sys.path:
+        sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+
+    from eagle.model.modeling_llama_kv import LlamaForCausalLM
+
+    source = inspect.getsource(LlamaForCausalLM.forward)
+    assert "self.config.return_dict" in source
+    assert "self.config.use_return_dict" not in source
+
+
+def test_eagle_qwen3_forward_docs_include_cache_position():
+    if str(ROOT / "externals" / "EAGLE") not in sys.path:
+        sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+
+    from eagle.model.modeling_qwen3_kv import Qwen3ForCausalLM, Qwen3Model
+
+    assert "cache_position" in (Qwen3Model.forward.__doc__ or "")
+    assert "cache_position" in (Qwen3ForCausalLM.forward.__doc__ or "")
+
+
 def test_fafo_modules_import_without_fastchat():
     fafo_root = ROOT / "externals" / "FAFO"
     env = dict(os.environ)
@@ -166,10 +198,12 @@ def test_specextend_has_termcolor_fallback():
     assert colored("hello", "green") == "hello"
 
 
-def test_sssd_without_fixed_datastore_is_allowed_as_prompt_only_smoke():
-    from common.longbench_adapter import preflight_baseline
+def test_sssd_without_fixed_datastore_is_allowed_as_prompt_only_smoke(monkeypatch):
+    import common.longbench_adapter as adapter
 
-    result = preflight_baseline(
+    monkeypatch.setattr(adapter, "_module_importable", lambda name: (True, None))
+
+    result = adapter.preflight_baseline(
         "sssd",
         config={"model": "meta-llama/Llama-3.1-8B-Instruct"},
         cuda_available=True,

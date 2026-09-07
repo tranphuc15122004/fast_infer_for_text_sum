@@ -118,6 +118,18 @@ chế độ phù hợp để kiểm tra máy T4/CPU. Không được diễn gi�
 `unsupported_dataset` thành số đo tốc độ; các field timing của chúng là
 `null`.
 
+Smoke có guard an toàn mặc định `LONG_BENCH_SMOKE_MAX_INPUT_TOKENS=4096`.
+Mẫu đầu của `gov_report` dài khoảng 10k token; với `vanilla_hf` eager
+attention, bộ nhớ attention tăng theo `L²` nên chạy nguyên mẫu có thể OOM ngay
+cả trên B200. Profile `representative`/`full` vẫn giữ mặc định
+`LONG_BENCH_MAX_INPUT_TOKENS=0`; muốn đo context dài phải đặt giới hạn phù hợp
+với baseline và VRAM rồi ghi rõ trong manifest.
+
+Runner cũng kiểm tra VRAM trống trước khi tạo process con. Mặc định cần ít nhất
+32 GiB trên GPU được chọn (`LONG_BENCH_MIN_FREE_GB=32`). Nếu `nvidia-smi` cho
+thấy GPU chỉ còn vài GiB, runner dừng sớm với hướng dẫn chọn GPU khác hoặc tắt
+process đang chiếm VRAM; dùng `--min-free-gb 0` chỉ khi đã hiểu rủi ro.
+
 ### Compatibility với runtime server
 
 Các adapter đã có lớp tương thích cho đúng stack Python 3.12/Transformers
@@ -134,6 +146,9 @@ trên server:
   Muốn đo đúng retrieval SSSD phải đặt `SSSD_DATASTORE_PATH` trỏ tới `.idx`
   đã build cho đúng tokenizer/model; nếu path đã khai báo nhưng không tồn tại,
   preflight vẫn dừng cell với `missing_checkpoint`.
+- SSSD cần binary wheel `sglang-kernel==0.4.1` khớp CUDA/GPU. Nếu
+  `sgl_kernel` không import được, preflight ghi `missing_dependency` và không
+  khởi chạy child process để tránh traceback import sâu.
 
 Ví dụ kiểm tra đầy đủ pipeline local:
 
@@ -183,6 +198,14 @@ chặn job khi không đủ VRAM, dùng ngưỡng `--min-free-gb`:
 bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 3 --min-free-gb 120
 # exit 0: GPU 3 đủ VRAM | exit 2: thiếu VRAM (dừng, chọn GPU khác)
 bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json /tmp/gpu_report.json  # automation
+```
+
+Kiểm tra với đúng ngưỡng mặc định của runner:
+
+```bash
+bash scripts/run_gpu_check.sh \
+  --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
+  --gpu-ids 0 --min-free-gb 32
 ```
 
 File liên quan: `scripts/check_gpu_vram.py` (logic) + `scripts/run_gpu_check.sh`

@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 import torch
 
-from .checkpoint import CheckpointManager
+from .checkpoint import CheckpointManager, restore_rng_state
 from .evaluation import Evaluator
 from .schedule import build_scheduler, current_lr, resolve_total_steps, validate_fixed_accumulation_plan
 from .strategy import StepContext, StepOutput, TrainBatch
@@ -46,9 +46,11 @@ class Trainer:
         max_grad_norm: float = 1.0,
         save_interval: int = 1,
         log_interval: int = 1,
+        eval_interval: int = 0,
         hardware_peak_tflops: float | None = None,
         device: torch.device | str | None = None,
         extra_checkpoint_state: dict[str, Any] | None = None,
+        resume_from: str | Path | None = None,
     ) -> None:
         if batch_size <= 0 or accumulation_steps <= 0 or num_epochs <= 0:
             raise ValueError("batch_size, accumulation_steps and num_epochs must be positive")
@@ -70,6 +72,7 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.save_interval = max(1, save_interval)
         self.log_interval = max(1, log_interval)
+        self.eval_interval = max(0, eval_interval)
         self.hardware_peak_tflops = hardware_peak_tflops
         self.extra_checkpoint_state = extra_checkpoint_state or {}
         self._train_items = self._materialize_if_needed(train_dataloader)
@@ -98,6 +101,9 @@ class Trainer:
         )
         module = strategy.trainable_module()
         module.to(self.device)
+        self._trainable_parameter_count = sum(
+            parameter.numel() for parameter in module.parameters() if parameter.requires_grad
+        )
         self.optimizer = torch.optim.AdamW(
             [parameter for parameter in module.parameters() if parameter.requires_grad],
             lr=learning_rate,
@@ -116,6 +122,9 @@ class Trainer:
         self.micro_step = 0
         self.metrics_path = self.output_dir / "metrics.jsonl"
         self.log_path = self.output_dir / "train.log"
+        self._last_eval_step: int | None = None
+        if resume_from is not None:
+            self._resume(resume_from)
 
     @staticmethod
     def _materialize_if_needed(value: Iterable[Any] | None) -> list[Any] | None:
@@ -150,6 +159,20 @@ class Trainer:
                 **self.extra_checkpoint_state,
             },
         )
+
+    def _resume(self, path: str | Path) -> None:
+        state = self.checkpoint_manager.load(path, map_location=self.device)
+        module = self.strategy.trainable_module()
+        load_module = module
+        if hasattr(self.strategy, "dflash_model"):
+            load_module = self.strategy.dflash_model.draft_model
+        load_module.load_state_dict(state["draft_state_dict"], strict=False)
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        trainer_state = state.get("trainer_state", {})
+        self.global_step = int(trainer_state.get("global_step", 0))
+        self.micro_step = int(trainer_state.get("micro_step", 0))
+        restore_rng_state(state["rng_state"])
 
     def save_checkpoint(self) -> Path:
         if self.global_step <= 0:
@@ -200,7 +223,18 @@ class Trainer:
                 tokens = 0
                 if isinstance(raw_batch, dict) and "input_ids" in raw_batch:
                     tokens = int(torch.as_tensor(raw_batch["input_ids"]).numel())
+                mfu = None
+                if self.hardware_peak_tflops is not None:
+                    # A transparent 6*N*token estimate; report null unless a
+                    # hardware peak was explicitly supplied by the config.
+                    mfu = (
+                        0.0
+                        if not tokens
+                        else (6.0 * self._trainable_parameter_count * tokens / elapsed)
+                        / (self.hardware_peak_tflops * 1e12)
+                    )
                 record = {
+                    "type": "step",
                     "step": self.global_step,
                     "epoch": epoch,
                     "loss": loss,
@@ -208,7 +242,7 @@ class Trainer:
                     "lr": current_lr(self.optimizer),
                     "step_time_s": elapsed,
                     "tokens_per_s": tokens / elapsed if tokens else 0.0,
-                    "mfu": None,
+                    "mfu": mfu,
                 }
                 for name, value in output.metrics.items():
                     if isinstance(value, torch.Tensor) and value.numel() == 1:
@@ -218,13 +252,27 @@ class Trainer:
                 self._write_record(record)
                 if self.global_step % self.save_interval == 0:
                     self._save()
+                if (
+                    self._validation_items is not None
+                    and self.eval_interval > 0
+                    and self.global_step % self.eval_interval == 0
+                ):
+                    eval_metrics = self.evaluate()
+                    self._write_record(
+                        {"type": "evaluation", "step": self.global_step, **eval_metrics}
+                    )
+                    self._last_eval_step = self.global_step
                 if self.global_step >= self.total_steps:
                     break
             if self.global_step >= self.total_steps:
                 break
         if self.global_step <= 0:
             raise ValueError("training completed without an optimizer step")
-        if not self.checkpoint_manager.latest_dir().exists():
+        try:
+            latest = self.checkpoint_manager.latest_dir()
+        except FileNotFoundError:
+            latest = None
+        if latest is None or not latest.exists():
             self._save()
         return self.global_step
 

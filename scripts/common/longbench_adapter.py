@@ -9,6 +9,7 @@ preflight.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
@@ -120,6 +121,23 @@ def _local_requirement(value: str | None) -> tuple[bool, str | None]:
 
 def _model(config: Mapping[str, Any]) -> str | None:
     return str(config.get("model") or "") or None
+
+
+def _module_available(name: str) -> bool:
+    """Check module discovery without importing CUDA extensions."""
+    return importlib.util.find_spec(name) is not None
+
+
+def _module_importable(name: str) -> tuple[bool, str | None]:
+    """Check that a module and its native dependencies can actually import."""
+    if not _module_available(name):
+        return False, f"{name} is not installed"
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        detail = str(exc).strip().splitlines()[0] or repr(exc)
+        return False, f"{type(exc).__name__}: {detail}"
+    return True, None
 
 
 def preflight_baseline(
@@ -245,6 +263,19 @@ def preflight_baseline(
             result.update(status="missing_dependency", reason="vendored SpecExtend source is missing")
 
     if baseline == "sssd":
+        kernel_available, kernel_reason = _module_importable("sgl_kernel")
+        result["requirements"]["sgl_kernel"] = {
+            "available": kernel_available,
+            "reason": kernel_reason if kernel_reason is not None else None,
+        }
+        if not kernel_available and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=(
+                    "sglang-kernel==0.4.1 cannot be imported in the shared "
+                    f"runtime ({kernel_reason})"
+                ),
+            )
         datastore = str(cfg.get("sssd_datastore_path") or "") or None
         if datastore:
             ok, reason = _local_requirement(datastore)
@@ -261,10 +292,10 @@ def preflight_baseline(
                 "available": False,
                 "reason": "empty datastore is allowed; using prompt/self-output-only retrieval",
             }
-            if result["status"] == "ready":
-                result.update(
-                    status="aggregate_only",
-                    reason="SSSD datastore is empty; using prompt/self-output-only retrieval",
+        if result["status"] == "ready":
+            result.update(
+                status="aggregate_only",
+                reason="SSSD datastore is empty; using prompt/self-output-only retrieval",
                 )
 
     if baseline == "magicdec":
@@ -526,6 +557,8 @@ def build_adapter_command(
             str(max_samples),
             "--max-new-tokens",
             str(max_new_tokens),
+            "--max-input-tokens",
+            str(max_input),
             "--datastore-path",
             str(cfg.get("sssd_datastore_path") or ""),
             "--num-draft-tokens",

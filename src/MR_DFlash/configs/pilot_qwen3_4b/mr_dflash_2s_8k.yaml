@@ -51,7 +51,8 @@ training:
   weight_decay: 0.0
   num_anchors: 512
   loss_decay_gamma: 7.0
-  objective_chunk_blocks: 128
+  # B200 100 GB: giảm đỉnh activation/lm_head; không đổi objective.
+  objective_chunk_blocks: 64
   attention_backend: sdpa
   loss_type: dflash
   indexer_train_mode: schedule

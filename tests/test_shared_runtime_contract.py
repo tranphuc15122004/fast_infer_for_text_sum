@@ -187,6 +187,11 @@ def test_preflight_checks_local_dflash_and_cuda():
     assert "cuda.is_available" in text
 
 
+def test_shared_preflight_checks_sssd_native_kernel():
+    text = (ROOT / "scripts/check_shared_env.py").read_text()
+    assert '"sgl_kernel"' in text
+
+
 def test_requirements_cover_runtime_preflight_modules():
     requirements = (ROOT / "requirements.txt").read_text()
     assert "sentence-transformers" in requirements

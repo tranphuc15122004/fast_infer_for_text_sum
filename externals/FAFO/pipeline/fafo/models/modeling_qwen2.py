@@ -20,7 +20,6 @@
 """ PyTorch Qwen2 model."""
 import inspect
 import math
-import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -36,9 +35,6 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import (
     PreTrainedModel,
-)
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_attention_mask,
 )
 
 from transformers.utils import (
@@ -65,10 +61,12 @@ _CONFIG_FOR_DOC = "Qwen2Config"
 
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-    warnings.warn(
-        "Calling `transformers.models.llama.modeling_llama._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask"
-    )
-    return _prepare_4d_attention_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
+    """Expand a 2-D padding mask without relying on deprecated Transformers APIs."""
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    inverted_mask = 1.0 - expanded_mask
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
 def _make_causal_mask(

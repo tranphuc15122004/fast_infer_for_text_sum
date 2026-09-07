@@ -84,6 +84,35 @@ def _env_int(name: str, default: int) -> int:
         raise SystemExit(f"{name} must be an integer") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+
+
+def resolve_max_input_tokens(mode: str, cli_value: int | None) -> int:
+    """Resolve the input cap, keeping smoke safe for quadratic attention.
+
+    LongBench smoke is a wiring/runtime check, not a full-length quality run.
+    The first canonical ``gov_report`` row is about 10k tokens, which is large
+    enough to make the eager HF baseline materialize a multi-GiB attention
+    matrix.  An explicit CLI value still wins; ``0`` intentionally disables
+    the cap for operators who want to override the smoke safety policy.
+    """
+    if cli_value is not None:
+        if cli_value < 0:
+            raise SystemExit("--max-input-tokens must be >= 0")
+        return cli_value
+    if mode == "smoke":
+        value = _env_int("LONG_BENCH_SMOKE_MAX_INPUT_TOKENS", 4096)
+    else:
+        value = _env_int("LONG_BENCH_MAX_INPUT_TOKENS", 0)
+    if value < 0:
+        raise SystemExit("LONG_BENCH input-token cap must be >= 0")
+    return value
+
+
 def _resolve(value: str | Path, *, base: Path = ROOT) -> Path:
     path = Path(value)
     return path if path.is_absolute() else (base / path).resolve()
@@ -508,6 +537,45 @@ def _missing_requested_gpus(report: Mapping[str, Any]) -> list[int]:
     return [index for index in requested if index not in present]
 
 
+def gpu_memory_guard_reason(
+    report: Mapping[str, Any], *, min_free_gb: float
+) -> str | None:
+    """Return an actionable reason when the selected GPU is already crowded.
+
+    ``nvidia-smi`` reports physical indices while torch uses the selected
+    ``CUDA_VISIBLE_DEVICES`` subset.  The runner has already applied that
+    mapping, so compare physical ids here before any model child is spawned.
+    If no inventory is available, leave the decision to the child process
+    rather than falsely claiming that the GPU is safe or unsafe.
+    """
+    if min_free_gb <= 0:
+        return None
+    host_gpus = list(report.get("host_gpus") or [])
+    if not host_gpus:
+        return None
+    requested = list(report.get("requested_ids") or [])
+    selected = requested or [int(host_gpus[0]["index"])]
+    by_index = {int(gpu["index"]): gpu for gpu in host_gpus}
+    failures: list[str] = []
+    for index in selected:
+        gpu = by_index.get(int(index))
+        if gpu is None:
+            failures.append(f"GPU {index}: not present on host")
+            continue
+        free = gpu.get("free_memory_gb")
+        if free is None:
+            failures.append(f"GPU {index}: free VRAM is unavailable")
+        elif float(free) < min_free_gb:
+            failures.append(f"GPU {index}: {float(free):.1f} GiB free")
+    if not failures:
+        return None
+    return (
+        f"selected GPU(s) do not meet the {min_free_gb:.1f} GiB free-VRAM "
+        f"guard ({'; '.join(failures)}). Stop other GPU processes or select a "
+        "different GPU; override with --min-free-gb 0 only if intentional."
+    )
+
+
 def print_gpu_summary(report: Mapping[str, Any], *, effective_cuda: bool) -> None:
     """Print a one-line GPU assignment banner for a normal run."""
     requested = report.get("requested_ids") or []
@@ -602,6 +670,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--warmup-runs", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=None)
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=None,
+        help="minimum free VRAM before launching children (default: 32; 0 disables)",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--preflight-only", action="store_true")
@@ -692,7 +766,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed = args.seed if args.seed is not None else _env_int("LONG_BENCH_SEED", 42)
     temperature = args.temperature if args.temperature is not None else float(os.environ.get("LONG_BENCH_TEMPERATURE", "0"))
     warmup_runs = args.warmup_runs if args.warmup_runs is not None else _env_int("LONG_BENCH_WARMUP_RUNS", 3)
-    max_input_tokens = args.max_input_tokens if args.max_input_tokens is not None else _env_int("LONG_BENCH_MAX_INPUT_TOKENS", 0)
+    max_input_tokens = resolve_max_input_tokens(args.mode, args.max_input_tokens)
+    min_free_gb = (
+        args.min_free_gb
+        if args.min_free_gb is not None
+        else _env_float("LONG_BENCH_MIN_FREE_GB", 32.0)
+    )
+    if min_free_gb < 0:
+        raise SystemExit("--min-free-gb/LONG_BENCH_MIN_FREE_GB must be >= 0")
+    gpu_guard_reason = gpu_memory_guard_reason(
+        gpu_report, min_free_gb=min_free_gb
+    ) if cuda_available else None
+    if gpu_guard_reason and not args.preflight_only:
+        print(f"[gpu] VRAM guard: {gpu_guard_reason}", file=sys.stderr)
+        return 2
     timeout_seconds = _env_int("LONG_BENCH_TIMEOUT_SECONDS", 900)
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     run_dir = output_root / run_id
@@ -715,6 +802,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "temperature": temperature,
         "warmup_runs": warmup_runs,
         "max_input_tokens": max_input_tokens,
+        "min_free_gb": min_free_gb,
+        "gpu_guard_reason": gpu_guard_reason,
         "seed": seed,
         "timeout_seconds": timeout_seconds,
         "strict": bool(args.strict),

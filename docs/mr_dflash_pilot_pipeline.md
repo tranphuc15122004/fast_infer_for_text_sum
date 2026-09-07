@@ -1,5 +1,10 @@
 # Pipeline thực nghiệm MR-DFlash pilot
 
+Profile B200 100 GB hiện hành được mô tả tại
+[`docs/mr_dflash_b200_profile.md`](mr_dflash_b200_profile.md). Các config
+pilot dùng `batch_size=1`, accumulation 4 và `objective_chunk_blocks=64` để
+giữ effective batch/fairness đồng thời chừa headroom VRAM.
+
 Tài liệu này khóa thực nghiệm công bằng trên cùng target `Qwen/Qwen3-4B`:
 
 | Variant | Draft | Feature target | Mục đích |

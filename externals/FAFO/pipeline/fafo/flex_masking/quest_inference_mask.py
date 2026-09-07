@@ -11,6 +11,7 @@ from pipeline.fafo.flex_masking.generation_mask import generating_gen_mask
 from pipeline.fafo.flex_masking.stream_mask import generating_stream_mask
 from pipeline.fafo.flex_masking.verification_mask import generating_verification_mask
 from pipeline.fafo.flex_masking.prefill_mask import generating_prefill_mask
+from pipeline.fafo.flex_masking.mask_cache import LazyBlockMaskCache
 
 
 def generate_quest_inference_mask(CONFIG_MAP):
@@ -50,10 +51,8 @@ def generate_quest_inference_mask(CONFIG_MAP):
         prefill_size
     )
     decoding_mask = or_masks(gen_mask, verification_mask, stream_mask, prefill_mask)
-    masks = []
-
-    for kv_len in range(128, 16580, 128):
-        mask = create_block_mask(decoding_mask, 1, 1, seq_len, kv_len, _compile=True)
-        masks.append(mask)
-
-    return masks
+    return LazyBlockMaskCache(
+        lambda kv_len: create_block_mask(
+            decoding_mask, 1, 1, seq_len, kv_len, _compile=True
+        )
+    )

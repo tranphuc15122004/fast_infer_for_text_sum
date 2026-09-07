@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -76,6 +77,61 @@ def test_sssd_command_uses_the_forked_sglang_entrypoint():
 def test_sssd_native_kernel_is_declared_for_the_server_runtime():
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "sglang-kernel==0.4.1" in requirements
+
+
+def test_sssd_preflight_rejects_broken_native_kernel(monkeypatch):
+    import common.longbench_adapter as adapter
+
+    monkeypatch.setattr(
+        adapter,
+        "_module_importable",
+        lambda name: (False, "ImportError: libnvrtc.so.12 is missing"),
+    )
+
+    result = adapter.preflight_baseline(
+        "sssd",
+        config={"model": "/models/llama"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert "libnvrtc.so.12" in result["reason"]
+
+
+def test_fafo_mask_cache_builds_contexts_beyond_static_limit():
+    fafo_root = ROOT / "externals" / "FAFO"
+    if str(fafo_root) not in sys.path:
+        sys.path.insert(0, str(fafo_root))
+
+    from pipeline.fafo.flex_masking.mask_cache import LazyBlockMaskCache
+
+    calls = []
+    masks = LazyBlockMaskCache(
+        lambda kv_len: calls.append(kv_len) or f"mask-{kv_len}",
+    )
+
+    assert masks[84] == "mask-10880"
+    assert masks[84] == "mask-10880"
+    assert calls == [10880]
+
+
+def test_fafo_expand_mask_has_no_transformers_deprecation_warning():
+    fafo_root = ROOT / "externals" / "FAFO"
+    if str(fafo_root) not in sys.path:
+        sys.path.insert(0, str(fafo_root))
+
+    import torch
+    from pipeline.fafo.models import modeling_llama, modeling_qwen2
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for module in (modeling_llama, modeling_qwen2):
+            expanded = module._expand_mask(
+                torch.ones((1, 3), dtype=torch.bool), torch.float32
+            )
+            assert expanded.shape == (1, 1, 3, 3)
+
+    assert not any("deprecated" in str(item.message).lower() for item in caught)
 
 
 def test_fafo_custom_generate_calls_return_tensors():

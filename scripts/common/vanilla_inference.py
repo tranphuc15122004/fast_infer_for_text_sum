@@ -32,7 +32,7 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-runs", type=int, default=3)
-    parser.add_argument("--max-input-tokens", type=int, default=0)
+    parser.add_argument("--max-input-tokens", type=int, default=None)
     parser.add_argument(
         "--device", default=os.environ.get("LONG_BENCH_DEVICE", "cuda")
     )
@@ -86,7 +86,8 @@ def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> 
     }
     if args.temperature > 0:
         kwargs["temperature"] = args.temperature
-    return model.generate(input_ids, **kwargs)
+    attention_mask = torch.ones_like(input_ids)
+    return model.generate(input_ids, attention_mask=attention_mask, **kwargs)
 
 
 def _next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -234,6 +235,10 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     if args.smoke:
         args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 8)
+        if args.max_input_tokens is None:
+            args.max_input_tokens = 4096
+    elif args.max_input_tokens is None:
+        args.max_input_tokens = 0
     if not args.data_file:
         raise SystemExit("--data-file or LONG_BENCH_DATA_FILE is required")
     if args.max_samples is not None and args.max_samples <= 0:

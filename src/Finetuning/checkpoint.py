@@ -176,7 +176,9 @@ class CheckpointManager:
             "draft_state_dict": torch.load(root / "draft_state_dict.pt", map_location=map_location, weights_only=True),
             "optimizer": torch.load(root / "optimizer.pt", map_location=map_location, weights_only=True),
             "scheduler": torch.load(root / "scheduler.pt", map_location=map_location, weights_only=True),
-            "rng_state": torch.load(root / "rng_state.pt", map_location=map_location, weights_only=False),
+            # RNG tensors stay on CPU; torch.set_rng_state expects a CPU byte
+            # tensor even when model/optimizer state is restored onto CUDA.
+            "rng_state": torch.load(root / "rng_state.pt", map_location="cpu", weights_only=False),
             "trainer_state": trainer_state,
             "extra": extra,
         }

@@ -48,14 +48,17 @@ training:
   strategy: mr_dflash
   num_epochs: 6
   max_steps: 10000
-  batch_size: 4
-  accumulation_steps: 1
+  # B200 100 GB: local batch thấp để giữ headroom và đồng nhất baseline;
+  # effective batch vẫn bằng 4 như protocol cũ.
+  batch_size: 1
+  accumulation_steps: 4
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
   num_anchors: 512
   loss_decay_gamma: 7.0
-  objective_chunk_blocks: 128
+  # B200 100 GB: giảm đỉnh activation/lm_head; không đổi objective.
+  objective_chunk_blocks: 64
   attention_backend: sdpa
   loss_type: dflash
   indexer_train_mode: schedule

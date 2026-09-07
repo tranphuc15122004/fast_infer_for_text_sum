@@ -107,6 +107,81 @@ def test_vanilla_record_contains_shared_timing_fields():
     assert record["attention_backend"] == "eager"
 
 
+def test_smoke_defaults_to_a_bounded_context_but_full_keeps_unlimited_inputs(monkeypatch):
+    import run_longbench_200
+
+    monkeypatch.delenv("LONG_BENCH_SMOKE_MAX_INPUT_TOKENS", raising=False)
+    monkeypatch.delenv("LONG_BENCH_MAX_INPUT_TOKENS", raising=False)
+
+    assert run_longbench_200.resolve_max_input_tokens("smoke", None) == 4096
+    assert run_longbench_200.resolve_max_input_tokens("full", None) == 0
+    assert run_longbench_200.resolve_max_input_tokens("smoke", 0) == 0
+
+
+def test_low_free_gpu_is_rejected_before_model_children_are_spawned():
+    from run_longbench_200 import gpu_memory_guard_reason
+
+    report = {
+        "requested_ids": [0],
+        "host_gpus": [
+            {"index": 0, "name": "NVIDIA B200", "free_memory_gb": 9.1}
+        ],
+    }
+
+    reason = gpu_memory_guard_reason(report, min_free_gb=32.0)
+
+    assert reason is not None
+    assert "GPU 0" in reason
+    assert "9.1" in reason
+
+
+def test_sssd_command_forwards_context_limit():
+    from common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "sssd",
+        config={
+            "python": "/usr/bin/python3",
+            "model": "/models/llama",
+            "max_input_tokens": 4096,
+            "smoke": True,
+        },
+        data_file=ROOT / "data/longbench_200/gov_report.jsonl",
+        output=ROOT / "outputs/test-sssd.jsonl",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert "--max-input-tokens" in command
+    assert command[command.index("--max-input-tokens") + 1] == "4096"
+
+
+def test_vanilla_generate_passes_attention_mask_to_avoid_pad_eos_ambiguity():
+    from types import SimpleNamespace
+
+    import torch
+
+    from common.vanilla_inference import _generate
+
+    class FakeModel:
+        generation_config = SimpleNamespace(pad_token_id=2)
+
+        def generate(self, input_ids, **kwargs):
+            self.kwargs = kwargs
+            return input_ids
+
+    model = FakeModel()
+    input_ids = torch.tensor([[5, 6, 2]])
+
+    _generate(
+        model,
+        input_ids,
+        SimpleNamespace(max_new_tokens=2, temperature=0.0),
+    )
+
+    assert torch.equal(model.kwargs["attention_mask"], torch.ones_like(input_ids))
+
+
 def test_registry_contains_exactly_requested_baselines():
     from common.longbench_adapter import BASELINES
 
