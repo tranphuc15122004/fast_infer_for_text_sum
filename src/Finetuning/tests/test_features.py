@@ -301,7 +301,9 @@ def test_capture_dataset_is_local_eval_no_grad_and_manifest_first(
     assert model.seen_output_hidden_states is True
     assert (output_dir / "manifest.json").is_file()
     stored = torch.load(
-        output_dir / "feature_00000000.pt", map_location="cpu", weights_only=True
+        output_dir / manifest.generation_dir / "feature_00000000.pt",
+        map_location="cpu",
+        weights_only=True,
     )
     assert torch.equal(stored["hidden_states"][:, :4], torch.ones(4, 4))
     assert torch.equal(stored["hidden_states"][:, 4:], torch.full((4, 4), 3.0))
@@ -332,8 +334,9 @@ def test_capture_dataset_republishes_without_stale_features(tmp_path, monkeypatc
     capture_dataset(str(snapshot), [example, example], output_dir, [0], 3, "cpu", torch.float32)
     capture_dataset(str(snapshot), [example], output_dir, [0], 3, "cpu", torch.float32)
 
-    assert len(OfflineFeatureDataset(output_dir)) == 1
-    assert len(list(output_dir.glob("feature_*.pt"))) == 1
+    dataset = OfflineFeatureDataset(output_dir)
+    assert len(dataset) == 1
+    assert len(list(dataset.record_root.glob("feature_*.pt"))) == 1
 
 
 def test_capture_dataset_rejects_fractional_loss_mask(tmp_path, monkeypatch) -> None:

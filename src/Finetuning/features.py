@@ -56,6 +56,7 @@ class FeatureManifest:
     loss_mask_dtype: str = "torch.float32"
     hidden_states_dtype: str = "torch.float32"
     schema_version: str = FEATURE_SCHEMA_VERSION
+    generation_dir: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_id, str) or not self.model_id:
@@ -121,6 +122,7 @@ class FeatureManifest:
             "input_ids_dtype": self.input_ids_dtype,
             "loss_mask_dtype": self.loss_mask_dtype,
             "hidden_states_dtype": self.hidden_states_dtype,
+            "generation_dir": self.generation_dir,
         }
 
     @classmethod
@@ -149,6 +151,11 @@ class FeatureManifest:
                 payload.get("hidden_states_dtype", payload.get("dtype", "torch.float32"))
             ),
             schema_version=str(payload.get("schema_version", FEATURE_SCHEMA_VERSION)),
+            generation_dir=(
+                str(payload["generation_dir"])
+                if payload.get("generation_dir") is not None
+                else None
+            ),
         )
 
 
@@ -277,11 +284,21 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         if not isinstance(manifest, FeatureManifest):
             raise TypeError("manifest must be a FeatureManifest or mapping")
         self.manifest = manifest
+        self.record_root = self.root
+        if manifest.generation_dir is not None:
+            root_resolved = self.root.resolve()
+            record_root = (self.root / manifest.generation_dir).resolve()
+            if root_resolved not in record_root.parents or not record_root.is_dir():
+                raise ValueError(
+                    "feature manifest generation_dir must name a directory inside root: "
+                    f"{manifest.generation_dir!r}"
+                )
+            self.record_root = record_root
         suffixes = (".pt", ".pth", ".ckpt", ".ckpt.gz")
         self._paths = sorted(
             (
                 path
-                for path in self.root.rglob("*")
+                for path in self.record_root.rglob("*")
                 if path.is_file() and path.name.endswith(suffixes)
             ),
             key=lambda path: path.relative_to(self.root).as_posix(),

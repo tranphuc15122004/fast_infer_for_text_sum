@@ -87,24 +87,22 @@ def _validate_feature_output_dir(destination: Path) -> None:
             )
 
 
-def _publish_feature_directory(staging: Path, destination: Path) -> None:
-    """Atomically replace a dedicated feature directory with a generation."""
+def _publish_feature_generation(
+    staging: Path,
+    destination: Path,
+    manifest: FeatureManifest,
+) -> None:
+    """Publish a complete immutable generation behind an atomic manifest."""
 
-    if not destination.exists():
-        os.replace(staging, destination)
-        return
-    _validate_feature_output_dir(destination)
-    backup = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.old-", dir=destination.parent)
-    )
-    backup.rmdir()
-    os.replace(destination, backup)
-    try:
-        os.replace(staging, destination)
-    except BaseException:
-        os.replace(backup, destination)
-        raise
-    shutil.rmtree(backup)
+    generations = destination / ".generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    generation_name = staging.name.lstrip(".")
+    generation_dir = generations / f"generation-{generation_name}"
+    os.replace(staging, generation_dir)
+    manifest.generation_dir = generation_dir.relative_to(destination).as_posix()
+    # Readers either retain the old manifest/generation or observe this new
+    # manifest after its complete generation has already been renamed in.
+    _atomic_json_save(manifest.to_dict(), destination / FEATURE_MANIFEST_FILENAME)
 
 
 def _target_config(model: Any) -> Any:
@@ -221,6 +219,8 @@ def capture_dataset(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         _validate_feature_output_dir(destination)
+    else:
+        destination.mkdir(parents=True)
     model = _load_local_target(model_path, device_obj, requested_dtype)
     config = _target_config(model)
     num_layers = int(getattr(config, "num_hidden_layers", 0))
@@ -285,9 +285,8 @@ def capture_dataset(
             _atomic_torch_save(record, staging / f"feature_{index:08d}.pt")
 
         # Publish only a complete generation.  A loader either sees the old
-        # directory or the new one, never a partial mixture of records.
-        _atomic_json_save(manifest.to_dict(), staging / FEATURE_MANIFEST_FILENAME)
-        _publish_feature_directory(staging, destination)
+        # manifest/generation or the new one, never a partial mixture.
+        _publish_feature_generation(staging, destination, manifest)
         return manifest
     finally:
         if staging.exists():
