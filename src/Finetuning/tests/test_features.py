@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +84,93 @@ def test_invalid_feature_width_and_dtypes_are_rejected() -> None:
             },
             manifest,
         )
+
+
+def test_manifest_and_records_reject_non_integer_input_ids() -> None:
+    manifest = tiny_manifest()
+    with pytest.raises(ValueError, match="input_ids.*integer"):
+        FeatureManifest(
+            model_id="tiny-qwen3",
+            layer_ids=[1, 3],
+            hidden_size=4,
+            max_length=8,
+            input_ids_dtype="torch.float32",
+        )
+    with pytest.raises(ValueError, match="input_ids.*integer"):
+        validate_feature_record(
+            {
+                "input_ids": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+                "loss_mask": torch.tensor([0, 1, 1, 0], dtype=torch.float32),
+                "hidden_states": torch.ones(4, 8),
+            },
+            manifest,
+        )
+
+
+def test_fractional_loss_mask_is_rejected() -> None:
+    manifest = tiny_manifest()
+
+    with pytest.raises(ValueError, match="binary"):
+        validate_feature_record(
+            {
+                "input_ids": torch.ones(4, dtype=torch.long),
+                "loss_mask": torch.tensor([0.0, 0.5, 1.0, 0.0]),
+                "hidden_states": torch.ones(4, 8),
+            },
+            manifest,
+        )
+
+
+def test_collator_canonicalizes_integral_ids_and_binary_masks() -> None:
+    _require_feature_api()
+
+    batch = collate_features(
+        [
+            {
+                "input_ids": torch.tensor([1.0, 2.0]),
+                "loss_mask": torch.tensor([0, 1], dtype=torch.int64),
+                "hidden_states": torch.ones(2, 4),
+            }
+        ]
+    )
+
+    assert batch["input_ids"].dtype == torch.long
+    assert batch["loss_mask"].dtype == torch.float32
+
+
+def _write_feature(path, *, length: int = 5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "input_ids": torch.arange(1, length + 1, dtype=torch.long),
+        "loss_mask": torch.tensor([0, 1, 1, 1, 0], dtype=torch.float32)[:length],
+        "hidden_states": torch.ones(length, 8),
+    }
+    if path.name.endswith(".gz"):
+        with gzip.open(path, "wb") as handle:
+            torch.save(payload, handle)
+    else:
+        torch.save(payload, path)
+
+
+def test_offline_dataset_recurses_reads_gzip_and_truncates_consistently(tmp_path) -> None:
+    _require_feature_api()
+    manifest = FeatureManifest(
+        model_id="tiny-qwen3", layer_ids=[1, 3], hidden_size=4, max_length=3
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(manifest.to_dict()), encoding="utf-8"
+    )
+    _write_feature(tmp_path / "nested" / "plain.ckpt")
+    _write_feature(tmp_path / "deeper" / "compressed.ckpt.gz")
+
+    dataset = OfflineFeatureDataset(tmp_path)
+
+    assert len(dataset) == 2
+    for record in dataset:
+        assert record["input_ids"].shape == (3,)
+        assert record["loss_mask"].shape == (3,)
+        assert record["hidden_states"].shape == (3, 8)
+        assert record["loss_mask"].tolist() == [0.0, 1.0, 1.0]
 
 
 def test_feature_validation_rejects_missing_adjacent_supervision() -> None:
@@ -197,7 +286,7 @@ def test_capture_dataset_is_local_eval_no_grad_and_manifest_first(
     output_dir = tmp_path / "features"
     examples = [
         {
-            "input_ids": torch.tensor([1, 2, 3, 4], dtype=torch.long),
+            "input_ids": torch.tensor([1.0, 2.0, 3.0, 4.0]),
             "loss_mask": torch.tensor([0, 1, 1, 0], dtype=torch.float32),
         }
     ]
@@ -216,7 +305,66 @@ def test_capture_dataset_is_local_eval_no_grad_and_manifest_first(
     )
     assert torch.equal(stored["hidden_states"][:, :4], torch.ones(4, 4))
     assert torch.equal(stored["hidden_states"][:, 4:], torch.full((4, 4), 3.0))
+    assert stored["input_ids"].dtype == torch.long
     assert len(OfflineFeatureDataset(output_dir, manifest=manifest)) == 1
+
+
+def test_capture_dataset_republishes_without_stale_features(tmp_path, monkeypatch) -> None:
+    _require_feature_api()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    model = FakeTargetModel()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(_path, **_kwargs):
+            return model
+
+    import transformers
+
+    monkeypatch.setattr(transformers, "AutoModelForCausalLM", FakeAutoModel)
+    example = {
+        "input_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+        "loss_mask": torch.tensor([0, 1, 1], dtype=torch.float32),
+    }
+    output_dir = tmp_path / "features"
+
+    capture_dataset(str(snapshot), [example, example], output_dir, [0], 3, "cpu", torch.float32)
+    capture_dataset(str(snapshot), [example], output_dir, [0], 3, "cpu", torch.float32)
+
+    assert len(OfflineFeatureDataset(output_dir)) == 1
+    assert len(list(output_dir.glob("feature_*.pt"))) == 1
+
+
+def test_capture_dataset_rejects_fractional_loss_mask(tmp_path, monkeypatch) -> None:
+    _require_feature_api()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    model = FakeTargetModel()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(_path, **_kwargs):
+            return model
+
+    import transformers
+
+    monkeypatch.setattr(transformers, "AutoModelForCausalLM", FakeAutoModel)
+    with pytest.raises(ValueError, match="binary"):
+        capture_dataset(
+            str(snapshot),
+            [
+                {
+                    "input_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+                    "loss_mask": torch.tensor([0.0, 0.5, 1.0]),
+                }
+            ],
+            tmp_path / "features",
+            [0],
+            3,
+            "cpu",
+            torch.float32,
+        )
 
 
 def test_capture_dataset_fails_on_missing_snapshot_and_width_mismatch(

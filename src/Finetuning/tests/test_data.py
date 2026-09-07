@@ -69,6 +69,34 @@ class FakeQwenTokenizer:
         return ids
 
 
+class MismatchQwenTokenizer(FakeQwenTokenizer):
+    """Tokenizer whose standalone summary encoding differs from chat encoding."""
+
+    all_special_ids = [97, 99]
+
+    def __call__(self, text: str, *, add_special_tokens: bool = False, **_kwargs):
+        del text, add_special_tokens
+        return {"input_ids": [700, 701]}
+
+    def apply_chat_template(
+        self,
+        conversation,
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        return_dict: bool = False,
+        **_kwargs,
+    ):
+        ids = super().apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=return_dict,
+        )
+        if not add_generation_prompt and conversation[-1]["role"] == "assistant":
+            ids.insert(-1, 97)  # end-of-turn control token before EOS
+        return ids
+
 def test_load_summary_jsonl_preserves_unicode_and_metadata() -> None:
     _require_data_api()
     fixture = Path(__file__).parent / "fixtures" / "synthetic_summary.jsonl"
@@ -116,3 +144,14 @@ def test_render_summary_example_rejects_short_supervision_after_truncation() -> 
 
     with pytest.raises(ValueError, match="two consecutive supervised tokens"):
         render_summary_example(record, FakeQwenTokenizer(), max_length=32)
+
+
+def test_render_fallback_does_not_supervise_control_token_suffix() -> None:
+    _require_data_api()
+    record = SummaryRecord(id="mismatch", document="Tài liệu", summary="Một bản")
+
+    example = render_summary_example(record, MismatchQwenTokenizer(), max_length=32)
+
+    control_positions = (example["input_ids"] == 97) | (example["input_ids"] == 99)
+    assert example["loss_mask"][control_positions].sum().item() == 0
+    assert example["loss_mask"].sum().item() == 2

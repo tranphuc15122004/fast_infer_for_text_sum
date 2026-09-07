@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gzip
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -29,6 +30,15 @@ def _resolve_dtype(name: str) -> torch.dtype:
     if not isinstance(value, torch.dtype):
         raise ValueError(f"unsupported tensor dtype in feature manifest: {name!r}")
     return value
+
+
+_INTEGER_DTYPES = {
+    torch.int8,
+    torch.uint8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
 
 
 @dataclass
@@ -82,6 +92,11 @@ class FeatureManifest:
             self.hidden_states_dtype,
         ):
             _resolve_dtype(dtype_name)
+        if _resolve_dtype(self.input_ids_dtype) not in _INTEGER_DTYPES:
+            raise ValueError(
+                "feature manifest input_ids_dtype must be an integer dtype, "
+                f"got {self.input_ids_dtype}"
+            )
         if self.schema_version != FEATURE_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported feature manifest schema {self.schema_version!r}"
@@ -181,16 +196,15 @@ def validate_feature_record(
             f"input_ids={lengths[0]}, loss_mask={lengths[1]}, "
             f"hidden_states={lengths[2]}"
         )
-    sequence_length = int(lengths[0])
-    if sequence_length > manifest.max_length:
-        raise ValueError(
-            f"feature sequence length {sequence_length} exceeds max_length "
-            f"{manifest.max_length}"
-        )
     if int(hidden_states.shape[1]) != manifest.feature_width:
         raise ValueError(
             "feature width mismatch: "
             f"{hidden_states.shape[1]} != {manifest.feature_width}"
+        )
+    if input_ids.dtype not in _INTEGER_DTYPES:
+        raise ValueError(
+            "feature input_ids must use an integer dtype, "
+            f"got {input_ids.dtype}"
         )
     expected_dtypes = {
         "input_ids": _resolve_dtype(manifest.input_ids_dtype),
@@ -210,9 +224,13 @@ def validate_feature_record(
             )
     if not torch.isfinite(loss_mask.float()).all():
         raise ValueError("feature loss_mask contains non-finite values")
+    if not torch.all((loss_mask == 0) | (loss_mask == 1)):
+        raise ValueError("feature loss_mask values must be binary (0 or 1)")
     if not torch.isfinite(hidden_states.float()).all():
         raise ValueError("feature hidden_states contains non-finite values")
-    mask = loss_mask.detach().cpu().tolist()
+    # SpecForge truncates aligned tensors before checking the minimum
+    # supervised span for the shifted objective.
+    mask = loss_mask[: manifest.max_length].detach().cpu().tolist()
     if not any(bool(current) and bool(following) for current, following in zip(mask, mask[1:])):
         raise ValueError(
             "offline feature requires two consecutive supervised tokens"
@@ -220,10 +238,13 @@ def validate_feature_record(
 
 
 def _load_record(path: Path) -> dict[str, torch.Tensor]:
+    opener = gzip.open if path.name.endswith(".gz") else open
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        with opener(path, "rb") as handle:
+            payload = torch.load(handle, map_location="cpu", weights_only=True)
     except TypeError:  # compatibility with older local torch builds
-        payload = torch.load(path, map_location="cpu")
+        with opener(path, "rb") as handle:
+            payload = torch.load(handle, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"feature file must contain a tensor mapping: {path}")
     return payload
@@ -256,10 +277,14 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         if not isinstance(manifest, FeatureManifest):
             raise TypeError("manifest must be a FeatureManifest or mapping")
         self.manifest = manifest
+        suffixes = (".pt", ".pth", ".ckpt", ".ckpt.gz")
         self._paths = sorted(
-            path
-            for path in self.root.iterdir()
-            if path.is_file() and path.suffix in {".pt", ".pth", ".ckpt"}
+            (
+                path
+                for path in self.root.rglob("*")
+                if path.is_file() and path.name.endswith(suffixes)
+            ),
+            key=lambda path: path.relative_to(self.root).as_posix(),
         )
         if not self._paths:
             raise ValueError(f"offline feature directory has no tensor records: {self.root}")
@@ -277,11 +302,34 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         input_ids = _one_dimensional(payload["input_ids"], "input_ids")
         loss_mask = _one_dimensional(payload["loss_mask"], "loss_mask")
         hidden_states = _hidden_2d(payload["hidden_states"])
+        max_length = self.manifest.max_length
         return {
-            "input_ids": input_ids.detach().cpu(),
-            "loss_mask": loss_mask.detach().cpu(),
-            "hidden_states": hidden_states.detach().cpu(),
+            "input_ids": input_ids[:max_length].detach().cpu(),
+            "loss_mask": loss_mask[:max_length].detach().cpu(),
+            "hidden_states": hidden_states[:max_length].detach().cpu(),
         }
+
+
+def _canonicalize_input_ids(value: torch.Tensor) -> torch.Tensor:
+    """Convert integral ids to the long dtype required by embeddings."""
+
+    if value.dtype in _INTEGER_DTYPES:
+        return value.to(dtype=torch.long)
+    if value.dtype.is_floating_point:
+        if not torch.isfinite(value).all() or not torch.equal(value, value.round()):
+            raise ValueError("input_ids must contain integer values")
+        return value.to(dtype=torch.long)
+    raise ValueError(f"input_ids must use an integer dtype, got {value.dtype}")
+
+
+def _canonicalize_loss_mask(value: torch.Tensor) -> torch.Tensor:
+    """Normalize binary masks to the float dtype consumed by the objective."""
+
+    if value.dtype.is_floating_point and not torch.isfinite(value).all():
+        raise ValueError("loss_mask contains non-finite values")
+    if not torch.all((value == 0) | (value == 1)):
+        raise ValueError("loss_mask values must be binary (0 or 1)")
+    return value.to(dtype=torch.float32)
 
 
 def collate_features(
@@ -296,8 +344,12 @@ def collate_features(
         missing = [key for key in FEATURE_KEYS if key not in feature]
         if missing:
             raise ValueError(f"feature {index} missing required keys {missing}")
-        input_ids = _one_dimensional(feature["input_ids"], "input_ids")
-        loss_mask = _one_dimensional(feature["loss_mask"], "loss_mask")
+        input_ids = _canonicalize_input_ids(
+            _one_dimensional(feature["input_ids"], "input_ids")
+        )
+        loss_mask = _canonicalize_loss_mask(
+            _one_dimensional(feature["loss_mask"], "loss_mask")
+        )
         hidden_states = _hidden_2d(feature["hidden_states"])
         lengths = (input_ids.shape[0], loss_mask.shape[0], hidden_states.shape[0])
         if len(set(int(length) for length in lengths)) != 1:

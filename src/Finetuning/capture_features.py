@@ -6,6 +6,7 @@ import json
 from itertools import chain
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Iterable, Mapping
 
@@ -14,8 +15,9 @@ import torch
 from .features import (
     FEATURE_MANIFEST_FILENAME,
     FeatureManifest,
+    _canonicalize_input_ids,
+    _canonicalize_loss_mask,
     _dtype_name,
-    _resolve_dtype,
     validate_feature_record,
 )
 
@@ -69,6 +71,40 @@ def _atomic_json_save(payload: Mapping[str, Any], path: Path) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _validate_feature_output_dir(destination: Path) -> None:
+    """Reject replacement of a directory containing unrelated user files."""
+
+    if destination.is_symlink() or not destination.is_dir():
+        raise ValueError(f"feature output path is not a directory: {destination}")
+    allowed_suffixes = (".pt", ".pth", ".ckpt", ".ckpt.gz")
+    for path in destination.rglob("*"):
+        if path.is_file() and path.name != FEATURE_MANIFEST_FILENAME and not path.name.endswith(allowed_suffixes):
+            raise ValueError(
+                "refusing to replace feature output containing unrelated file: "
+                f"{path}"
+            )
+
+
+def _publish_feature_directory(staging: Path, destination: Path) -> None:
+    """Atomically replace a dedicated feature directory with a generation."""
+
+    if not destination.exists():
+        os.replace(staging, destination)
+        return
+    _validate_feature_output_dir(destination)
+    backup = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.old-", dir=destination.parent)
+    )
+    backup.rmdir()
+    os.replace(destination, backup)
+    try:
+        os.replace(staging, destination)
+    except BaseException:
+        os.replace(backup, destination)
+        raise
+    shutil.rmtree(backup)
 
 
 def _target_config(model: Any) -> Any:
@@ -181,9 +217,11 @@ def capture_dataset(
     requested_dtype = _as_dtype(dtype)
     model_path = Path(target_model_path)
     device_obj = torch.device(device)
-    model = _load_local_target(model_path, device_obj, requested_dtype)
     destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        _validate_feature_output_dir(destination)
+    model = _load_local_target(model_path, device_obj, requested_dtype)
     config = _target_config(model)
     num_layers = int(getattr(config, "num_hidden_layers", 0))
     hidden_size = int(getattr(config, "hidden_size", 0))
@@ -197,10 +235,20 @@ def capture_dataset(
     except StopIteration as exc:
         raise ValueError("capture_dataset requires at least one prepared example") from exc
 
-    first_ids = _as_1d_tensor(first_example["input_ids"], "input_ids")
-    first_mask = _as_1d_tensor(first_example["loss_mask"], "loss_mask")
-    input_ids_dtype = _dtype_name(first_ids.dtype)
-    loss_mask_dtype = _dtype_name(first_mask.dtype)
+    def prepare_example(example: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        first_ids = _as_1d_tensor(example["input_ids"], "input_ids")
+        first_mask = _as_1d_tensor(example["loss_mask"], "loss_mask")
+        if first_ids.shape[0] != first_mask.shape[0]:
+            raise ValueError(
+                "prepared example has mismatched sequence lengths: "
+                f"input_ids={first_ids.shape[0]}, loss_mask={first_mask.shape[0]}"
+            )
+        return (
+            _canonicalize_input_ids(first_ids)[:max_length],
+            _canonicalize_loss_mask(first_mask)[:max_length],
+        )
+
+    first_ids, first_mask = prepare_example(first_example)
     manifest = FeatureManifest(
         model_id=str(model_path),
         revision=getattr(config, "_commit_hash", None),
@@ -208,55 +256,42 @@ def capture_dataset(
         layer_ids=layer_ids,
         hidden_size=hidden_size,
         max_length=max_length,
-        input_ids_dtype=input_ids_dtype,
-        loss_mask_dtype=loss_mask_dtype,
+        input_ids_dtype=_dtype_name(first_ids.dtype),
+        loss_mask_dtype=_dtype_name(first_mask.dtype),
         hidden_states_dtype=_dtype_name(requested_dtype),
     )
 
-    for index, example in enumerate(chain((first_example,), examples)):
-        input_ids = _as_1d_tensor(example["input_ids"], "input_ids")
-        loss_mask = _as_1d_tensor(example["loss_mask"], "loss_mask")
-        if input_ids.shape[0] != loss_mask.shape[0]:
-            raise ValueError(
-                "prepared example has mismatched sequence lengths: "
-                f"input_ids={input_ids.shape[0]}, loss_mask={loss_mask.shape[0]}"
-            )
-        input_ids = input_ids[:max_length]
-        loss_mask = loss_mask[:max_length]
-        if input_ids.dtype != _resolve_dtype(manifest.input_ids_dtype):
-            raise ValueError(
-                f"prepared example input_ids dtype mismatch: {input_ids.dtype} != "
-                f"{manifest.input_ids_dtype}"
-            )
-        if loss_mask.dtype != _resolve_dtype(manifest.loss_mask_dtype):
-            raise ValueError(
-                f"prepared example loss_mask dtype mismatch: {loss_mask.dtype} != "
-                f"{manifest.loss_mask_dtype}"
-            )
-        hidden_states = _capture_hidden_feature(
-            model, input_ids, layer_ids, device_obj, requested_dtype
-        )
-        if hidden_states.shape != (input_ids.shape[0], manifest.feature_width):
-            raise ValueError(
-                "captured feature width mismatch: "
-                f"got {tuple(hidden_states.shape)}, expected "
-                f"({input_ids.shape[0]}, {manifest.feature_width})"
-            )
-        record = {
-            "input_ids": input_ids,
-            "loss_mask": loss_mask,
-            "hidden_states": hidden_states,
-        }
-        validate_feature_record(record, manifest)
-        _atomic_torch_save(record, destination / f"feature_{index:08d}.pt")
-
-    # The manifest is committed last, atomically.  OfflineFeatureDataset
-    # refuses to open a directory without this file, so loaders cannot observe
-    # a partially published store.
-    _atomic_json_save(
-        manifest.to_dict(), destination / FEATURE_MANIFEST_FILENAME
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.new-", dir=destination.parent)
     )
-    return manifest
+    try:
+        for index, example in enumerate(chain((first_example,), examples)):
+            input_ids, loss_mask = prepare_example(example)
+            hidden_states = _capture_hidden_feature(
+                model, input_ids, layer_ids, device_obj, requested_dtype
+            )
+            if hidden_states.shape != (input_ids.shape[0], manifest.feature_width):
+                raise ValueError(
+                    "captured feature width mismatch: "
+                    f"got {tuple(hidden_states.shape)}, expected "
+                    f"({input_ids.shape[0]}, {manifest.feature_width})"
+                )
+            record = {
+                "input_ids": input_ids,
+                "loss_mask": loss_mask,
+                "hidden_states": hidden_states,
+            }
+            validate_feature_record(record, manifest)
+            _atomic_torch_save(record, staging / f"feature_{index:08d}.pt")
+
+        # Publish only a complete generation.  A loader either sees the old
+        # directory or the new one, never a partial mixture of records.
+        _atomic_json_save(manifest.to_dict(), staging / FEATURE_MANIFEST_FILENAME)
+        _publish_feature_directory(staging, destination)
+        return manifest
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 __all__ = ["capture_dataset"]

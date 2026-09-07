@@ -205,6 +205,25 @@ def _find_subsequence(sequence: list[int], subsequence: list[int], start: int) -
     return None
 
 
+def _tokenizer_control_ids(tokenizer: Any) -> set[int]:
+    control_ids = {
+        int(value)
+        for value in (getattr(tokenizer, "all_special_ids", ()) or ())
+    }
+    for name in (
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "unk_token_id",
+        "im_end_id",
+        "end_of_turn_token_id",
+    ):
+        value = getattr(tokenizer, name, None)
+        if value is not None:
+            control_ids.add(int(value))
+    return control_ids
+
+
 def render_summary_example(
     record: SummaryRecord,
     tokenizer: Any,
@@ -243,17 +262,21 @@ def render_summary_example(
     )
     summary_ids = _tokenize_text(tokenizer, record.summary)
     assistant_start = _find_subsequence(full_ids, summary_ids, len(prefix_ids))
+    used_fallback = assistant_start is None
     if assistant_start is None:
-        # Templates that tokenize content differently inside a role still have
-        # the assistant generation prefix.  Exclude a trailing EOS marker when
-        # possible, but fail later if the fallback leaves too little training
-        # signal.
+        # A standalone content tokenization can differ from the tokenization
+        # inside a chat-template role.  In that case, the generation prefix is
+        # still a safe lower bound, but the suffix must be filtered for known
+        # control tokens rather than supervising the complete assistant turn.
         assistant_start = min(len(prefix_ids), len(full_ids))
+        control_ids = _tokenizer_control_ids(tokenizer)
+        if assistant_start >= len(full_ids) or not control_ids:
+            raise ValueError(
+                "cannot locate a safe assistant content span in chat template"
+            )
         assistant_end = len(full_ids)
-        eos_token_id = getattr(tokenizer, "eos_token_id", None)
-        if assistant_end > assistant_start and eos_token_id is not None:
-            if full_ids[assistant_end - 1] == int(eos_token_id):
-                assistant_end -= 1
+        while assistant_end > assistant_start and full_ids[assistant_end - 1] in control_ids:
+            assistant_end -= 1
     else:
         assistant_end = assistant_start + len(summary_ids)
 
@@ -261,6 +284,16 @@ def render_summary_example(
     clipped_end = min(assistant_end, input_ids.shape[0])
     clipped_start = min(assistant_start, input_ids.shape[0])
     loss_mask = build_summary_loss_mask(input_ids, clipped_start, clipped_end)
+    if used_fallback:
+        control_ids = _tokenizer_control_ids(tokenizer)
+        loss_mask = loss_mask * torch.tensor(
+            [
+                0.0 if int(token_id) in control_ids else 1.0
+                for token_id in input_ids.tolist()
+            ],
+            dtype=loss_mask.dtype,
+            device=loss_mask.device,
+        )
     if loss_mask.numel():
         # Causal LM loss shifts labels one position to the right.  Keep the
         # public mask helper a pure span builder while making rendered samples
