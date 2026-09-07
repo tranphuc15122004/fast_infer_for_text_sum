@@ -18,6 +18,7 @@ from .features import (
     _canonicalize_input_ids,
     _canonicalize_loss_mask,
     _dtype_name,
+    _reject_symlink_components,
     validate_feature_record,
 )
 
@@ -220,6 +221,7 @@ def capture_dataset(
     model_path = Path(target_model_path)
     device_obj = torch.device(device)
     destination = Path(output_dir)
+    _reject_symlink_components(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         _validate_feature_output_dir(destination)

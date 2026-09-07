@@ -41,6 +41,17 @@ _INTEGER_DTYPES = {
 }
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """Reject symlinks in every lexical component of a feature path."""
+
+    absolute = path.absolute()
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"feature path cannot contain symlink component: {cursor}")
+
+
 @dataclass
 class FeatureManifest:
     """Provenance and tensor-shape contract for one feature directory."""
@@ -266,6 +277,7 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
         manifest: FeatureManifest | Mapping[str, Any] | None = None,
     ) -> None:
         self.root = Path(root)
+        _reject_symlink_components(self.root)
         if self.root.is_symlink() or not self.root.is_dir():
             raise FileNotFoundError(f"offline feature directory not found: {self.root}")
         manifest_path = self.root / FEATURE_MANIFEST_FILENAME

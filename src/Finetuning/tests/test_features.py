@@ -254,6 +254,13 @@ def test_offline_dataset_rejects_internal_and_record_symlinks(tmp_path) -> None:
     with pytest.raises(ValueError, match="symlink"):
         OfflineFeatureDataset(tmp_path)
 
+    outside_root = tmp_path / "outside_root"
+    outside_root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside_root, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        OfflineFeatureDataset(alias / "features")
+
     (tmp_path / "active").unlink()
     (tmp_path / "active").mkdir()
     (tmp_path / "active" / "feature_00000000.pt").symlink_to(
