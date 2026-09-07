@@ -5,8 +5,8 @@ Kiến trúc giữ nguyên logic SpecForge nhưng chỉ dùng ``torch`` (không 
 Qwen3 đều tự triển khai, nên model chạy được trên CPU cho contract test và dễ
 chỉnh sửa cho MR-DFlash. Attention dùng SDPA với additive mask dày đặc; mask
 được dựng ở tầng huấn luyện (block-parallel) theo đúng ngữ nghĩa DFlash:
-query draft chỉ attend context thật ``< anchor`` và các vị trí draft trước nó
-trong cùng block.
+query draft chỉ attend context thật ``< anchor`` và draft trong cùng block.
+Khi bật sliding attention, phần draft trong block chuyển sang causal.
 
 Khác SpecForge ở chỗ:
 - Không kế thừa ``Qwen3PreTrainedModel``; config truyền qua ``DraftSpec``.
@@ -185,7 +185,6 @@ class DFlashAttention(nn.Module):
         q = (q * q_cos) + (_rotate_half(q) * q_sin)
         k = (k * cos_k) + (_rotate_half(k) * sin_k)
 
-        q = q * self.scaling
         attn_output = F.scaled_dot_product_attention(
             q,
             k,
@@ -193,6 +192,7 @@ class DFlashAttention(nn.Module):
             attn_mask=attention_mask,
             dropout_p=0.0 if not self.training else 0.0,
             is_causal=False,
+            scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)

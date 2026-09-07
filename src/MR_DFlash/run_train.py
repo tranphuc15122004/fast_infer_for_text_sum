@@ -33,6 +33,7 @@ from .config import (
     TrainingConfig,
     resolve_draft_init_layer_ids,
     resolve_feature_layer_ids,
+    resolve_mr_stage_init_layer_ids,
 )
 from .model import DFlashDraftModel
 from .mr_model import MRDFlashDraftModel
@@ -111,6 +112,7 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "target_layer_ids": (cfg.model, "target_layer_ids"),
         "feature_layer_ids": (cfg.model, "feature_layer_ids"),
         "draft_init_layer_ids": (cfg.model, "draft_init_layer_ids"),
+        "mr_stage_init_layer_ids": (cfg.model, "mr_stage_init_layer_ids"),
         "block_size": (cfg.model, "block_size"),
         "mask_token_id": (cfg.model, "mask_token_id"),
         "draft_checkpoint_path": (cfg.model, "draft_checkpoint_path"),
@@ -122,6 +124,7 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "memory_local_window": (cfg.model, "memory_local_window"),
         "csa_top_k": (cfg.model, "csa_top_k"),
         "indexer_dim": (cfg.model, "indexer_dim"),
+        "indexer_num_heads": (cfg.model, "indexer_num_heads"),
         "train_data_path": (cfg.data, "train_data_path"),
         "eval_data_path": (cfg.data, "eval_data_path"),
         "eval_hidden_states_path": (cfg.data, "eval_hidden_states_path"),
@@ -145,6 +148,8 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "objective_chunk_blocks": (cfg.training, "objective_chunk_blocks"),
         "attention_backend": (cfg.training, "attention_backend"),
         "loss_type": (cfg.training, "loss_type"),
+        "indexer_train_mode": (cfg.training, "indexer_train_mode"),
+        "indexer_dense_steps": (cfg.training, "indexer_dense_steps"),
         "save_interval": (cfg.training, "save_interval"),
         "log_interval": (cfg.training, "log_interval"),
         "eval_interval": (cfg.training, "eval_interval"),
@@ -172,6 +177,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--feature-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--draft-init-layer-ids", type=int, nargs="+", default=None)
+    parser.add_argument("--mr-stage-init-layer-ids", type=int, nargs="+", default=None)
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--mask-token-id", type=int, default=None)
     parser.add_argument("--draft-checkpoint-path", type=str, default=None)
@@ -183,6 +189,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--memory-local-window", type=int, default=None)
     parser.add_argument("--csa-top-k", type=int, default=None)
     parser.add_argument("--indexer-dim", type=int, default=None)
+    parser.add_argument("--indexer-num-heads", type=int, default=None)
     parser.add_argument("--train-data-path", type=str, default=None)
     parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--eval-hidden-states-path", type=str, default=None)
@@ -206,6 +213,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--objective-chunk-blocks", type=int, default=None)
     parser.add_argument("--attention-backend", type=str, default=None)
     parser.add_argument("--loss-type", type=str, default=None)
+    parser.add_argument(
+        "--indexer-train-mode",
+        type=str,
+        choices=["schedule", "dense", "topk"],
+        default=None,
+    )
+    parser.add_argument("--indexer-dense-steps", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -331,6 +345,7 @@ def build_online_model(
             local_window=mcfg.memory_local_window,
             csa_top_k=mcfg.csa_top_k,
             indexer_dim=mcfg.indexer_dim,
+            indexer_num_heads=mcfg.indexer_num_heads,
         )
         draft = MRDFlashDraftModel(spec)
     else:
@@ -364,6 +379,14 @@ def build_online_model(
         objective_chunk_blocks=tcfg.objective_chunk_blocks,
         loss_type=tcfg.loss_type,
         attention_backend=tcfg.attention_backend,
+        **(
+            {
+                "indexer_train_mode": tcfg.indexer_train_mode,
+                "indexer_dense_steps": tcfg.indexer_dense_steps,
+            }
+            if mcfg.architecture == "mr_dflash"
+            else {}
+        ),
     ).to(device=device)
     return model
 
@@ -477,10 +500,16 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
 
     if cfg.model.init_draft_from_target:
         print("[run] init draft từ target layers ...")
-        draft_init_layer_ids = resolve_draft_init_layer_ids(
-            cfg.model,
-            num_target_layers=int(target_for_init.config.num_hidden_layers),
-        )
+        if cfg.model.architecture == "mr_dflash":
+            draft_init_layer_ids = resolve_mr_stage_init_layer_ids(
+                cfg.model,
+                num_target_layers=int(target_for_init.config.num_hidden_layers),
+            )
+        else:
+            draft_init_layer_ids = resolve_draft_init_layer_ids(
+                cfg.model,
+                num_target_layers=int(target_for_init.config.num_hidden_layers),
+            )
         copied = model.draft_model.init_from_target(
             target_for_init,
             target_layer_ids=draft_init_layer_ids,
@@ -512,6 +541,7 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         sample_limit=cfg.data.num_samples,
         expected_feature_width=model.draft_model.spec.context_feature_dim,
         expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
+        expected_target_model_path=cfg.model.target_model_path,
     )
     print(
         f"[run] dataset: {len(dataset)} mẫu, max_len={cfg.data.max_length}, "
@@ -528,6 +558,7 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
             run_id=f"{cfg.run_id}:eval",
             expected_feature_width=model.draft_model.spec.context_feature_dim,
             expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
+            expected_target_model_path=cfg.model.target_model_path,
         )
         if len(eval_dataset) == 0:
             raise RuntimeError("eval dataset rỗng — kiểm tra eval capture")

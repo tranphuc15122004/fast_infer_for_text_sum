@@ -423,6 +423,7 @@ class Trainer:
         save_draft_weights(
             str(self.output_dir / f"draft_{tag}.pt"),
             self._draft_state_dict(),
+            config_yaml=self.run_cfg.dump_yaml(),
         )
         print(f"[trainer] đã lưu checkpoint tại {path} (step {self.global_step})")
         barrier()

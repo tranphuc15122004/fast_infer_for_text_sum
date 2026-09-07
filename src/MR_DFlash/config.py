@@ -88,6 +88,40 @@ def resolve_draft_init_layer_ids(
     return values
 
 
+def resolve_mr_stage_init_layer_ids(
+    model_config: object,
+    *,
+    num_target_layers: int,
+) -> List[int]:
+    """Resolve target layers copied into MR stages.
+
+    MR stage depth is independent from ``draft_num_hidden_layers``. The new
+    field is preferred; accepting a same-length legacy list keeps old configs
+    readable while avoiding the one-layer-vs-two-stage ambiguity.
+    """
+    num_stages = int(getattr(model_config, "mr_num_stages"))
+    explicit = getattr(model_config, "mr_stage_init_layer_ids", None)
+    if explicit is None:
+        legacy = getattr(model_config, "draft_init_layer_ids", None)
+        explicit = legacy if legacy is not None and len(legacy) == num_stages else None
+    values = (
+        [int(value) for value in explicit]
+        if explicit is not None
+        else build_target_layer_ids(num_target_layers, num_stages)
+    )
+    if len(values) != num_stages:
+        raise ValueError(
+            "mr_stage_init_layer_ids phải có đúng số MR stage: "
+            f"{len(values)} != {num_stages}"
+        )
+    if any(value < 0 or value >= num_target_layers for value in values):
+        raise ValueError(
+            "mr_stage_init_layer_ids chứa layer ngoài target: "
+            f"values={values}, num_target_layers={num_target_layers}"
+        )
+    return values
+
+
 def resolve_dflash_attention_layout(
     layer_types: List[str],
     num_hidden_layers: int,
@@ -131,6 +165,8 @@ class ModelConfig:
     #: Các layer target dùng để copy weight vào draft khi init.
     #: None = tự sinh layout DFlash theo số draft layer.
     draft_init_layer_ids: Optional[List[int]] = None
+    #: Các layer target copy vào từng MR stage; độc lập với draft depth.
+    mr_stage_init_layer_ids: Optional[List[int]] = None
     #: Độ dài 1 block dự đoán song song.
     block_size: int = 16
     #: Loại attention từng draft layer: full_attention | sliding_attention.
@@ -147,7 +183,7 @@ class ModelConfig:
     init_draft_from_target: bool = False
     #: dtype huấn luyện.
     torch_dtype: str = "bfloat16"
-    #: Số stage target attention của MR-DFlash (HCA rồi CSA).
+    #: Số stage joint attention của MR-DFlash (route xen kẽ HCA/CSA).
     mr_num_stages: int = 2
     #: Tỉ lệ nén token cho memory HCA.
     hca_compression_ratio: int = 128
@@ -159,6 +195,8 @@ class ModelConfig:
     csa_top_k: int = 64
     #: Chiều projection Q/K indexer; null = hidden_size.
     indexer_dim: Optional[int] = None
+    #: Số head của Lightning-inspired indexer.
+    indexer_num_heads: int = 1
 
     def __post_init__(self) -> None:
         if self.architecture not in {"dflash", "mr_dflash"}:
@@ -182,7 +220,12 @@ class ModelConfig:
                 "target_layer_ids và feature_layer_ids phải giống nhau; "
                 "dùng feature_layer_ids cho config mới"
             )
-        for name in ("target_layer_ids", "feature_layer_ids", "draft_init_layer_ids"):
+        for name in (
+            "target_layer_ids",
+            "feature_layer_ids",
+            "draft_init_layer_ids",
+            "mr_stage_init_layer_ids",
+        ):
             values = getattr(self, name)
             if values is not None and (
                 not values or any(int(value) < 0 for value in values)
@@ -200,6 +243,8 @@ class ModelConfig:
                 raise ValueError(f"{name} phải >= 1")
         if self.indexer_dim is not None and self.indexer_dim < 1:
             raise ValueError("indexer_dim phải dương hoặc null")
+        if self.indexer_num_heads < 1:
+            raise ValueError("indexer_num_heads phải >= 1")
 
 
 @dataclass
@@ -259,6 +304,10 @@ class TrainingConfig:
     attention_backend: str = "sdpa"
     #: dflash | dpace | dpace-cumulative-confidence-only | ...
     loss_type: str = "dflash"
+    #: schedule = dense warm-up rồi hard Top-k; cũng hỗ trợ dense/topk cố định.
+    indexer_train_mode: str = "schedule"
+    #: Số optimizer step đầu chạy dense score-bias cho CSA indexer.
+    indexer_dense_steps: int = 1000
     save_interval: int = 1000
     log_interval: int = 10
     #: 0 = evaluate cuối run; >0 evaluate định kỳ theo optimizer step.
@@ -278,6 +327,13 @@ class TrainingConfig:
             )
         if self.loss_type not in VALID_LOSS_TYPES:
             raise ValueError(f"loss_type không hợp lệ: {self.loss_type}")
+        if self.indexer_train_mode not in {"schedule", "dense", "topk"}:
+            raise ValueError(
+                "indexer_train_mode phải là schedule, dense hoặc topk, "
+                f"got {self.indexer_train_mode}"
+            )
+        if self.indexer_dense_steps < 0:
+            raise ValueError("indexer_dense_steps phải >= 0")
         if not 0 <= self.warmup_ratio <= 1:
             raise ValueError(f"warmup_ratio phải thuộc [0,1], got {self.warmup_ratio}")
         if self.eval_interval < 0:
@@ -328,5 +384,6 @@ __all__ = [
     "build_target_layer_ids",
     "resolve_feature_layer_ids",
     "resolve_draft_init_layer_ids",
+    "resolve_mr_stage_init_layer_ids",
     "resolve_dflash_attention_layout",
 ]

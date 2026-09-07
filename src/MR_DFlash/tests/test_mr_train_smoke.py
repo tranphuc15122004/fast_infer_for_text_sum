@@ -84,6 +84,11 @@ def test_mr_train_smoke_and_checkpoint_reload_cpu() -> None:
             loss_type="dflash",
             attention_backend="sdpa",
         )
+        model.set_training_step(0)
+        assert model._effective_indexer_mode() == "dense"
+        model.set_training_step(1000)
+        assert model._effective_indexer_mode() == "topk"
+        model.set_training_step(0)
         before = draft.memory.adapter.hca.weight.detach().clone()
         cfg = RunConfig(
             run_id="mr-smoke",
@@ -138,6 +143,10 @@ def test_mr_train_smoke_and_checkpoint_reload_cpu() -> None:
         assert not torch.equal(before, draft.memory.adapter.hca.weight.detach())
         checkpoint = tmp / "out" / "checkpoint_final.pt"
         assert checkpoint.exists()
+
+        weights_payload = torch.load(tmp / "out" / "draft_final.pt", map_location="cpu", weights_only=False)
+        assert "config_yaml" in weights_payload
+        assert "mr_dflash" in weights_payload["config_yaml"]
 
         from MR_DFlash.checkpoint import warm_start_draft_model
 

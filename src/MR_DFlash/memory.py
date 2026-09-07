@@ -12,7 +12,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 
 def _check_feature_tensor(features: torch.Tensor, name: str = "features") -> None:
@@ -34,8 +33,9 @@ class MRMemoryState:
     local_csa: torch.Tensor
     local_positions: torch.Tensor
     pending_hca: torch.Tensor
+    pending_hca_positions: torch.Tensor
     pending_csa: torch.Tensor
-    pending_positions: torch.Tensor
+    pending_csa_positions: torch.Tensor
     total_tokens: int
 
 
@@ -83,11 +83,21 @@ class TargetFeatureAdapter(nn.Module):
 
 
 class WeightedTokenPool(nn.Module):
-    """Learned pooling trên từng nhóm token liên tiếp."""
+    """Learned pooling trên các nhóm token đầy đủ, liên tiếp.
 
-    def __init__(self, hidden_size: int) -> None:
+    Phần đuôi chưa đủ ``ratio`` token không thuộc pool. Caller giữ phần đó
+    trong pending cache để ``build`` và ``append`` có cùng semantics.
+    """
+
+    def __init__(self, hidden_size: int, max_ratio: int = 128) -> None:
         super().__init__()
-        self.score = nn.Linear(hidden_size, 1)
+        if max_ratio < 1:
+            raise ValueError("max_ratio phải >= 1")
+        self.max_ratio = int(max_ratio)
+        # One token weight per compressed channel (instead of one scalar per
+        # token), plus a learnable within-group positional bias.
+        self.score = nn.Linear(hidden_size, hidden_size)
+        self.position_bias = nn.Parameter(torch.zeros(self.max_ratio, hidden_size))
         self.value = nn.Linear(hidden_size, hidden_size, bias=False)
         with torch.no_grad():
             self.score.weight.zero_()
@@ -98,19 +108,19 @@ class WeightedTokenPool(nn.Module):
         _check_feature_tensor(tokens, "tokens")
         if ratio < 1:
             raise ValueError(f"ratio phải >= 1, got {ratio}")
+        if ratio > self.max_ratio:
+            raise ValueError(f"ratio={ratio} vượt max_ratio={self.max_ratio}")
         batch, length, hidden = tokens.shape
-        groups = (length + ratio - 1) // ratio
-        padded_length = groups * ratio
-        pad = padded_length - length
-        if pad:
-            tokens = F.pad(tokens, (0, 0, 0, pad))
-        valid = torch.arange(padded_length, device=tokens.device).view(1, groups, ratio)
-        valid = valid < length
+        groups = length // ratio
+        if groups < 1:
+            raise ValueError(
+                f"tokens phải có ít nhất một nhóm đầy đủ: length={length}, ratio={ratio}"
+            )
+        tokens = tokens[:, : groups * ratio]
         grouped = tokens.view(batch, groups, ratio, hidden)
-        scores = self.score(grouped).squeeze(-1)
-        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=-1)
-        return (weights.unsqueeze(-1) * self.value(grouped)).sum(dim=2)
+        scores = self.score(grouped) + self.position_bias[:ratio].view(1, 1, ratio, hidden)
+        weights = torch.softmax(scores, dim=2)
+        return (weights * self.value(grouped)).sum(dim=2)
 
 
 def _pool_with_positions(
@@ -137,9 +147,19 @@ def _pool_with_positions(
 
 
 class CSAIndexer(nn.Module):
-    """Learned query/key selector cho CSA memory."""
+    """Lightning-inspired learned query/key selector cho CSA memory.
 
-    def __init__(self, hidden_size: int, indexer_dim: Optional[int] = None) -> None:
+    Mỗi indexer head dùng interaction ``ReLU(q * k)`` và một trọng số head
+    phụ thuộc query. Đây vẫn là bản torch thuần gọn hơn Lightning Indexer
+    production, nhưng đã tách score path khỏi main attention projection.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        indexer_dim: Optional[int] = None,
+        num_heads: int = 1,
+    ) -> None:
         super().__init__()
         if hidden_size < 1:
             raise ValueError("hidden_size phải dương")
@@ -147,8 +167,15 @@ class CSAIndexer(nn.Module):
         self.indexer_dim = int(indexer_dim or hidden_size)
         if self.indexer_dim < 1:
             raise ValueError("indexer_dim phải dương")
+        if num_heads < 1 or self.indexer_dim % int(num_heads):
+            raise ValueError("indexer_dim phải chia hết cho indexer_num_heads")
+        self.num_heads = int(num_heads)
+        self.head_dim = self.indexer_dim // self.num_heads
         self.q_proj = nn.Linear(hidden_size, self.indexer_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.indexer_dim, bias=False)
+        self.weight_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
+        with torch.no_grad():
+            self.weight_proj.weight.zero_()
         self.scale = self.indexer_dim ** -0.5
 
     def select(
@@ -166,8 +193,7 @@ class CSAIndexer(nn.Module):
             raise ValueError("csa_memory phải có ít nhất một slot")
         if top_k < 1:
             raise ValueError("top_k phải >= 1")
-        scores = torch.matmul(self.q_proj(query), self.k_proj(csa_memory).transpose(-1, -2))
-        scores = scores * self.scale
+        scores = self.score(query, csa_memory)
         if allowed_mask is not None:
             if allowed_mask.shape != scores.shape:
                 raise ValueError(
@@ -179,6 +205,24 @@ class CSAIndexer(nn.Module):
         k = min(int(top_k), csa_memory.shape[1])
         top_scores, top_indices = scores.topk(k=k, dim=-1)
         return top_indices, top_scores
+
+    def score(self, query: torch.Tensor, csa_memory: torch.Tensor) -> torch.Tensor:
+        """Trả toàn bộ index scores để dense/indexer warm-up có gradient."""
+        if query.ndim != 3 or csa_memory.ndim != 3:
+            raise ValueError("query và csa_memory phải có dạng [batch, seq, hidden]")
+        if query.shape[0] != csa_memory.shape[0] or query.shape[-1] != self.hidden_size:
+            raise ValueError("query/csa_memory không cùng batch hoặc hidden size")
+        if csa_memory.shape[1] < 1:
+            raise ValueError("csa_memory phải có ít nhất một slot")
+        batch, query_len, _ = query.shape
+        memory_len = csa_memory.shape[1]
+        q = self.q_proj(query).view(batch, query_len, self.num_heads, self.head_dim)
+        k = self.k_proj(csa_memory).view(batch, memory_len, self.num_heads, self.head_dim)
+        similarity = torch.relu(
+            q.unsqueeze(2) * k.unsqueeze(1)
+        ).sum(dim=-1)
+        head_weights = 1.0 + self.weight_proj(query).unsqueeze(2)
+        return (similarity * head_weights).sum(dim=-1) * self.scale
 
     @staticmethod
     def gather(memory: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -205,6 +249,7 @@ class MRTargetMemory(nn.Module):
         local_window: int = 128,
         csa_top_k: int = 64,
         indexer_dim: Optional[int] = None,
+        indexer_num_heads: int = 1,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -222,9 +267,13 @@ class MRTargetMemory(nn.Module):
         self.local_window = int(local_window)
         self.csa_top_k = int(csa_top_k)
         self.adapter = TargetFeatureAdapter(input_dim, hidden_size)
-        self.hca_pool = WeightedTokenPool(hidden_size)
-        self.csa_pool = WeightedTokenPool(hidden_size)
-        self.indexer = CSAIndexer(hidden_size, indexer_dim=indexer_dim)
+        self.hca_pool = WeightedTokenPool(hidden_size, self.hca_compression_ratio)
+        self.csa_pool = WeightedTokenPool(hidden_size, self.csa_compression_ratio)
+        self.indexer = CSAIndexer(
+            hidden_size,
+            indexer_dim=indexer_dim,
+            num_heads=indexer_num_heads,
+        )
 
     def _positions(
         self,
@@ -245,32 +294,102 @@ class MRTargetMemory(nn.Module):
             )
         return positions.to(device=features.device, dtype=torch.long)
 
+    def _anchor_local_view(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather ``[B,Q,W,H]`` local views immediately before each anchor."""
+        query_positions = query_positions.to(device=tokens.device, dtype=torch.long)
+        if query_positions.ndim != 2 or query_positions.shape[0] != tokens.shape[0]:
+            raise ValueError(
+                "query_positions phải có dạng [batch, query] và cùng batch với features"
+            )
+        batch, query_len = query_positions.shape
+        length = tokens.shape[1]
+        offsets = torch.arange(
+            self.local_window, device=tokens.device, dtype=torch.long
+        )
+        # Positions are chronological. Counting values strictly before an
+        # anchor also handles non-zero prefix offsets without assuming that
+        # positions are exactly arange(length).
+        end = (positions.unsqueeze(1) < query_positions.unsqueeze(-1)).sum(dim=-1)
+        indices = end.unsqueeze(-1) - self.local_window + offsets
+        valid = (indices >= 0) & (indices < length)
+        safe_indices = indices.clamp(min=0, max=max(length - 1, 0))
+        expanded_tokens = tokens.unsqueeze(1).expand(-1, query_len, -1, -1)
+        gathered = torch.gather(
+            expanded_tokens,
+            2,
+            safe_indices.unsqueeze(-1).expand(-1, -1, -1, tokens.shape[-1]),
+        )
+        expanded_positions = positions.unsqueeze(1).expand(-1, query_len, -1)
+        gathered_positions = torch.gather(expanded_positions, 2, safe_indices)
+        gathered = gathered.masked_fill(~valid.unsqueeze(-1), 0)
+        invalid_position = torch.iinfo(torch.long).max
+        gathered_positions = gathered_positions.masked_fill(~valid, invalid_position)
+        return gathered.reshape(batch, query_len, self.local_window, -1), gathered_positions
+
     def build(
         self,
         features: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        query_positions: Optional[torch.Tensor] = None,
     ) -> MRMemoryState:
         _check_feature_tensor(features)
         pos = self._positions(features, positions)
         hca_tokens, csa_tokens = self.adapter(features)
-        hca, hca_pos = _pool_with_positions(
-            self.hca_pool, hca_tokens, pos, self.hca_compression_ratio
-        )
-        csa, csa_pos = _pool_with_positions(
-            self.csa_pool, csa_tokens, pos, self.csa_compression_ratio
-        )
-        local_start = max(0, features.shape[1] - self.local_window)
+        hca_complete = (hca_tokens.shape[1] // self.hca_compression_ratio) * self.hca_compression_ratio
+        csa_complete = (csa_tokens.shape[1] // self.csa_compression_ratio) * self.csa_compression_ratio
+        if hca_complete:
+            hca, hca_pos = _pool_with_positions(
+                self.hca_pool,
+                hca_tokens[:, :hca_complete],
+                pos[:, :hca_complete],
+                self.hca_compression_ratio,
+            )
+        else:
+            hca = hca_tokens[:, :0]
+            hca_pos = pos[:, :0]
+        if csa_complete:
+            csa, csa_pos = _pool_with_positions(
+                self.csa_pool,
+                csa_tokens[:, :csa_complete],
+                pos[:, :csa_complete],
+                self.csa_compression_ratio,
+            )
+        else:
+            csa = csa_tokens[:, :0]
+            csa_pos = pos[:, :0]
+        if query_positions is None:
+            local_start = max(0, features.shape[1] - self.local_window)
+            local_hca = hca_tokens[:, local_start:]
+            local_csa = csa_tokens[:, local_start:]
+            local_pos = pos[:, local_start:]
+        else:
+            local_hca, local_pos = self._anchor_local_view(
+                hca_tokens, pos, query_positions
+            )
+            local_csa, csa_local_pos = self._anchor_local_view(
+                csa_tokens, pos, query_positions
+            )
+            # Both streams represent the same raw target positions. Keep one
+            # position tensor in the state while retaining independent values.
+            if not torch.equal(local_pos, csa_local_pos):
+                raise RuntimeError("HCA/CSA local position views không nhất quán")
         return MRMemoryState(
             hca=hca,
             hca_positions=hca_pos,
             csa=csa,
             csa_positions=csa_pos,
-            local_hca=hca_tokens[:, local_start:],
-            local_csa=csa_tokens[:, local_start:],
-            local_positions=pos[:, local_start:],
-            pending_hca=hca_tokens[:, 0:0],
-            pending_csa=csa_tokens[:, 0:0],
-            pending_positions=pos[:, 0:0],
+            local_hca=local_hca,
+            local_csa=local_csa,
+            local_positions=local_pos,
+            pending_hca=hca_tokens[:, hca_complete:],
+            pending_hca_positions=pos[:, hca_complete:],
+            pending_csa=csa_tokens[:, csa_complete:],
+            pending_csa_positions=pos[:, csa_complete:],
             total_tokens=int(features.shape[1]),
         )
 
@@ -318,12 +437,14 @@ class MRTargetMemory(nn.Module):
             return state
         if features.shape[0] != state.local_hca.shape[0]:
             raise ValueError("batch của features không khớp memory state")
+        if state.local_hca.ndim != 3 or state.local_csa.ndim != 3:
+            raise ValueError("append không hỗ trợ state có local view theo nhiều anchor")
         pos = self._positions(features, positions, start=state.total_tokens)
         hca_new, csa_new = self.adapter(features)
         hca_add, hca_add_pos, hca_pending, hca_pending_pos = self._append_stream(
             state.pending_hca,
             hca_new,
-            state.pending_positions,
+            state.pending_hca_positions,
             pos,
             self.hca_pool,
             self.hca_compression_ratio,
@@ -331,7 +452,7 @@ class MRTargetMemory(nn.Module):
         csa_add, csa_add_pos, csa_pending, csa_pending_pos = self._append_stream(
             state.pending_csa,
             csa_new,
-            state.pending_positions,
+            state.pending_csa_positions,
             pos,
             self.csa_pool,
             self.csa_compression_ratio,
@@ -349,8 +470,9 @@ class MRTargetMemory(nn.Module):
             local_csa=local_csa[:, local_start:],
             local_positions=local_pos[:, local_start:],
             pending_hca=hca_pending,
+            pending_hca_positions=hca_pending_pos,
             pending_csa=csa_pending,
-            pending_positions=hca_pending_pos,
+            pending_csa_positions=csa_pending_pos,
             total_tokens=state.total_tokens + int(features.shape[1]),
         )
 

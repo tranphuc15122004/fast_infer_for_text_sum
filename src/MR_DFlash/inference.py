@@ -8,15 +8,16 @@ reject; backend KV/paged-attention có thể thay ở benchmark GPU sau.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
 
-from .checkpoint import warm_start_draft_model
+from .checkpoint import load_training_checkpoint, warm_start_draft_model
 from .memory import MRMemoryState
 from .mr_model import MRDFlashDraftModel
-from .training import build_mr_draft_spec_from_target_config
+from .training import build_dflash_additive_mask, build_mr_draft_spec_from_target_config
 
 
 @dataclass
@@ -103,14 +104,17 @@ class MRDFlashInferenceEngine:
         )
 
     def _block_mask(self, batch: int, length: int, dtype: torch.dtype) -> torch.Tensor:
-        mask = torch.full(
-            (batch, 1, length, length),
-            torch.finfo(dtype).min,
+        # Reuse the exact DFlash train helper with one synthetic block, so
+        # reference inference cannot silently drift from training semantics.
+        return build_dflash_additive_mask(
+            torch.zeros((batch, 1), device=self.device, dtype=torch.long),
+            torch.ones((batch, 1), device=self.device, dtype=torch.bool),
+            S=0,
+            block_size=length,
             device=self.device,
             dtype=dtype,
+            sliding_window=self.draft_model.spec.sliding_window,
         )
-        allow = torch.tril(torch.ones((length, length), device=self.device, dtype=torch.bool))
-        return mask.masked_fill(allow.view(1, 1, length, length), 0.0)
 
     @torch.no_grad()
     def draft_block(
@@ -156,12 +160,22 @@ class MRDFlashInferenceEngine:
         input_ids: torch.Tensor,
         proposed_ids: torch.Tensor,
         memory: MRMemoryState,
+        *,
+        max_append_tokens: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
     ) -> VerifyOutput:
-        """Greedy verify; chỉ append accepted proposals hoặc một replacement."""
+        """Greedy verify, có bonus token khi toàn block được accept.
+
+        ``max_append_tokens`` cho phép generation chặn bonus ở biên
+        ``max_new_tokens``. EOS được xử lý ngay trước khi cập nhật memory để
+        không bao giờ commit token đứng sau EOS.
+        """
         if input_ids.shape[0] != 1 or proposed_ids.shape[0] != 1:
             raise ValueError("reference inference hiện chỉ hỗ trợ batch=1")
         if proposed_ids.ndim != 2 or proposed_ids.shape[1] < 1:
             raise ValueError("proposed_ids phải có dạng [1,K], K>=1")
+        if max_append_tokens is not None and max_append_tokens < 1:
+            raise ValueError("max_append_tokens phải >= 1")
         prefix = input_ids.to(device=self.device, dtype=torch.long)
         proposals = proposed_ids.to(device=self.device, dtype=torch.long)
         if memory.total_tokens != prefix.shape[1]:
@@ -176,15 +190,37 @@ class MRDFlashInferenceEngine:
         while accepted_count < proposals.shape[1] and bool(equal[0, accepted_count]):
             accepted_count += 1
         if accepted_count == proposals.shape[1]:
-            accepted_ids = proposals
-            new_outputs = candidate_outputs
-            new_features = candidate_features
+            # The final target logit predicts the bonus token after a fully
+            # accepted proposal block. Do not request it when the caller has
+            # exactly consumed its generation budget.
+            append_bonus = (
+                max_append_tokens is None
+                or max_append_tokens > proposals.shape[1]
+            )
+            if append_bonus:
+                bonus = candidate_outputs.logits[:, -1:].argmax(dim=-1)
+                accepted_ids = torch.cat([proposals, bonus], dim=1)
+            else:
+                accepted_ids = proposals[:, :max_append_tokens]
+            new_ids = torch.cat([prefix, accepted_ids], dim=1)
+            new_outputs = self._target_forward(new_ids)
+            new_features = self._extract_features(new_outputs)
         else:
             replacement = choices[:, accepted_count : accepted_count + 1]
             accepted_ids = torch.cat([proposals[:, :accepted_count], replacement], dim=1)
             new_ids = torch.cat([prefix, accepted_ids], dim=1)
             new_outputs = self._target_forward(new_ids)
             new_features = self._extract_features(new_outputs)
+
+        # Truncate at the first EOS before extracting features/appending to
+        # the accepted-only memory state.
+        if eos_token_id is not None:
+            eos_hits = accepted_ids.eq(int(eos_token_id))[0].nonzero(as_tuple=False)
+            if eos_hits.numel():
+                accepted_ids = accepted_ids[:, : int(eos_hits[0].item()) + 1]
+                new_ids = torch.cat([prefix, accepted_ids], dim=1)
+                new_outputs = self._target_forward(new_ids)
+                new_features = self._extract_features(new_outputs)
         appended_features = new_features[:, prefix_len:]
         appended_positions = torch.arange(
             prefix_len,
@@ -198,7 +234,7 @@ class MRDFlashInferenceEngine:
             positions=appended_positions,
         )
         return VerifyOutput(
-            accepted_proposal_count=accepted_count,
+            accepted_proposal_count=min(accepted_count, accepted_ids.shape[1]),
             accepted_ids=accepted_ids,
             memory=new_memory,
             target_logits=new_outputs.logits[:, -1],
@@ -223,7 +259,13 @@ class MRDFlashInferenceEngine:
             draft = self.draft_block(current, memory)
             remaining = max_new_tokens - generated
             proposals = draft.proposed_ids[:, :remaining]
-            verified = self.verify(current, proposals, memory)
+            verified = self.verify(
+                current,
+                proposals,
+                memory,
+                max_append_tokens=remaining,
+                eos_token_id=eos_token_id,
+            )
             accepted_proposal_tokens += verified.accepted_proposal_count
             current = torch.cat([current, verified.accepted_ids], dim=1)
             memory = verified.memory
@@ -242,51 +284,101 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--target-model-path", required=True)
     parser.add_argument("--draft-checkpoint-path", required=True)
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--mask-token-id", type=int, required=True)
+    parser.add_argument("--mask-token-id", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None)
-    parser.add_argument("--hca-compression-ratio", type=int, default=128)
-    parser.add_argument("--csa-compression-ratio", type=int, default=4)
-    parser.add_argument("--memory-local-window", type=int, default=128)
-    parser.add_argument("--csa-top-k", type=int, default=64)
-    parser.add_argument("--mr-num-stages", type=int, default=2)
+    parser.add_argument("--hca-compression-ratio", type=int, default=None)
+    parser.add_argument("--csa-compression-ratio", type=int, default=None)
+    parser.add_argument("--memory-local-window", type=int, default=None)
+    parser.add_argument("--csa-top-k", type=int, default=None)
+    parser.add_argument("--mr-num-stages", type=int, default=None)
     parser.add_argument("--indexer-dim", type=int, default=None)
-    parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
+    parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default=None)
+    parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument("--device", default="auto")
     return parser.parse_args(argv)
+
+
+def _load_checkpoint_model_config(path: str) -> dict:
+    """Đọc model section từ checkpoint để tránh architecture mismatch khi infer."""
+    raw = load_training_checkpoint(path)
+    config_yaml = raw.get("config_yaml")
+    if not config_yaml:
+        return {}
+    try:
+        import yaml
+
+        payload = yaml.safe_load(config_yaml) or {}
+    except Exception as exc:  # pragma: no cover - malformed external checkpoint
+        raise ValueError(f"config_yaml trong checkpoint không đọc được: {path}") from exc
+    model_config = payload.get("model", {})
+    if not isinstance(model_config, dict):
+        raise ValueError("config_yaml.model phải là mapping")
+    return model_config
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    checkpoint_model = _load_checkpoint_model_config(args.draft_checkpoint_path)
+
+    def setting(name: str, default: Any) -> Any:
+        value = getattr(args, name)
+        if value is not None:
+            return value
+        return checkpoint_model.get(name, default)
+
+    dtype_name = setting("torch_dtype", "bfloat16")
     dtype = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
-    }[args.torch_dtype]
+    }[dtype_name]
     device = torch.device(
         args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    local_files_only = bool(args.local_files_only) or os.environ.get("FI_OFFLINE", "0").lower() in {
+        "1", "true", "yes", "on"
+    }
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path,
+        local_files_only=local_files_only,
+    )
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model_path,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
+        local_files_only=local_files_only,
     ).to(device).eval()
+    mask_token_id = setting("mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = getattr(tokenizer, "mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = getattr(target.config, "mask_token_id", None)
+    if mask_token_id is None:
+        raise ValueError(
+            "Không xác định được mask_token_id; truyền --mask-token-id hoặc lưu trong checkpoint/config"
+        )
+    target_layer_ids = args.target_layer_ids
+    if target_layer_ids is None:
+        target_layer_ids = checkpoint_model.get(
+            "feature_layer_ids", checkpoint_model.get("target_layer_ids")
+        )
     spec = build_mr_draft_spec_from_target_config(
         target.config,
-        draft_num_hidden_layers=1,
-        block_size=args.block_size,
-        target_layer_ids=args.target_layer_ids,
-        mask_token_id=args.mask_token_id,
-        num_stages=args.mr_num_stages,
-        hca_compression_ratio=args.hca_compression_ratio,
-        csa_compression_ratio=args.csa_compression_ratio,
-        local_window=args.memory_local_window,
-        csa_top_k=args.csa_top_k,
-        indexer_dim=args.indexer_dim,
+        draft_num_hidden_layers=int(setting("draft_num_hidden_layers", 1)),
+        block_size=int(setting("block_size", 16)),
+        target_layer_ids=target_layer_ids,
+        mask_token_id=int(mask_token_id),
+        num_stages=int(setting("mr_num_stages", 2)),
+        hca_compression_ratio=int(setting("hca_compression_ratio", 128)),
+        csa_compression_ratio=int(setting("csa_compression_ratio", 4)),
+        local_window=int(setting("memory_local_window", 128)),
+        csa_top_k=int(setting("csa_top_k", 64)),
+        indexer_dim=setting("indexer_dim", None),
+        indexer_num_heads=int(setting("indexer_num_heads", 1)),
     )
     draft = MRDFlashDraftModel(spec).to(device=device, dtype=dtype)
     warm_start_draft_model(draft, args.draft_checkpoint_path, key_prefix="draft_model.", strategy_name="mr_dflash")
@@ -294,9 +386,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     result = MRDFlashInferenceEngine(
         target,
         draft,
-        mask_token_id=args.mask_token_id,
+        mask_token_id=int(mask_token_id),
         device=device,
-    ).generate(encoded["input_ids"], max_new_tokens=args.max_new_tokens)
+    ).generate(
+        encoded["input_ids"],
+        max_new_tokens=args.max_new_tokens,
+        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+    )
     print(tokenizer.decode(result.input_ids[0], skip_special_tokens=True))
 
 

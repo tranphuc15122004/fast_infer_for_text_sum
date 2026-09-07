@@ -9,8 +9,8 @@ thuật toán block-parallel của DFlash:
 2. Với mỗi anchor dựng một block ``block_size``: vị trí 0 = embedding token
    anchor, các vị trí còn lại = embedding ``mask_token``.
 3. Mọi block chạy song song qua draft model; query chỉ attend context thật
-   ``< anchor`` và các vị trí draft trước nó trong cùng block (không
-   cross-block) → độ dài huấn luyện hiệu quả O(block) thay vì O(seq).
+   ``< anchor`` và draft trong cùng block (không cross-block; causal khi bật
+   sliding attention) → độ dài huấn luyện hiệu quả O(block) thay vì O(seq).
 4. Label "same-position": vị trí k trong block dự đoán token thật tại
    anchor + k; loss = cross-entropy với label hard (không dùng target
    distribution), weight = keep * (k>0) * bounds * loss_mask[label], có thể
@@ -67,8 +67,9 @@ def build_dflash_additive_mask(
     """Additive mask dày đặc (B,1,Q,KV) cho SDPA; Q=N*bs, KV=S+Q.
 
     Ngữ nghĩa giống ``create_dflash_sdpa_mask`` của SpecForge:
-    - draft query tại block q, offset k attend context kv < anchor (strict) và
-      draft trong cùng block offset <= k;
+    - draft query tại block q attend context kv < anchor (strict) và toàn bộ
+      draft trong cùng block; khi ``sliding_window`` được bật thì draft mask
+      chuyển thành causal offset <= k và context có cửa sổ trượt;
     - chỉ các block được giữ (block_keep_mask) là hợp lệ.
     """
     B, N = anchor_positions.shape
@@ -536,6 +537,8 @@ class OnlineMRDFlashModel(OnlineDFlashModel):
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
         mask_token_id: int,
+        indexer_train_mode: str = "schedule",
+        indexer_dense_steps: int = 1000,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -545,6 +548,22 @@ class OnlineMRDFlashModel(OnlineDFlashModel):
             mask_token_id,
             **kwargs,
         )
+        if indexer_train_mode not in {"schedule", "dense", "topk"}:
+            raise ValueError("indexer_train_mode phải là schedule, dense hoặc topk")
+        if indexer_dense_steps < 0:
+            raise ValueError("indexer_dense_steps phải >= 0")
+        self.indexer_train_mode = indexer_train_mode
+        self.indexer_dense_steps = int(indexer_dense_steps)
+        self.training_step = 0
+
+    def set_training_step(self, step: int) -> None:
+        """Trainer hook để chuyển dense indexer sang hard Top-k đúng phase."""
+        self.training_step = int(step)
+
+    def _effective_indexer_mode(self) -> str:
+        if self.indexer_train_mode != "schedule":
+            return self.indexer_train_mode
+        return "dense" if self.training_step < self.indexer_dense_steps else "topk"
 
     def _forward_draft_blocks(
         self,
@@ -567,7 +586,10 @@ class OnlineMRDFlashModel(OnlineDFlashModel):
             + torch.arange(self.block_size, device=device).view(1, 1, -1)
         ).reshape(bsz, -1)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        memory = self.draft_model.build_memory(hidden_states)
+        memory = self.draft_model.build_memory(
+            hidden_states,
+            query_positions=anchor_positions,
+        )
 
         dtype = next(self.draft_model.parameters()).dtype
         full_mask = build_dflash_additive_mask(
@@ -583,6 +605,7 @@ class OnlineMRDFlashModel(OnlineDFlashModel):
             memory=memory,
             position_ids=full_position_ids,
             attention_mask=full_mask,
+            indexer_mode=self._effective_indexer_mode(),
         )
         return anchor_positions, block_keep_mask, output_hidden, n_blocks
 
@@ -652,8 +675,9 @@ class DFlashTrainStrategy:
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
-        del ctx
         self.validate_batch(batch)
+        if ctx is not None and hasattr(self.model, "set_training_step"):
+            self.model.set_training_step(ctx.global_step)
         t = batch.tensors
         trainable = self.trainable_module()
         device = next(trainable.parameters()).device
@@ -762,6 +786,7 @@ def build_mr_draft_spec_from_target_config(
     local_window: int = 128,
     csa_top_k: int = 64,
     indexer_dim: Optional[int] = None,
+    indexer_num_heads: int = 1,
 ) -> MRDraftSpec:
     """Dựng MRDraftSpec từ HF config, kế thừa toàn bộ DFlash knobs."""
     base = build_draft_spec_from_target_config(
@@ -781,6 +806,7 @@ def build_mr_draft_spec_from_target_config(
         local_window=local_window,
         csa_top_k=csa_top_k,
         indexer_dim=indexer_dim,
+        indexer_num_heads=indexer_num_heads,
     )
 
 

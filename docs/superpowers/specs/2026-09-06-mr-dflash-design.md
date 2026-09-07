@@ -1,4 +1,4 @@
-# MR-DFlash V1 Design
+# MR-DFlash V1 Design — revision 2026-09-07
 
 ## Mục tiêu
 
@@ -33,28 +33,37 @@ Exploratory-only: acceptance/latency/ROUGE GPU; R0 không xác nhận quality ha
                   speedup thực tế.
 ```
 
-## Kiến trúc V1
+## Kiến trúc V1 — sau revision correctness
 
 Feature contract giữ nguyên: `hidden_states` có dạng `[B, S, n_layers * H]`,
 được concat theo `target_layer_ids`. `TargetFeatureAdapter` chiếu feature này
 thành hai không gian cùng chiều draft `H`:
 
-1. HCA memory: learned weighted pooling trên các nhóm token liên tiếp với
-   `compression_ratio=128`, cộng local raw target memory trong cửa sổ `128`.
-2. CSA memory: learned weighted pooling với `compression_ratio=4`; một learned
-   Q/K indexer nhận query từ trạng thái draft sau HCA và chọn tối đa `64` slot
-   bằng `torch.topk`. Local memory luôn được giữ, kể cả khi Top-k nhỏ hơn 64.
-
-Đường draft mặc định là:
+1. HCA memory: learned weighted pooling trên **complete** groups liên tiếp với
+   `compression_ratio=128`; incomplete tail được giữ ở `pending_hca` cùng
+   `pending_hca_positions`. Local HCA là cửa sổ raw tương đối theo từng anchor
+   trong training và tail cửa sổ trong incremental inference.
+2. CSA memory: learned weighted pooling trên complete groups với
+   `compression_ratio=4`; incomplete tail được giữ độc lập ở `pending_csa` và
+   `pending_csa_positions`.
+3. Mỗi stage dùng một joint DFlash attention:
 
 ```text
-block-causal DFlash attention + HCA target attention -> FFN
-block-causal DFlash attention + CSA target attention -> FFN
+Q = draft block
+KV = [HCA context ; draft block] -> FFN
+Q = draft block
+KV = [CSA local + selected context ; draft block] -> FFN
 ```
 
-Mask block vẫn không cho cross-block leakage. Bản reference dùng SDPA và
-materialize mask để chạy được trên CPU; tối ưu kernel/Flex là phần benchmark
-GPU sau.
+Local và selected CSA đi qua cùng một softmax. Context/draft đều dùng cùng
+quy ước RoPE theo absolute token position; compressed entry lấy position của
+token cuối group.
+
+Khi `sliding_window=None`, block mask là full same-block giống DFlash/SpecForge
+gốc; khi sliding attention được bật, draft sub-block dùng lower-triangular
+window. Training và reference inference bắt buộc dùng cùng helper/mask policy.
+Bản reference dùng SDPA và materialize mask để chạy được trên CPU; tối ưu
+kernel/Flex là phần benchmark GPU sau.
 
 ## Khởi tạo và tương đương DFlash
 
@@ -75,17 +84,38 @@ indexer_dim: null       # mặc định H
 ```
 
 `init_from_target` tiếp tục copy attention/FFN của target layer vào draft
-layer. Các adapter HCA/CSA và compressor được khởi tạo ổn định từ trung bình
-feature; value/output projection gần identity khi có thể. Indexer dùng Xavier
-deterministic. Do đó test “initialized draft” kiểm tra việc copy key và
-forward hữu hạn, không khẳng định logits bằng target.
+stage. `mr_num_stages` là số MR stages và có route xen kẽ `HCA, CSA, HCA, ...`;
+`mr_stage_init_layer_ids` có đúng một layer id cho mỗi stage. Các adapter HCA/CSA
+và compressor được khởi tạo ổn định từ trung bình feature; compressor dùng
+trọng số theo từng channel và positional bias trong group. Indexer là bản
+Lightning-inspired torch thuần (multi-head ReLU interaction + query head
+weight), với schedule `dense` warm-up trong `indexer_dense_steps` rồi chuyển
+`topk`. Cả dense và top-k đều truyền score qua attention bias để q/k còn
+gradient; không tuyên bố đây là full DeepSeek Lightning Indexer production.
+
+Test “initialized draft” kiểm tra copy key và forward hữu hạn, không khẳng định
+logits bằng target.
 
 ## Inference contract
 
 `MRDFlashInferenceEngine` cung cấp `prefill`, `draft_block`, `verify` và
 `generate`. Target HF model được giữ nguyên để verify lossless. `MRMemoryState`
 chỉ được cập nhật bằng hidden của token đã được target chấp nhận; token bị
-reject không được đưa vào HCA/CSA state.
+reject không được đưa vào HCA/CSA state. Checkpoint weights-only phải mang theo
+resolved model config để inference tự dựng đúng feature layer IDs/ratios/stage
+route; không phụ thuộc vào default CLI khác với lúc train.
+
+## Invariants bắt buộc trước serious training
+
+- `build(X[:N])` rồi `append(X[N:])` có cùng complete memory/pending state với
+  build một lần trên `X` (trong tolerance số học).
+- HCA/CSA pending positions độc lập và chỉ complete group mới được compress.
+- Training local window là `[anchor-window, anchor)`, không phải tail sequence.
+- Training/inference block mask giống nhau và SDPA chỉ scale đúng một lần.
+- DFlash loss tạo gradient hữu hạn tới CSA Indexer ở dense mode và score-bias
+  top-k mode.
+- Checkpoint reload reconstruct được feature width/layer IDs và không load target
+  weights vào draft.
 
 ## Ngoài phạm vi V1
 
@@ -93,3 +123,13 @@ reject không được đưa vào HCA/CSA state.
 - Không chạy job GPU trong lượt triển khai này.
 - Không claim speedup, acceptance rate hay ROUGE trước GPU experiment.
 - Không thêm dependency bắt buộc ngoài stack hiện tại.
+
+## Impact on Plan
+
+- Task memory phải sửa state/pending/tail và thêm parity tests.
+- Task model phải thay self-attention + target cross-attention bằng joint
+  attention, gộp CSA context và thêm RoPE/context bias.
+- Task train/inference phải truyền anchor-relative local windows, thống nhất
+  mask/scale và lưu resolved config trong checkpoint.
+- Task test phải thêm indexer gradient, mask parity, checkpoint reconstruction,
+  verifier EOS/bonus và build-vs-append parity.

@@ -32,13 +32,18 @@ Bản copy hiện có giữ các thành phần chính của quy trình DFlash:
 
 ## Phần MR-DFlash đã triển khai
 
-- `memory.py`: HCA ratio `128`, CSA ratio `4`, local window `128`, learned
-  CSA Top-k tối đa `64`, cùng incremental `MRMemoryState`.
-- `mr_model.py`: hai stage HCA/CSA giữ block-causal semantics DFlash.
+- `memory.py`: HCA ratio `128`, CSA ratio `4`, local window `128`, complete
+  groups + pending cache riêng, per-channel compressor và learned CSA
+  score/Top-k tối đa `64`.
+- `mr_model.py`: DFlash joint attention với route xen kẽ HCA/CSA, RoPE cho
+  memory positions và CSA local+selected trong một softmax.
 - `training.py`: `OnlineMRDFlashModel` và `MRDFlashTrainStrategy`; anchor,
-  label, hard CE, positional decay, accumulation và checkpoint giữ nguyên.
+  label, hard CE, positional decay, accumulation và checkpoint giữ nguyên;
+  indexer có dense warm-up rồi chuyển Top-k theo schedule.
 - `inference.py`: prefill, draft block, target greedy verify và chỉ append
-  token được accept; reference verify dùng full-prefix để ưu tiên correctness.
+  token được accept; full block accept còn commit bonus token, EOS được cắt
+  trước khi cập nhật memory; reference verify dùng full-prefix để ưu tiên
+  correctness.
 
 Chi tiết mapping file, semantics block/loss và lệnh chạy nằm trong
 [`src/MR_DFlash/README.md`](../src/MR_DFlash/README.md). Các thành phần này chỉ

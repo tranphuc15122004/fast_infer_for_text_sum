@@ -41,7 +41,7 @@ mốc so sánh.
 |---|---|---|
 | `model.py` | `modeling/draft/dflash.py`, `dflash_kernels.py` | `DFlashDraftModel`: projector `fc` + `N` decoder layer + RoPE/RMSNorm/SwiGLU tự triển khai (torch thuần) |
 | `memory.py` | MR-DFlash mới | HCA/CSA weighted pooling, learned `CSAIndexer`, incremental `MRMemoryState` |
-| `mr_model.py` | MR-DFlash mới | `MRDFlashDraftModel`: block attention + HCA target attention + CSA Top-k attention |
+| `mr_model.py` | MR-DFlash mới | `MRDFlashDraftModel`: DFlash joint attention với HCA/CSA memory + FFN |
 | `training.py` | `algorithms/common/dflash_family_model.py`, `training/strategies/base.py` | `OnlineDFlashModel`: sample anchor, noise embedding, block mask, forward song song, loss CE + positional decay; `DFlashTrainStrategy` |
 | `training.py` | MR-DFlash mới | `OnlineMRDFlashModel`, `MRDFlashTrainStrategy`: thay context path, giữ anchor/label/loss/checkpoint contract |
 | `inference.py` | MR-DFlash mới | `MRDFlashInferenceEngine`: prefill, draft block, greedy target verify, accepted-only memory update |
@@ -60,9 +60,10 @@ mốc so sánh.
    `loss_mask[t+1]` đều supervise.
 2. Mỗi anchor → 1 block `block_size`: vị trí 0 = embedding token anchor, còn lại
    = `mask_token` embedding (từ **embedding target frozen**).
-3. Mọi block chạy **song song** qua draft model. Attention: query draft chỉ
-   attend context thật `< anchor` + draft trước nó trong cùng block (không
-   cross-block) → huấn luyện hiệu quả O(block).
+3. Mọi block chạy **song song** qua draft model. Attention mặc định cho phép
+   toàn bộ draft trong cùng block và không cross-block; khi bật
+   `sliding_attention` thì dùng causal offset trong block. Cả train và
+   inference dùng cùng semantics này.
 4. Label same-position: vị trí `k` trong block dự đoán token thật tại
    `anchor+k`; `weight = keep × (k>0) × bounds × loss_mask[label]`; loss =
    CE với **label hard** (không dùng target distribution) + tuỳ chọn positional
@@ -76,14 +77,19 @@ MR-DFlash vẫn nhận feature contract cũ `hidden_states=[B,S,n_layers*H]`, v�
 feature capture và dataset không đổi format. Adapter chiếu feature concat thành
 hai view:
 
-1. HCA pool theo nhóm token liên tiếp với ratio `128`, cộng raw local memory
-   trong cửa sổ `128`.
-2. CSA pool với ratio `4`; indexer học Q/K và chọn tối đa `64` slot cho từng
-   draft query. Local CSA memory luôn được đưa vào attention.
+1. HCA pool theo nhóm token **đủ đầy** với ratio `128`; đuôi chưa đủ nhóm
+   nằm ở `pending_hca`. Raw local HCA có cửa sổ `128` và được gather tương
+   đối theo từng anchor trong training.
+2. CSA pool theo nhóm đủ với ratio `4`; `CSAIndexer` chấm điểm từng query.
+   Training mặc định chạy dense score-bias trong warm-up rồi chuyển hard
+   Top-k tối đa `64` theo `indexer_dense_steps`. Local và selected CSA được
+   nối vào cùng một context trước một softmax.
 
-Đường forward mặc định gồm hai stage `HCA -> FFN` rồi `CSA -> FFN`, mỗi stage
-giữ DFlash block-causal mask. `MRMemoryState.append()` chỉ nhận feature của
-token đã được verifier chấp nhận.
+Đường forward mặc định gồm các stage xen kẽ `HCA -> CSA -> HCA -> ...`.
+Mỗi stage dùng một DFlash joint attention với `KV=[MR context; draft block]`,
+áp RoPE cho query, raw local position và compressed group-end position.
+`MRMemoryState.append()` chỉ nhận feature của token đã được verifier chấp
+nhận; HCA/CSA giữ pending position độc lập.
 
 ## Cách chạy
 
@@ -190,9 +196,13 @@ python -m MR_DFlash.inference \
   --target-model-path Qwen/Qwen3-8B \
   --draft-checkpoint-path outputs/mr-dflash-qwen3-8b/draft_final.pt \
   --prompt "Summarize the document" \
-  --mask-token-id 151669 \
-  --device cuda
+  --device cuda --local-files-only
 ```
+
+Checkpoint mới chứa `config_yaml`, vì vậy CLI tự khôi phục feature layer
+IDs, block size, số stage, compression ratio, local window, Top-k và dtype.
+Các flag architecture truyền thủ công vẫn được ưu tiên khi cần tương thích
+checkpoint cũ không có metadata.
 
 Reference engine ưu tiên kiểm chứng semantics và hiện verify bằng full prefix;
 không dùng lệnh này để kết luận latency GPU trước khi hoàn thành protocol trong
@@ -207,14 +217,15 @@ không dùng lệnh này để kết luận latency GPU trước khi hoàn thàn
 
 ## Điểm cần chỉnh khi chạy thật (MR-DFlash)
 
-- `attention_backend`: mặc định `sdpa` (dày đặc, CPU-safe). Với B200 và
-  `num_anchors`/`max_length` lớn nên dùng `flex` (Flex Attention, không
-  materialize mask) — đã có `build_dflash_flex_block_mask`.
+- `attention_backend`: DFlash gốc hỗ trợ `sdpa`/`flex`. MR-DFlash joint
+  attention V1 dùng path tensor chung để giữ correctness và hiện cấu hình
+  khuyến nghị là `sdpa`; chưa claim Flex kernel speedup cho MR.
 - `mask_token_id`: phải đặt đúng token trong vocab target (Qwen3 VD `151669`).
-- `feature_layer_ids` là schema cache MR (các layer concat làm context), còn
-  `draft_init_layer_ids` là layer target dùng để copy weight khởi tạo draft;
-  hai layout này độc lập. `init_draft_from_target=True` dùng một lần nạp target
-  để giảm memory/time peak.
+- `feature_layer_ids` là schema cache MR (các layer concat làm context),
+  `draft_init_layer_ids` là layout init DFlash, còn
+  `mr_stage_init_layer_ids` có một layer target cho mỗi MR stage; ba layout
+  này độc lập. `init_draft_from_target=True` dùng một lần nạp target để giảm
+  memory/time peak.
 - Feature `hidden_states` capture bằng HF = toàn chuỗi (kể cả prompt). Nếu muốn
   tiết kiệm, chỉ capture prefix tới cuối assistant cần thiết.
 

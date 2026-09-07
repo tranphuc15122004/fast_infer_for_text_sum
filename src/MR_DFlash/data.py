@@ -205,6 +205,7 @@ def validate_feature_manifest(
     *,
     expected_feature_width: Optional[int] = None,
     expected_feature_layer_ids: Optional[Sequence[int]] = None,
+    expected_target_model_path: Optional[str] = None,
 ) -> None:
     """Validate các invariant cache biết chắc ở thời điểm dựng dataset."""
     if manifest.get("schema_version") != FEATURE_SCHEMA_VERSION:
@@ -224,6 +225,13 @@ def validate_feature_manifest(
             raise ValueError(
                 "feature_layer_ids trong manifest không khớp model: "
                 f"{actual} != {expected}"
+            )
+    if expected_target_model_path is not None:
+        actual_target = str(manifest.get("target_model_path", ""))
+        if actual_target != str(expected_target_model_path):
+            raise ValueError(
+                "target_model_path trong manifest không khớp model: "
+                f"{actual_target!r} != {str(expected_target_model_path)!r}"
             )
 
 
@@ -395,6 +403,7 @@ class DFlashFeatureDataset:
         sample_limit: Optional[int] = None,
         expected_feature_width: Optional[int] = None,
         expected_feature_layer_ids: Optional[Sequence[int]] = None,
+        expected_target_model_path: Optional[str] = None,
     ) -> None:
         self.refs = read_feature_refs(hidden_states_path, run_id=run_id)
         if sample_limit is not None:
@@ -409,6 +418,7 @@ class DFlashFeatureDataset:
                 self.manifest,
                 expected_feature_width=expected_feature_width,
                 expected_feature_layer_ids=expected_feature_layer_ids,
+                expected_target_model_path=expected_target_model_path,
             )
 
     def __len__(self) -> int:

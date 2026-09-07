@@ -4,7 +4,7 @@ Tài liệu này là runbook cho các run cần thực hiện sau khi có GPU đ
 riêng. Agent không tự chọn GPU hay chiếm GPU của job khác; người chạy phải
 điền đúng `CUDA_VISIBLE_DEVICES` sau khi scheduler xác nhận allocation.
 
-## Preflight gần nhất — 2026-09-06
+## Preflight gần nhất — 2026-09-07
 
 - `nvidia-smi` nhìn thấy Tesla T4 15 GiB, driver `550.163.01`, CUDA `12.4`,
   không có process đang chạy trên GPU.
@@ -14,13 +14,13 @@ riêng. Agent không tự chọn GPU hay chiếm GPU của job khác; người c
 - Vì runtime T4 hiện tại không expose CUDA cho PyTorch, GPU smoke B200 chưa
   được thực hiện tại workspace này; không xem kết quả CPU là bằng chứng GPU.
 - CPU simulation bằng `.venv/bin/python` (Python `3.12.13`) chạy được toàn bộ
-  MR-DFlash package smoke: `12 passed, 2 skipped` trong khoảng `31s`. Đây không phải validation
+  MR-DFlash package smoke: `22 passed, 2 skipped` trong khoảng `37s`. Đây không phải validation
   của server B200; `.venv` vẫn chứa PyTorch `cu130` và chỉ được dùng CPU trên
   máy T4 này.
-- Real-model smoke đã chạy offline với snapshot Qwen3-4B local: capture 5
+- Real-model smoke vừa chạy offline với snapshot Qwen3-4B local: capture 5
   layer (`hidden_size=2560`), train MR-DFlash `1` optimizer step, lưu/nạp
   `draft_final.pt`, rồi chạy đủ `prefill → draft → verify → generate`; kết quả
-  `1 passed` trong `211.45s`, `loss=12.5037`, output 2 token finite. Đây là
+  `1 passed` trong `150.73s`, `loss=11.1823`, output 2 token finite. Đây là
   functional smoke trên CPU, chưa phải GPU benchmark.
 - DDP CPU world-size 2 cũng đã pass bằng `torchrun`; đây chỉ là validation
   process-group/sharding/checkpoint, không thay thế GPU smoke.
@@ -108,7 +108,9 @@ DFlash và MR-DFlash với các tham số DFlash giống nhau:
 | Variant | MR-DFlash | 16 | 512 | 6e-4 | 7.0 |
 
 MR-specific values cố định ở V1: HCA `128`, CSA `4`, local `128`, Top-k `64`,
-2 stages. Mỗi run cần ghi:
+2 stages, indexer dense warm-up `1000` optimizer steps rồi hard Top-k. Joint
+attention MR V1 dùng path tensor SDPA-compatible để kiểm chứng correctness;
+chưa xem đây là benchmark kernel tối ưu. Mỗi run cần ghi:
 
 - primary: acceptance rate trên cùng token budget;
 - guardrails: target quality/ROUGE, draft memory, peak VRAM, prefill/decode

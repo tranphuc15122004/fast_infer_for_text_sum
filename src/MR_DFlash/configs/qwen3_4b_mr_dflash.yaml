@@ -14,14 +14,16 @@ model:
   torch_dtype: bfloat16
   # MR feature views: [layer + 1] hidden states are concatenated.
   feature_layer_ids: [1, 9, 17, 25, 33]
-  # DFlash draft has one layer; initialize it from the middle target layer.
+  # Legacy DFlash init layout (dùng khi architecture=dflash).
   draft_init_layer_ids: [18]
+  mr_stage_init_layer_ids: [17, 18]
   mr_num_stages: 2
   hca_compression_ratio: 128
   csa_compression_ratio: 4
   memory_local_window: 128
   csa_top_k: 64
   indexer_dim: null
+  indexer_num_heads: 1
 
 data:
   train_data_path: ./data/user_prompts.jsonl
@@ -52,6 +54,8 @@ training:
   objective_chunk_blocks: 128
   attention_backend: sdpa
   loss_type: dflash
+  indexer_train_mode: schedule
+  indexer_dense_steps: 1000
   save_interval: 1000
   log_interval: 10
   eval_interval: 0

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from MR_DFlash.config import DataConfig, ModelConfig, RunConfig, TrainingConfig
+from MR_DFlash.config import DataConfig, ModelConfig, RunConfig, TrainingConfig, resolve_mr_stage_init_layer_ids
 from MR_DFlash.data import (
     DFlashFeatureDataset,
     load_feature_manifest,
@@ -56,6 +56,19 @@ def test_feature_and_draft_init_layers_are_explicitly_separate() -> None:
         )
 
 
+def test_mr_stage_init_layout_is_independent_from_draft_depth() -> None:
+    cfg = ModelConfig(
+        architecture="mr_dflash",
+        draft_num_hidden_layers=1,
+        mr_num_stages=2,
+        draft_init_layer_ids=[18],
+        mr_stage_init_layer_ids=[17, 18],
+    )
+
+    assert resolve_mr_stage_init_layer_ids(cfg, num_target_layers=36) == [17, 18]
+    assert cfg.draft_num_hidden_layers == 1
+
+
 def test_feature_manifest_roundtrip_and_dataset_width_validation(tmp_path: Path) -> None:
     feature_dir = tmp_path / "features"
     manifest = {
@@ -88,6 +101,12 @@ def test_feature_manifest_roundtrip_and_dataset_width_validation(tmp_path: Path)
     with pytest.raises(ValueError, match="feature_width"):
         DFlashFeatureDataset(
             str(feature_dir), max_len=8, expected_feature_width=81
+        )
+    with pytest.raises(ValueError, match="target_model_path"):
+        DFlashFeatureDataset(
+            str(feature_dir),
+            max_len=8,
+            expected_target_model_path="other-target",
         )
 
 

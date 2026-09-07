@@ -47,13 +47,21 @@ def load_training_checkpoint(path: str) -> Dict[str, Any]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def save_draft_weights(path: str, draft_state_dict: Dict[str, torch.Tensor]) -> None:
-    """Ghi weights-only (warm start / export cho serving sau này)."""
+def save_draft_weights(
+    path: str,
+    draft_state_dict: Dict[str, torch.Tensor],
+    *,
+    config_yaml: Optional[str] = None,
+) -> None:
+    """Ghi weights-only kèm config để serving tự dựng đúng architecture."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"format": "mr_dflash_draft_weights_v1", "draft_state_dict": draft_state_dict},
-        path,
-    )
+    payload: Dict[str, Any] = {
+        "format": "mr_dflash_draft_weights_v1",
+        "draft_state_dict": draft_state_dict,
+    }
+    if config_yaml is not None:
+        payload["config_yaml"] = config_yaml
+    torch.save(payload, path)
 
 
 def warm_start_draft_model(
