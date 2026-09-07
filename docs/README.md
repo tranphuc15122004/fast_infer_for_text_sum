@@ -189,13 +189,18 @@ Runner ma trận chuẩn dùng `scripts/run_longbench_200.sh` và master config:
 
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
-  bash scripts/run_longbench_200.sh --config /path/to/fast_infer_master.env \
+  bash scripts/run_longbench_200.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
   --mode smoke --preflight-only
 ```
 
 `smoke`, `representative`, `full` tương ứng lần lượt 1 mẫu, 20 mẫu đại diện và
 200 mẫu/dataset; chi tiết output, status và lệnh B200 xem trong
-[`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md).
+[`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md). Trên máy nhiều
+GPU (B200) dùng `--gpu-ids <index>` hoặc env `LONG_BENCH_GPU_IDS` để chọn GPU,
+`--list-gpus` để xem inventory host trước khi chạy; chi tiết trong mục
+"Chọn GPU trên máy nhiều GPU" của tài liệu đó. Trước mỗi job, kiểm tra VRAM
+trống bằng `bash scripts/run_gpu_check.sh --config <master> [--gpu-ids N]
+[--min-free-gb GB]` (xem cùng mục tài liệu).
 
 ## Báo cáo kết quả semantic selection
 

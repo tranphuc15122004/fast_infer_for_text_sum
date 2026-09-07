@@ -363,6 +363,232 @@ def _normalize_child_output(
     return observations
 
 
+# ---------------------------------------------------------------------------
+# GPU selection & inventory helpers
+# ---------------------------------------------------------------------------
+
+def _gpu_selection_raw() -> str | None:
+    """Return the effective GPU-id request from the environment, if any."""
+    for name in ("LONG_BENCH_GPU_IDS", "FI_GPU_IDS", "CUDA_VISIBLE_DEVICES"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _parse_gpu_ids(value: str | None) -> list[int] | None:
+    """Parse a comma/space separated GPU id list into validated integers."""
+    if value is None or not str(value).strip():
+        return None
+    parts = [part for part in str(value).replace(",", " ").split() if part]
+    try:
+        ids = [int(part) for part in parts]
+    except ValueError as exc:
+        raise SystemExit(
+            f"invalid GPU ids {value!r}: expected device indices such as "
+            "'0', '2' or '0,1'"
+        ) from exc
+    if any(index < 0 for index in ids):
+        raise SystemExit(f"invalid GPU ids {value!r}: indices must be >= 0")
+    return ids
+
+
+def _device_policy() -> str:
+    return (
+        os.environ.get("LONG_BENCH_DEVICE")
+        or os.environ.get("FI_DEVICE")
+        or "cuda"
+    ).lower()
+
+
+def _nvidia_smi_gpus() -> list[dict[str, Any]] | None:
+    """Physical GPU inventory via nvidia-smi (immune to CUDA_VISIBLE_DEVICES).
+
+    Returns None when nvidia-smi is absent or fails; the caller then falls
+    back to what torch reports for the visible subset.
+    """
+    query = (
+        "index,name,memory.total,memory.free,memory.used,"
+        "utilization.gpu,compute_cap"
+    )
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=" + query, "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+
+    def _gib(value: str) -> float | None:
+        try:
+            return round(float(value) / 1024.0, 1)  # MiB -> GiB
+        except ValueError:
+            return None
+
+    gpus: list[dict[str, Any]] = []
+    for line in out.stdout.strip().splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 7:
+            continue
+        try:
+            index = int(fields[0])
+        except ValueError:
+            continue
+        util_raw = fields[5]
+        gpus.append(
+            {
+                "index": index,
+                "name": fields[1],
+                "total_memory_gb": _gib(fields[2]),
+                "free_memory_gb": _gib(fields[3]),
+                "used_memory_gb": _gib(fields[4]),
+                "utilization_percent": int(util_raw) if util_raw.isdigit() else None,
+                "compute_capability": fields[6] or None,
+            }
+        )
+    return gpus or None
+
+
+def _torch_visible_gpus() -> dict[str, Any]:
+    """Describe the CUDA-visible device subset as seen by torch."""
+    result: dict[str, Any] = {"torch_available": False}
+    try:
+        import torch
+    except Exception:
+        return result
+    result["torch_available"] = True
+    if not torch.cuda.is_available():
+        result["cuda_available"] = False
+        result["visible_gpu_count"] = 0
+        result["visible_gpus"] = []
+        return result
+    result["cuda_available"] = True
+    result["cuda_version"] = torch.version.cuda
+    visible: list[dict[str, Any]] = []
+    for index in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(index)
+        visible.append(
+            {
+                "visible_index": index,
+                "name": str(props.name),
+                "compute_capability": f"{props.major}.{props.minor}",
+                "total_memory_gb": round(props.total_memory / (1024**3), 1),
+            }
+        )
+    result["visible_gpu_count"] = len(visible)
+    result["visible_gpus"] = visible
+    return result
+
+
+def describe_gpu_assignment() -> dict[str, Any]:
+    """Return a JSON-safe snapshot of host GPUs, requested ids and visibility."""
+    requested_raw = _gpu_selection_raw()
+    host = _nvidia_smi_gpus() or []
+    report: dict[str, Any] = {
+        "requested": requested_raw,
+        "requested_ids": _parse_gpu_ids(requested_raw),
+        "device_policy": _device_policy(),
+        "host_gpu_count": len(host) or None,
+        "host_gpus": host,
+    }
+    report.update(_torch_visible_gpus())
+    return report
+
+
+def _missing_requested_gpus(report: Mapping[str, Any]) -> list[int]:
+    requested = report.get("requested_ids") or []
+    host = report.get("host_gpus") or []
+    if not requested or not host:
+        return []
+    present = {gpu["index"] for gpu in host}
+    return [index for index in requested if index not in present]
+
+
+def print_gpu_summary(report: Mapping[str, Any], *, effective_cuda: bool) -> None:
+    """Print a one-line GPU assignment banner for a normal run."""
+    requested = report.get("requested_ids") or []
+    host_count = report.get("host_gpu_count")
+    parts: list[str] = []
+    if host_count:
+        parts.append(f"host has {host_count} GPU(s)")
+    parts.append(
+        "selected GPU " + (", ".join(map(str, requested)) if requested else "(auto)")
+    )
+    if effective_cuda:
+        visible = report.get("visible_gpus") or []
+        names = ", ".join(gpu["name"] for gpu in visible)
+        parts.append(f"torch sees {report.get('visible_gpu_count', 0)} device(s) {names}")
+    else:
+        policy = report.get("device_policy") or "cuda"
+        if policy.startswith("cpu"):
+            parts.append(f"device policy {policy!r} -> CPU compute")
+        else:
+            parts.append("torch CUDA unavailable -> CPU compute")
+    print("[gpu] " + " | ".join(parts))
+    missing = _missing_requested_gpus(report)
+    if missing:
+        print(
+            f"[gpu] WARNING requested GPU id(s) {missing} not found on the host; "
+            "they will be invisible to CUDA",
+            file=sys.stderr,
+        )
+
+
+def print_gpu_inventory(report: Mapping[str, Any]) -> None:
+    """Print a human-readable GPU inventory and the effective mapping."""
+    print("\nHost GPU inventory (physical indices, nvidia-smi):")
+    host = report.get("host_gpus") or []
+    if not host:
+        print("  (no nvidia-smi data available)")
+    for gpu in host:
+        fields = [
+            f"GPU {gpu['index']}: {gpu['name']}",
+            f"{gpu.get('total_memory_gb')} GB total",
+            f"{gpu.get('free_memory_gb')} GB free",
+        ]
+        util = gpu.get("utilization_percent")
+        if util is not None:
+            fields.append(f"{util}% util")
+        if gpu.get("compute_capability"):
+            fields.append(f"cap {gpu['compute_capability']}")
+        print("  " + " | ".join(fields))
+
+    requested = report.get("requested_ids") or []
+    if requested:
+        print(f"\nRequested GPU ids: {', '.join(map(str, requested))}")
+    else:
+        print("\nRequested GPU ids: (unset - torch default visibility)")
+    print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+
+    print("\nTorch visibility:")
+    if not report.get("torch_available"):
+        print("  torch is not importable in this interpreter")
+    elif not report.get("cuda_available"):
+        print("  torch.cuda.is_available() = False (no visible CUDA device)")
+    else:
+        for gpu in report.get("visible_gpus") or []:
+            print(
+                "  "
+                f"visible {gpu['visible_index']} -> {gpu['name']} "
+                f"({gpu['total_memory_gb']} GB, cap {gpu['compute_capability']})"
+            )
+    missing = _missing_requested_gpus(report)
+    if missing:
+        print(
+            f"\nWARNING: requested GPU id(s) {missing} are not present on the host "
+            "and will be invisible to CUDA."
+        )
+    policy = report.get("device_policy") or "cuda"
+    if policy.startswith("cpu"):
+        print(f"\nNote: device policy is {policy!r} -> inference will run on CPU.")
+    elif not report.get("cuda_available"):
+        print("\nNote: no CUDA device is visible to torch -> inference will run on CPU.")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["smoke", "representative", "full"], default=os.environ.get("LONG_BENCH_MODE", "smoke"))
@@ -380,6 +606,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--allow-unsupported", action="store_true")
+    parser.add_argument(
+        "--gpu-ids",
+        dest="gpu_ids",
+        default=None,
+        help="physical GPU id(s) to run on, e.g. '0', '2' or '0,1'; "
+        "overrides LONG_BENCH_GPU_IDS / FI_GPU_IDS / CUDA_VISIBLE_DEVICES",
+    )
+    parser.add_argument(
+        "--list-gpus",
+        action="store_true",
+        help="list host GPUs, the current selection and torch visibility, then exit",
+    )
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=os.environ.get("LONG_BENCH_STRICT", "1") == "1")
     return parser
@@ -387,10 +625,28 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    gpu_ids = os.environ.get("LONG_BENCH_GPU_IDS") or os.environ.get("FI_GPU_IDS")
-    if gpu_ids is not None and "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+
+    # GPU selection: --gpu-ids is authoritative; otherwise honour the existing
+    # LONG_BENCH_GPU_IDS / FI_GPU_IDS / CUDA_VISIBLE_DEVICES chain. Applied
+    # before torch is imported so enumeration and every child process observe
+    # the same physical device(s). An explicit empty CUDA_VISIBLE_DEVICES
+    # (CPU smoke) is left untouched.
+    if args.gpu_ids is not None and args.gpu_ids.strip():
+        _parse_gpu_ids(args.gpu_ids)  # fail fast on malformed values
+        os.environ["LONG_BENCH_GPU_IDS"] = args.gpu_ids
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
+    elif "CUDA_VISIBLE_DEVICES" not in os.environ:
+        selection = _gpu_selection_raw()
+        if selection:
+            os.environ["CUDA_VISIBLE_DEVICES"] = selection
+
+    gpu_report = describe_gpu_assignment()
+    if args.list_gpus:
+        print_gpu_inventory(gpu_report)
+        return 0
+
     cuda_available = _effective_cuda_available()
+    print_gpu_summary(gpu_report, effective_cuda=cuda_available)
     profile = resolve_profile(
         mode=args.mode,
         cuda_available=cuda_available,
@@ -463,6 +719,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "timeout_seconds": timeout_seconds,
         "strict": bool(args.strict),
         "allow_unsupported": bool(args.allow_unsupported),
+        "gpu_ids": gpu_report.get("requested"),
+        "gpu": gpu_report,
         "runtime": runtime_metadata(),
         "cells": [],
     }

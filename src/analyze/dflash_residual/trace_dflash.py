@@ -81,6 +81,8 @@ def build_position_rows(
     target_candidate_logits: torch.Tensor | None = None,
     target_entropy: torch.Tensor | None = None,
     target_top1_probability: torch.Tensor | None = None,
+    draft_target_ranks: torch.Tensor | None = None,
+    draft_target_logits: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Convert one block's tensors to JSON-safe per-position rows."""
 
@@ -92,6 +94,12 @@ def build_position_rows(
         raise ValueError("target/dflash tokens must have batch dimension 1")
     if target_candidate_logits is not None and target_candidate_logits.shape != candidate_logits.shape:
         raise ValueError("target_candidate_logits shape must match candidate_logits")
+    for name, value in (
+        ("draft_target_ranks", draft_target_ranks),
+        ("draft_target_logits", draft_target_logits),
+    ):
+        if value is not None and value.shape != target_tokens.shape:
+            raise ValueError(f"{name} shape must match target_tokens")
     for name, value in (
         ("target_entropy", target_entropy),
         ("target_top1_probability", target_top1_probability),
@@ -139,6 +147,10 @@ def build_position_rows(
             row["target_top1_probability"] = float(
                 target_top1_probability[0, index].detach().cpu().item()
             )
+        if draft_target_ranks is not None:
+            row["draft_target_rank"] = int(draft_target_ranks[0, index].detach().cpu().item())
+        if draft_target_logits is not None:
+            row["draft_target_logit"] = float(draft_target_logits[0, index].detach().cpu().item())
         rows.append(row)
     return rows
 
@@ -167,6 +179,7 @@ def collect_one(
     stop_token_ids: Sequence[int] | None = None,
     record_target_candidate_logits: bool = False,
     record_target_entropy: bool = False,
+    record_draft_target_rank: bool = False,
     state_mode: str = "on_policy",
 ) -> list[dict[str, Any]]:
     """Collect one deterministic DFlash run, including every verified block."""
@@ -259,7 +272,16 @@ def collect_one(
             target_candidate_logits = None
             target_entropy = None
             target_top1_probability = None
+            draft_target_ranks = None
+            draft_target_logits = None
             verifier_logits = output.logits[:, :-1, :]
+            if record_draft_target_rank:
+                draft_target_logits = torch.gather(
+                    draft_logits.float(), dim=-1, index=target_tokens.unsqueeze(-1)
+                ).squeeze(-1)
+                draft_target_ranks = 1 + (
+                    draft_logits.float() > draft_target_logits.unsqueeze(-1)
+                ).sum(dim=-1)
             if record_target_candidate_logits:
                 if verifier_logits.shape[1] != candidate_ids.shape[1]:
                     raise ValueError(
@@ -292,6 +314,8 @@ def collect_one(
                 target_candidate_logits=target_candidate_logits,
                 target_entropy=target_entropy,
                 target_top1_probability=target_top1_probability,
+                draft_target_ranks=draft_target_ranks,
+                draft_target_logits=draft_target_logits,
                 target_token_source="verifier_posterior",
                 state_mode=state_mode,
             ))
@@ -376,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--record-target-candidate-logits", action="store_true")
     parser.add_argument("--record-target-entropy", action="store_true")
+    parser.add_argument("--record-draft-target-rank", action="store_true")
     parser.add_argument("--state-mode", choices=("on_policy", "reference"), default="on_policy")
     parser.add_argument("--reference-field", default="reference")
     return parser
@@ -453,6 +478,7 @@ def run(args: argparse.Namespace) -> int:
                     stop_token_ids=[int(tokenizer.eos_token_id)] if tokenizer.eos_token_id is not None else None,
                     record_target_candidate_logits=args.record_target_candidate_logits,
                     record_target_entropy=args.record_target_entropy,
+                    record_draft_target_rank=args.record_draft_target_rank,
                     state_mode=args.state_mode,
                 )
                 for row in rows:
@@ -493,6 +519,7 @@ def run(args: argparse.Namespace) -> int:
         "attn_implementation": attn_implementation,
         "record_target_candidate_logits": args.record_target_candidate_logits,
         "record_target_entropy": args.record_target_entropy,
+        "record_draft_target_rank": args.record_draft_target_rank,
         "state_mode": args.state_mode,
         "reference_field": args.reference_field if args.state_mode == "reference" else None,
     }, ensure_ascii=False, indent=2), encoding="utf-8")

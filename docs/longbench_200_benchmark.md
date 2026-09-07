@@ -92,8 +92,10 @@ ROUGE vào báo cáo code-completion.
 ## Orchestrator 3 profile
 
 Toàn bộ ma trận dùng một master shell-env ngoài repository, được trỏ bởi
-`config/master.path` hoặc override bằng `FAST_INFER_MASTER_CONFIG`. Interpreter
-được chọn bằng `FAST_INFER_PYTHON`/`FAST_INFER_VENV`; trên máy local dùng `.venv`:
+`config/master.path` (mặc định là master trên server B200:
+`/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env`)
+hoặc override bằng `FAST_INFER_MASTER_CONFIG`. Interpreter được chọn bằng
+`FAST_INFER_PYTHON`/`FAST_INFER_VENV`; trên máy local dùng `.venv`:
 
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
@@ -147,6 +149,58 @@ python scripts/collect_metrics.py \
   --outputs-dir /tmp/longbench_smoke/<run_id> \
   --data-dir data/longbench_200
 ```
+
+### Chọn GPU trên máy nhiều GPU (B200)
+
+Orchestrator chọn GPU theo thứ tự ưu tiên: flag `--gpu-ids` > env
+`LONG_BENCH_GPU_IDS` > `FI_GPU_IDS` > `CUDA_VISIBLE_DEVICES`. Giá trị là danh
+sách index **vật lý** (phân tách bằng dấu phẩy hoặc space), ví dụ `0`, `2`
+hoặc `0,1` khi baseline cần nhiều GPU. GPU được chọn được áp dụng lên
+`CUDA_VISIBLE_DEVICES` trước khi torch được import, nên cả orchestrator lẫn
+mọi child process đều thấy cùng tập device.
+
+Xem nhanh GPU trên host, lựa chọn hiện tại và mapping torch nhìn thấy (không
+cần data, không load model, thoát ngay):
+
+```bash
+bash scripts/run_longbench_200.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --list-gpus
+```
+
+Trước khi launch một run tốn GPU, kiểm tra **GPU id + VRAM còn trống** bằng
+script chuyên dụng (chỉ dùng `nvidia-smi`, không load model, chạy bằng python3
+hệ thống):
+
+```bash
+bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+```
+
+Báo cáo liệt kê từng GPU vật lý (total/used/free VRAM, utilization, nhiệt độ,
+tiến trình đang chiếm), đánh dấu `*` đúng GPU job sẽ dùng (theo
+`LONG_BENCH_GPU_IDS` như khi launch thật) và gợi ý GPU trống nhiều nhất. Muốn
+chặn job khi không đủ VRAM, dùng ngưỡng `--min-free-gb`:
+
+```bash
+bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 3 --min-free-gb 120
+# exit 0: GPU 3 đủ VRAM | exit 2: thiếu VRAM (dừng, chọn GPU khác)
+bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json /tmp/gpu_report.json  # automation
+```
+
+File liên quan: `scripts/check_gpu_vram.py` (logic) + `scripts/run_gpu_check.sh`
+(wrapper load master profile `longbench`).
+
+Chạy một run trên GPU vật lý số 2 (hai cách tương đương):
+
+```bash
+LONG_BENCH_GPU_IDS=2 bash scripts/run_longbench_200.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --mode full
+# hoặc dùng flag CLI (ưu tiên cao nhất, ghi đè mọi env):
+bash scripts/run_longbench_200.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --mode full --gpu-ids 2
+```
+
+Khi launch, runner in banner `[gpu] ...` cho biết host có bao nhiêu GPU, GPU
+được chọn và số device torch nhìn thấy; nếu index yêu cầu không tồn tại trên
+host sẽ có cảnh báo trên stderr. Lựa chọn và snapshot đầy đủ (host GPU + bản
+đồ visible) được ghi vào `run_manifest.json` ở các field `gpu_ids`/`gpu`. Khi
+`LONG_BENCH_DEVICE=cpu` (dev CPU) GPU vẫn được ghi lại nhưng compute chạy CPU.
 
 Mỗi run lưu `run_manifest.json`, input subset bất biến, log child process và
 `<baseline>/<dataset>.jsonl`. Record thành công có input/output tokens,
