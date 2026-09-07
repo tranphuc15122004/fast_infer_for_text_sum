@@ -111,6 +111,48 @@ def build_dflash_additive_mask(
     return additive
 
 
+def build_dflash_block_additive_mask(
+    block_keep_mask: torch.Tensor,       # (B, N) bool
+    block_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    sliding_window: Optional[int] = None,
+) -> torch.Tensor:
+    """Additive mask chỉ cho các block độc lập: ``[B*N,1,K,K]``.
+
+    Đây là biến thể dùng riêng cho MR-DFlash training. Không tạo ma trận
+    ``[B,1,N*K,N*K]`` rồi mask chéo block; mỗi block trở thành một phần tử
+    batch nên kích thước draft logits còn ``K*K``.
+    """
+    if block_size < 1:
+        raise ValueError("block_size phải >= 1")
+    if block_keep_mask.ndim != 2:
+        raise ValueError("block_keep_mask phải có dạng [B,N]")
+    if sliding_window is not None and sliding_window < 1:
+        raise ValueError("sliding_window phải >= 1")
+    batch, num_blocks = block_keep_mask.shape
+    allow = torch.ones(
+        (batch, num_blocks, block_size, block_size),
+        device=device,
+        dtype=torch.bool,
+    )
+    if sliding_window is not None:
+        offsets = torch.arange(block_size, device=device)
+        allow = allow & (
+            offsets.view(1, 1, -1, 1) - offsets.view(1, 1, 1, -1)
+            >= -(sliding_window - 1)
+        )
+        allow = allow & (
+            offsets.view(1, 1, -1, 1) >= offsets.view(1, 1, 1, -1)
+        )
+    allow = allow & block_keep_mask.to(device=device, dtype=torch.bool).view(
+        batch, num_blocks, 1, 1
+    )
+    additive = torch.zeros(allow.shape, device=device, dtype=dtype)
+    additive.masked_fill_(~allow, torch.finfo(dtype).min)
+    return additive.reshape(batch * num_blocks, 1, block_size, block_size)
+
+
 def build_dflash_flex_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -580,31 +622,31 @@ class OnlineMRDFlashModel(OnlineDFlashModel):
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         draft_position_ids = (
             anchor_positions.unsqueeze(-1)
             + torch.arange(self.block_size, device=device).view(1, 1, -1)
-        ).reshape(bsz, -1)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        ).reshape(bsz * n_blocks, self.block_size)
+        noise_embedding = noise_embedding.reshape(
+            bsz * n_blocks, self.block_size, -1
+        )
         memory = self.draft_model.build_memory(
             hidden_states,
             query_positions=anchor_positions,
-        )
+        ).flatten_blocks(n_blocks)
 
         dtype = next(self.draft_model.parameters()).dtype
-        full_mask = build_dflash_additive_mask(
-            anchor_positions,
+        block_mask = build_dflash_block_additive_mask(
             block_keep_mask,
-            seq_len,
             self.block_size,
             device,
             dtype,
+            sliding_window=self.draft_model.spec.sliding_window,
         )
         output_hidden = self.draft_model(
             noise_embedding=noise_embedding,
             memory=memory,
-            position_ids=full_position_ids,
-            attention_mask=full_mask,
+            position_ids=draft_position_ids,
+            attention_mask=block_mask,
             indexer_mode=self._effective_indexer_mode(),
         )
         return anchor_positions, block_keep_mask, output_hidden, n_blocks
@@ -819,6 +861,7 @@ __all__ = [
     "StepOutput",
     "StepContext",
     "build_dflash_additive_mask",
+    "build_dflash_block_additive_mask",
     "build_dflash_flex_block_mask",
     "build_draft_spec_from_target_config",
     "build_mr_draft_spec_from_target_config",

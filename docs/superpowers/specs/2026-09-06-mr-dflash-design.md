@@ -1,5 +1,9 @@
 # MR-DFlash V1 Design — revision 2026-09-07
 
+> Revision follow-up: training MR-DFlash xử lý từng anchor block ở batch
+> dimension; shared target KV được project một lần và CSA gather trên projected
+> KV. Đây là điều kiện bắt buộc trước pilot/serious training.
+
 ## Mục tiêu
 
 Triển khai một drafter MR-DFlash trong `src/MR_DFlash` trên nền DFlash hiện
@@ -59,6 +63,19 @@ Local và selected CSA đi qua cùng một softmax. Context/draft đều dùng c
 quy ước RoPE theo absolute token position; compressed entry lấy position của
 token cuối group.
 
+### Layout training và giới hạn bộ nhớ
+
+Training không flatten `N` anchor blocks thành một query sequence duy nhất.
+Với `K=block_size`, tensor được đổi từ `[B,N*K,H]` thành `[B*N,K,H]`; local
+view `[B,N,W,H]` được reshape thành `[B*N,W,H]`, còn global memory giữ batch
+`B` và dùng mapping block. Vì vậy draft logits có chi phí `O(B*N*K*K)` thay vì
+`O(B*(N*K)*(N*K))`.
+
+`MRDFlashJointAttention.project_context()` giữ shared KV ở dạng
+`[B,C,n_heads,D]`. Dense HCA/CSA project một lần; CSA Top-k project toàn bộ
+CSA memory một lần rồi gather `K/V` đã chiếu theo từng query. Chỉ tensor
+projected Top-k `[B*N,K,top_k,n_heads,D]` được materialize.
+
 Khi `sliding_window=None`, block mask là full same-block giống DFlash/SpecForge
 gốc; khi sliding attention được bật, draft sub-block dùng lower-triangular
 window. Training và reference inference bắt buộc dùng cùng helper/mask policy.
@@ -86,12 +103,19 @@ indexer_dim: null       # mặc định H
 `init_from_target` tiếp tục copy attention/FFN của target layer vào draft
 stage. `mr_num_stages` là số MR stages và có route xen kẽ `HCA, CSA, HCA, ...`;
 `mr_stage_init_layer_ids` có đúng một layer id cho mỗi stage. Các adapter HCA/CSA
-và compressor được khởi tạo ổn định từ trung bình feature; compressor dùng
-trọng số theo từng channel và positional bias trong group. Indexer là bản
-Lightning-inspired torch thuần (multi-head ReLU interaction + query head
-weight), với schedule `dense` warm-up trong `indexer_dense_steps` rồi chuyển
-`topk`. Cả dense và top-k đều truyền score qua attention bias để q/k còn
-gradient; không tuyên bố đây là full DeepSeek Lightning Indexer production.
+được khởi tạo ổn định từ trung bình feature rồi qua RMSNorm riêng; compressor
+dùng trọng số theo từng channel và positional bias trong group. Indexer là bản
+Lightning-inspired torch thuần: mỗi head dùng `ReLU(dot(q,k))` rồi query head
+weight, với schedule `dense` warm-up trong `indexer_dense_steps` rồi chuyển
+`topk`. V1 mặc định truyền score qua attention bias để q/k còn gradient; đây
+là engineering surrogate trong khi chưa có ranking/teacher loss riêng, không
+tuyên bố đây là full DeepSeek Lightning Indexer production. `indexer_num_heads`
+configurable (baseline `1`, ablation khuyến nghị `4` và `8`).
+
+Checkpoint DFlash có thể warm-start MR-DFlash qua converter tích hợp:
+attention/MLP/norm được copy vào từng stage, `fc`/`hidden_norm` được copy vào
+hai adapter; compressor và indexer là module mới nên giữ khởi tạo MR. Native
+MR checkpoint được load strict để không âm thầm chạy bằng random weights.
 
 Test “initialized draft” kiểm tra copy key và forward hữu hạn, không khẳng định
 logits bằng target.

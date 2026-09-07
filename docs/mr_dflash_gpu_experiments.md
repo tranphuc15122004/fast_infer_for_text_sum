@@ -11,16 +11,19 @@ riêng. Agent không tự chọn GPU hay chiếm GPU của job khác; người c
 - Python runtime hiện tại dùng `torch 2.11.0+cu130` nhưng báo
   `torch.cuda.is_available()=False` và `torch.cuda.device_count()=0`, kèm cảnh
   báo không khởi tạo được NVML.
+- Kiểm tra lại ở lượt refactor này: `nvidia-smi` trong runtime workspace không
+  giao tiếp được với NVIDIA driver; vì vậy không được xem máy hiện tại là GPU
+  smoke host dù lịch sử preflight có thấy T4.
 - Vì runtime T4 hiện tại không expose CUDA cho PyTorch, GPU smoke B200 chưa
   được thực hiện tại workspace này; không xem kết quả CPU là bằng chứng GPU.
 - CPU simulation bằng `.venv/bin/python` (Python `3.12.13`) chạy được toàn bộ
-  MR-DFlash package smoke: `22 passed, 2 skipped` trong khoảng `37s`. Đây không phải validation
+  MR-DFlash package smoke: `29 passed, 2 skipped` trong khoảng `31s`. Đây không phải validation
   của server B200; `.venv` vẫn chứa PyTorch `cu130` và chỉ được dùng CPU trên
   máy T4 này.
 - Real-model smoke vừa chạy offline với snapshot Qwen3-4B local: capture 5
   layer (`hidden_size=2560`), train MR-DFlash `1` optimizer step, lưu/nạp
   `draft_final.pt`, rồi chạy đủ `prefill → draft → verify → generate`; kết quả
-  `1 passed` trong `150.73s`, `loss=11.1823`, output 2 token finite. Đây là
+  `1 passed` trong `164.86s`, `loss=12.0915`, output 2 token finite. Đây là
   functional smoke trên CPU, chưa phải GPU benchmark.
 - DDP CPU world-size 2 cũng đã pass bằng `torchrun`; đây chỉ là validation
   process-group/sharding/checkpoint, không thay thế GPU smoke.
@@ -108,9 +111,11 @@ DFlash và MR-DFlash với các tham số DFlash giống nhau:
 | Variant | MR-DFlash | 16 | 512 | 6e-4 | 7.0 |
 
 MR-specific values cố định ở V1: HCA `128`, CSA `4`, local `128`, Top-k `64`,
-2 stages, indexer dense warm-up `1000` optimizer steps rồi hard Top-k. Joint
-attention MR V1 dùng path tensor SDPA-compatible để kiểm chứng correctness;
-chưa xem đây là benchmark kernel tối ưu. Mỗi run cần ghi:
+2 stages, indexer dense warm-up `1000` optimizer steps rồi hard Top-k,
+`indexer_num_heads=1` cho baseline. Joint attention MR V1 dùng block-batch
+layout `[B*N,K,H]`, project shared KV một lần và gather projected KV cho CSA;
+chưa xem đây là benchmark kernel tối ưu. Có thể chạy thêm ablation
+`indexer_num_heads=4,8` với seed/data giữ nguyên. Mỗi run cần ghi:
 
 - primary: acceptance rate trên cùng token budget;
 - guardrails: target quality/ROUGE, draft memory, peak VRAM, prefill/decode

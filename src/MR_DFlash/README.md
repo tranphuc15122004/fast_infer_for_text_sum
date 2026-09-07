@@ -81,15 +81,29 @@ hai view:
    nằm ở `pending_hca`. Raw local HCA có cửa sổ `128` và được gather tương
    đối theo từng anchor trong training.
 2. CSA pool theo nhóm đủ với ratio `4`; `CSAIndexer` chấm điểm từng query.
-   Training mặc định chạy dense score-bias trong warm-up rồi chuyển hard
-   Top-k tối đa `64` theo `indexer_dense_steps`. Local và selected CSA được
-   nối vào cùng một context trước một softmax.
+  Training mặc định chạy dense score-bias trong warm-up rồi chuyển hard
+  Top-k tối đa `64` theo `indexer_dense_steps`. Local và selected CSA được
+  nối vào cùng một context trước một softmax. Score dùng
+  `ReLU(dot(q_head, k_head))`; V1 score-bias là bridge để hard selection vẫn
+  có gradient.
 
 Đường forward mặc định gồm các stage xen kẽ `HCA -> CSA -> HCA -> ...`.
 Mỗi stage dùng một DFlash joint attention với `KV=[MR context; draft block]`,
 áp RoPE cho query, raw local position và compressed group-end position.
 `MRMemoryState.append()` chỉ nhận feature của token đã được verifier chấp
 nhận; HCA/CSA giữ pending position độc lập.
+
+Trong training, `N` anchor blocks được reshape thành batch `[B*N,K,H]`; local
+memory query-relative thành `[B*N,W,H]`, còn global memory giữ batch `[B,C,H]`
+và dùng mapping block. Joint attention vì vậy chỉ tạo draft logits `K×K` cho
+mỗi block. Shared context được chiếu K/V một lần;
+CSA Top-k gather trên projected K/V, không gather hidden-size memory rồi mới
+project theo query. Đây là layout bắt buộc cho `num_anchors=512`.
+
+Checkpoint DFlash có thể truyền qua `draft_checkpoint_path` để converter
+copy attention/MLP/norm vào mọi MR stage và copy `fc` vào hai adapter. Các
+compressor/indexer không có tensor tương ứng nên khởi tạo mới. Native MR
+checkpoint được kiểm tra strict khi infer.
 
 ## Cách chạy
 

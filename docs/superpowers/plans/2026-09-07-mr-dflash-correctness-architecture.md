@@ -139,3 +139,47 @@
 - [x] Cập nhật docs: approximation vs DeepSeek-faithful parts, indexer warm-up, stage config và B200 command.
 - [x] Chạy `git diff --check`, `py_compile`, toàn bộ `src/MR_DFlash/tests` và real Qwen3-4B smoke CPU.
 - [x] Ghi rõ GPU chưa chạy và không claim speedup/quality.
+
+## Follow-up review — scalability and architecture fidelity (2026-09-07)
+
+Phần này thực hiện các nhận xét mới sau khi đọc lại implementation tại
+`a182c46`. Các điểm DeepSeek-specific chưa đủ để gọi là faithful production
+module được giữ trong phạm vi V1 và ghi thành ablation/deferred work.
+
+### Task 7: Block-batch training và projected KV
+
+**Files:** `src/MR_DFlash/training.py`, `src/MR_DFlash/mr_model.py`,
+`src/MR_DFlash/memory.py`, `src/MR_DFlash/tests/test_mr_review_followups.py`
+
+- [x] Thêm `build_dflash_block_additive_mask()` trả `[B*N,1,K,K]` mà không
+  materialize mask/logits `[B,1,N*K,N*K]`.
+- [x] Reshape training noise/positions thành `[B*N,K,*]`; flatten memory
+  query-relative theo block và giữ tương thích với caller cũ nhiều block.
+- [x] Chiếu shared context một lần trong `project_context()`; Top-k gather
+  projected K/V thay vì gather hidden context rồi chiếu theo query.
+- [x] Test block batch, mask diagonal tương đương và local view từng anchor.
+
+### Task 8: Adapter, Indexer và checkpoint transfer
+
+**Files:** `src/MR_DFlash/memory.py`, `src/MR_DFlash/checkpoint.py`,
+`src/MR_DFlash/mr_model.py`, `src/MR_DFlash/tests/test_mr_review_followups.py`
+
+- [x] Thêm RMSNorm riêng cho HCA/CSA adapter.
+- [x] Đổi Indexer thành head-wise `ReLU(dot(q,k))`; giữ score-bias mặc định
+  như bridge differentiable và ghi rõ không phải ranking loss/Lightning
+  production.
+- [x] Thêm converter DFlash → MR-DFlash: map attention/MLP/norm vào mọi stage,
+  map `fc`/`hidden_norm` vào hai adapter, để compressor/indexer khởi tạo mới.
+- [x] Native MR checkpoint load strict; thiếu/unexpected key phải fail rõ ràng.
+- [x] Thêm test công thức score, converter và strict loading.
+
+### Task 9: Documentation and validation
+
+**Files:** `docs/mr_dflash.md`, `docs/mr_dflash_gpu_experiments.md`,
+`docs/superpowers/specs/2026-09-06-mr-dflash-design.md`
+
+- [x] Ghi complexity/layout mới, projected KV, Q/K Norm→RoPE, Indexer
+  surrogate và ablation `indexer_num_heads={1,4,8}`.
+- [x] Cập nhật B200 runbook; không tự chạy GPU khi chưa có allocation riêng.
+- [x] Chạy review tests và toàn bộ `src/MR_DFlash/tests`; giữ real Qwen smoke
+  cho validation cuối cùng trước claim pilot.

@@ -33,6 +33,17 @@ def _apply_rope(
     return states * cos + _rotate_half(states) * sin
 
 
+@dataclass(frozen=True)
+class MRProjectedContextPart:
+    """Một đoạn context đã chiếu, có thể dùng chung cho nhiều block."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+    # Với key/value [B,C,H,D], ánh xạ query batch [B*N] về B gốc. None nghĩa
+    # batch projected đã trùng trực tiếp với query batch.
+    batch_indices: Optional[torch.Tensor] = None
+
+
 class MRBlockAttention(nn.Module):
     """Self attention của draft block, không cho phép cross-block leakage."""
 
@@ -279,59 +290,103 @@ class MRDFlashJointAttention(nn.Module):
         sin = sin.unsqueeze(-2)
         return states * cos + _rotate_half(states) * sin
 
-    @staticmethod
-    def _as_per_query(
+    def project_context(
+        self,
         context: torch.Tensor,
         context_positions: torch.Tensor,
-        query_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chiếu context một lần, không mở rộng hidden theo query.
+
+        Shared context có layout ``[B,C,H]`` và projected KV có layout
+        ``[B,C,n_heads,D]``. Chỉ CSA Top-k cần layout per-query sau khi đã
+        gather projected KV: ``[B,Q,C,n_heads,D]``.
+        """
         if context.ndim == 3:
-            context = context.unsqueeze(1).expand(-1, query_len, -1, -1)
-        if context_positions.ndim == 2:
-            context_positions = context_positions.unsqueeze(1).expand(
-                -1, query_len, -1
+            batch, context_len, _ = context.shape
+            if context_positions.shape != (batch, context_len):
+                raise ValueError("context_positions không khớp shared context")
+            k = self.k_proj(context).view(
+                batch, context_len, self.num_kv_heads, self.head_dim
             )
-        if context.ndim != 4 or context_positions.ndim != 3:
-            raise ValueError(
-                "context phải có [B,K,H]/[B,Q,K,H] và positions tương ứng"
+            v = self.v_proj(context).view(
+                batch, context_len, self.num_kv_heads, self.head_dim
             )
-        if context.shape[:2] != context_positions.shape[:2]:
-            raise ValueError("context và context_positions không cùng B/Q")
-        if context.shape[2] != context_positions.shape[2]:
-            raise ValueError("context và context_positions không cùng K")
-        return context, context_positions
+            k = self._rope(self.k_norm(k), context_positions)
+            if self.num_key_value_groups > 1:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+            return k, v
+        if context.ndim == 4:
+            batch, query_len, context_len, _ = context.shape
+            if context_positions.shape != (batch, query_len, context_len):
+                raise ValueError("context_positions không khớp per-query context")
+            k = self.k_proj(context).view(
+                batch, query_len, context_len, self.num_kv_heads, self.head_dim
+            )
+            v = self.v_proj(context).view(
+                batch, query_len, context_len, self.num_kv_heads, self.head_dim
+            )
+            k = self._rope(self.k_norm(k), context_positions)
+            if self.num_key_value_groups > 1:
+                k = k.repeat_interleave(self.num_key_value_groups, dim=3)
+                v = v.repeat_interleave(self.num_key_value_groups, dim=3)
+            return k, v
+        raise ValueError("context phải có dạng [B,C,H] hoặc [B,Q,C,H]")
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        context: torch.Tensor,
+        context: Optional[torch.Tensor],
         query_positions: torch.Tensor,
         context_positions: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         context_bias: Optional[torch.Tensor] = None,
+        projected_context: Optional[tuple[MRProjectedContextPart, ...]] = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 3 or query_positions.ndim != 2:
             raise ValueError("hidden_states/query_positions phải có dạng [B,Q,...]")
         batch, query_len, _ = hidden_states.shape
         if query_positions.shape != (batch, query_len):
             raise ValueError("query_positions không khớp hidden_states")
-        context, context_positions = self._as_per_query(
-            context, context_positions, query_len
-        )
-        context_len = context.shape[2]
-
         q = self.q_proj(hidden_states).view(
             batch, query_len, self.num_heads, self.head_dim
         )
-        q = self.q_norm(self._rope(q, query_positions))
+        # DFlash convention: Q/K norm trước RoPE. RMSNorm có learned
+        # per-dimension scale nên đổi thứ tự không phải phép biến đổi vô hại.
+        q = self._rope(self.q_norm(q), query_positions)
 
-        k_context = self.k_proj(context).view(
-            batch, query_len, context_len, self.num_kv_heads, self.head_dim
+        if projected_context is None:
+            if context is None:
+                raise ValueError("context hoặc projected_context là bắt buộc")
+            k_context, v_context = self.project_context(context, context_positions)
+            context_parts = (MRProjectedContextPart(k_context, v_context),)
+        else:
+            context_parts = projected_context
+        context_lengths = []
+        for part in context_parts:
+            key = part.key
+            if key.ndim == 4:
+                if part.batch_indices is None and key.shape[0] != batch:
+                    raise ValueError("shared projected context không khớp batch")
+                if part.batch_indices is not None and part.batch_indices.shape != (batch,):
+                    raise ValueError("batch_indices của projected context không hợp lệ")
+                context_lengths.append(key.shape[1])
+            elif key.ndim == 5:
+                if key.shape[:2] != (batch, query_len):
+                    raise ValueError("per-query projected context không khớp query")
+                context_lengths.append(key.shape[2])
+            else:
+                raise ValueError(
+                    "projected context phải có dạng [B,C,H,D] hoặc [B,Q,C,H,D]"
+                )
+        context_len = sum(context_lengths)
+        expected_positions = (
+            (batch, context_len)
+            if context_positions.ndim == 2
+            else (batch, query_len, context_len)
         )
-        v_context = self.v_proj(context).view(
-            batch, query_len, context_len, self.num_kv_heads, self.head_dim
-        )
-        k_context = self.k_norm(self._rope(k_context, context_positions))
+        if context_positions.shape != expected_positions:
+            raise ValueError("context_positions không khớp projected context")
 
         k_draft = self.k_proj(hidden_states).view(
             batch, query_len, self.num_kv_heads, self.head_dim
@@ -339,21 +394,47 @@ class MRDFlashJointAttention(nn.Module):
         v_draft = self.v_proj(hidden_states).view(
             batch, query_len, self.num_kv_heads, self.head_dim
         )
-        k_draft = self.k_norm(self._rope(k_draft, query_positions))
+        k_draft = self._rope(self.k_norm(k_draft), query_positions)
 
         if self.num_key_value_groups > 1:
-            k_context = k_context.repeat_interleave(self.num_key_value_groups, dim=3)
-            v_context = v_context.repeat_interleave(self.num_key_value_groups, dim=3)
+            # project_context() đã trả context theo num_attention_heads;
+            # draft KV vẫn bắt đầu ở num_key_value_heads.
             k_draft = k_draft.repeat_interleave(self.num_key_value_groups, dim=2)
             v_draft = v_draft.repeat_interleave(self.num_key_value_groups, dim=2)
 
-        # Broadcast draft KV over the query axis: every draft query sees the
-        # entire draft block, with the block semantics supplied by the mask.
+        # Draft KV được broadcast theo query trong *một block*. Training đã
+        # đưa mỗi block vào batch dimension, nên query_len ở đây chỉ là K,
+        # không còn là toàn bộ N*K của sample.
         k_draft = k_draft.unsqueeze(1).expand(-1, query_len, -1, -1, -1)
         v_draft = v_draft.unsqueeze(1).expand(-1, query_len, -1, -1, -1)
-        k_all = torch.cat([k_context, k_draft], dim=2)
-        v_all = torch.cat([v_context, v_draft], dim=2)
-        scores = torch.einsum("bqhd,bqkhd->bqhk", q, k_all) * self.scaling
+
+        context_score_parts = []
+        for part in context_parts:
+            key = part.key
+            if key.ndim == 4:
+                if part.batch_indices is None:
+                    part_scores = torch.einsum("bqhd,bchd->bqhc", q, key)
+                else:
+                    base_batch = key.shape[0]
+                    if batch % base_batch:
+                        raise ValueError("projected context batch không chia hết query batch")
+                    num_blocks = batch // base_batch
+                    expected_indices = torch.arange(
+                        base_batch, device=q.device, dtype=torch.long
+                    ).repeat_interleave(num_blocks)
+                    if not torch.equal(part.batch_indices, expected_indices):
+                        raise ValueError("projected context batch_indices không tuần tự")
+                    grouped_q = q.reshape(
+                        base_batch, num_blocks, query_len, self.num_heads, self.head_dim
+                    )
+                    part_scores = torch.einsum(
+                        "bnqhd,bchd->bnqhc", grouped_q, key
+                    ).reshape(batch, query_len, self.num_heads, key.shape[1])
+            else:
+                part_scores = torch.einsum("bqhd,bqchd->bqhc", q, key)
+            context_score_parts.append(part_scores)
+        draft_scores = torch.einsum("bqhd,bqkhd->bqhk", q, k_draft)
+        scores = torch.cat([*context_score_parts, draft_scores], dim=-1) * self.scaling
 
         if context_bias is not None:
             if context_bias.shape != (batch, query_len, context_len):
@@ -376,7 +457,32 @@ class MRDFlashJointAttention(nn.Module):
             scores = scores + attention_mask.squeeze(1).unsqueeze(2)
 
         weights = scores.softmax(dim=-1)
-        output = torch.einsum("bqhk,bqkhd->bqhd", weights, v_all)
+        draft_weights = weights[..., context_len:]
+        context_output = torch.zeros_like(q)
+        offset = 0
+        for part, part_len in zip(context_parts, context_lengths):
+            part_weights = weights[..., offset : offset + part_len]
+            value = part.value
+            if value.ndim == 4:
+                if part.batch_indices is None:
+                    part_output = torch.einsum("bqhc,bchd->bqhd", part_weights, value)
+                else:
+                    base_batch = value.shape[0]
+                    num_blocks = batch // base_batch
+                    grouped_weights = part_weights.reshape(
+                        base_batch, num_blocks, query_len, self.num_heads, part_len
+                    )
+                    part_output = torch.einsum(
+                        "bnqhc,bchd->bnqhd", grouped_weights, value
+                    ).reshape(batch, query_len, self.num_heads, self.head_dim)
+            else:
+                part_output = torch.einsum(
+                    "bqhc,bqchd->bqhd", part_weights, value
+                )
+            context_output = context_output + part_output
+            offset += part_len
+        draft_output = torch.einsum("bqhk,bqkhd->bqhd", draft_weights, v_draft)
+        output = context_output + draft_output
         return self.o_proj(output.reshape(batch, query_len, -1))
 
 
@@ -409,18 +515,74 @@ class MRDraftStage(nn.Module):
         query_len: int,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if values.ndim == 4:
-            if values.shape[1] == query_len // block_size:
-                values = values.repeat_interleave(block_size, dim=1)
-                positions = positions.repeat_interleave(block_size, dim=1)
-            elif values.shape[1] != query_len:
-                raise ValueError("local memory không khớp số draft query/block")
-        if values.ndim == 3:
-            values = values.unsqueeze(1).expand(-1, query_len, -1, -1)
-            positions = positions.unsqueeze(1).expand(-1, query_len, -1)
-        if values.ndim != 4 or positions.ndim != 3:
-            raise ValueError("memory view phải có dạng [B,K,H] hoặc [B,Q,K,H]")
-        return values, positions
+        del block_size
+        if values.ndim == 3 and positions.ndim == 2:
+            return values, positions
+        if values.ndim == 4 and positions.ndim == 3:
+            if values.shape[:2] != (values.shape[0], query_len):
+                raise ValueError("per-query memory không khớp số draft query")
+            return values, positions
+        raise ValueError(
+            "memory view phải có dạng [B,K,H] hoặc [B,Q,K,H] và positions tương ứng"
+        )
+
+    @staticmethod
+    def _gather_projected(
+        values: torch.Tensor,
+        indices: torch.Tensor,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Gather ``[B,C,H,D]`` projected KV thành ``[B,Q,K,H,D]``."""
+        batch, query_len, top_k = indices.shape
+        if values.ndim != 4:
+            raise ValueError("projected memory không khớp indices")
+        if values.shape[0] == batch and batch_indices is None:
+            return torch.gather(
+                values.unsqueeze(1).expand(-1, query_len, -1, -1, -1),
+                2,
+                indices.unsqueeze(-1).unsqueeze(-1).expand(
+                    batch, query_len, top_k, values.shape[2], values.shape[3]
+                ),
+            )
+        if batch_indices is None:
+            raise ValueError("projected memory cần batch_indices khi batch khác nhau")
+        base_batch = values.shape[0]
+        if batch % base_batch or batch_indices.shape != (batch,):
+            raise ValueError("batch_indices không khớp projected memory")
+        num_blocks = batch // base_batch
+        expected_indices = torch.arange(
+            base_batch, device=indices.device, dtype=torch.long
+        ).repeat_interleave(num_blocks)
+        if not torch.equal(batch_indices, expected_indices):
+            raise ValueError("batch_indices phải ánh xạ tuần tự các block")
+        grouped_values = values.unsqueeze(1).unsqueeze(2).expand(
+            -1, num_blocks, query_len, -1, -1, -1
+        )
+        grouped_indices = indices.reshape(
+            base_batch, num_blocks, query_len, top_k
+        )
+        selected = torch.gather(
+            grouped_values,
+            3,
+            grouped_indices.unsqueeze(-1).unsqueeze(-1).expand(
+                base_batch,
+                num_blocks,
+                query_len,
+                top_k,
+                values.shape[2],
+                values.shape[3],
+            ),
+        )
+        return selected.reshape(batch, query_len, top_k, values.shape[2], values.shape[3])
+
+    @staticmethod
+    def _query_batch_positions(
+        positions: torch.Tensor,
+        batch_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if batch_indices is None:
+            return positions
+        return positions.index_select(0, batch_indices)
 
     def _context(
         self,
@@ -431,7 +593,12 @@ class MRDraftStage(nn.Module):
         csa_top_k: int,
         block_size: int,
         indexer_mode: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[tuple[MRProjectedContextPart, ...]],
+    ]:
         batch, query_len, _ = hidden.shape
         if self.route == "hca":
             global_values, global_pos = self._query_view(
@@ -440,29 +607,74 @@ class MRDraftStage(nn.Module):
             local_values, local_pos = self._query_view(
                 memory.local_hca, memory.local_positions, query_len, block_size
             )
+            global_k, global_v = self.joint_attn.project_context(
+                memory.hca, memory.hca_positions
+            )
+            local_k, local_v = self.joint_attn.project_context(
+                local_values, local_pos
+            )
+            global_pos = self._query_batch_positions(
+                memory.hca_positions, memory.block_batch_indices
+            )
             return (
-                torch.cat([global_values, local_values], dim=2),
-                torch.cat([global_pos, local_pos], dim=2),
                 None,
+                torch.cat([global_pos, local_pos], dim=1),
+                None,
+                (
+                    MRProjectedContextPart(
+                        global_k, global_v, memory.block_batch_indices
+                    ),
+                    MRProjectedContextPart(local_k, local_v),
+                ),
             )
 
         local_values, local_pos = self._query_view(
             memory.local_csa, memory.local_positions, query_len, block_size
         )
         if memory.csa.shape[1] == 0:
-            return local_values, local_pos, None
+            return local_values, local_pos, None, None
 
         global_values = memory.csa
-        global_pos = memory.csa_positions
+        global_base_pos = memory.csa_positions
+        global_pos = self._query_batch_positions(
+            global_base_pos, memory.block_batch_indices
+        )
         allowed = global_pos.unsqueeze(1) < anchor_positions.unsqueeze(-1)
-        raw_scores = indexer.score(hidden, global_values)
+        raw_scores = indexer.score(
+            hidden,
+            global_values,
+            batch_indices=memory.block_batch_indices,
+        )
         scores = raw_scores.masked_fill(~allowed, 0.0)
         if indexer_mode == "dense":
-            selected_values, selected_pos = self._query_view(
-                global_values, global_pos, query_len, block_size
-            )
+            selected_values, selected_pos = global_values, global_pos
             bias = torch.cat(
-                [torch.zeros_like(local_pos, dtype=hidden.dtype), scores], dim=-1
+                [
+                    torch.zeros(
+                        (batch, query_len, local_pos.shape[-1]),
+                        device=hidden.device,
+                        dtype=hidden.dtype,
+                    ),
+                    scores,
+                ],
+                dim=-1,
+            )
+            global_k, global_v = self.joint_attn.project_context(
+                global_values, memory.csa_positions
+            )
+            local_k, local_v = self.joint_attn.project_context(
+                local_values, local_pos
+            )
+            return (
+                None,
+                torch.cat([local_pos, global_pos], dim=1),
+                bias,
+                (
+                    MRProjectedContextPart(local_k, local_v),
+                    MRProjectedContextPart(
+                        global_k, global_v, memory.block_batch_indices
+                    ),
+                ),
             )
         elif indexer_mode == "topk":
             masked_scores = raw_scores.masked_fill(
@@ -470,20 +682,42 @@ class MRDraftStage(nn.Module):
             )
             k = min(csa_top_k, global_values.shape[1])
             top_scores, indices = masked_scores.topk(k=k, dim=-1)
-            selected_values = indexer.gather(global_values, indices)
             selected_pos = torch.gather(
                 global_pos.unsqueeze(1).expand(-1, query_len, -1), 2, indices
             )
             bias = torch.cat(
-                [torch.zeros_like(local_pos, dtype=hidden.dtype), top_scores], dim=-1
+                [
+                    torch.zeros(
+                        (batch, query_len, local_pos.shape[-1]),
+                        device=hidden.device,
+                        dtype=hidden.dtype,
+                    ),
+                    top_scores,
+                ],
+                dim=-1,
             )
+            local_k, local_v = self.joint_attn.project_context(
+                local_values, local_pos
+            )
+            global_k, global_v = self.joint_attn.project_context(
+                global_values, global_base_pos
+            )
+            selected_k = self._gather_projected(
+                global_k, indices, memory.block_batch_indices
+            )
+            selected_v = self._gather_projected(
+                global_v, indices, memory.block_batch_indices
+            )
+            local_k = local_k.unsqueeze(1).expand(-1, query_len, -1, -1, -1)
+            local_v = local_v.unsqueeze(1).expand(-1, query_len, -1, -1, -1)
+            projected_context = (
+                MRProjectedContextPart(local_k, local_v),
+                MRProjectedContextPart(selected_k, selected_v),
+            )
+            context_positions = torch.cat([local_pos.unsqueeze(1).expand(-1, query_len, -1), selected_pos], dim=2)
+            return None, context_positions, bias, projected_context
         else:
             raise ValueError("indexer_mode phải là 'dense' hoặc 'topk'")
-        return (
-            torch.cat([local_values, selected_values], dim=2),
-            torch.cat([local_pos, selected_pos], dim=2),
-            bias,
-        )
 
     def forward(
         self,
@@ -498,7 +732,7 @@ class MRDraftStage(nn.Module):
         indexer_mode: str,
     ) -> torch.Tensor:
         normalized = self.input_layernorm(hidden)
-        context, context_positions, context_bias = self._context(
+        context, context_positions, context_bias, projected_context = self._context(
             normalized,
             memory,
             anchor_positions,
@@ -513,7 +747,10 @@ class MRDraftStage(nn.Module):
                 raise ValueError("attention_mask phải có dạng [B,1,Q,Q]")
             if draft_mask.shape[-1] != hidden.shape[1]:
                 draft_mask = draft_mask[..., -hidden.shape[1] :]
-        context_allow = context_positions < anchor_positions.unsqueeze(-1)
+        if context_positions.ndim == 2:
+            context_allow = context_positions.unsqueeze(1) < anchor_positions.unsqueeze(-1)
+        else:
+            context_allow = context_positions < anchor_positions.unsqueeze(-1)
         context_mask = torch.zeros(
             (hidden.shape[0], 1, hidden.shape[1], context_allow.shape[-1]),
             device=hidden.device,
@@ -537,6 +774,7 @@ class MRDraftStage(nn.Module):
             context_positions,
             attention_mask=joint_mask,
             context_bias=context_bias,
+            projected_context=projected_context,
         )
         residual = hidden
         hidden = residual + self.mlp(self.post_attention_layernorm(hidden))
@@ -640,6 +878,40 @@ class MRDFlashDraftModel(nn.Module):
         draft_positions = position_ids[:, -length:]
         if length % self.block_size:
             raise ValueError("noise_embedding length phải chia hết cho block_size")
+        restore_shape = None
+        if length > self.block_size:
+            # Backward-compatible path cho callers cũ truyền toàn bộ anchor
+            # blocks trong một sequence. MR training dùng path mới trực tiếp
+            # với [B*N,K,H]; inference thường chỉ có một block.
+            num_blocks = length // self.block_size
+            restore_shape = (batch, length)
+            memory = memory.flatten_blocks(num_blocks)
+            noise_embedding = noise_embedding.reshape(
+                batch * num_blocks, self.block_size, hidden_size
+            )
+            draft_positions = draft_positions.reshape(
+                batch * num_blocks, self.block_size
+            )
+            if isinstance(attention_mask, dict):
+                attention_mask = attention_mask.get("full_attention")
+            if attention_mask is not None:
+                if attention_mask.ndim != 4:
+                    raise ValueError("attention_mask phải có dạng [B,1,L,L]")
+                # Nếu caller truyền mask có phần context, chỉ giữ draft ×
+                # draft trước khi lấy các block diagonal.
+                attention_mask = attention_mask[..., -length:, -length:]
+                attention_mask = torch.stack(
+                    [
+                        attention_mask[
+                            :, :, start : start + self.block_size,
+                            start : start + self.block_size,
+                        ]
+                        for start in range(0, length, self.block_size)
+                    ],
+                    dim=1,
+                ).reshape(batch * num_blocks, 1, self.block_size, self.block_size)
+            batch = batch * num_blocks
+            length = self.block_size
         anchor_positions = draft_positions.view(
             batch, length // self.block_size, self.block_size
         )[:, :, 0].repeat_interleave(self.block_size, dim=1)
@@ -663,7 +935,11 @@ class MRDFlashDraftModel(nn.Module):
                 self.block_size,
                 indexer_mode,
             )
-        return self.norm(hidden)
+        hidden = self.norm(hidden)
+        if restore_shape is not None:
+            original_batch, original_length = restore_shape
+            hidden = hidden.reshape(original_batch, original_length, hidden_size)
+        return hidden
 
     def init_from_target(
         self,

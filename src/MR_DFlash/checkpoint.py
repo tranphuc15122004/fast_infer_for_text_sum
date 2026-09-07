@@ -8,7 +8,7 @@ key dưới module draft (do ``DFlashTrainStrategy.checkpoint_state_filter`` quy
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -64,16 +64,83 @@ def save_draft_weights(
     torch.save(payload, path)
 
 
+def _convert_dflash_state_to_mr(
+    state: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """Map one-layer/multi-layer DFlash weights into every MR stage.
+
+    ``fc`` and ``hidden_norm`` initialize the two feature adapters; the
+    compressors and indexer intentionally remain at their MR initialization
+    because DFlash has no equivalent parameters.
+    """
+    current = model.state_dict()
+    source_layers: Dict[int, Dict[str, torch.Tensor]] = {}
+    for key, value in state.items():
+        if not key.startswith("layers."):
+            continue
+        parts = key.split(".", 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            source_layers.setdefault(int(parts[1]), {})[parts[2]] = value
+    if not source_layers:
+        raise ValueError("DFlash checkpoint không có layers.* để chuyển sang MR-DFlash")
+
+    target_stage_count = len(getattr(model, "stages", []))
+    if target_stage_count < 1:
+        raise ValueError("model đích không có stages MR-DFlash")
+    converted: Dict[str, torch.Tensor] = {}
+
+    group_map = {
+        "input_layernorm": "input_layernorm",
+        "self_attn": "joint_attn",
+        "post_attention_layernorm": "post_attention_layernorm",
+        "mlp": "mlp",
+    }
+    source_layer_ids = sorted(source_layers)
+    for stage_idx in range(target_stage_count):
+        source_idx = source_layer_ids[min(stage_idx, len(source_layer_ids) - 1)]
+        for source_key, value in source_layers[source_idx].items():
+            source_group, separator, suffix = source_key.partition(".")
+            destination_group = group_map.get(source_group)
+            if destination_group is None or not separator:
+                continue
+            destination_key = f"stages.{stage_idx}.{destination_group}.{suffix}"
+            if destination_key in current and current[destination_key].shape == value.shape:
+                converted[destination_key] = value
+
+    top_level_map = {
+        "fc.weight": "memory.adapter.hca.weight",
+        "hidden_norm.weight": "memory.adapter.hca_norm.weight",
+        "norm.weight": "norm.weight",
+    }
+    for source_key, destination_key in top_level_map.items():
+        value = state.get(source_key)
+        if value is None:
+            continue
+        if destination_key in current and current[destination_key].shape == value.shape:
+            converted[destination_key] = value
+    # Share the same DFlash adapter initialization across the two MR views.
+    if "memory.adapter.hca.weight" in converted:
+        if current["memory.adapter.csa.weight"].shape == converted["memory.adapter.hca.weight"].shape:
+            converted["memory.adapter.csa.weight"] = converted["memory.adapter.hca.weight"]
+    if "memory.adapter.hca_norm.weight" in converted:
+        if current["memory.adapter.csa_norm.weight"].shape == converted["memory.adapter.hca_norm.weight"].shape:
+            converted["memory.adapter.csa_norm.weight"] = converted["memory.adapter.hca_norm.weight"]
+    return converted
+
+
 def warm_start_draft_model(
     model: torch.nn.Module,
     checkpoint_path: str,
     *,
     key_prefix: str = "draft_model.",
     strategy_name: str = "dflash",
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     """Nạp draft weights từ checkpoint (training checkpoint hoặc weights-only).
 
-    Trả về danh sách key đã nạp; chỉ báo lỗi nếu thiếu key bắt buộc.
+    Trả về ``(missing, unexpected)``. Native ``mr_dflash`` checkpoint được
+    load strict; khi source là DFlash, converter cho phép thiếu các module MR
+    mới (pool/indexer) nhưng vẫn fail nếu thiếu tensor có thể chuyển.
     """
     raw = load_training_checkpoint(checkpoint_path)
     state = raw.get("draft_state_dict")
@@ -93,12 +160,40 @@ def warm_start_draft_model(
         else:
             loadable[key] = value
     current = model.state_dict()
-    missing_required = [k for k in current if k not in loadable and "fc." not in k and "hidden_norm." not in k]
+    is_mr_conversion = strategy_name == "mr_dflash" and any(
+        key.startswith("layers.") for key in loadable
+    )
+    if is_mr_conversion:
+        converted = _convert_dflash_state_to_mr(loadable, model)
+        incompatible = model.load_state_dict(converted, strict=False)
+        # Các tensor mới của MR không có trong DFlash và được khởi tạo riêng.
+        allowed_new = (
+            "memory.hca_pool.",
+            "memory.csa_pool.",
+            "memory.indexer.",
+        )
+        missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith(allowed_new)
+        ]
+        unexpected = list(incompatible.unexpected_keys)
+        if missing or unexpected:
+            raise RuntimeError(
+                "strict DFlash→MR-DFlash conversion failed: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        return [], []
+
     incompatible = model.load_state_dict(loadable, strict=False)
     missing = list(incompatible.missing_keys)
     unexpected = list(incompatible.unexpected_keys)
-    if missing_required and strategy_name:
-        # fc/hidden_norm có thể vắng ở checkpoint cũ; không báo lỗi.
+    if strategy_name == "mr_dflash" and (missing or unexpected):
+        raise RuntimeError(
+            "strict MR-DFlash checkpoint load failed: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if strategy_name and strategy_name != "mr_dflash":
+        # fc/hidden_norm có thể vắng ở checkpoint DFlash cũ.
         missing = [k for k in missing if "fc." not in k and "hidden_norm." not in k]
     return missing, unexpected
 

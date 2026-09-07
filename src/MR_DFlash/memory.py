@@ -13,6 +13,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from .model import RMSNorm
+
 
 def _check_feature_tensor(features: torch.Tensor, name: str = "features") -> None:
     if features.ndim != 3:
@@ -37,6 +39,56 @@ class MRMemoryState:
     pending_csa: torch.Tensor
     pending_csa_positions: torch.Tensor
     total_tokens: int
+    # Khi training flatten các anchor thành batch, global memory vẫn giữ batch
+    # gốc; field này ánh xạ từng block query về sample tương ứng.
+    block_batch_indices: Optional[torch.Tensor] = None
+
+    def flatten_blocks(self, num_blocks: int) -> "MRMemoryState":
+        """Đổi memory query-relative thành batch ``B * num_blocks``.
+
+        Training MR-DFlash xử lý từng draft block như một phần tử batch để
+        attention không phải dựng logits giữa các block độc lập. Global
+        memory giữ batch gốc và dùng ``block_batch_indices``; local memory đã có layout
+        ``[B, num_blocks, W, H]`` khi build với ``query_positions``.
+        """
+        if num_blocks < 1:
+            raise ValueError("num_blocks phải >= 1")
+        batch = self.hca.shape[0]
+
+        def flatten_local(values: torch.Tensor, name: str) -> torch.Tensor:
+            if values.ndim == 4:
+                if values.shape[1] != num_blocks:
+                    raise ValueError(
+                        f"{name} có {values.shape[1]} blocks, cần {num_blocks}"
+                    )
+                return values.reshape(batch * num_blocks, *values.shape[2:])
+            if values.ndim == 3:
+                if name == "local_positions" and values.shape[1] == num_blocks:
+                    return values.reshape(batch * num_blocks, values.shape[2])
+                return values.repeat_interleave(num_blocks, dim=0)
+            if values.ndim == 2:
+                return values.repeat_interleave(num_blocks, dim=0)
+            raise ValueError(f"{name} phải có dạng [B,W,H] hoặc [B,N,W,H]")
+
+        return MRMemoryState(
+            # Không repeat global hidden memory: joint attention/indexer dùng
+            # block_batch_indices để contraction trực tiếp với batch [B,N].
+            hca=self.hca,
+            hca_positions=self.hca_positions,
+            csa=self.csa,
+            csa_positions=self.csa_positions,
+            local_hca=flatten_local(self.local_hca, "local_hca"),
+            local_csa=flatten_local(self.local_csa, "local_csa"),
+            local_positions=flatten_local(self.local_positions, "local_positions"),
+            pending_hca=self.pending_hca,
+            pending_hca_positions=self.pending_hca_positions,
+            pending_csa=self.pending_csa,
+            pending_csa_positions=self.pending_csa_positions,
+            total_tokens=self.total_tokens,
+            block_batch_indices=torch.arange(
+                batch, device=self.hca.device, dtype=torch.long
+            ).repeat_interleave(num_blocks),
+        )
 
 
 class TargetFeatureAdapter(nn.Module):
@@ -50,6 +102,8 @@ class TargetFeatureAdapter(nn.Module):
         self.hidden_size = int(hidden_size)
         self.hca = nn.Linear(input_dim, hidden_size, bias=False)
         self.csa = nn.Linear(input_dim, hidden_size, bias=False)
+        self.hca_norm = RMSNorm(hidden_size)
+        self.csa_norm = RMSNorm(hidden_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -79,7 +133,7 @@ class TargetFeatureAdapter(nn.Module):
             raise ValueError(
                 f"feature width={features.shape[-1]} không khớp input_dim={self.input_dim}"
             )
-        return self.hca(features), self.csa(features)
+        return self.hca_norm(self.hca(features)), self.csa_norm(self.csa(features))
 
 
 class WeightedTokenPool(nn.Module):
@@ -206,23 +260,73 @@ class CSAIndexer(nn.Module):
         top_scores, top_indices = scores.topk(k=k, dim=-1)
         return top_indices, top_scores
 
-    def score(self, query: torch.Tensor, csa_memory: torch.Tensor) -> torch.Tensor:
+    def score(
+        self,
+        query: torch.Tensor,
+        csa_memory: torch.Tensor,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Trả toàn bộ index scores để dense/indexer warm-up có gradient."""
         if query.ndim != 3 or csa_memory.ndim != 3:
             raise ValueError("query và csa_memory phải có dạng [batch, seq, hidden]")
-        if query.shape[0] != csa_memory.shape[0] or query.shape[-1] != self.hidden_size:
+        if query.shape[-1] != self.hidden_size:
             raise ValueError("query/csa_memory không cùng batch hoặc hidden size")
         if csa_memory.shape[1] < 1:
             raise ValueError("csa_memory phải có ít nhất một slot")
         batch, query_len, _ = query.shape
         memory_len = csa_memory.shape[1]
         q = self.q_proj(query).view(batch, query_len, self.num_heads, self.head_dim)
-        k = self.k_proj(csa_memory).view(batch, memory_len, self.num_heads, self.head_dim)
+        memory_batch = csa_memory.shape[0]
+        k = self.k_proj(csa_memory).view(
+            memory_batch, memory_len, self.num_heads, self.head_dim
+        )
+        # Lightning-style head score: ReLU(dot(q, k)) per head. Applying
+        # ReLU after the reduction is intentional; ``sum(ReLU(q*k))`` has a
+        # different ranking and is not the agreed indexer formulation.
+        if batch_indices is None:
+            if batch != memory_batch:
+                raise ValueError("query/csa_memory không cùng batch")
+            similarity = torch.relu(
+                (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1)
+            )
+            head_weights = 1.0 + self.weight_proj(query).unsqueeze(2)
+            return (similarity * head_weights).sum(dim=-1) * self.scale
+
+        batch_indices = batch_indices.to(device=query.device, dtype=torch.long)
+        if batch_indices.shape != (batch,):
+            raise ValueError("batch_indices phải có dạng [query_batch]")
+        if batch == memory_batch:
+            # Cho phép caller truyền identity mapping mà không đổi layout.
+            if not torch.equal(
+                batch_indices,
+                torch.arange(batch, device=query.device, dtype=torch.long),
+            ):
+                raise ValueError("batch_indices không hợp lệ cho batch cùng kích thước")
+            similarity = torch.relu(
+                (q.unsqueeze(2) * k.unsqueeze(1)).sum(dim=-1)
+            )
+            head_weights = 1.0 + self.weight_proj(query).unsqueeze(2)
+            return (similarity * head_weights).sum(dim=-1) * self.scale
+        if batch % memory_batch or not torch.equal(
+            batch_indices,
+            torch.arange(memory_batch, device=query.device, dtype=torch.long)
+            .repeat_interleave(batch // memory_batch),
+        ):
+            raise ValueError("batch_indices phải ánh xạ tuần tự các block về batch gốc")
+        num_blocks = batch // memory_batch
+        q = q.reshape(memory_batch, num_blocks, query_len, self.num_heads, self.head_dim)
         similarity = torch.relu(
-            q.unsqueeze(2) * k.unsqueeze(1)
-        ).sum(dim=-1)
-        head_weights = 1.0 + self.weight_proj(query).unsqueeze(2)
-        return (similarity * head_weights).sum(dim=-1) * self.scale
+            torch.einsum("bnqhd,bmhd->bnqhm", q, k)
+        )
+        head_weights = 1.0 + self.weight_proj(query).reshape(
+            memory_batch, num_blocks, query_len, self.num_heads
+        ).unsqueeze(-1)
+        return (
+            (similarity * head_weights)
+            .sum(dim=-2)
+            .reshape(batch, query_len, memory_len)
+            * self.scale
+        )
 
     @staticmethod
     def gather(memory: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:

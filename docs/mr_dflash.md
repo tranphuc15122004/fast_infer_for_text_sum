@@ -4,8 +4,9 @@
 
 `src/MR_DFlash` đã có implementation V1 của **MR-DFlash** trên bản sao DFlash:
 HCA/CSA target memory, learned compressor/indexer, training adapter và
-reference speculative inference. Đây là implementation để kiểm chứng
-pipeline; chưa có kết quả GPU về latency, acceptance rate, ROUGE hoặc speedup.
+reference speculative inference. Training hiện xử lý block ở batch dimension
+để tránh logits liên block; chưa có kết quả GPU về latency, acceptance rate,
+ROUGE hoặc speedup.
 
 ## Vai trò trong repository
 
@@ -34,12 +35,18 @@ Bản copy hiện có giữ các thành phần chính của quy trình DFlash:
 
 - `memory.py`: HCA ratio `128`, CSA ratio `4`, local window `128`, complete
   groups + pending cache riêng, per-channel compressor và learned CSA
-  score/Top-k tối đa `64`.
+  score/Top-k tối đa `64`; Adapter có RMSNorm riêng và Indexer dùng
+  head-wise `ReLU(dot)`.
 - `mr_model.py`: DFlash joint attention với route xen kẽ HCA/CSA, RoPE cho
-  memory positions và CSA local+selected trong một softmax.
+  memory positions và CSA local+selected trong một softmax. Shared context
+  được project một lần; Top-k gather trên projected K/V.
 - `training.py`: `OnlineMRDFlashModel` và `MRDFlashTrainStrategy`; anchor,
   label, hard CE, positional decay, accumulation và checkpoint giữ nguyên;
-  indexer có dense warm-up rồi chuyển Top-k theo schedule.
+  anchor blocks được reshape thành batch `[B*N,K,H]`, mask cục bộ có shape
+  `[B*N,1,K,K]`; indexer có dense warm-up rồi chuyển Top-k theo schedule.
+- `checkpoint.py`: hỗ trợ converter DFlash → MR-DFlash cho attention/MLP/norm
+  và adapter; native MR load strict, module compressor/indexer mới được giữ
+  khởi tạo riêng.
 - `inference.py`: prefill, draft block, target greedy verify và chỉ append
   token được accept; full block accept còn commit bonus token, EOS được cắt
   trước khi cập nhật memory; reference verify dùng full-prefix để ưu tiên
@@ -61,6 +68,8 @@ là điểm xuất phát để so sánh trước/sau khi đưa thay đổi MR-DF
    bị thay đổi và giữ một test/smoke làm mốc hồi quy phù hợp.
 5. Không khởi chạy GPU nếu chưa có `CUDA_VISIBLE_DEVICES` được cấp riêng;
    protocol deferred nằm ở [`docs/mr_dflash_gpu_experiments.md`](mr_dflash_gpu_experiments.md).
+6. Không bật training lớn nếu chưa kiểm tra memory peak với layout `[B*N,K,H]`;
+   `indexer_num_heads=1` là baseline tương thích, `4/8` chỉ là ablation.
 
 ## Tài liệu liên quan
 
