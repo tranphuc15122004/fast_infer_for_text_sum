@@ -57,6 +57,7 @@ def tiny_online_dflash(
     attention_backend: str = "eager",
     num_anchors: int = 2,
     dpace_alpha: float = 0.5,
+    block_size: int = 4,
 ) -> OnlineDFlashModel:
     _require_objective_api()
     torch.manual_seed(7)
@@ -68,7 +69,7 @@ def tiny_online_dflash(
         target_lm_head=target_lm_head,
         target_embed_tokens=target_embed_tokens,
         mask_token_id=96,
-        block_size=4,
+        block_size=block_size,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
@@ -332,3 +333,10 @@ def test_invalid_loss_type_and_attention_backend_are_rejected() -> None:
         tiny_online_dflash(loss_type="not-a-dflash-loss")
     with pytest.raises(ValueError, match="attention_backend"):
         tiny_online_dflash(attention_backend="not-an-attention-backend")
+
+
+def test_block_size_one_is_rejected_before_empty_loss_denominator() -> None:
+    _require_objective_api()
+
+    with pytest.raises(ValueError, match="block_size.*2"):
+        tiny_online_dflash(block_size=1)

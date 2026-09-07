@@ -244,8 +244,11 @@ class OnlineDFlashModel(nn.Module):
                 "attention_backend must be one of "
                 f"{sorted(_VALID_ATTENTION_BACKENDS)}, got {attention_backend!r}"
             )
-        if block_size <= 0:
-            raise ValueError(f"block_size must be positive, got {block_size}")
+        if block_size < 2:
+            raise ValueError(
+                "block_size must be at least 2 because offset 0 is excluded "
+                f"from the loss, got {block_size}"
+            )
         if num_anchors <= 0:
             raise ValueError(f"num_anchors must be positive, got {num_anchors}")
         if not 0.0 <= dpace_alpha <= 1.0:

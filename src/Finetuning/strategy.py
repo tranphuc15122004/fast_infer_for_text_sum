@@ -97,6 +97,13 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
+    def _draft_dtype(self) -> torch.dtype:
+        draft_module = getattr(self.dflash_model, "draft_model", self.dflash_model)
+        for parameter in draft_module.parameters():
+            if parameter.is_floating_point():
+                return parameter.dtype
+        raise ValueError("DFlash draft module has no floating-point parameters")
+
     def forward_loss(
         self,
         batch: TrainBatch,
@@ -108,7 +115,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         device = self._device()
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=tensors["input_ids"].to(device),
-            hidden_states=tensors["hidden_states"].to(device),
+            hidden_states=tensors["hidden_states"].to(
+                device=device,
+                dtype=self._draft_dtype(),
+            ),
             loss_mask=tensors["loss_mask"].to(device),
         )
         metrics: Dict[str, Any] = {"accuracy": accuracy.detach()}

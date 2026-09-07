@@ -26,7 +26,7 @@ def _require_strategy_api() -> None:
         pytest.fail(f"DFlash strategy API is not implemented: {_STRATEGY_IMPORT_ERROR}")
 
 
-def tiny_online_dflash() -> OnlineDFlashModel:
+def tiny_online_dflash(dtype: torch.dtype = torch.float32) -> OnlineDFlashModel:
     _require_strategy_api()
     config = Qwen3Config(
         architectures=["DFlashDraftModel"],
@@ -46,7 +46,7 @@ def tiny_online_dflash() -> OnlineDFlashModel:
     )
     config._attn_implementation = "eager"
     draft_model = DFlashDraftModel(config)
-    return OnlineDFlashModel(
+    model = OnlineDFlashModel(
         draft_model=draft_model,
         target_lm_head=nn.Linear(32, 97, bias=False),
         target_embed_tokens=nn.Embedding(97, 32),
@@ -56,6 +56,7 @@ def tiny_online_dflash() -> OnlineDFlashModel:
         num_anchors=2,
         objective_chunk_blocks=1,
     )
+    return model.to(dtype)
 
 
 @dataclass
@@ -113,3 +114,23 @@ def test_strategy_optimizer_boundary_exposes_dflash_wrapper() -> None:
     assert strategy.trainable_module() is model
     assert strategy.name == "dflash"
     assert strategy.required_features == {"input_ids", "hidden_states", "loss_mask"}
+
+
+@pytest.mark.parametrize("draft_dtype", [torch.float32, torch.bfloat16])
+def test_strategy_casts_offline_hidden_states_to_draft_dtype(draft_dtype) -> None:
+    _require_strategy_api()
+    model = tiny_online_dflash(draft_dtype)
+    strategy = DFlashTrainStrategy(model)
+    batch = TrainBatch(
+        tensors={
+            "input_ids": torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11]], dtype=torch.long),
+            "hidden_states": torch.randn(1, 8, 64, dtype=torch.float32),
+            "loss_mask": torch.tensor([[0, 1, 1, 1, 0, 0, 1, 1]], dtype=torch.float32),
+        }
+    )
+
+    torch.manual_seed(19)
+    output = strategy.forward_loss(batch)
+
+    assert output.loss.is_floating_point()
+    assert torch.isfinite(output.loss)
