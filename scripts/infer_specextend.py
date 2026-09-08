@@ -14,10 +14,12 @@ import json
 import re
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 from common import io_util, verify
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 SPECEXTEND = ROOT / "externals" / "SpecExtend" / "specextend"
 
@@ -38,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-input-tokens", type=int, default=0,
                         help="truncate each input before inference; 0 disables truncation")
     parser.add_argument("--warmup-runs", type=int, default=3)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--use-specextend",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="enable/disable SpecExtend hybrid attention")
@@ -48,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    seed_everything(args.seed)
 
     if args.smoke:
         args.max_samples = 1
@@ -84,6 +92,7 @@ def main() -> None:
         env["SPECEXTEND_DRAFT_MODEL"] = args.draft_model
     env["SPECEXTEND_WARMUP_RUNS"] = str(args.warmup_runs)
     env["SPECEXTEND_MAX_INPUT_TOKENS"] = str(args.max_input_tokens)
+    env["SPECEXTEND_SEED"] = str(args.seed)
     proc = subprocess.run(cmd, cwd=SPECEXTEND, env=env,
                           capture_output=True, text=True)
     stdout = proc.stdout or ""

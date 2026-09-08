@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
-from _common import canonical_prompt, content_of, read_records, stable_id
+from _common import (
+    append_jsonl_durable,
+    canonical_prompt,
+    content_of,
+    read_records,
+    stable_id,
+)
 
 
 def _messages(row: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -28,8 +35,12 @@ def _messages(row: Dict[str, Any]) -> List[Dict[str, str]]:
             text = content_of(item).strip()
             if text:
                 result.append({"role": "system", "content": text})
-    if last_user and last_user.strip():
-        result.append({"role": "user", "content": last_user})
+    # Một số record ShareGPT chỉ có system/metadata hoặc role không nằm trong
+    # schema. Đây không phải prompt hợp lệ cho target regeneration; bỏ qua
+    # record thay vì để canonical_prompt dừng toàn bộ phase prepare.
+    if not last_user or not last_user.strip():
+        return []
+    result.append({"role": "user", "content": last_user})
     return result
 
 
@@ -48,10 +59,26 @@ def main(argv=None) -> None:
     existing = set()
     output_path = Path(args.output)
     if args.resume and output_path.exists():
-        with output_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    existing.add(str(json.loads(line).get("id", "")))
+        raw = output_path.read_text(encoding="utf-8")
+        lines = raw.splitlines()
+        valid_lines = []
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                valid_lines.append(line)
+                continue
+            try:
+                existing.add(str(json.loads(line).get("id", "")))
+            except json.JSONDecodeError as exc:
+                if line_number != len(lines) or raw.endswith(("\n", "\r")):
+                    raise ValueError(f"JSONL hỏng tại {output_path}:{line_number}") from exc
+                temporary = output_path.with_name(f".{output_path.name}.repair.tmp")
+                repaired = "\n".join(valid_lines)
+                if repaired:
+                    repaired += "\n"
+                temporary.write_text(repaired, encoding="utf-8")
+                os.replace(temporary, output_path)
+                break
+            valid_lines.append(line)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     def rows():
@@ -79,12 +106,20 @@ def main(argv=None) -> None:
         from tqdm import tqdm
     except ImportError:  # pragma: no cover - tqdm có trong requirements server
         tqdm = lambda iterator, **_kwargs: iterator
-    mode = "a" if args.resume and output_path.exists() else "w"
+    if not args.resume:
+        output_path.unlink(missing_ok=True)
     count = 0
-    with output_path.open(mode, encoding="utf-8") as handle:
-        for row in tqdm(rows(), desc="Normalize ShareGPT", unit="row"):
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-            count += 1
+    pending = []
+    for row in tqdm(rows(), desc="Normalize ShareGPT", unit="row"):
+        pending.append(row)
+        count += 1
+        if len(pending) >= 256:
+            append_jsonl_durable(output_path, pending)
+            pending.clear()
+    if pending:
+        append_jsonl_durable(output_path, pending)
+    if not output_path.exists():
+        output_path.touch()
     print(f"[prepare_sharegpt] wrote={count} output={args.output}")
 
 

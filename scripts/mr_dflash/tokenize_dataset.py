@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import json
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -48,7 +50,33 @@ def main(argv=None) -> None:
     shards: List[Dict[str, Any]] = []
     existing_ids = set()
     total = 0
+    existing_shards = sorted(root.glob("shard_*.pt"))
+    manifest_path = root / "manifest.json"
+    if not args.resume and (existing_shards or manifest_path.exists()):
+        raise FileExistsError(
+            f"tokenized output đã tồn tại: {root}; dùng --resume hoặc thư mục mới"
+        )
     if args.resume:
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"tokenized manifest không đọc được: {manifest_path}") from exc
+            if manifest.get("schema_version") != "mr_dflash_tokenized_v1":
+                raise ValueError(f"tokenized manifest không tương thích: {manifest_path}")
+            manifest_shards = manifest.get("shards", [])
+            if not isinstance(manifest_shards, list):
+                raise ValueError(f"tokenized manifest shards không phải list: {manifest_path}")
+            missing = [
+                str(root / str(item.get("path")))
+                for item in manifest_shards
+                if not isinstance(item, dict) or not (root / str(item.get("path"))).is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "tokenized output thiếu shard đã ghi trong manifest: "
+                    + ", ".join(missing[:3])
+                )
         for shard_path in sorted(root.glob("shard_*.pt")):
             payload = torch.load(shard_path, map_location="cpu", weights_only=False)
             shard_samples = payload.get("samples") if isinstance(payload, dict) else payload
@@ -64,7 +92,13 @@ def main(argv=None) -> None:
         if not samples:
             return
         name = f"shard_{len(shards):05d}.pt"
-        torch.save({"samples": samples}, root / name)
+        target = root / name
+        temporary = root / f".{name}.tmp"
+        with temporary.open("wb") as handle:
+            torch.save({"samples": samples}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
         shards.append({"path": name, "count": len(samples)})
         samples = []
 
@@ -121,10 +155,12 @@ def main(argv=None) -> None:
     if args.provenance_manifest:
         target = Path(args.provenance_manifest)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            __import__("json").dumps(manifest_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        temporary = target.with_name(f".{target.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(manifest_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
     print(f"[tokenize_dataset] samples={total} shards={len(shards)} output={root}")
 
 

@@ -10,6 +10,16 @@ from optional_deps import colored
 import argparse
 
 
+def seed_everything(seed: int) -> None:
+    """Keep target/draft RNG state aligned with the shared benchmark seed."""
+    import random
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -98,6 +108,8 @@ def main():
         help="If set, print result line-by-line instead of as a block."
     )
     args = parser.parse_args()
+    seed = int(os.environ.get("SPECEXTEND_SEED", "42"))
+    seed_everything(seed)
 
     # The vendored SpecExtend EAGLE module predates EAGLE-3 and expects the
     # old ``layers.*`` checkpoint layout.  Llama-3.1 uses the official
@@ -204,6 +216,7 @@ def main():
     print(colored(f'Warmup complete!', 'yellow'))
 
     for idx, text in enumerate(texts):
+        seed_everything(seed)
         print(colored(f"\n=== Sample {idx+1}/{len(texts)} ===", 'yellow'))
         input_ids = encode(text).to(accelerator.device)
 

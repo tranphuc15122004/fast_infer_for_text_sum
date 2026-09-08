@@ -6,6 +6,16 @@ from accelerate import Accelerator
 from termcolor import colored
 import argparse
 
+
+def seed_everything(seed: int) -> None:
+    """Keep target/draft RNG state aligned with the shared benchmark seed."""
+    import random
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 def load_texts_from_jsonl(path: str, max_samples: int = None):
     """
     Load up to `max_samples` texts from a JSONL file.
@@ -72,6 +82,8 @@ def main():
         help="If set, print result line-by-line instead of as a block."
     )
     args = parser.parse_args()
+    seed = int(os.environ.get("SPECEXTEND_SEED", "42"))
+    seed_everything(seed)
 
     base_model_map = {
         "vicuna_7b":  os.environ.get("SPECEXTEND_BASE_MODEL", "lmsys/vicuna-7b-v1.5-16k"),
@@ -126,6 +138,7 @@ def main():
     print(colored(f'Warmup complete!', 'yellow'))
 
     for idx, text in enumerate(texts):
+        seed_everything(seed)
         print(colored(f"\n=== Sample {idx+1}/{len(texts)} ===", 'yellow'))
         input_ids = tokenizer.encode(
             text, return_tensors="pt", add_special_tokens=True

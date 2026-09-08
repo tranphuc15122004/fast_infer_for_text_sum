@@ -8,6 +8,7 @@ trainer ngay trước khi gọi DFlash objective.
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -203,10 +204,13 @@ def write_tokenized_manifest(
         "num_samples": int(num_samples),
         "shards": list(shards),
     }
-    (root / "manifest.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    target = root / "manifest.json"
+    temporary = root / ".manifest.json.tmp"
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
     return payload
 
 

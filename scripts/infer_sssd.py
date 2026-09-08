@@ -23,6 +23,7 @@ from typing import Any
 from common import io_util, verify
 from common.data_loader import load_records
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 
 SSSD_ROOT = ROOT / "externals" / "SSSD"
@@ -108,6 +109,7 @@ def build_command(
     adaptive: bool = False,
     num_prompts: int = 1,
     context_len: int = 0,
+    seed: int = 42,
 ) -> list[str]:
     """Build the upstream SSSD offline benchmark command."""
 
@@ -140,6 +142,10 @@ def build_command(
         str(num_steps),
         "--speculative-eagle-topk",
         str(topk),
+        "--seed",
+        str(seed),
+        "--random-seed",
+        str(seed),
     ]
     if context_len > 0:
         command += ["--sharegpt-context-len", str(context_len)]
@@ -231,6 +237,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-draft-tokens", type=int, default=8)
     parser.add_argument("--num-steps", type=int, default=5)
     parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
@@ -239,6 +250,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
+    seed_everything(args.seed)
     if args.smoke:
         args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
@@ -275,6 +287,7 @@ def main() -> None:
             adaptive=args.adaptive,
             num_prompts=len(records),
             context_len=args.max_input_tokens,
+            seed=args.seed,
         )
         print("+ " + " ".join(command))
         with _with_orjson_compat(

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ from eagle.model.ea_model import EaModel  # noqa: E402
 from eagle.model.kv_cache import initialize_past_key_values  # noqa: E402
 
 from common import metrics, rouge  # noqa: E402
+from common.reproducibility import seed_everything  # noqa: E402
 
 
 def resolve_eagle_tree_config(
@@ -158,12 +160,18 @@ def main() -> None:
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--skip-naive", action="store_true",
                         help="Skip the naive autoregressive baseline (no speedup reported)")
     parser.add_argument("--smoke", action="store_true",
                         help="Run exactly one question with a short generation")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    seed_everything(args.seed)
 
     if args.smoke:
         args.question_end = min(args.question_end, args.question_begin + 1)
@@ -265,10 +273,11 @@ def main() -> None:
             prompt = question["turns"][0]
             qid = question.get("question_id", qi)
             for choice in range(args.num_choices):
-                torch.manual_seed(choice)
+                sample_seed = args.seed
                 input_ids = all_input_ids[qi]
                 input_len = input_ids.shape[1]
 
+                seed_everything(sample_seed)
                 with torch.inference_mode():
                     out_ids, new_tokens, tree_steps, eagle_time, acceptance_lengths = timed_generate(
                         model, input_ids, args.temperature,
@@ -277,6 +286,7 @@ def main() -> None:
                     answer = decode_answer(tokenizer, out_ids, input_len)
 
                     if not args.skip_naive:
+                        seed_everything(sample_seed)
                         _, naive_tokens, _, naive_time, _ = timed_generate(
                             model, input_ids, args.temperature,
                             args.max_new_tokens, args.total_token, spec=False,

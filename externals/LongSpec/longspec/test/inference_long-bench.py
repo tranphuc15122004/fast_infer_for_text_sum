@@ -72,6 +72,7 @@ def get_args():
     parser.add_argument("--test_length", default=1, type=int)
     parser.add_argument("--max_gen_len", default=1024, type=int)
     parser.add_argument("--temperature", default=0.0, type=float)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--gamma", default=4, type=int, help='sequence length')
     parser.add_argument('--tree_shape', nargs='+', type=int, default=[4, 16, 16, 16, 16], help='A list of tree size (default: [4, 16, 16, 16, 16])')
     args = parser.parse_args()
@@ -80,6 +81,9 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     log_path = "./long-bench_results"
     if not os.path.exists(log_path):

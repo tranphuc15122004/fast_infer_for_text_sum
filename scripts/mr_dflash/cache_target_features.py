@@ -23,8 +23,13 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from _common import read_jsonl
+from _common import append_jsonl_durable, read_jsonl
 from MR_DFlash.capture import HFTargetCapture
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """OOM không thể coi là lỗi của một sample rồi tiếp tục cache."""
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
 
 
 def _pad_samples(
@@ -68,6 +73,9 @@ def cache_dataset(
     supervision_mode: str = "last_assistant",
     target_revision: Optional[str] = None,
     resume: bool = False,
+    shard_index: int = 0,
+    num_shards: int = 1,
+    skipped_report: Optional[str] = None,
 ) -> Dict[str, int]:
     """Chạy target capture theo batch và ghi cache sharded resumable."""
     if batch_size < 1:
@@ -76,6 +84,8 @@ def cache_dataset(
         bucket_buffer_size = max(batch_size, batch_size * 8)
     if bucket_buffer_size < batch_size:
         raise ValueError("bucket_buffer_size phải >= batch_size")
+    if num_shards < 1 or shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("shard-index phải nằm trong [0, num-shards)")
 
     from MR_DFlash.data import build_sample
     from MR_DFlash.offline_features import ShardedFeatureWriter
@@ -115,6 +125,15 @@ def cache_dataset(
         "skipped_invalid": 0,
         "capture_errors": 0,
     }
+    skipped_report_path = Path(skipped_report) if skipped_report else Path(output_path) / "skipped.jsonl"
+
+    def record_skip(sample_id: str, *, kind: str, error: str) -> None:
+        append_row = {
+            "id": str(sample_id),
+            "kind": kind,
+            "error": error,
+        }
+        append_jsonl_durable(skipped_report_path, [append_row])
     buffer: List[Dict[str, Any]] = []
 
     try:
@@ -139,6 +158,8 @@ def cache_dataset(
         except Exception as exc:
             # Một sample lỗi không làm mất cả shard/batch. Fallback tuần tự
             # cũng giúp chẩn đoán rõ sample id trên model/driver bất ổn.
+            if _is_cuda_oom(exc):
+                raise
             print(f"[cache] batch capture lỗi, fallback từng mẫu: {exc!r}")
             for sample in batch:
                 try:
@@ -149,7 +170,10 @@ def cache_dataset(
                     else:
                         stats["skipped_existing"] += 1
                 except Exception as sample_exc:
+                    if _is_cuda_oom(sample_exc):
+                        raise
                     print(f"[cache] skip {sample['id']!r}: {sample_exc!r}")
+                    record_skip(sample["id"], kind="capture_error", error=repr(sample_exc))
                     stats["capture_errors"] += 1
             return
         for sample, feature in zip(batch, captured):
@@ -160,7 +184,10 @@ def cache_dataset(
                 else:
                     stats["skipped_existing"] += 1
             except Exception as exc:
+                if _is_cuda_oom(exc):
+                    raise
                 print(f"[cache] skip {sample['id']!r}: {exc!r}")
+                record_skip(sample["id"], kind="write_error", error=repr(exc))
                 stats["capture_errors"] += 1
 
     rows = tqdm(read_jsonl(data_path), desc="Cache target features", unit="row")
@@ -173,6 +200,8 @@ def cache_dataset(
 
     for row_index, row in enumerate(rows):
         stats["seen"] += 1
+        if row_index % num_shards != shard_index:
+            continue
         if num_samples is not None and writer.total_samples >= int(num_samples):
             break
         sample_id = str(row.get("id", row_index))
@@ -186,6 +215,7 @@ def cache_dataset(
             supervision_mode=supervision_mode,
         )
         if sample is None:
+            record_skip(sample_id, kind="invalid", error="sample không render được hoặc thiếu supervised tokens")
             stats["skipped_invalid"] += 1
             continue
         stats["valid"] += 1
@@ -213,6 +243,9 @@ def cache_dataset(
     stats["captured_total"] = writer.total_samples
     writer.close(stats=stats)
     capturer.close()
+    skipped_report_path.parent.mkdir(parents=True, exist_ok=True)
+    if not skipped_report_path.exists():
+        skipped_report_path.touch()
     print(
         f"[cache] xong: captured_now={stats['captured']} "
         f"total={writer.total_samples} shards={len(writer.shards)} "
@@ -244,6 +277,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="last_assistant",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--skipped-report", default=None)
     return parser.parse_args(argv)
 
 
@@ -267,6 +303,9 @@ def main(argv=None) -> None:
         supervision_mode=args.supervision_mode,
         target_revision=args.target_revision,
         resume=args.resume,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+        skipped_report=args.skipped_report,
     )
 
 

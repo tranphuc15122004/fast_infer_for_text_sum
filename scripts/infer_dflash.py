@@ -9,6 +9,7 @@ autoregressive reference used for the speedup fields.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ import torch
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 
 # DFlash is vendored rather than installed into the shared server Python.
@@ -96,6 +98,11 @@ def main() -> None:
                         help="truncate each prompt to this many tokens before "
                              "generation (0 = no limit; use on T4 smoke runs)")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
@@ -144,14 +151,14 @@ def main() -> None:
             input_ids = input_ids[:, : args.max_input_tokens]
         input_len = int(input_ids.shape[1])
 
-        torch.manual_seed(0)
+        seed_everything(args.seed)
         baseline, baseline_elapsed = _run_generation(
             dflash_generate, draft, target, input_ids,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             block_size=1,
         )
-        torch.manual_seed(0)
+        seed_everything(args.seed)
         result, elapsed = _run_generation(
             dflash_generate, draft, target, input_ids,
             max_new_tokens=args.max_new_tokens,

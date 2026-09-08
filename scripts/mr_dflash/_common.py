@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
@@ -83,10 +84,14 @@ def write_jsonl(path: str | Path, rows: Iterable[Dict[str, Any]]) -> int:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with target.open("w", encoding="utf-8") as handle:
+    temporary = target.with_name(f".{target.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
     return count
 
 
@@ -98,10 +103,32 @@ def stable_id(prefix: str, value: Any) -> str:
 def write_json(path: str | Path, value: Dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    temporary = target.with_name(f".{target.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+
+
+def append_jsonl_durable(path: str | Path, rows: Iterable[Dict[str, Any]]) -> int:
+    """Append một batch JSONL và fsync để hỗ trợ resume sau mất tiến trình."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with target.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() > 0:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"\n")
+        for row in rows:
+            handle.write((json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    return count
 
 
 def normalize_role(role: Any) -> str:

@@ -28,15 +28,17 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 |---|---|---|
 | `prepare` | `normalized/*.jsonl`, `source_manifest.json`, `split_manifest.json` | Chuẩn hóa ShareGPT/ArXiv, chọn 50K + 50K và split 90/5/5 |
 | `analyze` | `manifests/analysis.json` | Báo cáo nhanh source ratio, độ dài, duplicate và schema |
-| `regenerate_{3k,8k}_{split}` | `regenerated_3k/*.jsonl` hoặc `regenerated/*.jsonl`, regeneration manifests | Sinh assistant response deterministic bằng Qwen3-4B |
+| `regenerate_{3k,8k}_{split}` | `regenerated_3k/*.jsonl` hoặc `regenerated/*.jsonl`, `*.skipped.jsonl`, regeneration manifests | Sinh assistant response deterministic bằng Qwen3-4B và ghi riêng sample không xử lý được |
 | `validate_{3k,8k}_{split}` | `manifests/validation_*.json` | Kiểm tra assistant cuối, target provenance, token length |
 | `tokenize_{3k,8k}_{split}` | `tokenized*/{split}/shard_*.pt`, `manifest.json` | Lưu `input_ids`, `loss_mask`, length; không lưu hidden |
 | `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Chạy target forward và lưu hidden `[1,9,17,25,33]` tại mọi offset |
 
 Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
 `pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
-`pipeline_summary.json`. Nếu lỗi, wrapper dừng ngay tại stage đó; xem file
-`*.failed.json` để biết exit code/command và file `.log` để xem traceback.
+`pipeline_summary.json`. Lỗi hệ thống hoặc CUDA OOM dừng tại stage để bảo toàn
+tính đúng đắn; lỗi sample trong chế độ `skip` được ghi vào `*.skipped.jsonl`
+và stage tiếp tục. Xem file `*.failed.json` để biết exit code/command và file
+`.log` để xem traceback.
 
 Trên server B200, với model đã mount tại path local, chạy:
 
@@ -58,6 +60,77 @@ hidden vì các config train không dùng test cache. Muốn cache cả test, th
 ```bash
 --cache-splits train val test
 ```
+
+### Chế độ full-context cho dataset/cache gốc
+
+Nếu mục tiêu là giữ input ArXiv và response target đầy đủ trong phase
+preprocess, không dùng 3K làm giới hạn sinh. Bật `--full-context`; pipeline sẽ
+chỉ tạo một regime full và truyền `--preserve-full-input` cho target
+regeneration. Với Qwen3-4B, có thể bắt đầu bằng native context 32K và response
+budget 2048:
+
+```bash
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full \
+  --device cuda \
+  --local-files-only \
+  --full-context \
+  --full-context-length 32768 \
+  --max-new-tokens 2048 \
+  --overflow-policy skip \
+  --sample-error-policy skip \
+  --resume \
+  --cache-splits train val
+```
+
+Output của mode này nằm tại `regenerated_full/`, `tokenized_full/` và
+`target_features_qwen3_4b_full/`. Prompt không bị cắt một cách âm thầm. Nếu
+prompt dài nhưng vẫn còn ít nhất một token trống, response budget sẽ tự giảm
+đúng còn phần context còn lại và metadata ghi `generation_budget_clipped=true`.
+Nếu prompt tự nó vượt `full-context-length`, sample được ghi vào
+`regenerated_full/<split>.skipped.jsonl` kèm ID, số token và lý do; pipeline vẫn
+tiếp tục với sample còn lại. B200 chỉ cung cấp VRAM/throughput, không làm tăng
+giới hạn context của target.
+
+`--sample-error-policy skip` cũng ghi các lỗi dữ liệu/tokenize/generate theo
+từng sample vào cùng skipped report. Lỗi CUDA OOM không bị nuốt vì tiếp tục
+trong cùng process có thể làm sai kết quả; stage dừng an toàn và chạy lại với
+`--resume` sau khi giảm batch/context. Các JSON/manifest được ghi atomically,
+output JSONL có `fsync`, và pipeline có lock theo `data-root` để không có hai
+job cùng ghi một cache.
+
+Mode full-context là bộ dữ liệu/cache gốc để audit hoặc train long-context.
+Các config pilot 3K/8K hiện tại vẫn dùng artifact regime tương ứng và nên
+được chạy riêng khi thực hiện R2/R3 fairness experiment.
+
+### Chạy song song trên ba B200
+
+Với ba GPU vật lý `1,2,3`, thêm `--parallel-gpu-ids 1 2 3`. Pipeline sẽ tạo
+một worker process và một bản target model trên mỗi GPU; GPU 0 không bị dùng.
+Mỗi worker xử lý shard dòng cố định, sau đó parent kiểm tra đủ ID rồi mới merge
+output/cache. Các worker không ghi chung file nên có thể resume an toàn.
+
+```bash
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full \
+  --device cuda \
+  --local-files-only \
+  --full-context --full-context-length 32768 \
+  --max-new-tokens 2048 \
+  --overflow-policy skip --sample-error-policy skip \
+  --parallel-gpu-ids 1 2 3 \
+  --cache-batch-size-8k 2 \
+  --cache-splits train val \
+  --resume
+```
+
+`--cache-batch-size-8k 2` là điểm bắt đầu phù hợp cho B200 180 GB; nếu peak
+VRAM thực tế cao, hạ về `1`, còn không nên tăng cho tới khi pilot đo xong.
+Mỗi stage có worker log ở `.parallel_*/rank_*/worker.log`; trạng thái live ở
+`.parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
+pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
 
 Trước khi chạy thật, in toàn bộ command mà không đọc source/model:
 

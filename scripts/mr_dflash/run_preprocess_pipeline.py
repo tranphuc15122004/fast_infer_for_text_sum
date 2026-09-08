@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -24,6 +25,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - server production là Linux
+    fcntl = None
 
 from _common import (
     REPO_ROOT as DEFAULT_REPO_ROOT,
@@ -52,11 +58,15 @@ class PipelineOptions:
     sharegpt_count: int = 50_000
     arxiv_count: int = 50_000
     max_lengths: tuple[int, ...] = (3072, 8192)
+    full_context: bool = False
+    full_context_length: int = 32768
     cache_splits: tuple[str, ...] = ("train", "val")
     target_layer_ids: tuple[int, ...] = DEFAULT_FEATURE_LAYER_IDS
     supervision_mode: str = "last_assistant"
     seed: int = 42
     max_new_tokens: int = 768
+    overflow_policy: str = "error"
+    sample_error_policy: str = "error"
     temperature: float = 0.0
     analysis_limit: int = 1000
     device: str = "cuda"
@@ -68,6 +78,7 @@ class PipelineOptions:
     cache_bucket_buffer_8k: int = 8
     cache_shard_size_3k: int = 64
     cache_shard_size_8k: int = 32
+    parallel_gpu_ids: tuple[int, ...] = ()
     local_files_only: bool = True
     resume: bool = True
     dry_run: bool = False
@@ -81,6 +92,60 @@ class Stage:
     command: list[str]
     artifacts: Sequence[Path]
     kind: str = "files"
+
+
+class _PipelineLock:
+    """Khóa OS-level để hai process không cùng ghi một data-root.
+
+    ``flock`` tự nhả khóa khi process chết, nên một lần kill không tạo stale
+    lock khiến lần ``--resume`` sau bị kẹt. File vẫn giữ PID/command để chẩn
+    đoán khi có job khác đang chạy.
+    """
+
+    def __init__(self, data_root: Path, config_hash: str) -> None:
+        self.path = data_root / "pipeline_state" / ".pipeline.lock"
+        self.config_hash = config_hash
+        self._handle = None
+
+    def acquire(self) -> None:
+        if fcntl is None:
+            raise RuntimeError("pipeline lock cần fcntl; chỉ hỗ trợ server Linux")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"data-root đang được một pipeline khác sử dụng: {self.path}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "config_hash": self.config_hash,
+                    "started_at": _now(),
+                    "command": sys.argv,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+        self._handle = handle
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
 
 
 def _now() -> str:
@@ -199,15 +264,21 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
 
     # Tách các stage theo regime/split. Nếu 3K đã xong nhưng 8K lỗi, resume
     # chỉ phải tiếp tục 8K; các artifact 3K vẫn dùng chung cho matrix train.
-    for max_length in options.max_lengths:
+    configured_lengths = (
+        (int(options.full_context_length),)
+        if options.full_context
+        else tuple(int(value) for value in options.max_lengths)
+    )
+    for max_length in configured_lengths:
         max_length = int(max_length)
-        regime = _regime_name(max_length)
+        regime = "full" if options.full_context else _regime_name(max_length)
         regenerated = _regenerated_root(root, regime, max_length)
         tokenized = _tokenized_root(root, regime, max_length)
         feature_root = _feature_root(root, regime)
 
         for split in ("train", "val", "test"):
             output = regenerated / f"{split}.jsonl"
+            skipped_report = regenerated / f"{split}.skipped.jsonl"
             manifest = manifests / f"regeneration_{regime}_{split}.json"
             command = [
                 python,
@@ -232,15 +303,61 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 options.device,
                 "--torch-dtype",
                 options.torch_dtype,
+                *(["--preserve-full-input"] if options.full_context else []),
+                "--overflow-policy",
+                options.overflow_policy,
+                "--sample-error-policy",
+                options.sample_error_policy,
+                "--skipped-report",
+                str(skipped_report),
                 *(["--target-revision", options.target_revision] if options.target_revision else []),
                 *(_local_files_args(options)),
                 *(_resume_args(options)),
             ]
+            if options.parallel_gpu_ids:
+                command = [
+                    python,
+                    _stage_script(options, "parallel_stage.py"),
+                    "--mode",
+                    "regenerate",
+                    "--gpu-ids",
+                    *(str(value) for value in options.parallel_gpu_ids),
+                    "--input",
+                    str(normalized / f"{split}_prompts.jsonl"),
+                    "--output",
+                    str(output),
+                    "--manifest",
+                    str(manifest),
+                    "--work-root",
+                    str(regenerated / f".parallel_regenerate_{split}"),
+                    "--target-model-path",
+                    options.target_model_path,
+                    "--max-length",
+                    str(max_length),
+                    "--max-new-tokens",
+                    str(options.max_new_tokens),
+                    "--temperature",
+                    str(options.temperature),
+                    "--seed",
+                    str(options.seed),
+                    "--torch-dtype",
+                    options.torch_dtype,
+                    "--overflow-policy",
+                    options.overflow_policy,
+                    "--sample-error-policy",
+                    options.sample_error_policy,
+                    "--supervision-mode",
+                    options.supervision_mode,
+                    *(["--preserve-full-input"] if options.full_context else []),
+                    *(["--target-revision", options.target_revision] if options.target_revision else []),
+                    *(_local_files_args(options)),
+                    *(_resume_args(options)),
+                ]
             plan.append(
                 Stage(
                     name=f"regenerate_{regime}_{split}",
                     command=command,
-                    artifacts=(output, manifest),
+                    artifacts=(output, skipped_report, manifest),
                 )
             )
 
@@ -306,10 +423,7 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
         for split in options.cache_splits:
             output_dir = feature_root / split
             manifest = output_dir / "manifest.json"
-            plan.append(
-                Stage(
-                    name=f"cache_{regime}_{split}",
-                    command=[
+            cache_command = [
                         python,
                         _stage_script(options, "cache_target_features.py"),
                         "--target-model-path",
@@ -337,7 +451,45 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         *(["--target-revision", options.target_revision] if options.target_revision else []),
                         *(_local_files_args(options)),
                         *(_resume_args(options)),
-                    ],
+                    ]
+            if options.parallel_gpu_ids:
+                cache_command = [
+                    python,
+                    _stage_script(options, "parallel_stage.py"),
+                    "--mode",
+                    "cache",
+                    "--gpu-ids",
+                    *(str(value) for value in options.parallel_gpu_ids),
+                    "--input",
+                    str(regenerated / f"{split}.jsonl"),
+                    "--output",
+                    str(output_dir),
+                    "--manifest",
+                    str(manifest),
+                    "--work-root",
+                    str(output_dir.parent / f".parallel_cache_{split}"),
+                    "--target-model-path",
+                    options.target_model_path,
+                    "--max-length",
+                    str(max_length),
+                    "--batch-size",
+                    str(batch_size),
+                    "--bucket-buffer-size",
+                    str(bucket_buffer),
+                    "--shard-size",
+                    str(shard_size),
+                    "--torch-dtype",
+                    options.torch_dtype,
+                    "--supervision-mode",
+                    options.supervision_mode,
+                    *(["--target-revision", options.target_revision] if options.target_revision else []),
+                    *(_local_files_args(options)),
+                    *(_resume_args(options)),
+                ]
+            plan.append(
+                Stage(
+                    name=f"cache_{regime}_{split}",
+                    command=cache_command,
                     artifacts=(manifest,),
                     kind="cache",
                 )
@@ -503,8 +655,11 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
     )
     environment.setdefault("PYTHONUNBUFFERED", "1")
     return_code: Optional[int] = None
+    process: Optional[subprocess.Popen[str]] = None
     try:
-        with log_path.open("w", encoding="utf-8") as log_handle:
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n=== attempt { _now() } ===\n")
+            log_handle.flush()
             process = subprocess.Popen(
                 stage.command,
                 cwd=str(options.repo_root),
@@ -515,6 +670,7 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                start_new_session=True,
             )
             assert process.stdout is not None
             for line in process.stdout:
@@ -525,7 +681,20 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
         if return_code != 0:
             raise RuntimeError(f"command trả về exit code {return_code}")
         _check_artifacts(stage)
-    except Exception as exc:
+    except BaseException as exc:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                process.wait()
         failure_payload = _state_payload(
             stage,
             status="failed",
@@ -540,6 +709,8 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
             f"[pipeline] FAILED {stage.name}; xem {log_path} và {failure_marker}",
             file=sys.stderr,
         )
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         raise RuntimeError(f"pipeline dừng tại stage {stage.name}: {exc}") from exc
 
     success_payload = _state_payload(
@@ -615,11 +786,34 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--sharegpt-count", type=int, default=50_000)
     parser.add_argument("--arxiv-count", type=int, default=50_000)
     parser.add_argument("--max-lengths", type=int, nargs="+", default=[3072, 8192])
+    parser.add_argument(
+        "--full-context",
+        action="store_true",
+        help="chạy một regime full-context, không cắt prompt trước khi target generate",
+    )
+    parser.add_argument(
+        "--full-context-length",
+        type=int,
+        default=32768,
+        help="giới hạn tổng token của target context trong full-context mode",
+    )
     parser.add_argument("--cache-splits", nargs="+", choices=["train", "val", "test"], default=["train", "val"])
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=list(DEFAULT_FEATURE_LAYER_IDS))
     parser.add_argument("--supervision-mode", choices=["all_assistant", "last_assistant"], default="last_assistant")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument(
+        "--overflow-policy",
+        choices=["error", "skip"],
+        default="error",
+        help="sample có prompt vượt context: dừng hoặc ghi skipped report rồi tiếp tục",
+    )
+    parser.add_argument(
+        "--sample-error-policy",
+        choices=["error", "skip"],
+        default="error",
+        help="lỗi từng sample: dừng hoặc ghi skipped report rồi tiếp tục",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--analysis-limit", type=int, default=1000)
     parser.add_argument("--device", default="cuda")
@@ -631,6 +825,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cache-bucket-buffer-8k", type=int, default=8)
     parser.add_argument("--cache-shard-size-3k", type=int, default=64)
     parser.add_argument("--cache-shard-size-8k", type=int, default=32)
+    parser.add_argument(
+        "--parallel-gpu-ids",
+        type=int,
+        nargs="+",
+        default=[],
+        help="data-parallel GPU vật lý; ví dụ 1 2 3 (không dùng GPU 0 nếu không truyền)",
+    )
     parser.add_argument("--only-stage", action="append", default=[], help="chỉ chạy stage này; có thể lặp flag")
     parser.add_argument("--from-stage", default=None)
     parser.add_argument("--stop-after", default=None)
@@ -646,6 +847,20 @@ def main(argv=None) -> int:
         raise ValueError("sharegpt-count và arxiv-count phải dương")
     if not args.max_lengths:
         raise ValueError("cần ít nhất một --max-lengths")
+    if args.max_new_tokens < 1:
+        raise ValueError("max-new-tokens phải >= 1")
+    configured_lengths = [int(args.full_context_length)] if args.full_context else [int(x) for x in args.max_lengths]
+    if any(length < 1 for length in configured_lengths):
+        raise ValueError("mọi context length phải >= 1")
+    if int(args.max_new_tokens) > min(configured_lengths):
+        raise ValueError(
+            "max-new-tokens không được lớn hơn context length nhỏ nhất; "
+            "dùng budget nhỏ hơn hoặc chỉ chạy full-context"
+        )
+    if any(int(value) < 0 for value in args.parallel_gpu_ids):
+        raise ValueError("parallel-gpu-ids không được âm")
+    if len(args.parallel_gpu_ids) != len(set(args.parallel_gpu_ids)):
+        raise ValueError("parallel-gpu-ids không được trùng")
     options = PipelineOptions(
         repo_root=Path(args.repo_root).resolve(),
         data_root=Path(args.data_root),
@@ -655,11 +870,15 @@ def main(argv=None) -> int:
         sharegpt_count=int(args.sharegpt_count),
         arxiv_count=int(args.arxiv_count),
         max_lengths=tuple(int(value) for value in args.max_lengths),
+        full_context=bool(args.full_context),
+        full_context_length=int(args.full_context_length),
         cache_splits=tuple(args.cache_splits),
         target_layer_ids=tuple(int(value) for value in args.target_layer_ids),
         supervision_mode=str(args.supervision_mode),
         seed=int(args.seed),
         max_new_tokens=int(args.max_new_tokens),
+        overflow_policy=str(args.overflow_policy),
+        sample_error_policy=str(args.sample_error_policy),
         temperature=float(args.temperature),
         analysis_limit=int(args.analysis_limit),
         device=str(args.device),
@@ -671,6 +890,7 @@ def main(argv=None) -> int:
         cache_bucket_buffer_8k=int(args.cache_bucket_buffer_8k),
         cache_shard_size_3k=int(args.cache_shard_size_3k),
         cache_shard_size_8k=int(args.cache_shard_size_8k),
+        parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         local_files_only=bool(args.local_files_only),
         resume=bool(args.resume),
         dry_run=bool(args.dry_run),
@@ -686,61 +906,90 @@ def main(argv=None) -> int:
     print(f"[pipeline] data_root={options.data_root}")
     print(f"[pipeline] target={options.target_model_path}")
     print(f"[pipeline] stages={', '.join(stage.name for stage in selected)}")
+    lock: Optional[_PipelineLock] = None
     if not options.dry_run:
         options.data_root.mkdir(parents=True, exist_ok=True)
-        write_json(
-            options.data_root / "pipeline_plan.json",
-            {
-                "schema_version": "mr_dflash_pipeline_plan_v1",
-                "config_hash": config_hash,
-                "options": _options_payload(options),
-                "stages": [
-                    {
-                        "name": stage.name,
-                        "command": stage.command,
-                        "command_shell": shlex.join(stage.command),
-                        "artifacts": _artifact_paths(stage),
-                        "kind": stage.kind,
-                    }
-                    for stage in selected
-                ],
-            },
-        )
-
-    completed: list[str] = []
-    for stage in selected:
+        lock = _PipelineLock(options.data_root, config_hash)
         try:
-            result = run_stage(stage, options, config_hash)
-            if result.get("status") in {"success", "skipped"}:
-                completed.append(stage.name)
-        except Exception as exc:
-            if not options.dry_run:
-                _write_pipeline_summary(
-                    options,
-                    config_hash=config_hash,
-                    selected=selected,
-                    status="failed",
-                    completed=completed,
-                    failed_stage=stage.name,
-                    error=str(exc),
-                )
-            print(
-                f"[pipeline] FAILED at {stage.name}. "
-                f"State/log: {options.data_root / 'pipeline_state'} / "
-                f"{options.data_root / 'pipeline_logs'}",
-                file=sys.stderr,
+            lock.acquire()
+        except RuntimeError as exc:
+            print(f"[pipeline] LOCKED: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        if not options.dry_run:
+            write_json(
+                options.data_root / "pipeline_plan.json",
+                {
+                    "schema_version": "mr_dflash_pipeline_plan_v1",
+                    "config_hash": config_hash,
+                    "options": _options_payload(options),
+                    "stages": [
+                        {
+                            "name": stage.name,
+                            "command": stage.command,
+                            "command_shell": shlex.join(stage.command),
+                            "artifacts": _artifact_paths(stage),
+                            "kind": stage.kind,
+                        }
+                        for stage in selected
+                    ],
+                },
             )
-            return 1
-    if not options.dry_run:
-        _write_pipeline_summary(
-            options,
-            config_hash=config_hash,
-            selected=selected,
-            status="dry-run" if options.dry_run else "success",
-            completed=completed,
-        )
-    print("[pipeline] DONE toàn bộ stage đã chọn")
-    return 0
+
+        completed: list[str] = []
+        for stage in selected:
+            try:
+                result = run_stage(stage, options, config_hash)
+                if result.get("status") in {"success", "skipped"}:
+                    completed.append(stage.name)
+            except KeyboardInterrupt:
+                if not options.dry_run:
+                    _write_pipeline_summary(
+                        options,
+                        config_hash=config_hash,
+                        selected=selected,
+                        status="interrupted",
+                        completed=completed,
+                        failed_stage=stage.name,
+                        error="người dùng hoặc scheduler ngắt tiến trình; chạy lại với --resume",
+                    )
+                print(
+                    f"[pipeline] INTERRUPTED tại {stage.name}; chạy lại với --resume",
+                    file=sys.stderr,
+                )
+                return 130
+            except Exception as exc:
+                if not options.dry_run:
+                    _write_pipeline_summary(
+                        options,
+                        config_hash=config_hash,
+                        selected=selected,
+                        status="failed",
+                        completed=completed,
+                        failed_stage=stage.name,
+                        error=str(exc),
+                    )
+                print(
+                    f"[pipeline] FAILED at {stage.name}. "
+                    f"State/log: {options.data_root / 'pipeline_state'} / "
+                    f"{options.data_root / 'pipeline_logs'}",
+                    file=sys.stderr,
+                )
+                return 1
+        if not options.dry_run:
+            _write_pipeline_summary(
+                options,
+                config_hash=config_hash,
+                selected=selected,
+                status="success",
+                completed=completed,
+            )
+        print("[pipeline] DONE toàn bộ stage đã chọn")
+        return 0
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":

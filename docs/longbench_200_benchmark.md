@@ -125,6 +125,12 @@ cả trên B200. Profile `representative`/`full` vẫn giữ mặc định
 `LONG_BENCH_MAX_INPUT_TOKENS=0`; muốn đo context dài phải đặt giới hạn phù hợp
 với baseline và VRAM rồi ghi rõ trong manifest.
 
+Runner dùng `LONG_BENCH_SEED` (mặc định `42`) cho việc chọn sample và truyền
+tiếp vào mọi adapter target/drafter. Các adapter reset Python/NumPy/Torch RNG
+trước mỗi generation tương ứng; `LONG_BENCH_TEMPERATURE=0` giữ decoding ở chế
+độ greedy. Seed chung không đảm bảo bit-identical giữa các kernel/precision
+khác nhau, nhưng loại bỏ khác biệt do sampling RNG.
+
 Runner cũng kiểm tra VRAM trống trước khi tạo process con. Mặc định cần ít nhất
 32 GiB trên GPU được chọn (`LONG_BENCH_MIN_FREE_GB=32`). Nếu `nvidia-smi` cho
 thấy GPU chỉ còn vài GiB, runner dừng sớm với hướng dẫn chọn GPU khác hoặc tắt

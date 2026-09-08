@@ -95,7 +95,7 @@ def get_model_answers(
         temperature = 0.0 #force greedy
     else:
         temperature = 0.7
-    step = 1
+    step = int(os.environ.get("FAFO_SEED", "42"))
 
     for question_idx, question in enumerate(tqdm(questions)):
         stats[question_idx] = {} #

@@ -156,6 +156,48 @@ def test_sssd_command_forwards_context_limit():
     assert command[command.index("--max-input-tokens") + 1] == "4096"
 
 
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        "vanilla_hf",
+        "vanilla_fa",
+        "magicdec",
+        "longspec",
+        "eagle3",
+        "dflash",
+        "specextend",
+        "sssd",
+        "fafo",
+    ],
+)
+def test_all_longbench_adapters_forward_the_shared_seed(baseline):
+    from common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        baseline,
+        config={
+            "python": "/usr/bin/python3",
+            "model": "/models/llama",
+            "eagle_model": "/models/eagle",
+            "dflash_model": "/models/dflash",
+            "longspec_target_model": "/models/llama",
+            "longspec_draft_model": "/models/longspec",
+            "specextend_draft_model": "/models/eagle",
+            "sssd_datastore_path": "",
+            "seed": 37,
+            "max_input_tokens": 4096,
+            "smoke": True,
+        },
+        data_file=ROOT / "data/longbench_200/gov_report.jsonl",
+        output=ROOT / f"outputs/test-{baseline}.jsonl",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert "--seed" in command
+    assert command[command.index("--seed") + 1] == "37"
+
+
 def test_vanilla_generate_passes_attention_mask_to_avoid_pad_eos_ambiguity():
     from types import SimpleNamespace
 

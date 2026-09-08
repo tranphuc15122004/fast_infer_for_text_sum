@@ -59,10 +59,70 @@ def test_prepare_split_regenerate_validate_smoke(tmp_path: Path) -> None:
         "--input", str(tmp_path / "normalized" / "train_prompts.jsonl"),
         "--output", str(regenerated),
         "--responses-jsonl", str(response_path),
+        "--skipped-report", str(tmp_path / "regenerated" / "train.skipped.jsonl"),
     ])
     validate_main(["--input", str(regenerated), "--require-generated"])
     rows = list(regenerated.open("r", encoding="utf-8"))
     assert rows
+    assert (tmp_path / "regenerated" / "train.skipped.jsonl").exists()
+
+
+def test_regeneration_skips_invalid_sample_and_records_reason(tmp_path: Path) -> None:
+    from regenerate_pilot import main as regenerate_main
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "id": "valid",
+                "source": "sharegpt",
+                "conversations": [{"role": "user", "content": "Question"}],
+            },
+            {
+                "id": "invalid",
+                "source": "sharegpt",
+                "conversations": [],
+            },
+        ],
+    )
+    responses = tmp_path / "responses.jsonl"
+    _write_jsonl(responses, [{"id": "valid", "assistant": "Answer"}])
+    output = tmp_path / "regenerated.jsonl"
+    skipped = tmp_path / "regenerated.skipped.jsonl"
+    regenerate_main(
+        [
+            "--input", str(source),
+            "--output", str(output),
+            "--responses-jsonl", str(responses),
+            "--sample-error-policy", "skip",
+            "--skipped-report", str(skipped),
+        ]
+    )
+    assert [json.loads(line)["id"] for line in output.read_text(encoding="utf-8").splitlines()] == ["valid"]
+    skipped_rows = [json.loads(line) for line in skipped.read_text(encoding="utf-8").splitlines()]
+    assert skipped_rows == [
+        {
+            "id": "invalid",
+            "kind": "invalid",
+            "error": "sample không có conversations",
+            "prompt_tokens": None,
+            "max_length": 8192,
+            "requested_max_new_tokens": 768,
+        }
+    ]
+
+
+def test_regeneration_repairs_truncated_last_jsonl_line(tmp_path: Path) -> None:
+    from regenerate_pilot import _load_status_ids
+
+    path = tmp_path / "status.jsonl"
+    path.write_text(
+        '{"id": "complete"}\n{"id": "interrupted"',
+        encoding="utf-8",
+    )
+    assert _load_status_ids(path) == {"complete"}
+    assert path.read_text(encoding="utf-8") == '{"id": "complete"}\n'
 
 
 def test_validate_pilot_dataset_writes_machine_readable_report(tmp_path: Path) -> None:
@@ -131,6 +191,35 @@ def test_prepare_sharegpt_accepts_json_array(tmp_path: Path) -> None:
         "content": "Final question",
     }
     assert rows[0]["metadata"]["original_turn_count"] == 3
+
+
+def test_prepare_sharegpt_skips_records_without_user_turn(tmp_path: Path) -> None:
+    from prepare_sharegpt import main as sharegpt_main
+
+    source = tmp_path / "ShareGPT_V3.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "system-only",
+                    "conversations": [
+                        {"from": "system", "value": "Instruction only"},
+                    ],
+                },
+                {
+                    "id": "valid",
+                    "conversations": [
+                        {"from": "human", "value": "A real question"},
+                    ],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "sharegpt_prompts.jsonl"
+    sharegpt_main(["--input", str(source), "--output", str(output)])
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["id"] for row in rows] == ["sharegpt_valid"]
 
 
 def test_prepare_arxiv_joins_paragraphs_and_preserves_reference(tmp_path: Path) -> None:
@@ -281,6 +370,43 @@ def test_preprocess_pipeline_plan_contains_debuggable_stages(tmp_path: Path) -> 
     assert all(str(tmp_path / "pilot") in " ".join(stage.command) for stage in plan)
 
 
+def test_preprocess_pipeline_full_context_preserves_generation_input(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        max_new_tokens=2048,
+        overflow_policy="skip",
+        sample_error_policy="skip",
+    )
+    plan = build_stage_plan(options)
+    names = [stage.name for stage in plan]
+    assert "regenerate_full_train" in names
+    assert "regenerate_3k_train" not in names
+    stage = next(stage for stage in plan if stage.name == "regenerate_full_train")
+    assert "--preserve-full-input" in stage.command
+    assert "--overflow-policy" in stage.command
+    assert stage.command[stage.command.index("--overflow-policy") + 1] == "skip"
+    assert "--sample-error-policy" in stage.command
+    assert stage.command[stage.command.index("--sample-error-policy") + 1] == "skip"
+    assert tmp_path / "pilot" / "regenerated_full" / "train.skipped.jsonl" in stage.artifacts
+    assert "32768" in stage.command
+    assert str(tmp_path / "pilot" / "regenerated_full" / "train.jsonl") in stage.command
+
+
+def test_generation_budget_clips_only_response_not_full_prompt() -> None:
+    from regenerate_pilot import resolve_generation_budget
+
+    assert resolve_generation_budget(30_000, 32_768, 2_048) == (2_048, False)
+    assert resolve_generation_budget(32_000, 32_768, 2_048) == (768, True)
+    with pytest.raises(ValueError, match="prompt đã chiếm"):
+        resolve_generation_budget(32_768, 32_768, 2_048)
+
+
 def test_preprocess_pipeline_plan_options_are_json_serializable(tmp_path: Path) -> None:
     import json
 
@@ -346,3 +472,106 @@ def test_preprocess_pipeline_success_marker_allows_resume(tmp_path: Path) -> Non
     assert second["status"] == "skipped"
     assert artifact.read_text(encoding="utf-8") == "ok"
     assert (data_root / "pipeline_logs" / "unit_success.log").exists()
+
+
+def test_preprocess_pipeline_lock_prevents_concurrent_writers(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import _PipelineLock
+
+    first = _PipelineLock(tmp_path / "pilot", "hash-a")
+    second = _PipelineLock(tmp_path / "pilot", "hash-b")
+    first.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="đang được một pipeline khác"):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
+
+
+def test_parallel_regeneration_merge_preserves_input_order(tmp_path: Path) -> None:
+    from parallel_stage import merge_regenerated_outputs
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [{"id": f"s{i}", "source": "sharegpt"} for i in range(4)],
+    )
+    worker_root = tmp_path / "workers"
+    _write_jsonl(
+        worker_root / "rank_00" / "output.jsonl",
+        [{"id": "s0", "value": 0}, {"id": "s2", "value": 2}],
+    )
+    _write_jsonl(
+        worker_root / "rank_01" / "output.jsonl",
+        [{"id": "s1", "value": 1}, {"id": "s3", "value": 3}],
+    )
+    _write_jsonl(worker_root / "rank_00" / "skipped.jsonl", [])
+    _write_jsonl(worker_root / "rank_01" / "skipped.jsonl", [])
+    manifest = merge_regenerated_outputs(
+        input_path=source,
+        worker_roots=[worker_root / "rank_00", worker_root / "rank_01"],
+        output_path=tmp_path / "merged.jsonl",
+        skipped_path=tmp_path / "merged.skipped.jsonl",
+        manifest_path=tmp_path / "merged.manifest.json",
+        gpu_ids=[1, 2],
+    )
+    assert [row["id"] for row in map(json.loads, (tmp_path / "merged.jsonl").read_text().splitlines())] == [
+        "s0", "s1", "s2", "s3"
+    ]
+    assert manifest["stats"]["written"] == 4
+    assert manifest["stats"]["missing"] == 0
+
+
+def test_parallel_pipeline_plan_targets_explicit_gpu_ids(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        max_new_tokens=2048,
+        overflow_policy="skip",
+        sample_error_policy="skip",
+        parallel_gpu_ids=(1, 2, 3),
+    )
+    stage = next(stage for stage in build_stage_plan(options) if stage.name == "regenerate_full_train")
+    assert stage.command[1].endswith("parallel_stage.py")
+    assert stage.command[stage.command.index("--gpu-ids") + 1 : stage.command.index("--input")] == ["1", "2", "3"]
+    cache_stage = next(stage for stage in build_stage_plan(options) if stage.name == "cache_full_train")
+    assert cache_stage.command[1].endswith("parallel_stage.py")
+
+
+def test_parallel_cache_merge_validates_all_samples(tmp_path: Path) -> None:
+    from parallel_stage import merge_feature_caches
+    from MR_DFlash.offline_features import write_feature_shard, write_sharded_feature_manifest
+
+    worker_root = tmp_path / "workers" / "rank_00"
+    worker_root.mkdir(parents=True)
+    write_feature_shard(worker_root / "shard_00000.pt", [
+        {"id": "s0", "input_ids": [1, 2], "loss_mask": [1, 1], "hidden_states": [[0.0, 1.0], [1.0, 2.0]]},
+    ])
+    write_sharded_feature_manifest(
+        worker_root,
+        target_model_path="tiny",
+        feature_layer_ids=[1],
+        hidden_size=2,
+        feature_width=2,
+        max_length=8,
+        requested_torch_dtype="float32",
+        shards=[{"path": "shard_00000.pt", "count": 1, "ids": ["s0"], "lengths": [2]}],
+        sample_ids=["s0"],
+    )
+    input_path = tmp_path / "input.jsonl"
+    _write_jsonl(input_path, [{"id": "s0"}])
+    manifest = merge_feature_caches(
+        input_path=input_path,
+        worker_roots=[worker_root],
+        output_path=tmp_path / "merged_cache",
+        manifest_path=tmp_path / "cache.manifest.json",
+        gpu_ids=[1],
+    )
+    assert manifest["num_samples"] == 1
+    assert (tmp_path / "merged_cache" / "manifest.json").exists()

@@ -72,6 +72,8 @@ def test_sssd_command_uses_the_forked_sglang_entrypoint():
     assert command[command.index("--model-path") + 1] == "/models/llama"
     assert command[command.index("--dataset-name") + 1] == "custom"
     assert "--speculative-adaptive" in command
+    assert command[command.index("--seed") + 1] == "42"
+    assert command[command.index("--random-seed") + 1] == "42"
 
 
 def test_sssd_runtime_does_not_shadow_installed_native_extension(monkeypatch):

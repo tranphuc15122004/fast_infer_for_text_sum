@@ -9,6 +9,7 @@ the run produces output tokens / timing lines.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from common import io_util, verify
 from common import metrics, rouge
 from common.data_loader import load_records
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 MAGICDEC = ROOT / "externals" / "MagicDec"
 MAGICDEC_PARENT = ROOT / "externals"
@@ -60,6 +62,7 @@ def _run_canonical(args: argparse.Namespace) -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("MagicDec canonical inference requires CUDA")
+    seed_everything(args.seed)
     from transformers import AutoTokenizer
     from MagicDec.Engine.SnapKV.backend import LMBackend
 
@@ -124,6 +127,7 @@ def _run_canonical(args: argparse.Namespace) -> None:
 
     warmup_ids = tokenizer("Hello", return_tensors="pt", add_special_tokens=True).input_ids.to(device)
     for _ in range(max(args.warmup_runs, 0)):
+        seed_everything(args.seed)
         with torch.inference_mode():
             generate(warmup_ids)
 
@@ -131,6 +135,7 @@ def _run_canonical(args: argparse.Namespace) -> None:
     checks: list[tuple[bool, str]] = []
     with torch.inference_mode():
         for sample, input_ids in encoded_records:
+            seed_everything(args.seed)
             output_ids, timing = generate(input_ids)
             new_ids = output_ids[0, input_ids.shape[1]:]
             text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
@@ -224,7 +229,9 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--max-input-tokens", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed", type=int, default=int(os.environ.get("LONG_BENCH_SEED", "42"))
+    )
     parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-peak-memory", action=argparse.BooleanOptionalAction, default=True)
@@ -233,6 +240,7 @@ def main() -> None:
                         help="use torchrun even for single-GPU smoke")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    seed_everything(args.seed)
 
     if args.smoke:
         args.prefix_len = min(args.prefix_len, 1024)

@@ -150,6 +150,31 @@ resume stage hợp lệ; dùng `--dry-run`, `--only-stage cache_8k_train`, hoặ
 `--from-stage ... --stop-after ...` để debug. Script chỉ chuẩn bị dữ liệu và
 target cache, không tự khởi chạy các training experiment.
 
+Nếu cần giữ prompt/input và target response đầy đủ trong giới hạn native của
+Qwen3, dùng full-context mode thay vì lấy 3K làm giới hạn sinh:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full \
+  --device cuda --local-files-only \
+  --full-context --full-context-length 32768 --max-new-tokens 2048
+```
+
+Mode này tạo `regenerated_full/`, `tokenized_full/` và
+`target_features_qwen3_4b_full/`; prompt không bị truncate âm thầm. Nên thêm
+`--overflow-policy skip --sample-error-policy skip --resume` cho run dài:
+prompt tự nó vượt context sẽ được ghi vào `regenerated_full/*.skipped.jsonl`,
+còn prompt còn chỗ sẽ giữ nguyên input và tự giảm response budget nếu cần.
+Lỗi CUDA OOM vẫn dừng stage để bảo toàn tính đúng đắn; sau khi điều chỉnh
+batch/context có thể chạy lại với `--resume`.
+
+Trên server có ba B200 dùng GPU vật lý `1,2,3`, thêm
+`--parallel-gpu-ids 1 2 3` vào command. Mỗi GPU chạy một worker target riêng,
+worker ghi shard riêng rồi parent kiểm tra coverage trước khi merge. Có thể
+bắt đầu với `--cache-batch-size-8k 2`; nếu peak VRAM cao thì giảm xuống `1`.
+Log worker nằm trong các thư mục `.parallel_*/rank_*/worker.log`.
+
 ## Cách chạy
 
 ### 1. CPU smoke (máy dev, không GPU)

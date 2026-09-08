@@ -17,6 +17,7 @@ from common.benchmark_runtime import (
     runtime_metadata,
 )
 from common.data_loader import load_records
+from common.reproducibility import seed_everything
 
 
 def build_parser(default_backend: str, description: str) -> argparse.ArgumentParser:
@@ -30,7 +31,9 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed", type=int, default=int(os.environ.get("LONG_BENCH_SEED", "42"))
+    )
     parser.add_argument("--warmup-runs", type=int, default=3)
     parser.add_argument("--max-input-tokens", type=int, default=None)
     parser.add_argument(
@@ -246,7 +249,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     if args.max_new_tokens <= 0:
         raise SystemExit("--max-new-tokens must be positive")
 
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
     device = torch.device(args.device)
     records = load_records(Path(args.data_file), args.max_samples)
     data_name = Path(args.data_file).stem
@@ -270,6 +273,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     }
 
     with torch.inference_mode():
+        seed_everything(args.seed)
         warmup_ids = _prompt_batch(tokenizer, "Hello", max_input_tokens=0).to(device)
         for _ in range(max(args.warmup_runs, 0)):
             _generate(model, warmup_ids, args)
@@ -279,6 +283,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     writer = io_util.JsonlWriter(Path(args.output))
     successful = 0
     for sample in records:
+        seed_everything(args.seed)
         input_ids = _prompt_batch(
             tokenizer,
             sample["prompt"],

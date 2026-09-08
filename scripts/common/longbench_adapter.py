@@ -474,6 +474,8 @@ def build_adapter_command(
             str(max_input),
             "--temperature",
             temperature,
+            "--seed",
+            seed,
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])
@@ -494,6 +496,8 @@ def build_adapter_command(
             str(max_samples),
             "--max-gen-len",
             str(max_new_tokens),
+            "--seed",
+            seed,
             "--output",
             str(output),
         ]
@@ -529,6 +533,8 @@ def build_adapter_command(
             str(cfg.get("eagle_top_k", 4)),
             "--temperature",
             temperature,
+            "--seed",
+            seed,
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])
@@ -555,6 +561,8 @@ def build_adapter_command(
             str(max_input),
             "--warmup-runs",
             warmup,
+            "--seed",
+            seed,
             "--output",
             str(output),
             "--use-specextend",
@@ -582,6 +590,8 @@ def build_adapter_command(
             str(cfg.get("sssd_num_steps", 5)),
             "--topk",
             str(cfg.get("sssd_topk", 5)),
+            "--seed",
+            seed,
             "--output",
             str(output),
         ]
@@ -605,6 +615,8 @@ def build_adapter_command(
             str(max_new_tokens),
             "--kv-method",
             str(cfg.get("fafo_kv_method", "stream-llm")),
+            "--seed",
+            seed,
             "--output",
             str(output),
         ]

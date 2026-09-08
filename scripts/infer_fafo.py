@@ -22,6 +22,7 @@ from typing import Any
 from common import io_util, verify
 from common.data_loader import load_records
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 
 FAFO_ROOT = ROOT / "externals" / "FAFO"
@@ -174,6 +175,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default="What is 2 + 2? Give the answer briefly.")
     parser.add_argument("--max-samples", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--kv-method", choices=["stream-llm", "quest"], default="stream-llm")
     parser.add_argument("--use-flash", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--smoke", action="store_true")
@@ -183,6 +189,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
+    seed_everything(args.seed)
     if args.smoke:
         args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
@@ -234,10 +241,12 @@ def main() -> None:
             exp_desc=f"fafo_{args.kv_method}_{'smoke' if args.smoke else 'run'}",
         )
         print("+ " + " ".join(command))
+        child_env = _runtime_env()
+        child_env["FAFO_SEED"] = str(args.seed)
         proc = subprocess.run(
             command,
             cwd=FAFO_ROOT,
-            env=_runtime_env(),
+            env=child_env,
             capture_output=True,
             text=True,
         )

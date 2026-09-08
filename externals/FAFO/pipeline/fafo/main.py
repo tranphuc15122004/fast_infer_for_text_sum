@@ -20,7 +20,7 @@ import pipeline.main_utils as main_utils
 # fastchat/mt-bench data for mtbench) that are not required by other tasks and
 # may be absent on offline benchmark servers.
 
-SEED = 42
+SEED = int(os.environ.get("FAFO_SEED", "42"))
 main_utils.lock_seed(SEED)
 torch.cuda.reset_peak_memory_stats()
 start_time = datetime.datetime.now().astimezone()

@@ -13,6 +13,7 @@ Full mode (--full) delegates to the repo's inference_long-bench.py.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -24,6 +25,7 @@ from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.model_compat import ensure_rope_theta
 from common.paths import ROOT
+from common.reproducibility import seed_everything
 
 LONGSPEC = ROOT / "externals" / "LongSpec" / "longspec" / "test"
 # LongSpec modules (llama_glide / qwen2_glide / triton_tree_attn) live in the
@@ -96,6 +98,7 @@ def _run_representative(args: argparse.Namespace) -> None:
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
     for sample in records:
+        seed_everything(args.seed)
         prompt = _representative_prompt(sample["prompt"])
         original_ids = tokenizer(prompt, add_special_tokens=False).input_ids
         encoded = tokenizer(
@@ -114,6 +117,7 @@ def _run_representative(args: argparse.Namespace) -> None:
         )
         baseline_wall_s = time.perf_counter() - baseline_start
 
+        seed_everything(args.seed)
         tree_start = time.perf_counter()
         output_ids, accepted, verified, tree_decode_s, _ = model.tree_spec_generate(
             input_ids,
@@ -176,6 +180,7 @@ def _run_representative(args: argparse.Namespace) -> None:
             "accepted_tokens": int(accepted),
             "verified_tokens": int(verified),
             "avg_accept_length": round(float(accepted) / max(int(verified), 1), 4),
+            "seed": args.seed,
         }
         if record["task_type"] == "code_completion":
             metrics.add_code_completion(record, text, sample.get("reference"))
@@ -224,9 +229,15 @@ def main() -> None:
     parser.add_argument("--tree-shape", default="4 16 16 16 16")
     parser.add_argument("--max-gen-len", type=int, default=1024)
     parser.add_argument("--max-input-tokens", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("LONG_BENCH_SEED", "42")),
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    seed_everything(args.seed)
 
     if args.smoke:
         args.max_gen_len = min(args.max_gen_len, 32)
@@ -310,6 +321,7 @@ def main() -> None:
             "--data_path_prefix", args.data_path_prefix,
             "--max_gen_len", str(args.max_gen_len),
             "--temperature", "0",
+            "--seed", str(args.seed),
             "--tree_shape"] + args.tree_shape.split()
         print("+ " + " ".join(cmd))
         proc = subprocess.run(cmd, cwd=LONGSPEC, capture_output=True, text=True)

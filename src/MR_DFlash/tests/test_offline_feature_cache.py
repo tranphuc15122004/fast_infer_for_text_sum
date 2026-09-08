@@ -215,6 +215,69 @@ def test_cache_script_uses_batched_target_capture(tmp_path: Path, monkeypatch) -
     assert json.loads((output / "manifest.json").read_text())["num_samples"] == 2
 
 
+def test_cache_script_does_not_swallow_cuda_oom(tmp_path: Path, monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import cache_target_features
+
+    class TinyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+        def apply_chat_template(self, conversation, **_kwargs):
+            values = []
+            for message in conversation:
+                values.append(10 if message["role"] == "user" else 11)
+                values.extend(self(message["content"], add_special_tokens=False)["input_ids"])
+            return values
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": [20, 21]}
+
+        def convert_tokens_to_ids(self, _token):
+            return -1
+
+    class OOMCapturer:
+        def __init__(self, *_args, **_kwargs):
+            self.tokenizer = TinyTokenizer()
+            self.device = torch.device("cpu")
+            self.layer_ids = [0]
+            self.context_feature_dim = 2
+            self.model = SimpleNamespace(config=SimpleNamespace(hidden_size=2))
+
+        def capture_batch(self, *_args, **_kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(cache_target_features, "HFTargetCapture", OOMCapturer, raising=False)
+    data = tmp_path / "regenerated.jsonl"
+    _write_rows = {
+        "id": "oom-sample",
+        "conversations": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    }
+    data.write_text(json.dumps(_write_rows) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="out of memory"):
+        cache_target_features.cache_dataset(
+            target_model_path="tiny-target",
+            data_path=str(data),
+            output_path=str(tmp_path / "cache"),
+            max_length=64,
+            batch_size=1,
+            shard_size=1,
+            layer_ids=[0],
+            device="cpu",
+        )
+
+
 def test_trainer_accepts_sharded_feature_dataset(tmp_path: Path) -> None:
     from MR_DFlash.config import DataConfig, ModelConfig, RunConfig, TrainingConfig
     from MR_DFlash.offline_features import ShardedFeatureWriter, ShardedDFlashFeatureDataset
