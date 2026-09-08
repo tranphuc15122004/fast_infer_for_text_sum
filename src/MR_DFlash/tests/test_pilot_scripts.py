@@ -281,6 +281,21 @@ def test_preprocess_pipeline_plan_contains_debuggable_stages(tmp_path: Path) -> 
     assert all(str(tmp_path / "pilot") in " ".join(stage.command) for stage in plan)
 
 
+def test_preprocess_pipeline_plan_options_are_json_serializable(tmp_path: Path) -> None:
+    import json
+
+    from run_preprocess_pipeline import PipelineOptions, _options_payload
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+    )
+    # pipeline_plan.json được ghi bằng _common.write_json, nên payload phải
+    # serialize được ngay cả khi options dùng Path nội bộ.
+    json.dumps(_options_payload(options))
+
+
 def test_preprocess_pipeline_failure_state_is_resumable(tmp_path: Path) -> None:
     from run_preprocess_pipeline import (
         PipelineOptions,

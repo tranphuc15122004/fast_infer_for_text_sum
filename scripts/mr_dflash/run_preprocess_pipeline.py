@@ -346,7 +346,13 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
 
 
 def _options_payload(options: PipelineOptions) -> dict[str, Any]:
-    return asdict(options)
+    payload = asdict(options)
+    # ``write_json`` intentionally stays strict so that accidental non-JSON
+    # values are visible at call sites. PipelineOptions dùng Path để thao tác
+    # filesystem, do đó normalize hai field này trước khi ghi plan/summary.
+    payload["repo_root"] = str(options.repo_root)
+    payload["data_root"] = str(options.data_root)
+    return payload
 
 
 def pipeline_config_hash(options: PipelineOptions) -> str:
