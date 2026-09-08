@@ -47,8 +47,86 @@ _VALID_LOSS_TYPES = {
     "dpace",
     "dpace-cumulative-confidence-only",
     "dpace-continuation-value-only",
+    "spec-auf",
+    "dpace-hard-negative-all",
+    "dpace-hard-negative-shallow",
 }
-_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_DPACE_LOSS_TYPES = {
+    "dpace",
+    "dpace-cumulative-confidence-only",
+    "dpace-continuation-value-only",
+    "dpace-hard-negative-all",
+    "dpace-hard-negative-shallow",
+}
+_HARD_NEGATIVE_LOSS_TYPES = {
+    "dpace-hard-negative-all",
+    "dpace-hard-negative-shallow",
+}
+
+
+def build_spec_auf_support_mask(
+    predicted_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Keep CE support through the first predicted failure.
+
+    The anchor (offset zero) is never a proposal.  Invalid positions terminate
+    the active prefix, while the first valid mismatch itself remains
+    supervised, matching Accept-Until-Fail's ``through first failure`` rule.
+    """
+
+    if predicted_ids.shape != target_ids.shape or predicted_ids.shape != valid_mask.shape:
+        raise ValueError("predicted_ids/target_ids/valid_mask phải cùng shape")
+    valid = valid_mask.to(dtype=torch.bool).clone()
+    if valid.shape[-1] > 0:
+        # Offset zero is an anchor, not a proposal, but it must not terminate
+        # the prefix scan used to find the first proposal failure.
+        valid[..., 0] = True
+    prefix_valid = torch.cumprod(valid.to(dtype=torch.float32), dim=-1).to(dtype=torch.bool)
+    if prefix_valid.shape[-1] > 0:
+        prefix_valid[..., 0] = False
+    failure = prefix_valid & predicted_ids.ne(target_ids)
+    failure_count = torch.cumsum(failure.to(dtype=torch.int64), dim=-1)
+    first_failure = failure & (failure_count == 1)
+    return prefix_valid & ((failure_count == 0) | first_failure)
+
+
+def hard_negative_components(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    k: int = 32,
+    mode: str = "all",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return restricted CE, detached gate, and target rank.
+
+    The restricted CE contains the target and the current Top-K competitors.
+    ``mode=all`` gates every mismatch; ``mode=shallow`` gates only detached
+    target ranks 17--32, the E24 repairability band.
+    """
+
+    if logits.ndim < 2 or target_ids.shape != logits.shape[:-1] or valid_mask.shape != target_ids.shape:
+        raise ValueError("logits/target_ids/valid_mask shape không hợp lệ")
+    if k <= 0:
+        raise ValueError("hard-negative k phải dương")
+    if mode not in {"all", "shallow"}:
+        raise ValueError("hard-negative mode phải là all hoặc shallow")
+    top_k = min(int(k), int(logits.shape[-1]))
+    target_logits = logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    competitor_logits, competitor_ids = torch.topk(logits, k=top_k, dim=-1)
+    target_is_competitor = competitor_ids.eq(target_ids.unsqueeze(-1))
+    competitor_logits = competitor_logits.masked_fill(target_is_competitor, float("-inf"))
+    restricted_logits = torch.cat([competitor_logits, target_logits.unsqueeze(-1)], dim=-1)
+    restricted_loss = torch.logsumexp(restricted_logits, dim=-1) - target_logits
+    target_rank = 1 + logits.gt(target_logits.unsqueeze(-1)).sum(dim=-1)
+    mismatch = valid_mask.to(dtype=torch.bool) & logits.argmax(dim=-1).ne(target_ids)
+    if mode == "all":
+        gate = mismatch
+    else:
+        gate = mismatch & target_rank.ge(17) & target_rank.le(32)
+    return restricted_loss, gate.detach(), target_rank.detach()
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +309,8 @@ class OnlineDFlashModel(nn.Module):
         loss_type: str = "dflash",
         attention_backend: str = "sdpa",
         dpace_alpha: float = 0.5,
+        hard_negative_k: int = 32,
+        hard_negative_lambda: float = 0.25,
     ) -> None:
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -241,6 +321,10 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError(f"dpace_alpha phải thuộc [0,1], got {dpace_alpha}")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks phải >= 0")
+        if hard_negative_k <= 0:
+            raise ValueError("hard_negative_k phải dương")
+        if hard_negative_lambda < 0:
+            raise ValueError("hard_negative_lambda phải >= 0")
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -253,6 +337,8 @@ class OnlineDFlashModel(nn.Module):
         self.loss_type = loss_type
         self.attention_backend = attention_backend
         self.dpace_alpha = dpace_alpha
+        self.hard_negative_k = int(hard_negative_k)
+        self.hard_negative_lambda = float(hard_negative_lambda)
 
         self._freeze_target()
 
@@ -436,6 +522,9 @@ class OnlineDFlashModel(nn.Module):
             target_ids.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
+        predicted_ids = logits.argmax(dim=-1)
+        hard_num = neg_log_q.new_zeros(())
+        hard_den = neg_log_q.new_zeros(())
 
         if self.loss_type == "dflash":
             loss_weights = weight_mask
@@ -449,6 +538,15 @@ class OnlineDFlashModel(nn.Module):
                 loss_weights = loss_weights * decay_weights
             loss_num = (neg_log_q * loss_weights).sum()
             loss_den = loss_weights.sum()
+        elif self.loss_type == "spec-auf":
+            auf_support = build_spec_auf_support_mask(
+                predicted_ids,
+                target_ids,
+                weight_mask > 0.5,
+            )
+            loss_weights = weight_mask * auf_support.to(dtype=weight_mask.dtype)
+            loss_num = (neg_log_q * loss_weights).sum()
+            loss_den = loss_weights.sum()
         elif self.loss_type in _DPACE_LOSS_TYPES:
             with torch.no_grad():
                 target_probability = torch.exp(-neg_log_q)
@@ -456,15 +554,26 @@ class OnlineDFlashModel(nn.Module):
                     target_probability,
                     weight_mask,
                     weight_mask > 0,
-                    self.loss_type,
+                    "dpace" if self.loss_type in _HARD_NEGATIVE_LOSS_TYPES else self.loss_type,
                 )
             loss_num = (neg_log_q * weight_mask * dpace_weights).sum()
             loss_den = loss_num.new_zeros(())
+            if self.loss_type in _HARD_NEGATIVE_LOSS_TYPES:
+                mode = "shallow" if self.loss_type.endswith("shallow") else "all"
+                hard_loss, hard_gate, _ = hard_negative_components(
+                    logits,
+                    target_ids,
+                    weight_mask > 0.5,
+                    k=self.hard_negative_k,
+                    mode=mode,
+                )
+                hard_weight = weight_mask * hard_gate.to(dtype=weight_mask.dtype)
+                hard_num = (hard_loss * hard_weight).sum()
+                hard_den = hard_weight.sum()
         else:  # defensive
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
         with torch.no_grad():
-            predicted_ids = logits.argmax(dim=-1)
             valid = weight_mask > 0.5
             correct = predicted_ids.eq(target_ids)
             correct_num = (
@@ -492,6 +601,8 @@ class OnlineDFlashModel(nn.Module):
             position_den,
             accept_num,
             accept_den,
+            hard_num,
+            hard_den,
         )
 
     def _dpace_weight(
@@ -575,6 +686,8 @@ class OnlineDFlashModel(nn.Module):
             position_den,
             accept_num,
             accept_den,
+            hard_num,
+            hard_den,
         ) = checkpointed_chunk_reduce(
             self._objective_chunk_terms,
             hidden_4d,
@@ -589,14 +702,26 @@ class OnlineDFlashModel(nn.Module):
             "acc_pos": (position_correct.detach(), position_den.detach()),
             "accept_ge": (accept_num.detach(), accept_den.detach()),
         }
+        if self.loss_type in _HARD_NEGATIVE_LOSS_TYPES:
+            ratio_metrics["hard_negative"] = (
+                hard_den.detach(),
+                weight_mask.new_tensor(float(weight_mask.numel())),
+            )
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
         }
-        loss_denominator = (
-            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
-        )
-        loss = loss_num / loss_denominator
+        if self.loss_type in {"dflash", "spec-auf"}:
+            loss_denominator = loss_den
+            loss = loss_num / loss_denominator.clamp_min(torch.finfo(loss_num.dtype).tiny)
+        elif self.loss_type in _HARD_NEGATIVE_LOSS_TYPES:
+            base_denominator = loss_num.new_tensor(float(bsz))
+            hard_denominator = hard_den.clamp_min(torch.finfo(hard_num.dtype).tiny)
+            loss_denominator = base_denominator
+            loss = loss_num / base_denominator + self.hard_negative_lambda * hard_num / hard_denominator
+        else:
+            loss_denominator = loss_num.new_tensor(float(bsz))
+            loss = loss_num / loss_denominator
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
         return loss, accuracy, metrics

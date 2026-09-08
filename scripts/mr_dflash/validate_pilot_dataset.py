@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
-from _common import read_jsonl
+from _common import read_jsonl, write_json
 
 
 def main(argv=None) -> None:
@@ -15,13 +15,27 @@ def main(argv=None) -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--tokenizer", default=None)
+    parser.add_argument(
+        "--local-files-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="chỉ đọc tokenizer từ snapshot local (mặc định bật trên server)",
+    )
     parser.add_argument("--expected-target-model", default=None)
     parser.add_argument("--require-generated", action="store_true")
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="ghi báo cáo JSON để pipeline/CI đọc lại sau khi validate",
+    )
     args = parser.parse_args(argv)
     tokenizer = None
     if args.tokenizer:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer,
+            local_files_only=bool(args.local_files_only),
+        )
     seen = set()
     counts = Counter()
     strata = Counter()
@@ -57,7 +71,23 @@ def main(argv=None) -> None:
             if len(ids) > args.max_length or sum(mask) < 2:
                 raise ValueError(f"row {index}: tokenized length/mask không hợp lệ (len={len(ids)})")
         valid += 1
-    print(f"[validate_pilot_dataset] valid={valid} sources={dict(counts)} strata={dict(strata)}")
+    report = {
+        "schema_version": "mr_dflash_validation_v1",
+        "input": str(args.input),
+        "max_length": int(args.max_length),
+        "expected_target_model": args.expected_target_model,
+        "require_generated": bool(args.require_generated),
+        "valid": int(valid),
+        "unique_ids": int(len(seen)),
+        "source_counts": dict(sorted(counts.items())),
+        "length_strata": {str(key): int(value) for key, value in sorted(strata.items())},
+    }
+    if args.report:
+        write_json(args.report, report)
+    print(
+        f"[validate_pilot_dataset] valid={valid} sources={dict(counts)} "
+        f"strata={dict(strata)}"
+    )
 
 
 if __name__ == "__main__":

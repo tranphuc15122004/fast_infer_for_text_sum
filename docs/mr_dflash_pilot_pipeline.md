@@ -18,40 +18,133 @@ Ba config đều dùng block size 16, DFlash loss, `num_anchors=512`,
 `init_draft_from_target=false`. Config pilot không dùng các config Qwen legacy
 ở thư mục gốc vì chúng có thể mang init policy khác.
 
+## Chạy toàn bộ preprocess bằng một script
+
+`run_preprocess_pipeline.py` là entry point duy nhất cho phase dữ liệu/cache.
+Nó không train drafter; sau khi cache hoàn tất, nhiều run train có thể dùng
+chung các shard target. Các stage được thực hiện theo thứ tự:
+
+| Stage | Đầu ra chính | Ý nghĩa |
+|---|---|---|
+| `prepare` | `normalized/*.jsonl`, `source_manifest.json`, `split_manifest.json` | Chuẩn hóa ShareGPT/ArXiv, chọn 50K + 50K và split 90/5/5 |
+| `analyze` | `manifests/analysis.json` | Báo cáo nhanh source ratio, độ dài, duplicate và schema |
+| `regenerate_{3k,8k}_{split}` | `regenerated_3k/*.jsonl` hoặc `regenerated/*.jsonl`, regeneration manifests | Sinh assistant response deterministic bằng Qwen3-4B |
+| `validate_{3k,8k}_{split}` | `manifests/validation_*.json` | Kiểm tra assistant cuối, target provenance, token length |
+| `tokenize_{3k,8k}_{split}` | `tokenized*/{split}/shard_*.pt`, `manifest.json` | Lưu `input_ids`, `loss_mask`, length; không lưu hidden |
+| `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Chạy target forward và lưu hidden `[1,9,17,25,33]` tại mọi offset |
+
+Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
+`pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
+`pipeline_summary.json`. Nếu lỗi, wrapper dừng ngay tại stage đó; xem file
+`*.failed.json` để biết exit code/command và file `.log` để xem traceback.
+
+Trên server B200, với model đã mount tại path local, chạy:
+
+```bash
+cd /workspace/fast_infer_text_sum   # sửa thành thư mục repo thực tế nếu khác
+export PYTHONPATH="$PWD/src"
+
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
+  --device cuda \
+  --local-files-only
+```
+
+Hai context regime 3K và 8K đều được chuẩn bị. Mặc định cache `train` và
+`val`; `test` vẫn được regenerate/tokenize để evaluation nhưng không cache
+hidden vì các config train không dùng test cache. Muốn cache cả test, thêm:
+
+```bash
+--cache-splits train val test
+```
+
+Trước khi chạy thật, in toàn bộ command mà không đọc source/model:
+
+```bash
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
+  --dry-run
+```
+
+Nếu phiên chạy bị ngắt, chạy lại đúng command sẽ skip stage đã có marker và
+artifact hợp lệ. Một số cách debug/resume:
+
+```bash
+# Chỉ chạy lại một stage sau khi đã hoàn tất các dependency trước đó.
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
+  --only-stage cache_8k_train
+
+# Chạy từ một stage đến hết 8K validation.
+python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
+  --from-stage regenerate_8k_train --stop-after validate_8k_test
+```
+
+`--only-stage` giả định các input/artifact của dependency đã tồn tại. Không
+dùng `--no-resume` trên cùng data root nếu chưa chủ động kiểm tra artifact;
+flag này dùng khi muốn chạy lại từ đầu với output mới hoặc data root mới.
+
 ## Các artifact
 
 ```text
-data/mr_dflash_pilot/
+/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/
 ├── normalized/       # prompt-only và split prompt
 ├── regenerated_3k/   # target trajectory với budget 3K
 ├── regenerated/      # target trajectory với budget 8K
 ├── tokenized_3k/     # R2, max_length=3072
 ├── tokenized/        # R3, max_length=8192
-└── manifests/        # source/split/regeneration/tokenization provenance
+├── target_features_qwen3_4b_3k/
+│   ├── train/        # hidden cache shard dùng chung cho 3K matrix
+│   └── val/
+├── target_features_qwen3_4b_8k/
+│   ├── train/        # hidden cache shard dùng chung cho 8K matrix
+│   └── val/
+├── manifests/        # source/split/regeneration/validation/tokenization provenance
+├── pipeline_logs/    # stdout/stderr từng stage, ví dụ cache_8k_train.log
+├── pipeline_state/   # *.running/success/failed.json của từng stage
+├── pipeline_plan.json
+└── pipeline_summary.json
 ```
 
 `raw/` là input do người dùng cung cấp và không bị script ghi đè.
-Hidden-state cache chỉ dành cho smoke/debug; pilot 100K dùng `feature_mode:
-online`.
+Target-generated response được lưu trong `regenerated_3k/` và `regenerated/`;
+hidden cache được lưu shard ở `target_features_*`. Ba variant trong matrix đọc
+cùng một cache của mỗi context regime.
 
 ### Cache target trước train hay không?
 
-Với các config pilot hiện tại, **không có phase cache hidden state trước train**:
+Có. Config pilot B200 hiện tại dùng **phase cache offline trước train**:
 
 ```text
-tokenized shard có sẵn
-    -> trainer đọc input_ids/attention_mask
-    -> target Qwen frozen forward trong từng batch
-    -> hook lấy [1,9,17,25,33], detach
-    -> draft model + DFlash/MR-DFlash loss
+regenerated JSONL (đã có output của Qwen target)
+    -> cache_target_features.py
+    -> target Qwen frozen forward theo batch
+    -> hook lấy [1,9,17,25,33] tại mọi offset hợp lệ
+    -> sharded feature cache + manifest
+    -> DFlash/MR-DFlash train chỉ đọc cache
 ```
 
-Target vẫn được load một lần và giữ `eval/frozen`, nhưng hidden states chỉ tồn
-tại trong batch hiện tại rồi được giải phóng. Cách này tránh feature cache nhiều
-terabyte trên 100K mẫu. Nếu đặt `data.feature_mode: offline`,
-`run_train.py` sẽ chạy `capture.py` trước train (hoặc dùng
-`data.hidden_states_path`) và lưu từng sample vào thư mục
-`captured_features`; đó là mode cache trước train, không phải mode pilot chính.
+Cache này giúp các run DFlash-2L, MR-DFlash-2S và DFlash-5L không phải chạy
+Qwen target lại. `input_ids`, `loss_mask` và hidden states được lưu cùng
+sample; hidden states bao gồm cả prompt và response, không chỉ token có
+`loss_mask=1`, vì memory của drafter cần mọi offset trước anchor. Response text
+vẫn nằm trong regenerated JSONL để audit/reproduce/evaluate.
+
+Không cache full target logits: objective hiện tại chỉ cần hidden features,
+target embedding và frozen lm_head khi train. Full logits sẽ làm dung lượng
+tăng thêm nhiều lần mà không đem lại thông tin cần thiết cho pipeline này.
+
+Cache sharded dùng nhiều sample trong một file `.pt`, có `manifest.json`, LRU
+reader và `--resume`. Cache `.ckpt` một-file/mẫu trong `capture.py` vẫn được
+giữ cho backward compatibility và smoke nhỏ. Khi một config explicit
+`data.hidden_states_path` trỏ tới cache chưa hoàn chỉnh, `run_train.py` sẽ
+dừng và chỉ rõ lệnh cache; nó không tự chạy một pass target đắt tiền trong lúc
+bắt đầu train.
 
 ## Dữ liệu server và schema thực tế
 
@@ -89,7 +182,7 @@ Lệnh chạy đúng là:
 python3 scripts/mr_dflash/prepare_server_data.py \
   --sharegpt-source "$SHAREGPT_SOURCE" \
   --arxiv-source "$ARXIV_SOURCE" \
-  --output-root data/mr_dflash_pilot \
+  --output-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
   --sharegpt-count 50000 --arxiv-count 50000 \
   --tokenizer "$TARGET_MODEL"
 ```
@@ -118,17 +211,17 @@ Nếu muốn gọi từng bước thay vì wrapper:
 ```bash
 PYTHONPATH=src python3 scripts/mr_dflash/prepare_sharegpt.py \
   --input "$SHAREGPT_SOURCE" \
-  --output data/mr_dflash_pilot/normalized/sharegpt_prompts.jsonl
+  --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/sharegpt_prompts.jsonl
 
 PYTHONPATH=src python3 scripts/mr_dflash/prepare_arxiv.py \
   --input "$ARXIV_SOURCE" \
-  --output data/mr_dflash_pilot/normalized/arxiv_prompts.jsonl \
+  --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/arxiv_prompts.jsonl \
   --tokenizer "$TARGET_MODEL"
 
 PYTHONPATH=src python3 scripts/mr_dflash/build_pilot_dataset.py \
-  --sharegpt data/mr_dflash_pilot/normalized/sharegpt_prompts.jsonl \
-  --arxiv data/mr_dflash_pilot/normalized/arxiv_prompts.jsonl \
-  --output-root data/mr_dflash_pilot
+  --sharegpt /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/sharegpt_prompts.jsonl \
+  --arxiv /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/arxiv_prompts.jsonl \
+  --output-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot
 ```
 
 Split mặc định là 90K/5K/5K với tỷ lệ ShareGPT:ArXiv = 50:50; ArXiv được
@@ -145,23 +238,23 @@ tokenize 3K vì truncation sau khi generate có thể cắt response; mỗi regi
 ```bash
 for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/regenerate_pilot.py \
-    --input data/mr_dflash_pilot/normalized/${split}_prompts.jsonl \
-    --output data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
+    --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/${split}_prompts.jsonl \
+    --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
     --target-model-path "$TARGET_MODEL" \
     --max-length 3072 --max-new-tokens 768 \
     --temperature 0 --device cuda --local-files-only \
-    --manifest data/mr_dflash_pilot/manifests/regeneration_3k_${split}.json \
+    --manifest /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/manifests/regeneration_3k_${split}.json \
     --resume
 done
 
 for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/regenerate_pilot.py \
-    --input data/mr_dflash_pilot/normalized/${split}_prompts.jsonl \
-    --output data/mr_dflash_pilot/regenerated/${split}.jsonl \
+    --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/${split}_prompts.jsonl \
+    --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/${split}.jsonl \
     --target-model-path "$TARGET_MODEL" \
     --max-length 8192 --max-new-tokens 768 \
     --temperature 0 --device cuda --local-files-only \
-    --manifest data/mr_dflash_pilot/manifests/regeneration_8k_${split}.json \
+    --manifest /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/manifests/regeneration_8k_${split}.json \
     --resume
 done
 ```
@@ -172,12 +265,12 @@ Nếu target được chạy bởi service khác, truyền `--responses-jsonl` t
 
 ```bash
 PYTHONPATH=src python3 scripts/mr_dflash/validate_pilot_dataset.py \
-  --input data/mr_dflash_pilot/regenerated_3k/train.jsonl \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/train.jsonl \
   --tokenizer "$TARGET_MODEL" --max-length 3072 \
   --expected-target-model "$TARGET_MODEL" --require-generated
 
 PYTHONPATH=src python3 scripts/mr_dflash/validate_pilot_dataset.py \
-  --input data/mr_dflash_pilot/regenerated/train.jsonl \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/train.jsonl \
   --tokenizer "$TARGET_MODEL" --max-length 8192 \
   --expected-target-model "$TARGET_MODEL" \
   --require-generated
@@ -188,25 +281,63 @@ PYTHONPATH=src python3 scripts/mr_dflash/validate_pilot_dataset.py \
 ```bash
 for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/tokenize_dataset.py \
-    --input data/mr_dflash_pilot/regenerated/${split}.jsonl \
-    --output data/mr_dflash_pilot/tokenized/${split} \
+    --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/${split}.jsonl \
+    --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/tokenized/${split} \
     --target-model-path "$TARGET_MODEL" --max-length 8192 \
     --supervision-mode last_assistant --local-files-only \
-    --provenance-manifest data/mr_dflash_pilot/manifests/tokenization_8k_${split}.json \
+    --provenance-manifest /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/manifests/tokenization_8k_${split}.json \
     --resume
 done
 
 for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/tokenize_dataset.py \
-    --input data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
-    --output data/mr_dflash_pilot/tokenized_3k/${split} \
+    --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
+    --output /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/tokenized_3k/${split} \
     --target-model-path "$TARGET_MODEL" --max-length 3072 \
     --supervision-mode last_assistant --local-files-only \
-    --provenance-manifest data/mr_dflash_pilot/manifests/tokenization_3k_${split}.json \
+    --provenance-manifest /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/manifests/tokenization_3k_${split}.json \
     --resume
 done
 ```
 `attention_mask` được tạo từ độ dài thật, không suy ra bằng `input_ids != 0`.
+
+## Cache hidden states một lần trên B200
+
+Chạy sau khi đã validate và regenerate đúng context regime. `--batch-size`
+chỉ ảnh hưởng throughput của phase cache, không thay đổi batch/optimizer của
+training. Bắt đầu với 2 trên một B200 100 GB cho 3K; với 8K bắt đầu bằng 1.
+`--bucket-buffer-size` giúp ghép các sample gần độ dài nhau.
+
+```bash
+for split in train val test; do
+  PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
+    --target-model-path "$TARGET_MODEL" \
+    --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
+    --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_3k/${split} \
+    --target-layer-ids 1 9 17 25 33 \
+    --max-length 3072 --batch-size 2 --bucket-buffer-size 16 \
+    --shard-size 64 --supervision-mode last_assistant \
+    --device cuda --local-files-only --resume
+done
+
+for split in train val test; do
+  PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
+    --target-model-path "$TARGET_MODEL" \
+    --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/${split}.jsonl \
+    --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_8k/${split} \
+    --target-layer-ids 1 9 17 25 33 \
+    --max-length 8192 --batch-size 1 --bucket-buffer-size 8 \
+    --shard-size 32 --supervision-mode last_assistant \
+    --device cuda --local-files-only --resume
+done
+```
+
+Trước khi chạy 50K + 50K, dùng output fixture nhỏ và kiểm tra report; không
+đổi target revision, layer IDs, chat template hoặc supervision mode giữa các
+cache dùng chung trong một matrix. Với Qwen3-4B, feature width là 12,800 và
+BF16 tốn khoảng 25.6 KB/token; 100K sample dài vài nghìn token có thể cần
+nhiều TB. Nếu filesystem không đủ, dừng ở R2 hoặc dùng bản copy config online,
+không train trên cache ghi dở.
 
 ## Fairness check và smoke train
 
@@ -232,6 +363,36 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python3 \
 Chỉ dùng device đã được allocate riêng. R0 có thể chạy với fixture test
 `src/MR_DFlash/tests/test_online_pilot_pipeline.py`; không cần model Qwen thật.
 
+### E23/E24 objective screen
+
+Sau khi feature train/val đã tồn tại, chạy cùng một config DFlash-5L để giữ
+model, dữ liệu, batch, seed và lịch học cố định:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python3 \
+  scripts/mr_dflash/run_e23_e24.py \
+  --config src/MR_DFlash/configs/pilot_qwen3_4b/dflash_5l_3k.yaml \
+  --output-root outputs/mr_dflash_e23_e24 \
+  --eval-input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/test.jsonl \
+  --local-files-only \
+  --stop-on-failure
+```
+
+E23 chạy `dflash`, `dpace`, `spec-auf`; E24 chạy
+`dpace-hard-negative-all` và `dpace-hard-negative-shallow`. E24 dùng
+`Top-32` competitor và `lambda=0.25` cho screen đầu tiên. Không trộn các
+checkpoint giữa conditions. Mỗi condition phải có `metrics.jsonl`,
+`eval_metrics.json`, checkpoint và `run.log`; nếu một condition lỗi, kiểm tra
+manifest trước khi kết luận về objective.
+
+Smoke không tải model thật:
+
+```bash
+PYTHONPATH=src:. python3 -m pytest -q \
+  src/MR_DFlash/tests/test_research_objectives.py \
+  src/MR_DFlash/tests/test_research_runner.py
+```
+
 ## Các rung thực nghiệm
 
 * R0: khoảng 100 sample, chuẩn hóa → regenerate → tokenize → online 1 step.
@@ -249,7 +410,7 @@ acceptance proxy theo chuỗi prefix chứ không chỉ accuracy token độc l�
 PYTHONPATH=src python3 scripts/mr_dflash/evaluate_pilot.py \
   --config src/MR_DFlash/configs/pilot_qwen3_4b/mr_dflash_2s_8k.yaml \
   --checkpoint outputs/mr_dflash_pilot/mr_dflash_2s_8k/checkpoint_final.pt \
-  --input data/mr_dflash_pilot/regenerated/test.jsonl \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/test.jsonl \
   --output outputs/mr_dflash_pilot/eval_mr_2s.jsonl \
   --max-new-tokens 128 --exactness-check --device cuda
 ```

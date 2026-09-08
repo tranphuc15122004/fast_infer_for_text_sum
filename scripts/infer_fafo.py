@@ -130,16 +130,34 @@ def _runtime_env() -> dict[str, str]:
 
 
 def _parse_log(log: str) -> dict[str, float | int | None]:
-    """Extract the one-sample timing line emitted by upstream FAFO."""
+    """Extract timing metrics from FAFO's per-step or aggregate log format."""
 
-    time_match = re.findall(r"time:\s*([0-9.eE+-]+)", log)
-    token_match = re.findall(r"generated tokens:\s*([0-9]+)", log)
+    time_match = re.findall(r"time:\s*([0-9.eE+-]+)", log, flags=re.IGNORECASE)
+    token_match = re.findall(
+        r"(?:generated\s+tokens|OVERALL\s+GEN)\s*:\s*([0-9]+)",
+        log,
+        flags=re.IGNORECASE,
+    )
+    stat_match = re.findall(
+        r"\bSTAT\s*\[\s*([0-9.eE+-]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9.eE+-]+)\s*\]",
+        log,
+        flags=re.IGNORECASE,
+    )
     average_match = re.findall(
-        r"AVERAGE THROUGHPUT2\s+([0-9.eE+-]+)", log
+        r"AVERAGE\s+THROUGHPUT2\s+([0-9.eE+-]+)", log,
+        flags=re.IGNORECASE,
     )
     e2e_s = float(time_match[-1]) if time_match else None
     output_tokens = int(token_match[-1]) if token_match else None
     throughput = float(average_match[-1]) if average_match else None
+    if stat_match:
+        _, _, stat_tokens, stat_time = stat_match[-1]
+        if output_tokens is None:
+            output_tokens = int(stat_tokens)
+        if e2e_s is None:
+            e2e_s = float(stat_time)
+        if throughput is None and e2e_s > 0:
+            throughput = output_tokens / e2e_s
     if throughput is None and e2e_s and output_tokens is not None:
         throughput = output_tokens / e2e_s
     return {

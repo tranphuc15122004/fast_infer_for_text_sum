@@ -33,6 +33,10 @@ warmup và ghi kết quả vào `outputs/sssd.jsonl` (hoặc `OUTPUT_FILE`).
   Python `gguf==0.19.0` và extension native `sssd_speculator` đã được build/cài
   trong shared runtime. `sglang-kernel` là package binary; chỉ có thư mục
   `externals/SSSD/sgl-kernel/python` thì chưa đủ.
+- Kiểm tra extension bằng `python3 -c 'from sssd_speculator import Reader, Writer'`.
+  Launcher không đưa thư mục source `externals/SSSD/sssd_speculator` vào đầu
+  `PYTHONPATH` trừ khi trong đó đã có file `.so`, vì package source chưa build
+  sẽ che native extension được cài trong shared runtime.
 - Với server không có internet, đặt wheel
   `sglang_kernel-0.4.2+cu130-*-cp310-abi3-*.whl`
   và wheel `gguf-0.19.0-py3-none-any.whl`

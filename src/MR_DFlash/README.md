@@ -120,7 +120,8 @@ prepare_server_data.py
   -> regenerate_pilot.py bằng target frozen
   -> validate_pilot_dataset.py
   -> tokenize_dataset.py (tokenized_3k hoặc tokenized cho 8K)
-  -> run_train.py với data.feature_mode=online
+  -> cache_target_features.py (target hidden states theo shard)
+  -> run_train.py với data.feature_mode=offline
 ```
 
 `prepare_sharegpt.py` nhận cả JSON array `.json` và JSONL; `prepare_arxiv.py`
@@ -130,6 +131,24 @@ tokenize hỗ trợ progress bar/resume. Chạy smoke khoảng 100 mẫu và xem
 trước khi xử lý 50K ShareGPT + 50K ArXiv. Quy trình đầy đủ, các path server và
 điều kiện approve scale được ghi tại
 [`docs/mr_dflash_pilot_pipeline.md`](../../docs/mr_dflash_pilot_pipeline.md).
+
+Để chạy trọn phase chuẩn bị/cache bằng một entry point có log và trạng thái
+theo stage:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot \
+  --device cuda --local-files-only
+```
+
+Wrapper ghi `pipeline_plan.json`, `pipeline_summary.json`, log tại
+`pipeline_logs/` và marker `*.success.json`/`*.failed.json` tại
+`pipeline_state/`. Mặc định nó chuẩn bị cả 3K và 8K, cache `train`/`val`, và
+giữ test ở dạng regenerated/tokenized cho evaluation. Chạy lại cùng lệnh sẽ
+resume stage hợp lệ; dùng `--dry-run`, `--only-stage cache_8k_train`, hoặc
+`--from-stage ... --stop-after ...` để debug. Script chỉ chuẩn bị dữ liệu và
+target cache, không tự khởi chạy các training experiment.
 
 ## Cách chạy
 
@@ -166,7 +185,27 @@ nhận functional correctness trên model thật; không phải benchmark GPU. T
 máy dev T4 hiện tại, PyTorch không khởi tạo được CUDA do driver 12.4 không
 tương thích torch `cu130`, nên lệnh trên cố ý chạy CPU.
 
-### 2. Capture feature offline (một lần)
+### 2. Cache target feature offline (một lần, khuyến nghị cho train lặp lại)
+
+Sau khi đã có target-generated JSONL, dùng cache sharded để các baseline đọc
+cùng hidden states mà không chạy target lại:
+
+```bash
+PYTHONPATH=src python scripts/mr_dflash/cache_target_features.py \
+  --target-model-path Qwen/Qwen3-4B \
+  --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/train.jsonl \
+  --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_3k/train \
+  --target-layer-ids 1 9 17 25 33 \
+  --max-length 3072 --batch-size 2 --shard-size 64 \
+  --supervision-mode last_assistant --device cuda --local-files-only --resume
+```
+
+Script lưu hidden state tại mọi offset hợp lệ (prompt và response), cùng
+`input_ids`/`loss_mask` trong shard `.pt`, và ghi provenance vào
+`manifest.json`. Có thể chạy lại với `--resume`; sample id đã hoàn tất không
+bị capture lại.
+
+### 2.1. Capture feature legacy cho smoke nhỏ
 
 ```bash
 cd src
@@ -192,8 +231,10 @@ python -m MR_DFlash.run_train \
   --config MR_DFlash/configs/qwen3_8b_mr_dflash.yaml
 ```
 
-Nếu `data.hidden_states_path` chưa có, `run_train` tự chạy capture vào
-`output_dir/captured_features`. Có thể override CLI:
+Cache explicit phải được tạo trước. Nếu `data.hidden_states_path` chưa tồn tại,
+`run_train` dừng với lệnh `cache_target_features.py` thay vì âm thầm chạy target
+trong phase train. Chỉ khi bỏ trống `hidden_states_path`, run legacy mới tự
+capture `.ckpt` vào `output_dir/captured_features`. Có thể override CLI:
 `--max-steps 100 --batch-size 1 --output-dir out ...`
 
 Hoặc không dùng YAML, truyền thẳng flag: `--target-model-path ... --train-data-path ...`.
@@ -274,6 +315,31 @@ barrier; checkpoint và metrics chỉ ghi ở rank 0. `eval_data_path` bật
 evaluation loss/accuracy cuối run (hoặc định kỳ với
 `training.eval_interval > 0`).
 
+### E23/E24 objective matrix
+
+Các objective có thể chạy trên cùng một YAML mà không đổi model, dữ liệu,
+batch, seed hay lịch học:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_e23_e24.py \
+  --config src/MR_DFlash/configs/pilot_qwen3_4b/dflash_5l_3k.yaml \
+  --output-root outputs/mr_dflash_e23_e24 \
+  --eval-input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/test.jsonl \
+  --local-files-only \
+  --stop-on-failure
+```
+
+Matrix gồm:
+
+- E23: `e23_fixed_decay` (`dflash`), `e23_dpace` (`dpace`),
+  `e23_spec_auf` (`spec-auf`);
+- E24: `e24_dpace_hn_all` và `e24_dpace_hn_shallow`.
+
+`spec-auf` giữ loss support tới first predicted failure. Hai biến thể E24
+dùng restricted CE trên target + Top-32 competitors; bản `shallow` chỉ bật
+ở target rank 17–32. Mỗi biến thể ghi `run.log`, `metrics.jsonl`,
+`eval_metrics.json` và matrix manifest riêng dưới `--output-root`.
+
 ### 4. Reference inference
 
 API chính nằm ở `MR_DFlash.inference.MRDFlashInferenceEngine`. CLI:
@@ -329,8 +395,9 @@ số vòng và số token proposal được accept cho pilot latency.
 
 - Online disaggregated (SGLang capture server + Mooncake) — không tái hiện
   standalone được; seam: thay `capture_dataset` bằng consumer đọc feature.
-- EAGLE3/P-EAGLE/Domino/DSpark/D-PACE strategy (chỉ giữ DFlash; D-PACE loss
-  dạng `dpace*` đã có trong `OnlineDFlashModel`).
+- EAGLE3/P-EAGLE/Domino/DSpark strategy; D-PACE, Spec-AUF và E24 objective
+  hiện chỉ là các loss screen trong `OnlineDFlashModel`, chưa phải serving
+  architecture mới.
 - Liger kernel, config schema đầy đủ, FSDP/model-parallel và vocab mapping.
 - DDP hiện chỉ là data-parallel cơ bản qua `torchrun`; chưa có elastic launch,
   resume tự động sau lỗi rank hoặc sharding target model.
@@ -340,10 +407,10 @@ số vòng và số token proposal được accept cho pilot latency.
 Các giới hạn còn lại được ghi ở [`docs/mr_dflash.md`](../../docs/mr_dflash.md)
 và protocol GPU deferred ở
 [`docs/mr_dflash_gpu_experiments.md`](../../docs/mr_dflash_gpu_experiments.md).
-## Pilot data/online training
+## Pilot data/offline training
 
 Pipeline thực nghiệm đã khóa cho câu hỏi MR-DFlash trên long context nằm tại
 [`docs/mr_dflash_pilot_pipeline.md`](../../docs/mr_dflash_pilot_pipeline.md).
-Pipeline dùng tokenized shard + online hidden features; feature cache offline
-chỉ giữ cho smoke/debug. Ba config công bằng là DFlash-2L, MR-DFlash-2S và
+Pipeline dùng target-generated JSONL + offline target feature shard; ba config
+công bằng là DFlash-2L, MR-DFlash-2S và
 DFlash-5L trong `configs/pilot_qwen3_4b/`.

@@ -5,6 +5,30 @@ Package này triển khai P0–P4 cho câu hỏi:
 > Khi context dài lên, DFlash mất token đúng khỏi candidate set, hay DFlash2
 > không chọn token đúng dù token đó vẫn còn trong candidate set?
 
+## E22 — Rank-band repair oracle
+
+E22 dùng các trace E20 fixed on-policy (`reveal_count=0`) để ước lượng
+headroom của từng rank band. Mỗi band được chạy độc lập; tại các row thuộc
+band, oracle thay token draft được chọn bằng target token rồi tính lại longest
+accepted prefix của block. Vì vậy kết quả phản ánh prefix amplification và
+không thể được suy ra bằng cách cộng marginal recall.
+
+Chạy trên ba trace hiện có:
+
+```bash
+python3 -m src.analyze.dflash_residual.e22_rank_band \
+  --trace multi_news=outputs/dflash_residual/2026-09-07_causal_screening/trace_multi_news.jsonl \
+  --trace govreport=outputs/dflash_residual/2026-09-07_causal_screening/trace_govreport.jsonl \
+  --trace cnn_dm=outputs/dflash_residual/2026-09-07_causal_screening/trace_cnn_dm.jsonl \
+  --output outputs/dflash_residual/2026-09-08_rank_band_oracle \
+  --bootstrap-samples 500 \
+  --seed 42
+```
+
+Gate E22 là relative gain của band `17-32` lớn hơn 20% trên ít nhất hai
+dataset. Nếu gate fail, không chạy E23/E24; Top-K oracle E20 vẫn được báo cáo
+như diagnostic, nhưng không đủ để biện minh cho training method fixed-budget.
+
 ## Contract
 
 Collector ghi một JSONL row cho mỗi `(sample_id, round_index,

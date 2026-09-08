@@ -160,6 +160,8 @@ def sharded_feature_store_ready(path: str | Path) -> bool:
         return False
     try:
         manifest = load_feature_manifest(str(root))
+        if root.is_file():
+            root = root.parent
         shards = manifest.get("shards", [])
         if not isinstance(shards, list) or not shards:
             return False
@@ -215,6 +217,7 @@ class ShardedFeatureWriter:
             )
         self.shards: List[Dict[str, Any]] = []
         self.sample_ids: List[str] = []
+        manifest: Optional[Dict[str, Any]] = None
         if resume and manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if manifest.get("schema_version") != SHARDED_FEATURE_SCHEMA_VERSION:
@@ -233,6 +236,33 @@ class ShardedFeatureWriter:
                     )
             self.shards = [dict(item) for item in manifest.get("shards", [])]
             self.sample_ids = [str(x) for x in manifest.get("sample_ids", [])]
+            missing_shards = [
+                str(item.get("path"))
+                for item in self.shards
+                if not (self.root / str(item.get("path"))).is_file()
+            ]
+            if missing_shards:
+                raise FileNotFoundError(
+                    "feature cache thiếu shard khi resume: "
+                    + ", ".join(missing_shards[:3])
+                )
+            # flush() ghi shard trước rồi mới ghi manifest. Nếu tiến trình bị
+            # dừng giữa hai thao tác, phục hồi shard mồ côi thay vì ghi đè nó
+            # ở lần --resume kế tiếp.
+            listed_names = {str(item.get("path")) for item in self.shards}
+            for shard_path in existing_pt:
+                if shard_path.name in listed_names:
+                    continue
+                payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+                samples = payload.get("samples") if isinstance(payload, dict) else payload
+                if not isinstance(samples, list):
+                    raise ValueError(f"shard không có list samples: {shard_path}")
+                ids = [str(item["id"]) for item in samples]
+                if set(ids) & set(self.sample_ids):
+                    raise ValueError(f"shard mồ côi chứa sample id đã có: {shard_path}")
+                lengths = [int(item.get("length", len(item["input_ids"]))) for item in samples]
+                self.shards.append({"path": shard_path.name, "count": len(ids), "ids": ids, "lengths": lengths})
+                self.sample_ids.extend(ids)
         elif resume and existing_pt:
             # Recovery path cho cache bị dừng trước lần ghi manifest đầu tiên.
             for shard_path in existing_pt:
@@ -249,10 +279,15 @@ class ShardedFeatureWriter:
         self._pending_ids: set[str] = set()
         self._stored_dtype: Optional[str] = (
             str(manifest.get("stored_feature_dtype"))
-            if resume and manifest_path.exists() and manifest.get("stored_feature_dtype")
+            if manifest is not None and manifest.get("stored_feature_dtype")
             else None
         )
         self.stats: Dict[str, Any] = {}
+
+    @property
+    def total_samples(self) -> int:
+        """Số sample đã ghi hoặc đang chờ flush."""
+        return len(self.sample_ids) + len(self._pending)
 
     def add(self, sample: Dict[str, Any]) -> bool:
         """Thêm sample; trả False nếu id đã có khi resume."""
@@ -317,6 +352,7 @@ class ShardedDFlashFeatureDataset:
         expected_feature_width: Optional[int] = None,
         expected_feature_layer_ids: Optional[Sequence[int]] = None,
         expected_target_model_path: Optional[str] = None,
+        expected_max_length: Optional[int] = None,
     ) -> None:
         root = Path(hidden_states_path)
         self.root = root if root.is_dir() else root.parent
@@ -337,6 +373,11 @@ class ShardedDFlashFeatureDataset:
             expected_feature_layer_ids=expected_feature_layer_ids,
             expected_target_model_path=expected_target_model_path,
         )
+        if expected_max_length is not None and int(self.manifest.get("max_length", -1)) != int(expected_max_length):
+            raise ValueError(
+                "feature cache max_length không khớp model: "
+                f"{self.manifest.get('max_length')} != {expected_max_length}"
+            )
         raw_shards = self.manifest.get("shards", [])
         if not isinstance(raw_shards, list) or not raw_shards:
             raise ValueError(f"manifest không có shards: {root}")

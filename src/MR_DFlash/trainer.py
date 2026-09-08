@@ -390,7 +390,10 @@ class Trainer:
                         prefix = "accept_ge"
                     else:
                         prefix = name
-                    for offset, value in enumerate(ratios.detach().cpu().tolist(), 1):
+                    ratio_values = ratios.detach().cpu().tolist()
+                    if not isinstance(ratio_values, list):
+                        ratio_values = [ratio_values]
+                    for offset, value in enumerate(ratio_values, 1):
                         metrics[f"{prefix}_{offset}"] = float(value)
                 self._log(metrics)
                 window_loss = 0.0

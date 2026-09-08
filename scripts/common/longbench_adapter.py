@@ -263,6 +263,21 @@ def preflight_baseline(
             result.update(status="missing_dependency", reason="vendored SpecExtend source is missing")
 
     if baseline == "sssd":
+        speculator_available, speculator_reason = _module_importable(
+            "sssd_speculator"
+        )
+        result["requirements"]["sssd_speculator"] = {
+            "available": speculator_available,
+            "reason": speculator_reason if speculator_reason is not None else None,
+        }
+        if not speculator_available and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=(
+                    "sssd_speculator native extension cannot be imported in the "
+                    f"shared runtime ({speculator_reason})"
+                ),
+            )
         kernel_available, kernel_reason = _module_importable("sgl_kernel")
         result["requirements"]["sgl_kernel"] = {
             "available": kernel_available,

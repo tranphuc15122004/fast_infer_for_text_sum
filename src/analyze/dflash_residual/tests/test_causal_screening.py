@@ -6,6 +6,11 @@ from src.analyze.dflash_residual.causal_screening_analysis import (
     candidate_depth_sweep,
     reveal_oracle,
 )
+from src.analyze.dflash_residual.e22_rank_band import (
+    BAND_SPECS,
+    rank_band_repair_oracle,
+    repaired_prefix_length,
+)
 
 
 def _row(position: int, target: int, rank: int, *, state: str = "s", reveal: int = 0) -> dict:
@@ -65,3 +70,47 @@ def test_reveal_oracle_uses_same_state_baseline(tmp_path) -> None:
     item = result["datasets"]["multi_news"]["conditions"]["1"]
     assert item["conditional_cmat_o16"] > item["same_state_r0_baseline_cmat_o16"]
     assert item["relative_gain_vs_same_state_r0"] > 0
+
+
+def test_repaired_prefix_only_changes_the_selected_rank_band() -> None:
+    block = [
+        _row(1, 1, 1),
+        _row(2, 2, 17),
+        _row(3, 3, 33),
+    ]
+    assert repaired_prefix_length(block, None) == 1
+    assert repaired_prefix_length(block, BAND_SPECS["17-32"]) == 2
+    assert repaired_prefix_length(block, BAND_SPECS["33-64"]) == 1
+    assert repaired_prefix_length(block, BAND_SPECS["2-16"]) == 1
+
+
+def test_rank_band_oracle_reports_non_additive_prefix_gain(tmp_path) -> None:
+    path = tmp_path / "trace.jsonl"
+    rows = [
+        _row(1, 1, 1),
+        _row(2, 2, 17),
+        _row(3, 3, 17),
+    ]
+    path.write_text("\n".join(__import__("json").dumps(row) for row in rows) + "\n")
+    result = rank_band_repair_oracle(
+        {"multi_news": path},
+        bootstrap_samples=25,
+    )
+    item = result["datasets"]["multi_news"]
+    assert item["status"] == "ok"
+    assert item["mat_d"] == 1.0
+    assert item["bands"]["17-32"]["mat_repaired"] == 3.0
+    assert item["bands"]["17-32"]["relative_gain_vs_mat_d"] == 2.0
+    assert item["bands"]["33-64"]["mat_repaired"] == 1.0
+    assert result["gate"]["decision"] == "FAIL"
+
+
+def test_rank_band_oracle_rejects_missing_rank_rows(tmp_path) -> None:
+    path = tmp_path / "trace.jsonl"
+    row = _row(1, 1, 1)
+    row.pop("draft_target_rank")
+    path.write_text(__import__("json").dumps(row) + "\n")
+    result = rank_band_repair_oracle({"multi_news": path})
+    item = result["datasets"]["multi_news"]
+    assert item["status"] == "inconclusive"
+    assert item["reason"] == "missing_full_vocabulary_rank"

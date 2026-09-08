@@ -28,6 +28,9 @@ DEFAULT_SHAREGPT_SOURCE = (
 DEFAULT_ARXIV_SOURCE = (
     "/workspace/storage-shared/nlp/dungdx4/datasets/arxiv/train.label.jsonl"
 )
+DEFAULT_OUTPUT_ROOT = (
+    "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot"
+)
 
 
 def _run(script: str, arguments: list[str], *, dry_run: bool) -> None:
@@ -43,7 +46,7 @@ def main(argv=None) -> None:
     )
     parser.add_argument("--sharegpt-source", default=DEFAULT_SHAREGPT_SOURCE)
     parser.add_argument("--arxiv-source", default=DEFAULT_ARXIV_SOURCE)
-    parser.add_argument("--output-root", default="data/mr_dflash_pilot")
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--sharegpt-count", type=int, default=DEFAULT_SHAREGPT_COUNT)
     parser.add_argument("--arxiv-count", type=int, default=DEFAULT_ARXIV_COUNT)
     parser.add_argument("--seed", type=int, default=42)
@@ -131,7 +134,8 @@ def main(argv=None) -> None:
     else:
         print(
             "[prepare_server_data] normalized/split hoàn tất; "
-            "bước tiếp theo là regenerate_pilot.py rồi tokenize_dataset.py"
+            "bước tiếp theo là regenerate_pilot.py, tokenize_dataset.py "
+            "và cache_target_features.py"
         )
 
 

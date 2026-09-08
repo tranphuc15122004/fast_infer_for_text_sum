@@ -5,6 +5,11 @@ Các config pilot Qwen3-4B trong
 đã được khóa cho profile B200 100 GB. Profile này ưu tiên đúng protocol và
 headroom bộ nhớ hơn việc đẩy batch lên tối đa.
 
+Dataset artifacts của pilot được đặt mặc định tại
+`/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot`,
+không nằm trong working tree của repo. Vì vậy có thể chạy config trực tiếp từ
+repo sau khi hoàn tất các phase chuẩn hóa, regenerate và cache.
+
 ## Profile đã áp dụng
 
 Tất cả sáu config pilot (`3k` và `8k`) dùng chung:
@@ -18,6 +23,7 @@ block_size             16
 num_anchors            512
 objective_chunk_blocks 64
 attention_backend      sdpa
+feature cache           offline, sharded, dùng chung theo target/context
 ```
 
 `objective_chunk_blocks=64` chỉ chia nhỏ phần tính objective và target LM
@@ -36,6 +42,28 @@ Các config Llama 3.1 8B benchmark cũng dùng `batch_size=1`, accumulation 4 v�
 B200 có 100 GB. Các config legacy Qwen ở thư mục gốc vẫn được giữ nguyên để
 không phá các run cũ; khi chạy protocol pilot hãy dùng đúng thư mục
 `pilot_qwen3_4b` hoặc config Llama benchmark tương ứng.
+
+Trước khi train, phải tạo target feature cache theo từng context regime. Ví dụ
+với 8K:
+
+```bash
+export TARGET_MODEL=Qwen/Qwen3-4B
+for split in train val; do
+  python3 scripts/mr_dflash/cache_target_features.py \
+    --target-model-path "$TARGET_MODEL" \
+    --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/${split}.jsonl \
+    --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_8k/${split} \
+    --target-layer-ids 1 9 17 25 33 --max-length 8192 \
+    --batch-size 1 --bucket-buffer-size 8 --shard-size 32 \
+    --device cuda --local-files-only --resume
+done
+```
+
+Các config pilot đã trỏ tới thư mục này. `run_train.py` kiểm tra manifest,
+target model, layer IDs, feature width và max length; nếu cache thiếu hoặc
+không khớp, run dừng trước khi nạp draft để không train nhầm. Cache 3K dùng
+thư mục `target_features_qwen3_4b_3k` tương ứng. Ước tính dung lượng trước khi
+scale: Qwen3-4B có feature width 12,800 nên BF16 cần khoảng 25.6 KB/token.
 
 ## Chạy trên một B200
 

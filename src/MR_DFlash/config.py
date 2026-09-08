@@ -18,8 +18,15 @@ from typing import List, Optional
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 VALID_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
-VALID_LOSS_TYPES = {"dflash", "dpace", "dpace-cumulative-confidence-only",
-                    "dpace-continuation-value-only"}
+VALID_LOSS_TYPES = {
+    "dflash",
+    "dpace",
+    "dpace-cumulative-confidence-only",
+    "dpace-continuation-value-only",
+    "spec-auf",
+    "dpace-hard-negative-all",
+    "dpace-hard-negative-shallow",
+}
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
@@ -332,6 +339,11 @@ class TrainingConfig:
     attention_backend: str = "sdpa"
     #: dflash | dpace | dpace-cumulative-confidence-only | ...
     loss_type: str = "dflash"
+    #: D-PACE confidence smoothing floor.
+    dpace_alpha: float = 0.5
+    #: Top-K competitors and coefficient for E24 hard-negative variants.
+    hard_negative_k: int = 32
+    hard_negative_lambda: float = 0.25
     #: schedule = dense warm-up rồi hard Top-k; cũng hỗ trợ dense/topk cố định.
     indexer_train_mode: str = "schedule"
     #: Số optimizer step đầu chạy dense score-bias cho CSA indexer.
@@ -355,6 +367,12 @@ class TrainingConfig:
             )
         if self.loss_type not in VALID_LOSS_TYPES:
             raise ValueError(f"loss_type không hợp lệ: {self.loss_type}")
+        if not 0.0 <= self.dpace_alpha <= 1.0:
+            raise ValueError(f"dpace_alpha phải thuộc [0,1], got {self.dpace_alpha}")
+        if self.hard_negative_k < 1:
+            raise ValueError("hard_negative_k phải >= 1")
+        if self.hard_negative_lambda < 0:
+            raise ValueError("hard_negative_lambda phải >= 0")
         if self.indexer_train_mode not in {"schedule", "dense", "topk"}:
             raise ValueError(
                 "indexer_train_mode phải là schedule, dense hoặc topk, "

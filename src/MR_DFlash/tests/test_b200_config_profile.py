@@ -35,6 +35,11 @@ def test_qwen_pilot_configs_use_b200_safe_fair_profile() -> None:
 
     assert {cfg.data.max_length for cfg in configs[:3]} == {3072}
     assert {cfg.data.max_length for cfg in configs[3:]} == {8192}
+    for cfg in configs:
+        regime = "3k" if cfg.data.max_length == 3072 else "8k"
+        expected = f"target_features_qwen3_4b_{regime}"
+        assert expected in cfg.data.hidden_states_path
+        assert expected in cfg.data.eval_hidden_states_path
     assert {cfg.training.batch_size * cfg.training.accumulation_steps for cfg in configs} == {4}
 
 

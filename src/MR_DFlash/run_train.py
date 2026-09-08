@@ -6,8 +6,9 @@ Tương ứng ``specforge train --config <yaml>`` nhưng tự đóng gói:
 
 1. Đọc config (mặc định dataclass hoặc file YAML khớp cây
    ``model/data/training``).
-2. Offline: nếu chưa có feature (``data.hidden_states_path``) → chạy capture
-   bằng HF. Online: đọc tokenized shard và lấy feature từ target frozen.
+2. Offline: đọc feature cache (sharded cache được tạo ở phase riêng; cache
+   legacy chỉ tự capture khi không có explicit ``hidden_states_path``). Online:
+   đọc tokenized shard và lấy feature từ target frozen.
 3. Nạp target parts (embed_tokens + lm_head, frozen) và dựng draft model +
    ``OnlineDFlashModel``.
 4. Chạy ``Trainer.fit()`` (accumulation, cosine+warmup, checkpoint).
@@ -155,6 +156,9 @@ def apply_cli_overrides(cfg: RunConfig, args: argparse.Namespace) -> None:
         "objective_chunk_blocks": (cfg.training, "objective_chunk_blocks"),
         "attention_backend": (cfg.training, "attention_backend"),
         "loss_type": (cfg.training, "loss_type"),
+        "dpace_alpha": (cfg.training, "dpace_alpha"),
+        "hard_negative_k": (cfg.training, "hard_negative_k"),
+        "hard_negative_lambda": (cfg.training, "hard_negative_lambda"),
         "indexer_train_mode": (cfg.training, "indexer_train_mode"),
         "indexer_dense_steps": (cfg.training, "indexer_dense_steps"),
         "save_interval": (cfg.training, "save_interval"),
@@ -229,6 +233,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--objective-chunk-blocks", type=int, default=None)
     parser.add_argument("--attention-backend", type=str, default=None)
     parser.add_argument("--loss-type", type=str, default=None)
+    parser.add_argument("--dpace-alpha", type=float, default=None)
+    parser.add_argument("--hard-negative-k", type=int, default=None)
+    parser.add_argument("--hard-negative-lambda", type=float, default=None)
     parser.add_argument(
         "--indexer-train-mode",
         type=str,
@@ -397,6 +404,9 @@ def build_online_model(
         objective_chunk_blocks=tcfg.objective_chunk_blocks,
         loss_type=tcfg.loss_type,
         attention_backend=tcfg.attention_backend,
+        dpace_alpha=tcfg.dpace_alpha,
+        hard_negative_k=tcfg.hard_negative_k,
+        hard_negative_lambda=tcfg.hard_negative_lambda,
         **(
             {
                 "indexer_train_mode": tcfg.indexer_train_mode,
@@ -414,6 +424,11 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
     from .capture import capture_dataset
     from .checkpoint import warm_start_draft_model
     from .data import DFlashFeatureDataset, list_feature_files
+    from .offline_features import (
+        ShardedDFlashFeatureDataset,
+        sharded_feature_store_ready,
+        is_sharded_feature_store,
+    )
     from .online_features import OnlineTargetFeatureProvider
     from .sampler import LengthBucketBatchSampler
     from .tokenized_data import TokenizedDFlashDataset
@@ -433,14 +448,25 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         *,
         sample_limit: Optional[int],
     ) -> Optional[str]:
-        """Capture một split đúng một lần rồi đồng bộ các rank."""
-        if configured_path and list_feature_files(configured_path):
+        """Resolve split cache; cache sharded phải được tạo trước khi train.
+
+        Khi người dùng chỉ đặt ``train_data_path`` (không đặt feature path),
+        vẫn giữ behavior legacy tự capture `.ckpt` cho smoke/debug. Với path
+        explicit, không tự động chạy một pass target đắt tiền trong lúc bắt
+        đầu train; thiếu cache sẽ báo lệnh cache rõ ràng để tránh chạy nhầm.
+        """
+        if configured_path and (
+            sharded_feature_store_ready(configured_path)
+            or bool(list_feature_files(configured_path))
+        ):
             return configured_path
+        if configured_path:
+            cache_kind = "sharded" if is_sharded_feature_store(configured_path) else "offline"
+            raise FileNotFoundError(
+                f"{cache_kind} feature cache chưa sẵn sàng: {configured_path}. "
+                "Hãy chạy scripts/mr_dflash/cache_target_features.py trước khi train."
+            )
         if not raw_data_path:
-            if configured_path:
-                raise ValueError(
-                    f"feature path {configured_path!r} chưa có file và thiếu raw data"
-                )
             return None
         features = Path(configured_path) if configured_path else out_dir / default_name
         error_file = out_dir / f".{default_name}.error"
@@ -593,15 +619,23 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
             world_size=dist_ctx.world_size,
         )
     else:
-        dataset = DFlashFeatureDataset(
-            features_path,
-            max_len=cfg.data.max_length,
-            run_id=cfg.run_id,
-            sample_limit=cfg.data.num_samples,
-            expected_feature_width=model.draft_model.spec.context_feature_dim,
-            expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
-            expected_target_model_path=cfg.model.target_model_path,
+        dataset_cls = (
+            ShardedDFlashFeatureDataset
+            if is_sharded_feature_store(features_path)
+            else DFlashFeatureDataset
         )
+        dataset_kwargs = {
+            "max_len": cfg.data.max_length,
+            "sample_limit": cfg.data.num_samples,
+            "expected_feature_width": model.draft_model.spec.context_feature_dim,
+            "expected_feature_layer_ids": resolve_feature_layer_ids(cfg.model),
+            "expected_target_model_path": cfg.model.target_model_path,
+        }
+        if dataset_cls is ShardedDFlashFeatureDataset:
+            dataset_kwargs["expected_max_length"] = cfg.data.max_length
+        else:
+            dataset_kwargs["run_id"] = cfg.run_id
+        dataset = dataset_cls(features_path, **dataset_kwargs)
     print(
         f"[run] dataset: {len(dataset)} mẫu, max_len={cfg.data.max_length}, "
         f"block_size={model.block_size}, anchors={cfg.training.num_anchors}"
@@ -622,14 +656,22 @@ def run(cfg: RunConfig, *, device: torch.device, resume_from: Optional[str] = No
         if len(eval_dataset) == 0:
             raise RuntimeError("online eval dataset rỗng")
     elif eval_features_path is not None:
-        eval_dataset = DFlashFeatureDataset(
-            eval_features_path,
-            max_len=cfg.data.max_length,
-            run_id=f"{cfg.run_id}:eval",
-            expected_feature_width=model.draft_model.spec.context_feature_dim,
-            expected_feature_layer_ids=resolve_feature_layer_ids(cfg.model),
-            expected_target_model_path=cfg.model.target_model_path,
+        dataset_cls = (
+            ShardedDFlashFeatureDataset
+            if is_sharded_feature_store(eval_features_path)
+            else DFlashFeatureDataset
         )
+        dataset_kwargs = {
+            "max_len": cfg.data.max_length,
+            "expected_feature_width": model.draft_model.spec.context_feature_dim,
+            "expected_feature_layer_ids": resolve_feature_layer_ids(cfg.model),
+            "expected_target_model_path": cfg.model.target_model_path,
+        }
+        if dataset_cls is ShardedDFlashFeatureDataset:
+            dataset_kwargs["expected_max_length"] = cfg.data.max_length
+        else:
+            dataset_kwargs["run_id"] = f"{cfg.run_id}:eval"
+        eval_dataset = dataset_cls(eval_features_path, **dataset_kwargs)
         if len(eval_dataset) == 0:
             raise RuntimeError("eval dataset rỗng — kiểm tra eval capture")
 

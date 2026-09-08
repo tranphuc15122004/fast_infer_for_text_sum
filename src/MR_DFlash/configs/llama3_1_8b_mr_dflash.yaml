@@ -32,10 +32,11 @@ model:
   indexer_num_heads: 1
 
 data:
+  feature_mode: offline
   train_data_path: ./data/user_prompts.jsonl
   eval_data_path: null
-  hidden_states_path: null
-  eval_hidden_states_path: null
+  hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_llama3_1_8b_3k/train
+  eval_hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_llama3_1_8b_3k/val
   max_length: 3072
   chat_template: llama
   cache_dir: ./cache

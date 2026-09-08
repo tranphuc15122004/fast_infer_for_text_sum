@@ -74,9 +74,29 @@ def test_sssd_command_uses_the_forked_sglang_entrypoint():
     assert "--speculative-adaptive" in command
 
 
+def test_sssd_runtime_does_not_shadow_installed_native_extension(monkeypatch):
+    module = _load_script("infer_sssd.py")
+    import os
+
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join((str(module.SSSD_SPECULATOR), "/tmp/keep-this-path")),
+    )
+    entries = module._runtime_env()["PYTHONPATH"].split(os.pathsep)
+
+    assert str(module.SSSD_PYTHON) in entries
+    assert str(module.SSSD_SPECULATOR) not in entries
+    assert "/tmp/keep-this-path" in entries
+
+
 def test_sssd_native_kernel_is_declared_for_the_server_runtime():
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-    assert "sglang-kernel==0.4.2" in requirements
+    sglang_kernel_lines = [
+        line.strip()
+        for line in requirements.splitlines()
+        if line.strip().startswith("sglang-kernel")
+    ]
+    assert any("0.4.2" in line for line in sglang_kernel_lines)
     assert "\ngguf" in f"\n{requirements}"
 
 
@@ -196,6 +216,20 @@ def test_fafo_command_uses_upstream_main_and_single_sample_configs():
     evaluation = module.build_eval_config("/tmp/one-sample.jsonl")
     assert evaluation["eval_params"]["dataset"] == "gsm8k"
     assert evaluation["eval_params"]["dataset_path"] == "/tmp/one-sample.jsonl"
+
+
+def test_fafo_parser_accepts_aggregate_summary_log():
+    module = _load_script("infer_fafo.py")
+    parsed = module._parse_log(
+        """
+AGE THROUGHPUT1 1.415505116185281 AVERAGE THROUGHPUT2 1.415505116185281 STAT [1.415505116185281, 1, 16, 11.303385496139526]
+FAFO LOG - OVERALL GEN: 16 STEPS: 9 AVG COMPRESS RATIO: 1.7777777777777777
+"""
+    )
+
+    assert parsed["output_tokens"] == 16
+    assert parsed["e2e_s"] == 11.303385496139526
+    assert parsed["throughput"] == 1.415505116185281
 
 
 def test_master_example_documents_llama_sssd_fafo_defaults():

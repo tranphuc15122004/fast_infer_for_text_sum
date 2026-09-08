@@ -32,6 +32,8 @@ def main(argv=None) -> None:
         "feature_mode": lambda c: c.data.feature_mode,
         "tokenized_data_path": lambda c: c.data.tokenized_data_path,
         "eval_tokenized_data_path": lambda c: c.data.eval_tokenized_data_path,
+        "hidden_states_path": lambda c: c.data.hidden_states_path,
+        "eval_hidden_states_path": lambda c: c.data.eval_hidden_states_path,
         "max_length": lambda c: c.data.max_length,
         "supervision_mode": lambda c: c.data.supervision_mode,
         "strategy_objective": lambda c: (c.training.loss_type, c.training.loss_decay_gamma),
@@ -59,8 +61,10 @@ def main(argv=None) -> None:
             "indexer_dim": cfg.model.indexer_dim,
         }
         report["variants"][path.stem] = variant
-        if cfg.data.feature_mode != "online":
-            failures.append(f"{path}: pilot phải dùng data.feature_mode=online")
+        if cfg.data.feature_mode == "offline" and not cfg.data.hidden_states_path:
+            failures.append(f"{path}: offline pilot cần data.hidden_states_path")
+        if cfg.data.feature_mode == "online" and not cfg.data.tokenized_data_path:
+            failures.append(f"{path}: online pilot cần data.tokenized_data_path")
         if cfg.model.init_draft_from_target:
             failures.append(f"{path}: pilot comparison bắt buộc init_draft_from_target=false")
     if args.report:

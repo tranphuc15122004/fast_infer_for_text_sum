@@ -48,6 +48,24 @@ def _child_imports_orjson(python: str) -> bool:
     return probe.returncode == 0
 
 
+def _child_imports_native_speculator(python: str, env: dict[str, str]) -> tuple[bool, str]:
+    """Check the installed SSSD extension without importing the SGLang fork."""
+    try:
+        probe = subprocess.run(
+            [python, "-c", "from sssd_speculator import Reader, Writer"],
+            cwd=SSSD_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return False, f"could not execute {python}: {exc}"
+    if probe.returncode == 0:
+        return True, ""
+    detail = (probe.stderr or probe.stdout or "native import failed").strip()
+    return False, detail.splitlines()[-1] if detail else "native import failed"
+
+
 @contextlib.contextmanager
 def _with_orjson_compat(python: str, env: dict[str, str]):
     """Yield ``env``, prepending a stdlib-``json`` ``orjson`` shim when needed.
@@ -179,9 +197,24 @@ def _float_or_none(value: Any) -> float | None:
 
 def _runtime_env() -> dict[str, str]:
     env = dict(os.environ)
-    entries = [str(SSSD_PYTHON), str(SSSD_SPECULATOR), str(ROOT / "scripts")]
+    # The source tree contains only ``__init__.py`` and C++ sources.  Adding
+    # its parent unconditionally makes that incomplete package shadow the
+    # compiled extension installed in the shared environment.  Include the
+    # source parent only when an in-place native build is actually present.
+    entries = [str(SSSD_PYTHON)]
+    if any(SSSD_SPECULATOR.glob("sssd_speculator/sssd_speculator*.so")):
+        entries.append(str(SSSD_SPECULATOR))
+    entries.append(str(ROOT / "scripts"))
     if env.get("PYTHONPATH"):
-        entries.append(env["PYTHONPATH"])
+        for entry in env["PYTHONPATH"].split(os.pathsep):
+            if not entry:
+                continue
+            try:
+                if Path(entry).resolve() == SSSD_SPECULATOR.resolve():
+                    continue
+            except OSError:
+                pass
+            entries.append(entry)
     env["PYTHONPATH"] = os.pathsep.join(entries)
     return env
 
@@ -248,15 +281,27 @@ def main() -> None:
             python=command[0] if command else sys.executable,
             env=_runtime_env(),
         ) as child_env:
-            proc = subprocess.run(
-                command,
-                cwd=SSSD_ROOT,
-                env=child_env,
-                capture_output=True,
-                text=True,
+            native_ok, native_reason = _child_imports_native_speculator(
+                command[0] if command else sys.executable,
+                child_env,
             )
-        process_returncode = proc.returncode
-        process_log = (proc.stdout or "") + (proc.stderr or "")
+            if not native_ok:
+                process_returncode = 1
+                process_log = (
+                    "[SSSD] native extension import failed before launching SGLang: "
+                    f"{native_reason}\n"
+                    "Install/build sssd_speculator in the shared runtime, then rerun."
+                )
+            else:
+                proc = subprocess.run(
+                    command,
+                    cwd=SSSD_ROOT,
+                    env=child_env,
+                    capture_output=True,
+                    text=True,
+                )
+                process_returncode = proc.returncode
+                process_log = (proc.stdout or "") + (proc.stderr or "")
         print(process_log[-4000:])
         result = _last_json_line(raw_result_path)
 

@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT_DIR = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
 if str(SCRIPT_DIR) not in sys.path:
@@ -61,6 +63,41 @@ def test_prepare_split_regenerate_validate_smoke(tmp_path: Path) -> None:
     validate_main(["--input", str(regenerated), "--require-generated"])
     rows = list(regenerated.open("r", encoding="utf-8"))
     assert rows
+
+
+def test_validate_pilot_dataset_writes_machine_readable_report(tmp_path: Path) -> None:
+    from validate_pilot_dataset import main as validate_main
+
+    source = tmp_path / "regenerated.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "id": "sharegpt_1",
+                "source": "sharegpt",
+                "conversations": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "metadata": {"generation_model": "/models/Qwen3-4B"},
+            }
+        ],
+    )
+    report = tmp_path / "reports" / "validation.json"
+    validate_main(
+        [
+            "--input",
+            str(source),
+            "--expected-target-model",
+            "/models/Qwen3-4B",
+            "--require-generated",
+            "--report",
+            str(report),
+        ]
+    )
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["valid"] == 1
+    assert payload["source_counts"] == {"sharegpt": 1}
 
 
 def test_prepare_sharegpt_accepts_json_array(tmp_path: Path) -> None:
@@ -208,9 +245,89 @@ def test_analyze_pilot_data_reports_small_sample(tmp_path: Path) -> None:
 def test_server_data_defaults_balance_sharegpt_and_arxiv() -> None:
     from build_pilot_dataset import DEFAULT_ARXIV_COUNT, DEFAULT_SHAREGPT_COUNT
     from prepare_server_data import DEFAULT_ARXIV_COUNT as WRAPPER_ARXIV_COUNT
+    from prepare_server_data import DEFAULT_OUTPUT_ROOT
     from prepare_server_data import DEFAULT_SHAREGPT_COUNT as WRAPPER_SHAREGPT_COUNT
 
     assert DEFAULT_SHAREGPT_COUNT == 50000
     assert DEFAULT_ARXIV_COUNT == 50000
     assert WRAPPER_SHAREGPT_COUNT == 50000
     assert WRAPPER_ARXIV_COUNT == 50000
+    assert DEFAULT_OUTPUT_ROOT == (
+        "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot"
+    )
+
+
+def test_preprocess_pipeline_plan_contains_debuggable_stages(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        sharegpt_count=4,
+        arxiv_count=6,
+        max_lengths=(3072, 8192),
+        cache_splits=("train", "val"),
+    )
+    plan = build_stage_plan(options)
+    names = [stage.name for stage in plan]
+    assert names[0] == "prepare"
+    assert "analyze" in names
+    assert "regenerate_3k_train" in names
+    assert "validate_8k_val" in names
+    assert "tokenize_3k_train" in names
+    assert "cache_8k_val" in names
+    assert all(stage.command for stage in plan)
+    assert all(str(tmp_path / "pilot") in " ".join(stage.command) for stage in plan)
+
+
+def test_preprocess_pipeline_failure_state_is_resumable(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import (
+        PipelineOptions,
+        Stage,
+        run_stage,
+    )
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        max_lengths=(3072,),
+    )
+    stage = Stage(
+        name="unit_failure",
+        command=["/bin/sh", "-c", "exit 7"],
+        artifacts=[],
+    )
+    with pytest.raises(RuntimeError, match="unit_failure"):
+        run_stage(stage, options, config_hash="test-hash")
+    state = tmp_path / "pilot" / "pipeline_state" / "unit_failure.failed.json"
+    assert state.exists()
+    assert '"return_code": 7' in state.read_text(encoding="utf-8")
+
+
+def test_preprocess_pipeline_success_marker_allows_resume(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, Stage, run_stage
+
+    data_root = tmp_path / "pilot"
+    artifact = data_root / "artifact.txt"
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=data_root,
+        target_model_path="/models/Qwen3-4B",
+    )
+    stage = Stage(
+        name="unit_success",
+        command=[
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(artifact)!r}).write_text('ok')",
+        ],
+        artifacts=[artifact],
+    )
+    first = run_stage(stage, options, config_hash="test-hash")
+    second = run_stage(stage, options, config_hash="test-hash")
+    assert first["status"] == "success"
+    assert second["status"] == "skipped"
+    assert artifact.read_text(encoding="utf-8") == "ok"
+    assert (data_root / "pipeline_logs" / "unit_success.log").exists()

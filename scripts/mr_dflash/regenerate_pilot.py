@@ -94,6 +94,11 @@ def main(argv=None) -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="giữ output hiện có và bỏ qua sample id đã regenerate",
+    )
     args = parser.parse_args(argv)
     if bool(args.target_model_path) == bool(args.responses_jsonl):
         raise ValueError("chọn đúng một trong --target-model-path hoặc --responses-jsonl")
@@ -122,8 +127,16 @@ def main(argv=None) -> None:
             parameter.requires_grad_(False)
 
     output = Path(args.output)
+    if output.exists() and not args.resume:
+        raise FileExistsError(
+            f"regenerated output đã tồn tại: {output}; dùng --resume hoặc thư mục mới"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
-    existing = {str(row.get("id")) for row in read_jsonl(output)} if output.exists() else set()
+    existing = (
+        {str(row.get("id")) for row in read_jsonl(output)}
+        if args.resume and output.exists()
+        else set()
+    )
     generated: List[Dict[str, Any]] = []
     stats = {"written": 0, "skipped_existing": 0, "skipped_invalid": 0}
     for index, row in enumerate(read_jsonl(args.input)):

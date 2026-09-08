@@ -71,6 +71,7 @@ class HFTargetCapture:
         torch_dtype: str = "bfloat16",
         device: str = "auto",
         local_files_only: Optional[bool] = None,
+        target_revision: Optional[str] = None,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -89,18 +90,18 @@ class HFTargetCapture:
                 "1", "true", "yes", "on"
             }
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            target_model_path,
-            cache_dir=cache_dir,
-            trust_remote_code=trust_remote_code,
-            local_files_only=local_files_only,
-        )
+        load_kwargs = {
+            "cache_dir": cache_dir,
+            "trust_remote_code": trust_remote_code,
+            "local_files_only": local_files_only,
+        }
+        if target_revision:
+            load_kwargs["revision"] = target_revision
+        self.tokenizer = AutoTokenizer.from_pretrained(target_model_path, **load_kwargs)
         self.model = AutoModelForCausalLM.from_pretrained(
             target_model_path,
-            cache_dir=cache_dir,
-            trust_remote_code=trust_remote_code,
             torch_dtype=dtype,
-            local_files_only=local_files_only,
+            **load_kwargs,
         ).to(self.device)
         self.model.eval()
 
