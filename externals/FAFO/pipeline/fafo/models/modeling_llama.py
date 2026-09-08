@@ -715,7 +715,7 @@ class LlamaAttention(nn.Module):
         if decoding_mask is not None:
             # enable_gqa lets flex_attention consume grouped KV directly, so we skip
             # materialising the repeat_kv expansion (saves memory bandwidth on GQA models).
-            mask = decoding_mask[key_states.size(2) // 128]
+            mask = decoding_mask.for_length(key_states.size(2))
             attn_output = flex_attention(
                 query_states, key_states, value_states, block_mask=mask, enable_gqa=True
             )

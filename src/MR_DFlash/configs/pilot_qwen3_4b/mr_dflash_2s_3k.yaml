@@ -24,8 +24,8 @@ model:
 
 data:
   feature_mode: online
-  train_data_path: data/mr_dflash_pilot/regenerated/train.jsonl
-  eval_data_path: data/mr_dflash_pilot/regenerated/val.jsonl
+  train_data_path: data/mr_dflash_pilot/regenerated_3k/train.jsonl
+  eval_data_path: data/mr_dflash_pilot/regenerated_3k/val.jsonl
   tokenized_data_path: data/mr_dflash_pilot/tokenized_3k/train
   eval_tokenized_data_path: data/mr_dflash_pilot/tokenized_3k/val
   hidden_states_path: null

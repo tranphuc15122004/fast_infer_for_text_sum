@@ -76,7 +76,8 @@ def test_sssd_command_uses_the_forked_sglang_entrypoint():
 
 def test_sssd_native_kernel_is_declared_for_the_server_runtime():
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-    assert "sglang-kernel==0.4.1" in requirements
+    assert "sglang-kernel==0.4.2" in requirements
+    assert "\ngguf" in f"\n{requirements}"
 
 
 def test_sssd_preflight_rejects_broken_native_kernel(monkeypatch):
@@ -113,6 +114,23 @@ def test_fafo_mask_cache_builds_contexts_beyond_static_limit():
     assert masks[84] == "mask-10880"
     assert masks[84] == "mask-10880"
     assert calls == [10880]
+
+
+def test_fafo_mask_cache_builds_exact_non_block_aligned_kv_length():
+    fafo_root = ROOT / "externals" / "FAFO"
+    if str(fafo_root) not in sys.path:
+        sys.path.insert(0, str(fafo_root))
+
+    from pipeline.fafo.flex_masking.mask_cache import LazyBlockMaskCache
+
+    calls = []
+    masks = LazyBlockMaskCache(
+        lambda kv_len: calls.append(kv_len) or f"mask-{kv_len}",
+    )
+
+    assert masks.for_length(11508) == "mask-11508"
+    assert masks.for_length(11508) == "mask-11508"
+    assert calls == [11508]
 
 
 def test_fafo_expand_mask_has_no_transformers_deprecation_warning():

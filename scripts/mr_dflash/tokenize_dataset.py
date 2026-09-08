@@ -25,6 +25,11 @@ def main(argv=None) -> None:
     parser.add_argument("--feature-layer-ids", type=int, nargs="+", default=[1, 9, 17, 25, 33])
     parser.add_argument("--shard-size", type=int, default=512)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="giữ các shard đã ghi và bỏ qua sample id đã tokenize",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
     if args.shard_size < 1:
@@ -41,7 +46,18 @@ def main(argv=None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     samples: List[Dict[str, Any]] = []
     shards: List[Dict[str, Any]] = []
+    existing_ids = set()
     total = 0
+    if args.resume:
+        for shard_path in sorted(root.glob("shard_*.pt")):
+            payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+            shard_samples = payload.get("samples") if isinstance(payload, dict) else payload
+            if not isinstance(shard_samples, list):
+                raise ValueError(f"shard không có list samples: {shard_path}")
+            shard_ids = {str(item.get("id", "")) for item in shard_samples if isinstance(item, dict)}
+            existing_ids.update(shard_ids)
+            shards.append({"path": shard_path.name, "count": len(shard_samples)})
+            total += len(shard_samples)
 
     def flush() -> None:
         nonlocal samples
@@ -52,9 +68,17 @@ def main(argv=None) -> None:
         shards.append({"path": name, "count": len(samples)})
         samples = []
 
-    for row_index, row in enumerate(read_jsonl(args.input)):
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm có trong requirements server
+        tqdm = lambda iterator, **_kwargs: iterator
+    rows = tqdm(read_jsonl(args.input), desc="Tokenize MR-DFlash", unit="row")
+    for row_index, row in enumerate(rows):
         if args.limit is not None and total >= args.limit:
             break
+        sample_id = str(row.get("id", row_index))
+        if sample_id in existing_ids:
+            continue
         conversations = row.get("conversations") or []
         input_ids, loss_mask = render_conversation(
             conversations,
@@ -72,11 +96,12 @@ def main(argv=None) -> None:
         ids = torch.tensor(input_ids, dtype=torch.long)
         mask = torch.tensor(loss_mask, dtype=torch.float32)
         samples.append({
-            "id": str(row.get("id", row_index)),
+            "id": sample_id,
             "input_ids": ids,
             "loss_mask": mask,
             "length": int(ids.numel()),
         })
+        existing_ids.add(sample_id)
         total += 1
         if len(samples) >= args.shard_size:
             flush()

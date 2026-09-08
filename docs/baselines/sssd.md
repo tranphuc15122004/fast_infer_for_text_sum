@@ -29,15 +29,20 @@ warmup và ghi kết quả vào `outputs/sssd.jsonl` (hoặc `OUTPUT_FILE`).
 ## Điều kiện và giới hạn
 
 - Cần GPU CUDA, fork SGLang tương thích với torch/CUDA/GPU, package native
-  `sglang-kernel==0.4.1` và extension native `sssd_speculator` đã được build/cài
+  `sglang-kernel==0.4.2` (được build cho Torch 2.11 trong runtime này), package
+  Python `gguf==0.19.0` và extension native `sssd_speculator` đã được build/cài
   trong shared runtime. `sglang-kernel` là package binary; chỉ có thư mục
   `externals/SSSD/sgl-kernel/python` thì chưa đủ.
-- Với server không có internet, đặt wheel `sglang_kernel-0.4.1+cu130-*-cp310-abi3-*.whl`
+- Với server không có internet, đặt wheel
+  `sglang_kernel-0.4.2+cu130-*-cp310-abi3-*.whl`
+  và wheel `gguf-0.19.0-py3-none-any.whl`
   vào wheelhouse nội bộ rồi cài bằng:
 
   ```bash
   python3 -m pip install --no-index --no-deps \
-    /path/to/wheelhouse/sglang_kernel-0.4.1+cu130-*-cp310-abi3-*.whl
+    /path/to/wheelhouse/sglang_kernel-0.4.2+cu130-*-cp310-abi3-*.whl
+  python3 -m pip install --no-index --no-deps \
+    /path/to/wheelhouse/gguf-0.19.0-py3-none-any.whl
   python3 -c 'import sgl_kernel; print(sgl_kernel.__file__)'
   ```
 

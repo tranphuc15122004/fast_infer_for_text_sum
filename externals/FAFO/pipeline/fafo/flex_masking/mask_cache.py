@@ -1,9 +1,10 @@
 class LazyBlockMaskCache:
     """Cache block masks on demand for arbitrarily long KV sequences.
 
-    FAFO indexes masks by ``key_length // block_size``.  Prebuilding a fixed
-    list only up to 6.5k tokens made long prompts fail with ``IndexError``.
-    The factory is called once for each required rounded-up KV length.
+    The exact-length API is used by the attention path because FlexAttention
+    requires the BlockMask KV dimension to match the tensor exactly.  The
+    integer-index API remains for older FAFO call sites and preserves its
+    block-rounded behavior.
     """
 
     def __init__(self, factory, block_size: int = 128):
@@ -12,6 +13,22 @@ class LazyBlockMaskCache:
         self._factory = factory
         self._block_size = block_size
         self._cache = {}
+
+    def for_length(self, kv_len: int):
+        """Return a mask whose KV dimension is exactly ``kv_len``.
+
+        FlexAttention rejects a BlockMask that is larger than the actual KV
+        tensor.  The decoder can have padding/cache-manager bookkeeping that
+        leaves KV lengths which are not multiples of ``block_size``; those
+        lengths must not be rounded up.
+        """
+        if not isinstance(kv_len, int):
+            raise TypeError("kv_len must be an integer")
+        if kv_len <= 0:
+            raise ValueError("kv_len must be positive")
+        if kv_len not in self._cache:
+            self._cache[kv_len] = self._factory(kv_len)
+        return self._cache[kv_len]
 
     def __getitem__(self, index: int):
         if not isinstance(index, int):

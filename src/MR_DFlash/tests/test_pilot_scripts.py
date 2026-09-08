@@ -61,3 +61,156 @@ def test_prepare_split_regenerate_validate_smoke(tmp_path: Path) -> None:
     validate_main(["--input", str(regenerated), "--require-generated"])
     rows = list(regenerated.open("r", encoding="utf-8"))
     assert rows
+
+
+def test_prepare_sharegpt_accepts_json_array(tmp_path: Path) -> None:
+    import json
+
+    from prepare_sharegpt import main as sharegpt_main
+
+    source = tmp_path / "ShareGPT_V3.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "conversation-1",
+                    "conversations": [
+                        {"from": "human", "value": "First question"},
+                        {"from": "gpt", "value": "Old answer"},
+                        {"from": "human", "value": "Final question"},
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "sharegpt_prompts.jsonl"
+    sharegpt_main(["--input", str(source), "--output", str(output)])
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["id"] == "sharegpt_conversation-1"
+    assert rows[0]["conversations"][-1] == {
+        "role": "user",
+        "content": "Final question",
+    }
+    assert rows[0]["metadata"]["original_turn_count"] == 3
+
+
+def test_prepare_arxiv_joins_paragraphs_and_preserves_reference(tmp_path: Path) -> None:
+    import json
+
+    from prepare_arxiv import main as arxiv_main
+
+    source = tmp_path / "train.label.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "id": "paper-1",
+                "text": ["Paragraph one.", "Paragraph two."],
+                "summary": ["Summary one.", "Summary two."],
+                "label": [1, 3],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "arxiv_prompts.jsonl"
+    arxiv_main(["--input", str(source), "--output", str(output)])
+    row = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert row["conversations"][0]["content"].endswith(
+        "Paragraph one.\n\nParagraph two."
+    )
+    assert row["metadata"]["reference_summary"] == "Summary one.\n\nSummary two."
+    assert row["metadata"]["label"] == [1, 3]
+
+
+def test_prepare_server_sources_builds_current_pilot_layout(tmp_path: Path) -> None:
+    import json
+
+    from prepare_server_data import main as prepare_server_main
+
+    share_source = tmp_path / "sharegpt.json"
+    share_source.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "s1",
+                    "conversations": [
+                        {"from": "human", "value": "Share question"},
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    arxiv_source = tmp_path / "arxiv.jsonl"
+    arxiv_source.write_text(
+        json.dumps({"id": "a1", "text": ["Document"], "summary": ["Reference"]})
+        + "\n",
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "pilot"
+    prepare_server_main(
+        [
+            "--sharegpt-source",
+            str(share_source),
+            "--arxiv-source",
+            str(arxiv_source),
+            "--output-root",
+            str(output_root),
+            "--sharegpt-count",
+            "1",
+            "--arxiv-count",
+            "1",
+            "--allow-short",
+        ]
+    )
+    assert (output_root / "normalized" / "train_prompts.jsonl").exists()
+    manifest = json.loads(
+        (output_root / "manifests" / "source_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["sharegpt_input"] == str(share_source)
+    assert manifest["arxiv_input"] == str(arxiv_source)
+    assert manifest["sharegpt_count"] == 1
+    assert manifest["arxiv_count"] == 1
+
+
+def test_analyze_pilot_data_reports_small_sample(tmp_path: Path) -> None:
+    import json
+
+    from analyze_pilot_data import main as analyze_main
+
+    source = tmp_path / "prompts.jsonl"
+    rows = [
+        {
+            "id": "sharegpt_s1",
+            "source": "sharegpt",
+            "conversations": [{"role": "user", "content": "Question"}],
+            "metadata": {"source_length": 8},
+        },
+        {
+            "id": "arxiv_a1",
+            "source": "arxiv",
+            "conversations": [{"role": "user", "content": "Document"}],
+            "metadata": {"source_length": 8, "source_token_length": 2, "reference_summary": "Summary"},
+        },
+    ]
+    _write_jsonl(source, rows)
+    report_path = tmp_path / "analysis.json"
+    analyze_main(["--input", str(source), "--output", str(report_path), "--limit", "2"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["rows"] == 2
+    assert report["source_counts"] == {"arxiv": 1, "sharegpt": 1}
+    assert report["duplicate_ids"] == []
+    assert report["reference_rows"] == 1
+
+
+def test_server_data_defaults_balance_sharegpt_and_arxiv() -> None:
+    from build_pilot_dataset import DEFAULT_ARXIV_COUNT, DEFAULT_SHAREGPT_COUNT
+    from prepare_server_data import DEFAULT_ARXIV_COUNT as WRAPPER_ARXIV_COUNT
+    from prepare_server_data import DEFAULT_SHAREGPT_COUNT as WRAPPER_SHAREGPT_COUNT
+
+    assert DEFAULT_SHAREGPT_COUNT == 50000
+    assert DEFAULT_ARXIV_COUNT == 50000
+    assert WRAPPER_SHAREGPT_COUNT == 50000
+    assert WRAPPER_ARXIV_COUNT == 50000

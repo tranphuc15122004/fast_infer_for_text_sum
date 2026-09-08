@@ -12,6 +12,10 @@ from typing import Any, Dict, Iterable, List
 from _common import read_jsonl, stable_id, write_json, write_jsonl
 
 
+DEFAULT_SHAREGPT_COUNT = 50000
+DEFAULT_ARXIV_COUNT = 50000
+
+
 def _split_counts(total: int) -> Dict[str, int]:
     train = int(total * 0.90)
     val = int(total * 0.05)
@@ -80,9 +84,19 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Build the MR-DFlash pilot manifest")
     parser.add_argument("--sharegpt", required=True)
     parser.add_argument("--arxiv", required=True)
+    parser.add_argument(
+        "--source-sharegpt-input",
+        default=None,
+        help="raw source path để ghi provenance; mặc định dùng --sharegpt",
+    )
+    parser.add_argument(
+        "--source-arxiv-input",
+        default=None,
+        help="raw source path để ghi provenance; mặc định dùng --arxiv",
+    )
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--sharegpt-count", type=int, default=40000)
-    parser.add_argument("--arxiv-count", type=int, default=60000)
+    parser.add_argument("--sharegpt-count", type=int, default=DEFAULT_SHAREGPT_COUNT)
+    parser.add_argument("--arxiv-count", type=int, default=DEFAULT_ARXIV_COUNT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-short", action="store_true")
     args = parser.parse_args(argv)
@@ -117,6 +131,9 @@ def main(argv=None) -> None:
         split: dict(Counter(str(row.get("source", "unknown")) for row in rows))
         for split, rows in splits.items()
     }
+    observed_sharegpt = sum(1 for row in (*sharegpt, *arxiv) if row.get("source") == "sharegpt")
+    observed_arxiv = sum(1 for row in (*sharegpt, *arxiv) if row.get("source") == "arxiv")
+    observed_total = observed_sharegpt + observed_arxiv
     split_manifest = {
         "schema_version": "mr_dflash_split_v1",
         "seed": args.seed,
@@ -124,9 +141,15 @@ def main(argv=None) -> None:
         "train": counts["train"],
         "val": counts["val"],
         "test": counts["test"],
-        "source_ratio": {"sharegpt": 0.4, "arxiv": 0.6},
+        "source_ratio": {
+            "sharegpt": observed_sharegpt / max(1, observed_total),
+            "arxiv": observed_arxiv / max(1, observed_total),
+        },
         "source_counts": source_counts,
-        "stratification": {"arxiv": [2048, 4096, 6144, 8192]},
+        "stratification": {
+            "arxiv": [2048, 4096, 6144, 8192],
+            "metric": "source_token_length (fallback source_length_chars)",
+        },
         "ids": {split: [str(row["id"]) for row in rows] for split, rows in splits.items()},
     }
     split_manifest["id_sha256"] = {
@@ -144,8 +167,8 @@ def main(argv=None) -> None:
             "sharegpt_count": len(sharegpt),
             "arxiv_count": len(arxiv),
             "total": len(sharegpt) + len(arxiv),
-            "sharegpt_input": str(args.sharegpt),
-            "arxiv_input": str(args.arxiv),
+            "sharegpt_input": str(args.source_sharegpt_input or args.sharegpt),
+            "arxiv_input": str(args.source_arxiv_input or args.arxiv),
         },
     )
     print(f"[build_pilot_dataset] total={sum(counts.values())} splits={counts}")

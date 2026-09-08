@@ -142,11 +142,54 @@ class HFTargetCapture:
         input_ids: List[int],
     ) -> torch.Tensor:
         """Chạy target trên toàn chuỗi → hidden concat (1, seq, feat)."""
-        ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+        return self.capture_batch(
+            torch.tensor([input_ids], dtype=torch.long, device=self.device)
+        )[0].unsqueeze(0)
+
+    def capture_batch(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        """Capture nhiều sample và cắt phần padding khỏi từng sample.
+
+        ``input_ids`` có dạng ``[batch, padded_seq]``. Hidden states được
+        trả về trên CPU theo list, mỗi phần tử có dạng ``[valid_seq, width]``.
+        Vì cắt sau forward nên mọi offset hợp lệ của sample, gồm cả prompt và
+        target-generated response, đều được lưu; padding không đi vào cache.
+        """
+        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() != 2:
+            raise ValueError("input_ids capture_batch phải là Tensor [batch, seq]")
+        ids = input_ids.to(device=self.device, dtype=torch.long)
+        if attention_mask is None:
+            if lengths is None:
+                lengths = torch.full(
+                    (ids.shape[0],), ids.shape[1], dtype=torch.long
+                )
+            attention_mask = torch.zeros_like(ids, dtype=torch.long)
+            for row, length in enumerate(lengths.tolist()):
+                attention_mask[row, : int(length)] = 1
+        else:
+            attention_mask = attention_mask.to(device=self.device, dtype=torch.long)
+            if attention_mask.shape != ids.shape:
+                raise ValueError(
+                    "attention_mask capture_batch phải cùng shape input_ids: "
+                    f"{tuple(attention_mask.shape)} != {tuple(ids.shape)}"
+                )
+            lengths = attention_mask.sum(dim=-1).to(device="cpu")
+        if lengths is None:
+            lengths = attention_mask.sum(dim=-1).to(device="cpu")
+        lengths = torch.as_tensor(lengths, dtype=torch.long).flatten().cpu()
+        if lengths.numel() != ids.shape[0] or (lengths < 1).any() or (lengths > ids.shape[1]).any():
+            raise ValueError("lengths capture_batch không hợp lệ")
+
         self._captured_layers.clear()
         with torch.inference_mode():
             outputs = self.model(
                 input_ids=ids,
+                attention_mask=attention_mask,
                 output_hidden_states=not self._hooks,
                 use_cache=False,
             )
@@ -162,7 +205,11 @@ class HFTargetCapture:
             )
         else:
             features = _extract_context_feature(outputs.hidden_states, self.layer_ids)
-        return features.float().cpu() if self.device.type == "cpu" else features.cpu()
+        result: List[torch.Tensor] = []
+        for row, length in enumerate(lengths.tolist()):
+            value = features[row, : int(length)]
+            result.append(value.float().cpu() if self.device.type == "cpu" else value.cpu())
+        return result
 
 
 def capture_dataset(

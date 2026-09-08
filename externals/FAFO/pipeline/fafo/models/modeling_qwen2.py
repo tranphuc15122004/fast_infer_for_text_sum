@@ -368,7 +368,7 @@ class Qwen2Attention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         if decoding_mask is not None:
-            mask = decoding_mask[key_states.size(2) // 128]
+            mask = decoding_mask.for_length(key_states.size(2))
             attn_output = flex_attention(query_states, key_states, value_states, block_mask = mask)
 
             if hasattr(self.kv_cache_manager, 'accumulate_verify_logits'):

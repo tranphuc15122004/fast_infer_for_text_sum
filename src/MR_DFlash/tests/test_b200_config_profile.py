@@ -24,6 +24,10 @@ def test_qwen_pilot_configs_use_b200_safe_fair_profile() -> None:
         assert cfg.model.torch_dtype == "bfloat16"
         assert cfg.model.block_size == 16
         assert cfg.model.feature_layer_ids == [1, 9, 17, 25, 33]
+        assert cfg.data.feature_mode == "offline"
+        assert cfg.data.hidden_states_path is not None
+        assert cfg.data.eval_hidden_states_path is not None
+        assert "target_features" in cfg.data.hidden_states_path
         assert cfg.training.num_anchors == 512
         assert cfg.training.batch_size == 1
         assert cfg.training.accumulation_steps == 4

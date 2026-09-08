@@ -105,6 +105,32 @@ copy attention/MLP/norm vào mọi MR stage và copy `fc` vào hai adapter. Các
 compressor/indexer không có tensor tương ứng nên khởi tạo mới. Native MR
 checkpoint được kiểm tra strict khi infer.
 
+## Dữ liệu train trên server B200
+
+Inventory mẫu nằm tại `data/train_data_on_server/sample.txt`. Hai source của
+inventory không cùng format: ShareGPT là JSON array với role `human/gpt`, còn
+ArXiv là JSONL với `text[]`, `summary[]` và `label`. Không đưa `sample.txt`
+hoặc raw assistant/summary trực tiếp vào DataLoader.
+
+Pipeline chuẩn hóa dùng:
+
+```text
+prepare_server_data.py
+  -> normalized JSONL + deterministic 90/5/5 split
+  -> regenerate_pilot.py bằng target frozen
+  -> validate_pilot_dataset.py
+  -> tokenize_dataset.py (tokenized_3k hoặc tokenized cho 8K)
+  -> run_train.py với data.feature_mode=online
+```
+
+`prepare_sharegpt.py` nhận cả JSON array `.json` và JSONL; `prepare_arxiv.py`
+nối các đoạn `text[]` bằng dòng trống, giữ `summary` ở
+`metadata.reference_summary` và `label` ở metadata. Các script chuẩn hóa và
+tokenize hỗ trợ progress bar/resume. Chạy smoke khoảng 100 mẫu và xem report
+trước khi xử lý 50K ShareGPT + 50K ArXiv. Quy trình đầy đủ, các path server và
+điều kiện approve scale được ghi tại
+[`docs/mr_dflash_pilot_pipeline.md`](../../docs/mr_dflash_pilot_pipeline.md).
+
 ## Cách chạy
 
 ### 1. CPU smoke (máy dev, không GPU)

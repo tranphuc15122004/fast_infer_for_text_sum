@@ -146,7 +146,8 @@ trên server:
   Muốn đo đúng retrieval SSSD phải đặt `SSSD_DATASTORE_PATH` trỏ tới `.idx`
   đã build cho đúng tokenizer/model; nếu path đã khai báo nhưng không tồn tại,
   preflight vẫn dừng cell với `missing_checkpoint`.
-- SSSD cần binary wheel `sglang-kernel==0.4.1` khớp CUDA/GPU. Nếu
+- SSSD cần binary wheel `sglang-kernel==0.4.2` khớp Torch 2.11/CUDA/GPU và
+  package `gguf==0.19.0`. Nếu
   `sgl_kernel` không import được, preflight ghi `missing_dependency` và không
   khởi chạy child process để tránh traceback import sâu.
 

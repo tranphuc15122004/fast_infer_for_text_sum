@@ -27,6 +27,58 @@ def read_jsonl(path: str | Path) -> Iterator[Dict[str, Any]]:
             yield value
 
 
+def read_records(path: str | Path) -> Iterator[Dict[str, Any]]:
+    """Đọc JSON array (`.json`) hoặc JSONL (`.jsonl`) thành các record.
+
+    ShareGPT trên server là một JSON array lớn, trong khi ArXiv là JSONL.
+    Tách primitive này khỏi ``read_jsonl`` để tránh coi cả array là một dòng
+    JSON object. File JSON array được load một lần có chủ đích: nó chỉ chứa
+    metadata/text thô, không chứa hidden states; bước pilot vẫn ghi artifact
+    chuẩn hóa theo từng dòng ra thư mục mới.
+    """
+    source = Path(path)
+    if source.suffix.lower() != ".json":
+        yield from read_jsonl(source)
+        return
+    with source.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if isinstance(value, dict):
+        # Một số mirror bọc records dưới data/records; vẫn chấp nhận JSON
+        # object đơn để smoke fixture và báo lỗi rõ nếu schema bất thường.
+        for key in ("data", "records", "conversations"):
+            nested = value.get(key)
+            if isinstance(nested, list) and key != "conversations":
+                value = nested
+                break
+        else:
+            value = [value]
+    if not isinstance(value, list):
+        raise ValueError(f"{source} phải là JSON array hoặc JSON object")
+    for index, row in enumerate(value, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"{source}[{index}] phải là JSON object")
+        yield row
+
+
+def join_text(value: Any, *, separator: str = "\n\n") -> str:
+    """Chuẩn hóa text dạng string/list thành text thuần.
+
+    ArXiv ``text`` và ``summary`` là list các đoạn/câu. Không dùng ``str``
+    trực tiếp vì nó tạo Python-list literal trong prompt.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            if key in value:
+                return join_text(value[key], separator=separator)
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        parts = [join_text(item, separator=separator).strip() for item in value]
+        return separator.join(part for part in parts if part)
+    return str(value)
+
+
 def write_jsonl(path: str | Path, rows: Iterable[Dict[str, Any]]) -> int:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
