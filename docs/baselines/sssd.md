@@ -33,6 +33,19 @@ warmup và ghi kết quả vào `outputs/sssd.jsonl` (hoặc `OUTPUT_FILE`).
   Python `gguf==0.19.0` và extension native `sssd_speculator` đã được build/cài
   trong shared runtime. `sglang-kernel` là package binary; chỉ có thư mục
   `externals/SSSD/sgl-kernel/python` thì chưa đủ.
+- Build `sssd_speculator` không cần `git clone`: CMake tự dùng bản `libsais` đã
+  vendored trong `externals/SSSD/sssd_speculator/evaluation/REST/` và bundled
+  header compatibility cho `spdlog`. Cài bằng đúng interpreter chạy SGLang:
+
+  ```bash
+  python3 -m pip install -e externals/SSSD/sssd_speculator \
+    --config-settings editable_mode=compat
+  ```
+
+  Nếu server có checkout local đầy đủ của hai thư viện và build bằng CMake
+  trực tiếp, truyền thêm `-DSSSD_LIBSAIS_SOURCE_DIR=/path/to/libsais` và
+  `-DSSSD_SPDLOG_SOURCE_DIR=/path/to/spdlog`. Build sẽ dừng với thông báo rõ
+  ràng nếu thiếu source local, không tự truy cập GitHub.
 - Kiểm tra extension bằng `python3 -c 'from sssd_speculator import Reader, Writer'`.
   Launcher không đưa thư mục source `externals/SSSD/sssd_speculator` vào đầu
   `PYTHONPATH` trừ khi trong đó đã có file `.so`, vì package source chưa build
