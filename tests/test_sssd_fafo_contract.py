@@ -121,6 +121,86 @@ def test_sssd_preflight_rejects_broken_native_kernel(monkeypatch):
     assert "libnvrtc.so.12" in result["reason"]
 
 
+def test_sssd_preflight_accepts_inplace_speculator_build(monkeypatch, tmp_path):
+    """Preflight mirrors infer_sssd: an in-tree .so build must not be reported
+    as missing_dependency just because it is not pip-installed in the shared
+    runtime."""
+    import common.longbench_adapter as adapter
+
+    speculator_dir = tmp_path / "sssd_speculator"
+    package_dir = speculator_dir / "sssd_speculator"
+    package_dir.mkdir(parents=True)
+    (package_dir / "sssd_speculator.cpython-312-x86_64-linux-gnu.so").write_text("x")
+
+    def fake_module_importable(name):
+        if name == "sgl_kernel":
+            return True, None
+        return False, "sssd_speculator is not installed"
+
+    monkeypatch.setattr(adapter, "_module_importable", fake_module_importable)
+    monkeypatch.setattr(adapter, "SSSD_SPECULATOR", speculator_dir)
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        adapter,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    result = adapter.preflight_baseline(
+        "sssd",
+        config={"model": "/models/llama", "python": "/venv/bin/python"},
+        cuda_available=True,
+    )
+
+    # An empty datastore turns a ready SSSD cell into ``aggregate_only``, which
+    # the runner treats the same as ``ready`` for launching the child.
+    assert result["status"] in ("ready", "aggregate_only")
+    assert result["requirements"]["sssd_speculator"]["available"] is True
+
+
+def test_sssd_preflight_rejects_broken_inplace_speculator_build(monkeypatch, tmp_path):
+    import common.longbench_adapter as adapter
+
+    speculator_dir = tmp_path / "sssd_speculator"
+    package_dir = speculator_dir / "sssd_speculator"
+    package_dir.mkdir(parents=True)
+    (package_dir / "sssd_speculator.cpython-312-x86_64-linux-gnu.so").write_text("x")
+
+    def fake_module_importable(name):
+        if name == "sgl_kernel":
+            return True, None
+        return False, "sssd_speculator is not installed"
+
+    monkeypatch.setattr(adapter, "_module_importable", fake_module_importable)
+    monkeypatch.setattr(adapter, "SSSD_SPECULATOR", speculator_dir)
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        adapter,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **k: SimpleNamespace(
+                returncode=1, stdout="", stderr="ImportError: wrong ELF class"
+            )
+        ),
+    )
+
+    result = adapter.preflight_baseline(
+        "sssd",
+        config={"model": "/models/llama", "python": "/venv/bin/python"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert "wrong ELF class" in result["reason"]
+    assert result["requirements"]["sssd_speculator"]["available"] is False
+
+
 def test_fafo_mask_cache_builds_contexts_beyond_static_limit():
     fafo_root = ROOT / "externals" / "FAFO"
     if str(fafo_root) not in sys.path:

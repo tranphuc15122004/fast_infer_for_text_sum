@@ -118,6 +118,48 @@ chế độ phù hợp để kiểm tra máy T4/CPU. Không được diễn gi�
 `unsupported_dataset` thành số đo tốc độ; các field timing của chúng là
 `null`.
 
+### Theo dõi log trong runtime
+
+Runner tạo `run_manifest.json` và thư mục `logs/` ngay khi bắt đầu run. Trước
+mỗi baseline/dataset, terminal in đường dẫn live log tương ứng, ví dụ:
+
+```text
+outputs/longbench_200/<run-id>/logs/vanilla_hf_gov_report.log
+```
+
+Child process được stream đồng thời ra terminal và file log; không cần chờ
+baseline kết thúc. Có thể theo dõi một cell bằng:
+
+```bash
+tail -F outputs/longbench_200/<run-id>/logs/vanilla_hf_gov_report.log
+```
+
+Log giữ nguyên output gốc của baseline, còn terminal thêm prefix
+`[<baseline>_<dataset>]` để phân biệt cell. Runner đặt `PYTHONUNBUFFERED=1`
+cho child Python và vẫn áp dụng timeout của master config. Nếu baseline bị
+treo, xem log live trước khi timeout; sau timeout trạng thái và `log_tail`
+được ghi vào `run_manifest.json`.
+
+### Tổng hợp metric tự động trong run
+
+Mỗi run không chỉ ghi raw JSONL: khi run kết thúc (không phải
+`--preflight-only`), orchestrator **tự chạy collector** trên chính run đó và
+ghi vào run dir ba file tổng hợp `metrics_summary.json` (đầy đủ),
+`metrics_summary.csv` (bảng rộng) và `metrics_summary.md` (báo cáo đọc được).
+Kết quả bước tổng hợp (status, exit code, đường dẫn file, log) được ghi vào
+`run_manifest.json` ở field `aggregate`; nếu run sạch (không cell nào fail),
+collector chạy ở chế độ `--strict` để xác nhận đủ 200 mẫu cho mỗi
+(baseline, dataset) — thiếu mẫu sẽ làm exit code của run khác 0.
+
+- Tắt tổng hợp tự động khi cần: `--no-collect` (hoặc `LONG_BENCH_COLLECT=0`).
+  Muốn chạy lại tay: `python scripts/collect_metrics.py --outputs-dir <run_dir>
+  --data-dir data/longbench_200`.
+- `--preflight-only` luôn bỏ qua tổng hợp (chỉ có status rows, không có
+  inference records); để kiểm tra pipeline local đầy đủ phải chạy collector
+  tay như ví dụ bên dưới.
+- Tổng hợp là best-effort: collector fail không làm mất raw JSONL đã ghi, chỉ
+  được ghi nhận trong manifest và (khi chạy strict) làm exit code khác 0.
+
 Smoke có guard an toàn mặc định `LONG_BENCH_SMOKE_MAX_INPUT_TOKENS=4096`.
 Mẫu đầu của `gov_report` dài khoảng 10k token; với `vanilla_hf` eager
 attention, bộ nhớ attention tăng theo `L²` nên chạy nguyên mẫu có thể OOM ngay
@@ -157,7 +199,8 @@ trên server:
   `sgl_kernel` không import được, preflight ghi `missing_dependency` và không
   khởi chạy child process để tránh traceback import sâu.
 
-Ví dụ kiểm tra đầy đủ pipeline local:
+Ví dụ kiểm tra đầy đủ pipeline local (preflight-only nên **không** tự tổng
+hợp; phải chạy collector tay):
 
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \

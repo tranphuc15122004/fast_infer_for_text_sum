@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,6 +34,14 @@ BASELINES = (
 )
 
 CUDA_BASELINES = set(BASELINES)
+
+# SSSD native extension resolution mirrors ``infer_sssd.py``: the extension is
+# used either from the pip-installed package in the shared runtime or from an
+# in-place CMake build under the vendored tree.  Preflight must accept both so
+# a local build is not falsely reported as ``missing_dependency``.
+SSSD_ROOT = ROOT / "externals" / "SSSD"
+SSSD_PYTHON = SSSD_ROOT / "python"
+SSSD_SPECULATOR = SSSD_ROOT / "sssd_speculator"
 
 
 def _path(value: str | os.PathLike[str] | None) -> Path | None:
@@ -138,6 +147,56 @@ def _module_importable(name: str) -> tuple[bool, str | None]:
         detail = str(exc).strip().splitlines()[0] or repr(exc)
         return False, f"{type(exc).__name__}: {detail}"
     return True, None
+
+
+def _sssd_child_env() -> dict[str, str]:
+    """Environment the SSSD adapter uses for its SGLang child process."""
+    env = dict(os.environ)
+    entries = [str(SSSD_PYTHON)]
+    if any(SSSD_SPECULATOR.glob("sssd_speculator/sssd_speculator*.so")):
+        entries.append(str(SSSD_SPECULATOR))
+    if env.get("PYTHONPATH"):
+        for entry in env["PYTHONPATH"].split(os.pathsep):
+            if not entry:
+                continue
+            try:
+                if Path(entry).resolve() == SSSD_SPECULATOR.resolve():
+                    continue
+            except OSError:
+                pass
+            entries.append(entry)
+    env["PYTHONPATH"] = os.pathsep.join(entries)
+    return env
+
+
+def _sssd_speculator_available(python: str) -> tuple[bool, str | None]:
+    """Return whether the SSSD native extension is importable.
+
+    Matches the adapter runtime resolution in ``infer_sssd.py``: a shared
+    runtime install wins; otherwise an in-place build under the vendored tree
+    is probed with the child interpreter and the adapter env.  File presence
+    alone is not treated as success because a stale or wrong-interpreter build
+    would only surface later as a deep import traceback inside the child.
+    """
+    installed, reason = _module_importable("sssd_speculator")
+    if installed:
+        return True, None
+    if not any(SSSD_SPECULATOR.glob("sssd_speculator/sssd_speculator*.so")):
+        return False, reason or "sssd_speculator is not installed"
+    try:
+        probe = subprocess.run(
+            [python, "-c", "from sssd_speculator import Reader, Writer"],
+            cwd=SSSD_ROOT,
+            env=_sssd_child_env(),
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return False, f"could not execute {python}: {exc}"
+    if probe.returncode == 0:
+        return True, None
+    detail = (probe.stderr or probe.stdout or "in-place native import failed").strip()
+    return False, detail.splitlines()[-1] if detail else "in-place native import failed"
 
 
 def preflight_baseline(
@@ -263,19 +322,19 @@ def preflight_baseline(
             result.update(status="missing_dependency", reason="vendored SpecExtend source is missing")
 
     if baseline == "sssd":
-        speculator_available, speculator_reason = _module_importable(
-            "sssd_speculator"
+        speculator_available, speculator_reason = _sssd_speculator_available(
+            str(cfg.get("python") or sys.executable)
         )
         result["requirements"]["sssd_speculator"] = {
             "available": speculator_available,
-            "reason": speculator_reason if speculator_reason is not None else None,
+            "reason": speculator_reason,
         }
         if not speculator_available and result["status"] == "ready":
             result.update(
                 status="missing_dependency",
                 reason=(
-                    "sssd_speculator native extension cannot be imported in the "
-                    f"shared runtime ({speculator_reason})"
+                    "sssd_speculator native extension cannot be imported by the "
+                    f"SSSD runtime ({speculator_reason})"
                 ),
             )
         kernel_available, kernel_reason = _module_importable("sgl_kernel")

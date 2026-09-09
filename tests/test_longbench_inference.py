@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,57 @@ def test_longbench_launcher_uses_master_and_shared_runtime():
     assert "fast_infer_load_config longbench" in text
     assert "scripts/common/runtime.sh" in text
     assert "run_longbench_200.py" in text
+
+
+def test_child_log_is_streamed_before_baseline_exits(tmp_path):
+    from run_longbench_200 import _run_child
+
+    marker = tmp_path / "child-ready"
+    release = tmp_path / "release-child"
+    log_path = tmp_path / "baseline.log"
+    code = (
+        "from pathlib import Path; import time; "
+        "print('first runtime line'); "
+        f"Path({str(marker)!r}).write_text('ready'); "
+        f"release=Path({str(release)!r}); "
+        "\nwhile not release.exists(): time.sleep(0.01); "
+        "print('second runtime line')"
+    )
+    result_holder = {}
+
+    def run_child():
+        result_holder["value"] = _run_child(
+            [sys.executable, "-c", code],
+            output=tmp_path / "child-output.jsonl",
+            log_path=log_path,
+            timeout_seconds=10,
+        )
+
+    thread = threading.Thread(target=run_child)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), "child did not reach its streaming checkpoint"
+
+        deadline = time.monotonic() + 2
+        streamed = False
+        while time.monotonic() < deadline:
+            if log_path.is_file() and "first runtime line" in log_path.read_text(
+                encoding="utf-8"
+            ):
+                streamed = True
+                break
+            time.sleep(0.01)
+        assert streamed, "baseline log was not updated while child was running"
+    finally:
+        release.write_text("release", encoding="utf-8")
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert result_holder["value"]["status"] == "success"
+    assert "second runtime line" in log_path.read_text(encoding="utf-8")
 
 
 def test_measure_call_returns_elapsed_and_output():
@@ -277,11 +330,95 @@ def test_orchestrator_smoke_preflight_writes_manifest_without_loading_model(tmp_
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "Run directory:" in result.stdout
     manifests = list(tmp_path.glob("*/run_manifest.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert manifest["mode"] == "smoke"
     assert manifest["preflight_only"] is True
+    # Preflight-only runs must not attempt metric aggregation.
+    assert manifest["aggregate"]["status"] == "skipped"
+
+
+def test_run_collector_forwards_strict_completeness(monkeypatch):
+    import run_longbench_200
+
+    calls: dict = {}
+
+    def fake_run_child(command, **kwargs):
+        calls["command"] = list(command)
+        calls["kwargs"] = kwargs
+        return {
+            "status": "success",
+            "returncode": 0,
+            "elapsed_ms": 3.0,
+            "output_exists": True,
+            "log": "ok",
+            "log_tail": "",
+            "command": list(command),
+        }
+
+    monkeypatch.setattr(run_longbench_200, "_run_child", fake_run_child)
+
+    result = run_longbench_200._run_collector(
+        Path("/out/run1"),
+        Path("/data/longbench_200"),
+        baselines=["vanilla_hf", "fafo"],
+        datasets=["lcc", "gov_report"],
+        expected_samples=200,
+        strict=True,
+        timeout_seconds=60,
+    )
+
+    cmd = calls["command"]
+    assert cmd[1].endswith("collect_metrics.py")
+    assert cmd[cmd.index("--outputs-dir") + 1] == "/out/run1"
+    assert cmd[cmd.index("--data-dir") + 1] == "/data/longbench_200"
+    assert "--strict" in cmd
+    assert (
+        cmd[cmd.index("--expected-baselines") + 1] == "vanilla_hf fafo"
+    )
+    assert (
+        cmd[cmd.index("--expected-datasets") + 1] == "lcc gov_report"
+    )
+    assert cmd[cmd.index("--expected-samples") + 1] == "200"
+    assert result["strict"] is True
+    assert result["output_files"]["json"].endswith("metrics_summary.json")
+    assert result["output_files"]["csv"].endswith("metrics_summary.csv")
+    assert result["output_files"]["md"].endswith("metrics_summary.md")
+
+
+def test_run_collector_is_best_effort_without_strict(monkeypatch):
+    import run_longbench_200
+
+    calls: dict = {}
+
+    def fake_run_child(command, **kwargs):
+        calls["command"] = list(command)
+        return {
+            "status": "success",
+            "returncode": 0,
+            "elapsed_ms": 2.0,
+            "output_exists": True,
+            "log": "ok",
+            "log_tail": "",
+            "command": list(command),
+        }
+
+    monkeypatch.setattr(run_longbench_200, "_run_child", fake_run_child)
+
+    result = run_longbench_200._run_collector(
+        Path("/out/run2"),
+        Path("/data/longbench_200"),
+        baselines=["vanilla_hf"],
+        datasets=["lcc"],
+        expected_samples=200,
+        strict=False,
+        timeout_seconds=60,
+    )
+
+    assert "--strict" not in calls["command"]
+    assert result["strict"] is False
 
 
 def test_full_profile_requires_cuda_unless_unsupported_is_allowed():

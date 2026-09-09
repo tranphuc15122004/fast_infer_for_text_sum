@@ -50,6 +50,22 @@ warmup và ghi kết quả vào `outputs/sssd.jsonl` (hoặc `OUTPUT_FILE`).
   Launcher không đưa thư mục source `externals/SSSD/sssd_speculator` vào đầu
   `PYTHONPATH` trừ khi trong đó đã có file `.so`, vì package source chưa build
   sẽ che native extension được cài trong shared runtime.
+- Preflight của runner LongBench (`run_longbench_200.py`) resolve `sssd_speculator`
+  **giống hệt adapter** `infer_sssd.py`: chấp nhận cả (1) package pip-installed
+  trong shared runtime lẫn (2) bản build in-place trong cây vendored. Nếu server
+  không cho ghi vào shared runtime, có thể build tại chỗ mà preflight vẫn nhận:
+
+  ```bash
+  cd externals/SSSD/sssd_speculator && python3 setup.py build_ext --inplace
+  ls externals/SSSD/sssd_speculator/sssd_speculator/sssd_speculator*.so
+  ```
+
+  Preflight probe bằng đúng interpreter chạy child; `.so` tồn tại nhưng sai
+  interpreter/ELF vẫn bị báo `missing_dependency` kèm lý do import.
+- Preflight kiểm tra lần lượt `sssd_speculator`, rồi `sgl_kernel`, rồi datastore;
+  reason hiển thị blocker **đầu tiên** — muốn cell SSSD xanh phải thỏa cả
+  extension native `sssd_speculator`, wheel `sglang-kernel` và package `gguf`
+  trong cùng runtime.
 - Với server không có internet, đặt wheel
   `sglang_kernel-0.4.2+cu130-*-cp310-abi3-*.whl`
   và wheel `gguf-0.19.0-py3-none-any.whl`

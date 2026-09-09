@@ -10,11 +10,13 @@ for another.
 from __future__ import annotations
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -234,6 +236,9 @@ def _write_status_file(
 def _safe_env() -> dict[str, str]:
     """Child environment with the shared Python path and selected GPU IDs."""
     env = dict(os.environ)
+    # Baseline output must reach the parent while inference is running.  This
+    # applies to Python-based adapters and is harmless for other child tools.
+    env["PYTHONUNBUFFERED"] = "1"
     scripts = str(ROOT / "scripts")
     env["PYTHONPATH"] = scripts + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     gpu_ids = env.get("LONG_BENCH_GPU_IDS") or env.get("FI_GPU_IDS")
@@ -249,37 +254,161 @@ def _run_child(
     log_path: Path,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    """Run one baseline while teeing its combined output to log and console.
+
+    ``subprocess.run(capture_output=True)`` delayed the log file until the
+    baseline exited, which made long inference runs impossible to monitor.
+    A reader thread drains the pipe continuously while the parent keeps the
+    existing bounded timeout around ``wait``.  The raw child output is kept in
+    the per-cell log; the console copy is prefixed with the log stem so output
+    from sequential cells remains attributable to a baseline/dataset.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.perf_counter()
     timed_out = False
     returncode: int | None = None
-    log = ""
+    log_tail = ""
+
+    # Create the file before spawning the child so operators can tail it as
+    # soon as the cell is launched, even before its first output line.
+    log_handle = log_path.open("w", encoding="utf-8", buffering=1)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             list(command),
             cwd=ROOT,
             env=_safe_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
         )
-        returncode = proc.returncode
-        log = (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        log = (exc.stdout or "") + (exc.stderr or "")
-        returncode = None
+    except BaseException:
+        log_handle.close()
+        raise
+
+    def _stream_output() -> None:
+        nonlocal log_tail
+        assert proc.stdout is not None
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                try:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if not text:
+                    continue
+                log_tail = (log_tail + text)[-2000:]
+                log_handle.write(text)
+                log_handle.flush()
+                print(f"[{log_path.stem}] {text}", end="", flush=True)
+            remainder = decoder.decode(b"", final=True)
+            if remainder:
+                log_tail = (log_tail + remainder)[-2000:]
+                log_handle.write(remainder)
+                log_handle.flush()
+                print(f"[{log_path.stem}] {remainder}", end="", flush=True)
+        finally:
+            proc.stdout.close()
+
+    reader = threading.Thread(
+        target=_stream_output,
+        name=f"longbench-log-{log_path.stem}",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        try:
+            returncode = proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            proc.wait()
+            returncode = None
+    finally:
+        # A normal child closes stdout promptly.  On timeout, close the pipe
+        # after killing the child so a descendant that inherited stdout cannot
+        # keep the logging thread alive indefinitely.
+        reader.join(timeout=5 if not timed_out else 1)
+        if reader.is_alive() and proc.stdout is not None:
+            proc.stdout.close()
+            reader.join(timeout=1)
+        log_handle.flush()
+        log_handle.close()
+
     elapsed_ms = round((time.perf_counter() - start) * 1000.0, 3)
-    log_path.write_text(log, encoding="utf-8", errors="replace")
     return {
         "status": "timeout" if timed_out else ("success" if returncode == 0 else "failed"),
         "returncode": returncode,
         "elapsed_ms": elapsed_ms,
         "output_exists": output.is_file(),
         "log": str(log_path),
-        "log_tail": log[-2000:],
+        "log_tail": log_tail,
         "command": [str(part) for part in command],
     }
+
+
+def _run_collector(
+    run_dir: Path,
+    data_dir: Path,
+    *,
+    baselines: Sequence[str],
+    datasets: Sequence[str],
+    expected_samples: int,
+    strict: bool,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Run the metric collector over a finished run directory.
+
+    The collector runs as a child process with the same interpreter and env as
+    the orchestrator so aggregation never shares process state with model
+    runs, and its output lands in ``run_dir/metrics_summary.{json,csv,md}``
+    with a log under ``run_dir/logs/``.  In ``strict`` mode the collector also
+    validates that every (baseline, dataset) pair produced the expected number
+    of successful samples.  Aggregation is best-effort reporting on top of the
+    raw JSONL: a failure here never invalidates the cell outputs already
+    written, but it is recorded in ``run_manifest.json`` under ``aggregate``.
+    """
+    out_path = run_dir / "metrics_summary.json"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "collect_metrics.py"),
+        "--outputs-dir",
+        str(run_dir),
+        "--data-dir",
+        str(data_dir),
+        "--out",
+        str(out_path),
+        "--csv",
+        str(run_dir / "metrics_summary.csv"),
+        "--md",
+        str(run_dir / "metrics_summary.md"),
+    ]
+    if strict:
+        command += [
+            "--strict",
+            "--expected-baselines",
+            " ".join(baselines),
+            "--expected-datasets",
+            " ".join(datasets),
+            "--expected-samples",
+            str(expected_samples),
+        ]
+    result = _run_child(
+        command,
+        output=out_path,
+        log_path=run_dir / "logs" / "collect_metrics.log",
+        timeout_seconds=timeout_seconds,
+    )
+    result["strict"] = bool(strict)
+    result["output_files"] = {
+        "json": str(out_path),
+        "csv": str(run_dir / "metrics_summary.csv"),
+        "md": str(run_dir / "metrics_summary.md"),
+    }
+    return result
 
 
 _TIMING_FIELDS = (
@@ -694,6 +823,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=os.environ.get("LONG_BENCH_STRICT", "1") == "1")
+    parser.add_argument(
+        "--collect",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LONG_BENCH_COLLECT", "1") == "1",
+        help="run the metric collector over the finished run and write "
+        "metrics_summary.{json,csv,md} into the run directory (default: on; "
+        "always skipped for --preflight-only runs)",
+    )
     return parser
 
 
@@ -814,6 +951,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cells": [],
     }
     _write_json(run_dir / "run_manifest.json", manifest)
+    print(f"Run directory: {run_dir}", flush=True)
+    print(
+        f"Run manifest (live): {run_dir / 'run_manifest.json'}",
+        flush=True,
+    )
 
     failures = 0
     for dataset in datasets:
@@ -861,7 +1003,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 cell.update(status=status, reason=reason, returncode=0)
                 manifest["cells"].append(cell)
-                print(f"[{baseline}/{dataset}] {status}: {reason}")
+                print(f"[{baseline}/{dataset}] {status}: {reason}", flush=True)
                 continue
 
             if check["status"] not in {"ready", "aggregate_only"}:
@@ -880,7 +1022,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 cell.update(status=check["status"], reason=check["reason"])
                 manifest["cells"].append(cell)
-                print(f"[{baseline}/{dataset}] {check['status']}: {check['reason']}")
+                print(
+                    f"[{baseline}/{dataset}] {check['status']}: {check['reason']}",
+                    flush=True,
+                )
                 continue
 
             converted = run_dir / "inputs" / f"{baseline}_{dataset}.jsonl"
@@ -911,11 +1056,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest["cells"].append(cell)
                 continue
 
-            print(f"[{baseline}/{dataset}] launching {len(normalized)} sample(s)")
+            live_log = run_dir / "logs" / f"{baseline}_{dataset}.log"
+            print(
+                f"[{baseline}/{dataset}] launching {len(normalized)} sample(s)\n"
+                f"[{baseline}/{dataset}] live log: {live_log}",
+                flush=True,
+            )
             child = _run_child(
                 command,
                 output=output_path,
-                log_path=run_dir / "logs" / f"{baseline}_{dataset}.log",
+                log_path=live_log,
                 timeout_seconds=timeout_seconds,
             )
             if child["status"] == "success":
@@ -947,14 +1097,65 @@ def main(argv: Sequence[str] | None = None) -> int:
                         run_id=run_id,
                     )
             manifest["cells"].append(cell)
-            print(f"[{baseline}/{dataset}] {child['status']} in {child['elapsed_ms']} ms")
+            print(
+                f"[{baseline}/{dataset}] {child['status']} in "
+                f"{child['elapsed_ms']} ms",
+                flush=True,
+            )
 
     manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
     manifest["failure_count"] = failures
     manifest["cell_count"] = len(manifest["cells"])
+
+    # Aggregate metrics as part of the run so every finished run ships its own
+    # metrics_summary.{json,csv,md}.  Preflight-only runs write status rows
+    # instead of inference records, so aggregation is skipped for them.  Strict
+    # completeness is only meaningful when every cell actually succeeded;
+    # ``failures == 0`` is not enough because smoke and --allow-unsupported
+    # runs may record blocked cells without counting them as failures.
+    clean_cells = bool(manifest["cells"]) and all(
+        cell.get("status") == "success" for cell in manifest["cells"]
+    )
+    if args.collect and not args.preflight_only:
+        aggregate = _run_collector(
+            run_dir,
+            data_dir,
+            baselines=baselines,
+            datasets=datasets,
+            expected_samples=sample_count,
+            strict=bool(args.strict) and clean_cells,
+            timeout_seconds=timeout_seconds,
+        )
+        if aggregate["status"] == "success":
+            print(
+                "[aggregate] metrics_summary.{json,csv,md} written to "
+                f"{run_dir}",
+                flush=True,
+            )
+        else:
+            print(
+                "[aggregate] collector failed "
+                f"(exit {aggregate.get('returncode')}); see {aggregate['log']}",
+                file=sys.stderr,
+                flush=True,
+            )
+    elif args.preflight_only:
+        aggregate = {
+            "status": "skipped",
+            "reason": "preflight-only run has no inference records to aggregate",
+        }
+    else:
+        aggregate = {
+            "status": "skipped",
+            "reason": "metric collection disabled with --no-collect",
+        }
+    manifest["aggregate"] = aggregate
     _write_json(run_dir / "run_manifest.json", manifest)
-    print(f"Run manifest: {run_dir / 'run_manifest.json'}")
-    return 1 if failures else 0
+    print(f"Run manifest: {run_dir / 'run_manifest.json'}", flush=True)
+    strict_aggregate_failed = (
+        aggregate.get("status") == "failed" and bool(aggregate.get("strict"))
+    )
+    return 1 if (failures or strict_aggregate_failed) else 0
 
 
 if __name__ == "__main__":
