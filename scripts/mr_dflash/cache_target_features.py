@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from _common import append_jsonl_durable, read_jsonl
+from MR_DFlash.cache_batching import CacheBatchSchedule
 from MR_DFlash.capture import HFTargetCapture
 from progress import ProgressReporter, estimate_fields, install_exception_hook
 
@@ -37,6 +38,20 @@ from progress import ProgressReporter, estimate_fields, install_exception_hook
 def _is_cuda_oom(exc: BaseException) -> bool:
     """OOM không thể coi là lỗi của một sample rồi tiếp tục cache."""
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _cache_progress_kwargs(workload: Dict[str, Any]) -> dict[str, Any]:
+    """Cấu hình thanh tiến trình theo sample hợp lệ của worker hiện tại."""
+    total = max(0, int(workload.get("valid_samples", 0)))
+    initial = min(total, max(0, int(workload.get("existing_samples", 0))))
+    return {
+        "total": total,
+        "initial": initial,
+        "desc": "Cache target features",
+        "unit": "sample",
+        "dynamic_ncols": True,
+        "mininterval": 1.0,
+    }
 
 
 def _pad_samples(
@@ -249,6 +264,7 @@ def cache_dataset(
     num_shards: int = 1,
     skipped_report: Optional[str] = None,
     progress_path: Optional[str] = None,
+    batch_profile: Optional[str] = None,
 ) -> Dict[str, int]:
     """Chạy target capture theo batch và ghi cache sharded resumable."""
     if data_path is None and tokenized_path is None:
@@ -257,10 +273,19 @@ def cache_dataset(
         raise ValueError("batch_size phải >= 1")
     if io_threads < 0 or io_queue_size < 0:
         raise ValueError("io_threads và io_queue_size không được âm")
+    batch_schedule = CacheBatchSchedule.from_path(batch_profile) if batch_profile else None
     if bucket_buffer_size is None:
-        bucket_buffer_size = max(batch_size, batch_size * 8)
+        bucket_buffer_size = max(
+            batch_size,
+            batch_schedule.max_batch_size if batch_schedule else batch_size * 8,
+        )
     if bucket_buffer_size < batch_size:
         raise ValueError("bucket_buffer_size phải >= batch_size")
+    if batch_schedule is not None and bucket_buffer_size < batch_schedule.max_batch_size:
+        # Buffer là RAM phía producer, không phải GPU batch. Tự mở rộng nó
+        # để schedule auto-batch không bị giảm hiệu quả chỉ vì người dùng
+        # còn giữ giá trị buffer cố định cũ.
+        bucket_buffer_size = batch_schedule.max_batch_size
     if num_shards < 1 or shard_index < 0 or shard_index >= num_shards:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
 
@@ -301,6 +326,27 @@ def cache_dataset(
         io_threads=int(io_threads),
         io_queue_size=int(io_queue_size),
     )
+    if batch_schedule is not None:
+        batch_schedule.validate(
+            target_model_path=target_model_path,
+            feature_layer_ids=capturer.layer_ids,
+            max_length=max_length,
+            requested_torch_dtype=torch_dtype,
+            attention_backend=attention_backend,
+            target_revision=target_revision,
+        )
+        reporter.update(
+            "batch_profile_ready",
+            batch_profile=str(batch_profile),
+            batch_schedule=[
+                {
+                    "min_length": int(bucket["min_length"]),
+                    "max_length": int(bucket["max_length"]),
+                    "batch_size": int(bucket["selected_batch_size"]),
+                }
+                for bucket in batch_schedule.buckets
+            ],
+        )
     pad_token_id = getattr(capturer.tokenizer, "pad_token_id", None)
     if pad_token_id is None:
         pad_token_id = getattr(capturer.tokenizer, "eos_token_id", 0) or 0
@@ -321,6 +367,10 @@ def cache_dataset(
         io_queue_size=io_queue_size,
         capture_backend="hf_backbone",
         attention_backend=attention_backend,
+        cache_batch_profile=batch_profile,
+        cache_batch_profile_sha256=(
+            batch_schedule.profile_sha256 if batch_schedule is not None else None
+        ),
     )
     stats = {
         "seen": 0,
@@ -370,6 +420,35 @@ def cache_dataset(
         **estimate_progress(),
     )
 
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm có trong requirements server
+        cache_bar = None
+    else:
+        cache_bar = tqdm(**_cache_progress_kwargs(workload))
+    last_bar_captured = int(stats["captured"])
+
+    def refresh_cache_bar(sample_id: Optional[str] = None) -> None:
+        """Cập nhật theo sample đã ghi, không cập nhật theo từng token."""
+        nonlocal last_bar_captured
+        if cache_bar is None:
+            return
+        captured_now = int(stats["captured"])
+        delta = captured_now - last_bar_captured
+        if delta > 0:
+            cache_bar.update(delta)
+            last_bar_captured = captured_now
+        progress = estimate_progress()
+        rate = progress.get("throughput_tokens_per_second")
+        rate_text = "-" if rate is None else f"{float(rate):.1f} tok/s"
+        cache_bar.set_postfix(
+            sample=sample_id or "-",
+            tokens=f"{int(progress['completed_tokens'])}/{total_tokens}",
+            rate=rate_text,
+            eta=progress.get("eta_human", "unknown"),
+        )
+        cache_bar.refresh()
+
     def record_skip(sample_id: str, *, kind: str, error: str) -> None:
         append_row = {
             "id": str(sample_id),
@@ -385,11 +464,6 @@ def cache_dataset(
             completed_samples=int(writer.total_samples),
         )
     buffer: List[Dict[str, Any]] = []
-
-    try:
-        from tqdm import tqdm
-    except ImportError:  # pragma: no cover
-        tqdm = lambda iterator, **_kwargs: iterator
 
     def process(batch: List[Dict[str, Any]]) -> None:
         nonlocal capture_started_at, completed_tokens, captured_tokens
@@ -445,6 +519,7 @@ def cache_dataset(
                 durable_samples=len(writer.sample_ids),
                 **estimate_progress(),
             )
+            refresh_cache_bar(str(batch[-1]["id"]))
             return
         for sample, feature in zip(batch, captured):
             try:
@@ -470,6 +545,7 @@ def cache_dataset(
             durable_samples=len(writer.sample_ids),
             **estimate_progress(),
         )
+        refresh_cache_bar(str(batch[-1]["id"]))
 
     if tokenized_path is not None:
         from MR_DFlash.tokenized_data import TokenizedDFlashDataset
@@ -491,13 +567,19 @@ def cache_dataset(
         def iter_cache_rows():
             yield from read_jsonl(data_path)
 
-    rows = tqdm(iter_cache_rows(), desc="Cache target features", unit="row")
+    rows = iter_cache_rows()
 
-    def next_batch_size() -> int:
+    def next_batch_size(sample_length: Optional[int] = None) -> int:
+        if batch_schedule is not None:
+            if sample_length is None:
+                raise ValueError("auto-batch cần sample_length để chọn bucket")
+            selected = batch_schedule.batch_size_for_length(sample_length)
+        else:
+            selected = batch_size
         if num_samples is None:
-            return batch_size
+            return selected
         remaining = int(num_samples) - writer.total_samples
-        return max(0, min(batch_size, remaining))
+        return max(0, min(selected, remaining))
 
     for row_index, row in enumerate(rows):
         stats["seen"] += 1
@@ -537,10 +619,15 @@ def cache_dataset(
             # Stable sort giữ kết quả deterministic trong cùng độ dài; batch
             # gần độ dài nhau để giảm padding trên target forward.
             buffer.sort(key=lambda item: -len(item["input_ids"]))
-            while len(buffer) >= batch_size:
-                current_batch_size = next_batch_size()
+            while buffer:
+                current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
                 if current_batch_size == 0:
                     buffer.clear()
+                    break
+                # Với profile hợp lệ, bucket_buffer_size đã >= batch lớn nhất.
+                # Điều kiện này vẫn bảo vệ trường hợp schedule đổi giữa lúc
+                # debug hoặc số sample còn lại quá ít.
+                if len(buffer) < current_batch_size:
                     break
                 process(buffer[:current_batch_size])
                 del buffer[:current_batch_size]
@@ -549,7 +636,12 @@ def cache_dataset(
                     break
     buffer.sort(key=lambda item: -len(item["input_ids"]))
     while buffer and (num_samples is None or writer.total_samples < int(num_samples)):
-        current_batch_size = next_batch_size()
+        current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
+        if current_batch_size == 0:
+            break
+        # Batch cuối có thể nhỏ hơn schedule khi shard kết thúc; đây là batch
+        # an toàn vì nó chỉ giảm memory, không làm tăng padding length.
+        current_batch_size = min(current_batch_size, len(buffer))
         process(buffer[:current_batch_size])
         del buffer[:current_batch_size]
 
@@ -580,6 +672,9 @@ def cache_dataset(
         seen=int(stats["seen"]),
         **estimate_progress(),
     )
+    if cache_bar is not None:
+        refresh_cache_bar()
+        cache_bar.close()
     sys.excepthook = previous_hook
     return {key: int(value) for key, value in stats.items() if isinstance(value, int)}
 
@@ -637,6 +732,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--skipped-report", default=None)
     parser.add_argument("--progress-path", default=None)
+    parser.add_argument(
+        "--batch-profile",
+        default=None,
+        help="profile JSON do profile_cache_batches.py tạo; chọn batch theo length bucket",
+    )
     return parser.parse_args(argv)
 
 
@@ -670,6 +770,7 @@ def main(argv=None) -> None:
         num_shards=args.num_shards,
         skipped_report=args.skipped_report,
         progress_path=args.progress_path,
+        batch_profile=args.batch_profile,
     )
 
 

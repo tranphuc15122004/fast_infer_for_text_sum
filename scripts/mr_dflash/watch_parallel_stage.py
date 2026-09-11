@@ -90,6 +90,30 @@ def format_status(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _progress_bar_state(progress: dict[str, Any]) -> dict[str, Any]:
+    """Chọn counter cho cache theo sample hoặc regenerate theo token."""
+    total_samples = progress.get("total_samples")
+    if isinstance(total_samples, (int, float)) and not isinstance(total_samples, bool):
+        total = max(0, int(total_samples))
+        completed = max(0, int(progress.get("completed_samples", 0) or 0))
+        return {
+            "mode": "sample",
+            "total": total,
+            "n": min(total, completed),
+            "unit": "sample",
+        }
+    budget = progress.get("generation_budget")
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool) and int(budget) > 0:
+        generated = max(0, int(progress.get("generated_tokens", 0) or 0))
+        return {
+            "mode": "token",
+            "total": int(budget),
+            "n": min(int(budget), generated),
+            "unit": "token",
+        }
+    return {"mode": "unknown", "total": None, "n": 0, "unit": "item"}
+
+
 def _watch_tqdm(status_path: Path, *, interval: float, once: bool) -> int:
     """Hiển thị một thanh/worker, dữ liệu vẫn lấy từ heartbeat atomic."""
     try:
@@ -100,6 +124,7 @@ def _watch_tqdm(status_path: Path, *, interval: float, once: bool) -> int:
 
     bars: dict[int, Any] = {}
     last_phases: dict[int, str] = {}
+    last_modes: dict[int, str] = {}
     try:
         while True:
             payload = _read_status(status_path)
@@ -108,33 +133,49 @@ def _watch_tqdm(status_path: Path, *, interval: float, once: bool) -> int:
                 rank = int(worker.get("rank", position))
                 progress = worker.get("progress") or {}
                 phase = str(progress.get("phase", "unknown"))
-                budget = progress.get("generation_budget")
-                total = int(budget) if isinstance(budget, (int, float)) and int(budget) > 0 else None
+                state = _progress_bar_state(progress)
+                total = state["total"]
                 if rank not in bars:
                     bars[rank] = tqdm(
                         total=total,
+                        initial=state["n"],
                         position=position,
                         leave=True,
                         dynamic_ncols=True,
+                        unit=state["unit"],
                         desc=f"GPU {worker.get('gpu_id', '?')} {phase}",
                     )
                 bar = bars[rank]
-                if total is not None and bar.total != total:
+                if state["mode"] != last_modes.get(rank):
                     bar.total = total
-                generated = progress.get("generated_tokens")
+                    bar.n = state["n"]
+                    bar.unit = state["unit"]
+                    bar.refresh()
+                    last_modes[rank] = state["mode"]
+                elif total is not None and bar.total != total:
+                    bar.total = total
+                current = int(state["n"])
+                if current < bar.n:
+                    bar.n = current
+                elif current > bar.n:
+                    bar.update(current - bar.n)
                 completed = progress.get("completed_samples", "-")
                 if phase != last_phases.get(rank):
                     bar.set_description(f"GPU {worker.get('gpu_id', '?')} {phase}")
                     last_phases[rank] = phase
-                if isinstance(generated, (int, float)):
-                    generated = int(generated)
-                    if generated < bar.n:
-                        bar.n = generated
-                    else:
-                        bar.update(generated - bar.n)
                 memory = progress.get("cuda_memory_allocated_gb")
                 memory_text = "-" if memory is None else f"{float(memory):.1f}GB"
-                bar.set_postfix(sample=progress.get("sample_id", "-"), done=completed, vram=memory_text)
+                postfix = {
+                    "sample": progress.get("sample_id", "-"),
+                    "done": completed,
+                    "vram": memory_text,
+                }
+                if state["mode"] == "sample":
+                    postfix["tokens"] = (
+                        f"{progress.get('completed_tokens', 0)}/"
+                        f"{progress.get('total_tokens', 0)}"
+                    )
+                bar.set_postfix(**postfix)
                 bar.refresh()
             if once or payload.get("status") in {"success", "failed"}:
                 return 0 if payload.get("status") == "success" else (0 if once else 1)

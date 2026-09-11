@@ -187,6 +187,23 @@ def test_preflight_checks_local_dflash_and_cuda():
     assert "cuda.is_available" in text
 
 
+def test_preflight_covers_mr_dflash_train_cache_and_infer_runtime():
+    text = (ROOT / "scripts/check_shared_env.py").read_text()
+    required_modules = (
+        "yaml",
+        "safetensors",
+        "tqdm",
+        "MR_DFlash",
+        "MR_DFlash.capture",
+        "MR_DFlash.offline_features",
+        "MR_DFlash.online_features",
+        "MR_DFlash.run_train",
+        "MR_DFlash.inference",
+    )
+    for module in required_modules:
+        assert f'"{module}"' in text, module
+
+
 def test_shared_preflight_checks_sssd_native_kernel():
     text = (ROOT / "scripts/check_shared_env.py").read_text()
     assert '"sgl_kernel"' in text

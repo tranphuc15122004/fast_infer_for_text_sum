@@ -2,7 +2,9 @@
 """Offline preflight for the single server runtime.
 
 This command checks the interpreter and imports packages without loading a
-model, resolving a Hugging Face repo, or calling any network API.
+model, resolving a Hugging Face repo, or calling any network API.  The import
+set covers both the shared benchmark runners and the local MR-DFlash
+train/cache/inference modules.
 """
 
 from __future__ import annotations
@@ -18,6 +20,26 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
     "torch",
     "transformers",
+    # MR-DFlash train/cache/preprocess dependencies.
+    "numpy",
+    "yaml",
+    "safetensors",
+    "tqdm",
+    "MR_DFlash",
+    "MR_DFlash.capture",
+    "MR_DFlash.checkpoint",
+    "MR_DFlash.config",
+    "MR_DFlash.data",
+    "MR_DFlash.inference",
+    "MR_DFlash.memory",
+    "MR_DFlash.mr_model",
+    "MR_DFlash.offline_features",
+    "MR_DFlash.online_features",
+    "MR_DFlash.run_train",
+    "MR_DFlash.tokenized_data",
+    "MR_DFlash.trainer",
+    "MR_DFlash.training",
+    # Shared benchmark/runtime dependencies.
     "vllm",
     "triton",
     "flashinfer",
@@ -31,6 +53,10 @@ MODULES = (
 DIST_NAMES = {
     "torch": "torch",
     "transformers": "transformers",
+    "numpy": "numpy",
+    "yaml": "PyYAML",
+    "safetensors": "safetensors",
+    "tqdm": "tqdm",
     "vllm": "vllm",
     "triton": "triton",
     "flashinfer": "flashinfer-python",
@@ -47,8 +73,13 @@ def _version(module_name: str, module: object) -> str:
     value = getattr(module, "__version__", None)
     if value:
         return str(value)
+    distribution = DIST_NAMES.get(module_name)
+    if distribution is None:
+        distribution = DIST_NAMES.get(module_name.split(".", 1)[0])
+    if distribution is None:
+        return "local"
     try:
-        return importlib.metadata.version(DIST_NAMES[module_name])
+        return importlib.metadata.version(distribution)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
 
@@ -72,6 +103,7 @@ def main() -> int:
         Path(path).mkdir(parents=True, exist_ok=True)
 
     # Make local baseline packages discoverable without installing them.
+    sys.path.insert(0, str(ROOT / "src"))
     sys.path.insert(0, str(ROOT / "externals" / "dflash"))
     sys.path.insert(0, str(ROOT / "externals" / "LLMLingua"))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -80,7 +112,7 @@ def main() -> int:
     failures: list[str] = []
     print(f"python: {sys.executable}")
     print(f"version: {sys.version.split()[0]}")
-    print("mode: offline import-only (no model loading)")
+    print("mode: offline import-only (no model loading; MR-DFlash included)")
     if sys.version_info[:2] != (3, 12):
         failures.append("Python 3.12 is required")
 

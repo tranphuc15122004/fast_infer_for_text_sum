@@ -5,6 +5,10 @@ Profile B200 100 GB hiện hành được mô tả tại
 pilot dùng `batch_size=1`, accumulation 4 và `objective_chunk_blocks=64` để
 giữ effective batch/fairness đồng thời chừa headroom VRAM.
 
+Cơ chế chọn batch tự động cho target-feature cache được mô tả tại
+[`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md). Bật
+`--cache-auto-batch` để pipeline profile trước rồi mới chạy cache.
+
 Tài liệu này khóa thực nghiệm công bằng trên cùng target `Qwen/Qwen3-4B`:
 
 | Variant | Draft | Feature target | Mục đích |
@@ -31,6 +35,7 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 | `regenerate_{3k,8k}_{split}` | `regenerated_3k/*.jsonl` hoặc `regenerated/*.jsonl`, `*.skipped.jsonl`, regeneration manifests | Sinh assistant response deterministic bằng Qwen3-4B và ghi riêng sample không xử lý được |
 | `validate_{3k,8k}_{split}` | `manifests/validation_*.json` | Kiểm tra assistant cuối, target provenance, token length |
 | `tokenize_{3k,8k}_{split}` | `tokenized*/{split}/shard_*.pt`, `manifest.json` | Lưu `input_ids`, `loss_mask`, length; không lưu hidden |
+| `profile_cache_batch_{regime}` *(auto-batch)* | `manifests/cache_batch_profile_<regime>.json` | Đo batch an toàn theo bucket độ dài trên GPU profile; không ghi feature |
 | `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Đọc tokenized shard, chạy backbone target và lưu hidden `[1,9,17,25,33]` tại mọi offset |
 
 Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
@@ -136,6 +141,14 @@ Mỗi stage có worker log ở `parallel_*/rank_*/worker.log`; trạng thái liv
 `parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
 pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
 
+Muốn chọn batch tự động theo VRAM, dùng `--cache-auto-batch` và bắt đầu từ
+stage `profile_cache_batch_full`. Profiler đo trên GPU profile các bucket
+`1-8192`, `8193-16384`, `16385-24576`, `24577-32768`, sau đó mọi worker dùng
+schedule cố định trong file
+`manifests/cache_batch_profile_full.json`. Với B200 180 GB có thể đặt hard
+limit `--cache-profile-vram-limit-gb 170`; chi tiết lệnh và cách dùng lại
+profile xem [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md).
+
 ### Theo dõi và dừng an toàn từng GPU
 
 Từ phiên bản có `mr_dflash_worker_progress_v1`, mỗi worker còn ghi:
@@ -159,13 +172,22 @@ python3 scripts/mr_dflash/watch_parallel_stage.py \
 ```
 
 Nếu terminal hỗ trợ carriage-return, thêm `--tqdm` để mỗi GPU có một thanh
-tiến trình riêng:
+tiến trình riêng. Với phase `cache`, thanh dùng **sample hợp lệ đã ghi** làm
+counter (`x/y sample`); với phase `regenerate`, thanh vẫn dùng token đang
+decode:
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
   --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json \
   --interval 5 --tqdm
 ```
+
+Khi chạy cache trực tiếp bằng `cache_target_features.py`, script cũng hiển thị
+một thanh `Cache target features` theo tổng sample hợp lệ của worker. Thanh
+khởi đầu từ số sample đã có khi dùng `--resume`, cập nhật sau mỗi batch ghi
+thành công, và hiển thị thêm token, throughput cùng ETA. Vì vậy với dataset
+100K sample không cần suy ra tiến độ từ số dòng đã đọc hoặc log của từng
+sample.
 
 Kiểm tra một lần dùng `--once`. Nếu `phase=generating` và `tokens` tăng, worker
 đang decode bình thường dù `output.jsonl` chưa có sample mới. Output regenerate

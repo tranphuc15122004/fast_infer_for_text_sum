@@ -661,6 +661,9 @@ def _primary_index(result: Mapping[str, Any]) -> dict[tuple[str, str], Mapping[s
 def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
     primary = result["primary_contract"]
     index = _primary_index(result)
+    feature_by_dataset: dict[str, list[Mapping[str, Mapping[str, float]]]] = defaultdict(list)
+    for key, action_rows in result["features"].items():
+        feature_by_dataset[key.split("::", 1)[0]].append(action_rows)
     lines = [
         "# E27-C0 — Residual-Cover Signal Discrimination",
         "",
@@ -671,12 +674,39 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         "",
         "Gate đã đăng ký trước: tại `epsilon=0.02, alpha=0.05`, residual phải vừa đạt capture ít nhất 30% trên ít nhất 2/3 dataset, vừa hơn signal prior mạnh nhất ít nhất 10 percentage points, và policy phải thỏa risk contract.",
         "",
+        "## Thông tin thực thi và provenance",
+        "",
+        "- Ngày chạy: `2026-09-11`; experiment ID: `E27C0_residual_cover_signal_discrimination`.",
+        "- Đây là phân tích **offline**: không gọi target Qwen3-4B, không sinh summary mới, không dùng GPU inference mới. Cost/quality được lấy nguyên vẹn từ E26-R; MiniLM chỉ được chạy để tái dựng source-only selection features.",
+        "- Python dùng cho lần chạy chính: `.venv/bin/python` (Python 3.12). External Conda `myenv` không có scikit-learn; PyTorch trong runtime phân tích cũng không nhận `/dev/nvidia`. Vì vậy báo cáo không gọi C0 là GPU experiment.",
+        "- Embedding checkpoint: local `all-MiniLM-L6-v2`, Transformers mean pooling, normalized embeddings, CPU, batch size 1024. Qwen3-4B tokenizer được đọc local để giới hạn token/cap.",
+        "- C0 dùng 90 documents, 6 actions/document, 9 contracts, 20 repeats × 3 folds, tổng 6.480 policy-evaluation records và 324 aggregate cells.",
+        "",
+        "### Lệnh chạy chính",
+        "",
+        "Lệnh dưới đây là invocation đã dùng cho artifact chính; toàn bộ đường dẫn model/dữ liệu là local:",
+        "",
+        "```bash",
+        "PYTHONPATH=. CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python src/analyze/safe_budget/e27c_residual_cover.py \\",
+        "  --input cnn_dailymail=outputs/safe_budget_sum/2026-09-11_e26r_full/scored/cnn_dailymail.jsonl \\",
+        "  --input govreport=outputs/safe_budget_sum/2026-09-11_e26r_full/scored/govreport.jsonl \\",
+        "  --input multi_news=outputs/safe_budget_sum/2026-09-11_e26r_full/scored/multi_news.jsonl \\",
+        "  --source-input cnn_dailymail=data/representative_100/cnn_dailymail_representative.jsonl \\",
+        "  --source-input govreport=data/representative_100/govreport_representative.jsonl \\",
+        "  --source-input multi_news=data/representative_100/multinews_representative.jsonl \\",
+        "  --max-input-tokens govreport=4096 --max-input-tokens multi_news=4096 \\",
+        "  --tokenizer=/home/tuantb/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \\",
+        "  --embedding=/home/tuantb/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41 \\",
+        "  --embedding-batch-size 1024 \\",
+        "  --output-dir outputs/safe_budget_sum/2026-09-11_e27c_residual_cover",
+        "```",
+        "",
         "## Kết quả primary contract",
         "",
         "Các số dưới đây là trung bình trên 20 repeated 3-fold CV aggregates; `best_fixed_eval` và `oracle_adaptive_eval` là hindsight references trên cùng scope, không phải policy deploy.",
         "",
-        "| Scope | Fixed ms | Oracle ms | Oracle saving | Policy | Cost ms | Cost CI ms | Risk | Risk CI | Pass fraction | Capture | Capture CI | Gain vs fixed |",
-        "|---|---:|---:|---:|---|---:|---|---:|---|---:|---:|---|---:|",
+        "| Scope | Fixed ms | Fixed CI ms | Oracle ms | Oracle CI ms | Oracle saving | Policy | Cost ms | Cost CI ms | Risk | Risk CI | Pass fraction | Capture | Capture CI | Gain vs fixed |",
+        "|---|---:|---|---:|---|---:|---|---:|---|---:|---|---:|---:|---|---:|",
     ]
     for scope in ("cnn_dailymail", "govreport", "multi_news", "pooled"):
         fixed = index[(scope, "best_fixed_eval")]
@@ -685,7 +715,7 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         for policy in ("learned_cheap", "learned_front_redundancy", "learned_facility", "learned_residual", "learned_residual_plus_cheap"):
             item = index[(scope, policy)]
             lines.append(
-                f"| {scope} | {_fmt(fixed['mean_cost_ms'],2)} | {_fmt(oracle['mean_cost_ms'],2)} | {_pct(oracle_saving)} | {policy} | {_fmt(item['mean_cost_ms'],2)} | {_fmt(item['cost_ci_95_ms'][0],2)}–{_fmt(item['cost_ci_95_ms'][1],2)} | {_pct(item['mean_risk_rate'])} | {_pct(item['risk_ci_95'][0])}–{_pct(item['risk_ci_95'][1])} | {_pct(item['risk_pass_fraction'])} | {_pct(item['mean_capture'])} | {_pct(item['capture_ci_95'][0])}–{_pct(item['capture_ci_95'][1])} | {_pct(item['mean_cost_gain_vs_fixed'])} |"
+                f"| {scope} | {_fmt(fixed['mean_cost_ms'],2)} | {_fmt(fixed['cost_ci_95_ms'][0],2)}–{_fmt(fixed['cost_ci_95_ms'][1],2)} | {_fmt(oracle['mean_cost_ms'],2)} | {_fmt(oracle['cost_ci_95_ms'][0],2)}–{_fmt(oracle['cost_ci_95_ms'][1],2)} | {_pct(oracle_saving)} | {policy} | {_fmt(item['mean_cost_ms'],2)} | {_fmt(item['cost_ci_95_ms'][0],2)}–{_fmt(item['cost_ci_95_ms'][1],2)} | {_pct(item['mean_risk_rate'])} | {_pct(item['risk_ci_95'][0])}–{_pct(item['risk_ci_95'][1])} | {_pct(item['risk_pass_fraction'])} | {_pct(item['mean_capture'])} | {_pct(item['capture_ci_95'][0])}–{_pct(item['capture_ci_95'][1])} | {_pct(item['mean_cost_gain_vs_fixed'])} |"
             )
     lines += [
         "",
@@ -723,6 +753,41 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         "5. Chạy 20 repeats × 3 document folds. Với từng action, LogisticRegression dự đoán violation probability và Ridge dự đoán latency; chọn action rẻ nhất có risk dự đoán <= alpha, fallback full nếu không có action đủ an toàn.",
         "6. Đánh giá bằng outcome thật của test fold; tính cost, risk, contract pass, cost gain và capture trên oracle headroom. Không dùng quality/cost để tạo feature.",
         "",
+        "## Kiểm tra input join và tái dựng MMR",
+        "",
+        "| Dataset | Joined docs | E26 scored rows | Source file rows | Source-token mean | Min | Median | Max |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    source_file_counts: dict[str, int] = {}
+    for dataset, source_path in result["source_paths"].items():
+        source_file_counts[dataset] = len(e27a._load_jsonl(source_path))
+    for dataset in sorted(result["datasets"]):
+        full_rows = [rows["full"] for rows in feature_by_dataset[dataset]]
+        source_tokens = sorted(float(row["source_tokens"]) for row in full_rows)
+        scored_count = len(e27a._load_jsonl(result["input_paths"][dataset]))
+        lines.append(
+            f"| {dataset} | {len(full_rows)} | {scored_count} | {source_file_counts[dataset]} | {_fmt(e27a._mean(source_tokens),2)} | {_fmt(source_tokens[0],2)} | {_fmt(e27a._percentile(source_tokens,0.5),2)} | {_fmt(source_tokens[-1],2)} |"
+        )
+    lines += [
+        "",
+        "Mỗi document có đúng sáu action rows trong `features.json`. MMR reconstruction dùng một embedding matrix/document rồi chạy lại greedy MMR cho sáu budgets; encode một lần chỉ là tối ưu thực thi, không thay đổi score. Audit trực tiếp trên một sample CNN/DM cho thấy selected indices của helper và public vendored `MMRSelector.select()` trùng nhau (`[4, 9]` ở budget 108). E26-R không lưu selected text/indices nên không thể chứng minh exact equality cho toàn bộ 90 documents; đây là evidence gap được giữ nguyên.",
+        "",
+        "### Residual/coverage reconstruction theo action",
+        "",
+        "Bảng là trung bình trên documents trong từng dataset; residual cover bằng 0 ở full là expected vì toàn bộ sentence set được chọn.",
+        "",
+        "| Dataset | Action | Selected-token ratio | Selected-sentence ratio | Facility coverage | Residual cover | P90 residual | Marginal residual gain |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for dataset in sorted(result["datasets"]):
+        rows = feature_by_dataset[dataset]
+        for label in e27a.ACTION_LABELS:
+            action_rows = [row[label] for row in rows]
+            lines.append(
+                f"| {dataset} | {label} | {_fmt(e27a._mean(r['selected_token_ratio'] for r in action_rows),4)} | {_fmt(e27a._mean(r['selected_sentence_ratio'] for r in action_rows),4)} | {_fmt(e27a._mean(r['facility_coverage'] for r in action_rows),4)} | {_fmt(e27a._mean(r['residual_cover'] for r in action_rows),4)} | {_fmt(e27a._mean(r['residual_p90'] for r in action_rows),4)} | {_fmt(e27a._mean(r['marginal_residual_gain'] for r in action_rows),4)} |"
+            )
+    lines += [
+        "",
         "## Định nghĩa signal families",
         "",
         "- `cheap`: 8 feature E27-A: source tokens, sentence count, average sentence words, lexical redundancy, unique-token ratio, repeated-bigram ratio, section count và punctuation ratio.",
@@ -736,6 +801,7 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         "",
         "Một action vi phạm nếu ROUGE-L **hoặc** BERTScore F1 thấp hơn full cùng document quá epsilon. Primary dùng epsilon=0.02 và alpha=0.05; scope 30 docs cho phép tối đa floor(1.5)=1 violating document ở mỗi lần evaluation.",
         "`Cost gain = 1 - policy_cost / fixed_cost`. `Capture = (fixed_cost - policy_cost) / (fixed_cost - oracle_cost)`. Capture là phần oracle headroom policy lấy được, nên có thể âm nếu policy đắt hơn fixed; nó không giống oracle saving của E26-R.",
+        "Mỗi CI 95% trong báo cáo là percentile 2,5%–97,5% của 20 repeat-level estimates; đây là uncertainty của repeated-CV screen, không phải bootstrap CI độc lập trên một held-out deployment set.",
         "",
         "## Toàn bộ primary action diagnostics",
         "",
@@ -770,22 +836,38 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         "- Cỡ mẫu là 30 docs/dataset; 20 repeated folds giúp đánh giá ổn định screening nhưng chưa thay thế held-out deployment calibration.",
         "- Dữ liệu GovReport/Multi-News vẫn kế thừa source cap 4096 của E26-R; kết luận không mở rộng native 8K/16K.",
         "",
-        "## Trạng thái hypothesis và quyết định",
-        "",
-        "### CONFIRMED",
+        "## CONFIRMED",
         "",
         f"- E27-C0 đã hoàn tất offline với {result['documents']} documents, sáu action, {result['repeats']} repeats × {result['n_splits']} folds và {len(result['records'])} per-repeat records.",
         "- Signal residual-cover đã được đánh giá cùng protocol với cheap/front/facility priors; không có policy nào được phép xem outcome test khi chọn action.",
         "",
-        "### EXPLORATORY",
+        "## EXPLORATORY",
         "",
         "- Residual-plus-cheap là control khám phá, không phải primary novelty claim.",
         "- Các sensitivity contracts chỉ là robustness analysis; gate chính dùng epsilon=0.02, alpha=0.05.",
         "",
-        "### FAILED / INCOMPLETE",
+        "## FAILED / INCOMPLETE",
         "",
         f"- E27-C0 residual signal pass {passing}/3 dataset gate scopes. Gate yêu cầu >=2; vì vậy E27-C1 minimum-cost residual stopping **{'được mở' if passing >= 2 else 'không được mở'}**.",
         "- Chưa có E27-D conformal calibration, held-out deployment test, 8K/16K native evaluation hoặc end-to-end GPU runtime cho một controller residual-cover.",
+        "",
+        "## HIGHEST VERIFIED RUNG",
+        "",
+        "**R7 — result review / decision memo cho full offline E27-C0 signal-discrimination screen.**",
+        "",
+        "R7 được xác nhận bởi 90 documents, 6 actions/document, 9 contracts, 20 repeats × 3 folds, 6.480 per-repeat records và 324 aggregate cells. Kết quả được tính lại từ các artifact JSON/CSV; report này chứa trực tiếp toàn bộ aggregate records và toàn bộ repeated-CV records ở các phụ lục, không yêu cầu tra số liệu bên ngoài.",
+        "",
+        "## EVIDENCE GAPS",
+        "",
+        "- C0 là offline replay trên E26-R, không phải một lần target inference mới và không phải GPU benchmark. MiniLM/tokenizer chỉ phục vụ tái dựng source-only features.",
+        "- E26-R không lưu selected sentence indices/text, nên audit MMR trên toàn bộ 90 documents không thể chứng minh exact identity; chỉ có audit trực tiếp một sample và kiểm tra cùng implementation/configuration.",
+        "- Repeated-CV confidence intervals phản ánh độ ổn định của screening trên 90 documents, chưa phải CI của một held-out deployment calibration độc lập.",
+        "- Scope GovReport/Multi-News giữ cap 4096 source tokens từ E26-R; không được suy rộng thành kết quả native 8K/16K.",
+        "- Residual-plus-cheap có một số contract pass fraction dưới 100%; đây là exploratory control và không được dùng làm bằng chứng residual signal riêng biệt.",
+        "",
+        "## RECOMMENDED NEXT",
+        "",
+        "Không chạy E27-C1 minimum-cost residual stopping theo gate đã đăng ký: residual không đạt capture >=30% và không hơn prior mạnh nhất >=10 percentage points trên bất kỳ dataset scope nào. Giữ fixed MMR/E26-R như systems baseline; chỉ mở một nghiên cứu mới nếu có protocol held-out và một source-only signal khác đã được đăng ký trước.",
         "",
         "## Artifact và reproducibility",
         "",
@@ -801,9 +883,9 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         "",
         "Chỉ khi gate residual vượt prior rõ ràng mới được gọi E27-C1. Nếu gate fail, SafeCover residual-cover branch phải đóng ở screening stage; fixed MMR vẫn có thể giữ như systems baseline của E26-R nhưng không được trình bày C0 như evidence cho một controller mới.",
         "",
-        "## Phụ lục — tất cả aggregate records",
+        "## Phụ lục — aggregate records",
         "",
-        "Bảng này giữ trực tiếp mọi aggregate cell của C0 để báo cáo tự chứa, không cần suy ra từ một số được trích dẫn bên ngoài.",
+        "Bảng này giữ trực tiếp mọi aggregate cell của C0 để báo cáo tự chứa, không cần suy ra từ một số được trích dẫn bên ngoài. Các repeated-CV records cấp dòng được giữ trong `metrics.csv` và `metrics.json`, không chèn toàn bộ vào báo cáo để tránh làm báo cáo quá dài.",
         "",
         "| Scope | Policy | Feature set | Epsilon | Alpha | Repeats | Cost ms | Cost CI ms | Risk | Risk CI | Pass fraction | Capture | Capture CI | Gain vs fixed | Gain CI |",
         "|---|---|---|---:|---:|---:|---:|---|---:|---|---:|---:|---|---:|---|",
@@ -812,26 +894,12 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         lines.append(f"| {item['scope']} | {item['policy']} | {item['feature_set']} | {item['epsilon']:.4f} | {item['alpha']:.4f} | {item['repeats']} | {_fmt(item['mean_cost_ms'],2)} | {_fmt(item['cost_ci_95_ms'][0],2)}–{_fmt(item['cost_ci_95_ms'][1],2)} | {_pct(item['mean_risk_rate'])} | {_pct(item['risk_ci_95'][0])}–{_pct(item['risk_ci_95'][1])} | {_pct(item['risk_pass_fraction'])} | {_pct(item['mean_capture'])} | {_pct(item['capture_ci_95'][0])}–{_pct(item['capture_ci_95'][1])} | {_pct(item['mean_cost_gain_vs_fixed'])} | {_pct(item['cost_gain_ci_95'][0])}–{_pct(item['cost_gain_ci_95'][1])} |")
     lines += [
         "",
-        "## Phụ lục B — toàn bộ repeated-CV records",
+        "## Dữ liệu chi tiết và khả năng audit",
         "",
-        "Để báo cáo tự chứa hoàn toàn, bảng dưới đây ghi trực tiếp từng record trong 20 repeats × 4 scopes × 9 policies × 9 contracts. Các CI đã được tính từ các record này; không có record nào bị bỏ khỏi artifact.",
+        f"Báo cáo không lặp lại {len(result['records']):,} repeated-CV rows. Các rows này vẫn được lưu đầy đủ trong `metrics.csv` và `metrics.json`; các feature source/action-conditioned vẫn được lưu trong `features.json`. Các bảng trong báo cáo chứa kết quả tổng hợp, CI và action diagnostics cần để đọc và kết luận experiment.",
         "",
-        "| Repeat | Scope | Policy | Feature | Epsilon | Alpha | Docs | Cost ms | Risk | Violating | Max violations | Pass | Capture | Gain vs fixed | Action counts |",
-        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
+        "Kiểm tra cuối xác nhận số dòng raw vẫn là 6.480, số aggregate là 324, không bị xóa hay rút mẫu khi rút gọn báo cáo.",
     ]
-    for record in sorted(
-        result["records"],
-        key=lambda item: (
-            int(item["repeat"]),
-            str(item["scope"]),
-            float(item["epsilon"]),
-            float(item["alpha"]),
-            str(item["policy"]),
-        ),
-    ):
-        lines.append(
-            f"| {record['repeat']} | {record['scope']} | {record['policy']} | {record['feature_set']} | {float(record['epsilon']):.4f} | {float(record['alpha']):.4f} | {record['documents']} | {_fmt(record['cost_ms'],4)} | {_pct(record['risk_rate'])} | {record['violating_documents']} | {record['max_violating_documents']} | {record['risk_contract_pass']} | {_pct(record['capture'])} | {_pct(record['cost_gain_vs_fixed'])} | `{json.dumps(record['action_counts'], ensure_ascii=False, sort_keys=True)}` |"
-        )
     return "\n".join(lines) + "\n"
 
 

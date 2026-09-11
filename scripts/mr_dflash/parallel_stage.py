@@ -12,6 +12,7 @@ generation/cache và không làm các worker tranh chấp cùng một output fil
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -271,6 +272,8 @@ def merge_feature_caches(
         "target_revision",
         "capture_backend",
         "attention_backend",
+        "cache_batch_profile",
+        "cache_batch_profile_sha256",
     )
     base: Dict[str, Any] | None = None
     all_ids: list[str] = []
@@ -336,6 +339,8 @@ def merge_feature_caches(
         stored_feature_dtype=base.get("stored_feature_dtype"),
         capture_backend=str(base.get("capture_backend", "hf_backbone")),
         attention_backend=base.get("attention_backend"),
+        cache_batch_profile=base.get("cache_batch_profile"),
+        cache_batch_profile_sha256=base.get("cache_batch_profile_sha256"),
         stats={
             "worker_count": len(worker_roots),
             "gpu_ids": [int(value) for value in gpu_ids],
@@ -403,6 +408,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
         ]
         if args.tokenized_path:
             command.extend(["--tokenized-path", args.tokenized_path])
+        if args.batch_profile:
+            command.extend(["--batch-profile", args.batch_profile])
     if args.target_revision:
         command.extend(["--target-revision", args.target_revision])
     if args.local_files_only:
@@ -599,6 +606,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--bucket-buffer-size", type=int, default=8)
     parser.add_argument("--shard-size", type=int, default=32)
     parser.add_argument(
+        "--batch-profile",
+        default=None,
+        help="profile JSON dùng chung cho mọi worker cache; chọn batch theo length bucket",
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=["auto", "eager", "sdpa", "flash_attention_2"],
         default="sdpa",
@@ -656,6 +668,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
     if args.stall_timeout_seconds < 0:
         raise ValueError("stall-timeout-seconds không được âm")
+    if args.batch_profile and not Path(args.batch_profile).is_file():
+        raise FileNotFoundError(f"không tìm thấy cache batch profile: {args.batch_profile}")
     if args.work_root is None:
         output = Path(args.output)
         args.work_root = str(resolve_parallel_work_root(output, args.mode))
@@ -682,6 +696,8 @@ def main(argv=None) -> int:
         raise FileExistsError(
             f"parallel output đã tồn tại ({output_path}); dùng --resume hoặc output/work-root mới"
         )
+    if args.mode == "cache" and args.batch_profile and not Path(args.batch_profile).is_file():
+        raise FileNotFoundError(f"không tìm thấy cache batch profile: {args.batch_profile}")
     plan_path = work_root / "parallel_plan.json"
     plan = {
         "schema_version": "mr_dflash_parallel_plan_v1",
@@ -708,6 +724,12 @@ def main(argv=None) -> int:
         "batch_size": int(args.batch_size),
         "bucket_buffer_size": int(args.bucket_buffer_size),
         "shard_size": int(args.shard_size),
+        "batch_profile": str(args.batch_profile) if args.batch_profile else None,
+        "batch_profile_sha256": (
+            hashlib.sha256(Path(args.batch_profile).read_bytes()).hexdigest()
+            if args.batch_profile
+            else None
+        ),
         "attention_backend": args.attention_backend,
         "io_threads": int(args.io_threads),
         "io_queue_size": int(args.io_queue_size),
@@ -732,6 +754,8 @@ def main(argv=None) -> int:
             "max_new_tokens",
             "target_layer_ids",
             "attention_backend",
+            "batch_profile",
+            "batch_profile_sha256",
             "io_threads",
             "io_queue_size",
             "num_shards",

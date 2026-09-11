@@ -48,9 +48,18 @@ python3 scripts/setup_server_env.py --init
 # Kiểm tra Python 3.12, package, master config và LongBench.
 python3 scripts/setup_server_env.py --check
 
-# Hoặc init + check trong một lần.
+# Hoặc init + check trong một lần. `--all` cũng kiểm tra các dependency và
+# module MR-DFlash dùng cho train/cache/inference theo chế độ import-only;
+# không load Qwen3-4B và không chiếm GPU cho runtime smoke.
 python3 scripts/setup_server_env.py --all
 ```
+
+`--all` kiểm tra các package runtime bắt buộc, bao gồm `torch`,
+`transformers`, `PyYAML`, `safetensors`, `tqdm` và các module trong
+`src/MR_DFlash`. Đây là preflight thư viện/source, không phải kiểm tra model,
+cache hay checkpoint cụ thể. Khi cần xác nhận GPU B200 và asset của baseline,
+dùng thêm `scripts/check_b200_env.py`; khi cần kiểm tra model thật, chạy smoke
+riêng của pipeline.
 
 Script không ghi đè phần cấu hình operator-owned và không xoá dataset đã
 checkout. Nếu master config đã được tạo bởi script này, `--init` sẽ refresh

@@ -132,6 +132,12 @@ trước khi xử lý 50K ShareGPT + 50K ArXiv. Quy trình đầy đủ, các pa
 điều kiện approve scale được ghi tại
 [`docs/mr_dflash_pilot_pipeline.md`](../../docs/mr_dflash_pilot_pipeline.md).
 
+Phase cache hỗ trợ `--cache-auto-batch`: profiler đo batch an toàn theo bucket
+độ dài trên GPU thật trước khi cache, sau đó các worker dùng schedule cố định.
+Không chạy cache nếu batch 1 không nằm dưới hard VRAM limit. Xem
+[`docs/mr_dflash_cache_auto_batch.md`](../../docs/mr_dflash_cache_auto_batch.md)
+để biết lệnh B200 và cách audit profile.
+
 Để chạy trọn phase chuẩn bị/cache bằng một entry point có log và trạng thái
 theo stage:
 

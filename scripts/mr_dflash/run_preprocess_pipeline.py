@@ -85,6 +85,16 @@ class PipelineOptions:
     cache_attention_backend: str = "sdpa"
     cache_io_threads: int = 2
     cache_io_queue_size: int = 4
+    # Auto-batch profile được tạo trước cache trên một GPU rồi dùng cố định
+    # cho mọi worker theo bucket độ dài. ``cache_batch_profile`` cho phép
+    # truyền profile đã tạo từ trước và bỏ qua stage profile.
+    cache_auto_batch: bool = False
+    cache_batch_profile: Optional[str] = None
+    cache_profile_gpu_id: int = 0
+    cache_profile_max_batch_size: int = 8
+    cache_profile_vram_limit_gb: Optional[float] = None
+    cache_profile_headroom_fraction: float = 0.10
+    cache_profile_bucket_step: int = 8192
     parallel_gpu_ids: tuple[int, ...] = ()
     progress_interval_tokens: int = 256
     regenerate_output_batch_size: int = 1
@@ -437,7 +447,62 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 )
             )
 
+        profile_path = (
+            Path(options.cache_batch_profile)
+            if options.cache_batch_profile
+            else manifests / f"cache_batch_profile_{regime}.json"
+        )
+        if options.cache_auto_batch and not options.cache_batch_profile:
+            profile_device = options.device
+            if profile_device in {"cuda", "auto"}:
+                profile_device = f"cuda:{options.cache_profile_gpu_id}"
+            plan.append(
+                Stage(
+                    name=f"profile_cache_batch_{regime}",
+                    command=[
+                        python,
+                        _stage_script(options, "profile_cache_batches.py"),
+                        "--target-model-path",
+                        options.target_model_path,
+                        "--tokenized-path",
+                        str(tokenized / "train"),
+                        "--output",
+                        str(profile_path),
+                        "--max-length",
+                        str(max_length),
+                        "--target-layer-ids",
+                        *(str(layer) for layer in options.target_layer_ids),
+                        "--max-batch-size",
+                        str(options.cache_profile_max_batch_size),
+                        "--bucket-step",
+                        str(options.cache_profile_bucket_step),
+                        "--vram-headroom-fraction",
+                        str(options.cache_profile_headroom_fraction),
+                        "--attention-backend",
+                        options.cache_attention_backend,
+                        "--device",
+                        profile_device,
+                        "--torch-dtype",
+                        options.torch_dtype,
+                        *(
+                            ["--vram-limit-gb", str(options.cache_profile_vram_limit_gb)]
+                            if options.cache_profile_vram_limit_gb is not None
+                            else []
+                        ),
+                        *(
+                            ["--target-revision", options.target_revision]
+                            if options.target_revision
+                            else []
+                        ),
+                        *(_local_files_args(options)),
+                    ],
+                    artifacts=(profile_path,),
+                    kind="profile",
+                )
+            )
+
         batch_size, bucket_buffer, shard_size = _cache_sizes(options, regime)
+        use_batch_profile = bool(options.cache_auto_batch or options.cache_batch_profile)
         for split in options.cache_splits:
             output_dir = feature_root / split
             manifest = output_dir / "manifest.json"
@@ -468,6 +533,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(options.cache_io_threads),
                         "--io-queue-size",
                         str(options.cache_io_queue_size),
+                        *(
+                            ["--batch-profile", str(profile_path)]
+                            if use_batch_profile
+                            else []
+                        ),
                         "--device",
                         options.device,
                         "--torch-dtype",
@@ -514,6 +584,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(options.cache_io_threads),
                     "--io-queue-size",
                     str(options.cache_io_queue_size),
+                    *(
+                        ["--batch-profile", str(profile_path)]
+                        if use_batch_profile
+                        else []
+                    ),
                     "--torch-dtype",
                     options.torch_dtype,
                     "--supervision-mode",
@@ -820,6 +895,37 @@ def _select_stages(
     return list(plan[start:end])
 
 
+def _add_auto_batch_dependencies(
+    plan: Sequence[Stage],
+    selected: Sequence[Stage],
+    *,
+    enabled: bool,
+    has_explicit_profile: bool,
+) -> list[Stage]:
+    """Tự thêm stage profile khi user chọn chạy riêng một cache stage.
+
+    Nếu chạy toàn pipeline thì profile đã có sẵn đúng vị trí trong plan. Hàm
+    này xử lý các lệnh tiện dụng như ``--only-stage cache_full_train`` hoặc
+    ``--from-stage cache_full_train`` để không vô tình chạy cache khi profile
+    còn thiếu.
+    """
+    if not enabled or has_explicit_profile:
+        return list(selected)
+    selected_names = {stage.name for stage in selected}
+    required_profiles: set[str] = set()
+    for stage in selected:
+        if stage.kind != "cache" or not stage.name.startswith("cache_"):
+            continue
+        parts = stage.name.split("_")
+        if len(parts) < 3:
+            continue
+        required_profiles.add(f"profile_cache_batch_{parts[1]}")
+    if not required_profiles:
+        return list(selected)
+    selected_names.update(required_profiles)
+    return [stage for stage in plan if stage.name in selected_names]
+
+
 def _write_pipeline_summary(
     options: PipelineOptions,
     *,
@@ -941,6 +1047,49 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="số shard tối đa chờ ghi trên mỗi cache worker",
     )
     parser.add_argument(
+        "--cache-auto-batch",
+        action="store_true",
+        help=(
+            "profile batch size trên một GPU trước cache, sau đó chọn batch "
+            "cố định theo bucket độ dài"
+        ),
+    )
+    parser.add_argument(
+        "--cache-batch-profile",
+        default=None,
+        help="dùng profile JSON đã có; không tạo lại stage profile",
+    )
+    parser.add_argument(
+        "--cache-profile-gpu-id",
+        type=int,
+        default=0,
+        help="GPU dùng để profile auto-batch (ID logical theo CUDA_VISIBLE_DEVICES)",
+    )
+    parser.add_argument(
+        "--cache-profile-max-batch-size",
+        type=int,
+        default=8,
+        help="candidate batch lớn nhất khi profile; mặc định 1,2,4,8",
+    )
+    parser.add_argument(
+        "--cache-profile-vram-limit-gb",
+        type=float,
+        default=None,
+        help="hard limit VRAM cho profile, ví dụ 170 trên B200 180GB",
+    )
+    parser.add_argument(
+        "--cache-profile-headroom-fraction",
+        type=float,
+        default=0.10,
+        help="headroom nếu không truyền hard VRAM limit; mặc định 10%%",
+    )
+    parser.add_argument(
+        "--cache-profile-bucket-step",
+        type=int,
+        default=8192,
+        help="độ rộng bucket độ dài; 8192 tạo bucket 8K/16K/24K/32K",
+    )
+    parser.add_argument(
         "--parallel-gpu-ids",
         type=int,
         nargs="+",
@@ -1003,6 +1152,14 @@ def main(argv=None) -> int:
         raise ValueError("progress-interval-tokens và regenerate-output-batch-size phải >= 1")
     if args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
         raise ValueError("cache-io-threads và cache-io-queue-size không được âm")
+    if args.cache_profile_gpu_id < 0:
+        raise ValueError("cache-profile-gpu-id không được âm")
+    if args.cache_profile_max_batch_size < 1 or args.cache_profile_bucket_step < 1:
+        raise ValueError("cache-profile-max-batch-size và bucket-step phải >= 1")
+    if not 0.0 <= float(args.cache_profile_headroom_fraction) < 1.0:
+        raise ValueError("cache-profile-headroom-fraction phải thuộc [0, 1)")
+    if args.cache_profile_vram_limit_gb is not None and args.cache_profile_vram_limit_gb <= 0:
+        raise ValueError("cache-profile-vram-limit-gb phải > 0")
     if args.worker_stall_timeout_seconds < 0:
         raise ValueError("worker-stall-timeout-seconds không được âm")
     options = PipelineOptions(
@@ -1037,6 +1194,17 @@ def main(argv=None) -> int:
         cache_attention_backend=str(args.cache_attention_backend),
         cache_io_threads=int(args.cache_io_threads),
         cache_io_queue_size=int(args.cache_io_queue_size),
+        cache_auto_batch=bool(args.cache_auto_batch),
+        cache_batch_profile=str(args.cache_batch_profile) if args.cache_batch_profile else None,
+        cache_profile_gpu_id=int(args.cache_profile_gpu_id),
+        cache_profile_max_batch_size=int(args.cache_profile_max_batch_size),
+        cache_profile_vram_limit_gb=(
+            float(args.cache_profile_vram_limit_gb)
+            if args.cache_profile_vram_limit_gb is not None
+            else None
+        ),
+        cache_profile_headroom_fraction=float(args.cache_profile_headroom_fraction),
+        cache_profile_bucket_step=int(args.cache_profile_bucket_step),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         progress_interval_tokens=int(args.progress_interval_tokens),
         regenerate_output_batch_size=int(args.regenerate_output_batch_size),
@@ -1052,6 +1220,12 @@ def main(argv=None) -> int:
         only=args.only_stage,
         from_stage=args.from_stage,
         stop_after=args.stop_after,
+    )
+    selected = _add_auto_batch_dependencies(
+        plan,
+        selected,
+        enabled=bool(args.cache_auto_batch),
+        has_explicit_profile=bool(args.cache_batch_profile),
     )
     config_hash = pipeline_config_hash(options)
     print(f"[pipeline] data_root={options.data_root}")

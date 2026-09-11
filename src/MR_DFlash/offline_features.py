@@ -118,6 +118,8 @@ def write_sharded_feature_manifest(
     stored_feature_dtype: Optional[str] = None,
     capture_backend: str = "hf_backbone",
     attention_backend: Optional[str] = None,
+    cache_batch_profile: Optional[str] = None,
+    cache_batch_profile_sha256: Optional[str] = None,
     stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Ghi manifest schema ``mr_dflash_feature_sharded_v1``."""
@@ -141,6 +143,8 @@ def write_sharded_feature_manifest(
         "source_tokenized_path": source_tokenized_path,
         "capture_backend": str(capture_backend),
         "attention_backend": attention_backend,
+        "cache_batch_profile": cache_batch_profile,
+        "cache_batch_profile_sha256": cache_batch_profile_sha256,
         "stats": dict(stats or {}),
     }
     _atomic_json_write(root / SHARDED_FEATURE_MANIFEST_FILENAME, payload)
@@ -205,6 +209,8 @@ class ShardedFeatureWriter:
         io_queue_size: int = 0,
         capture_backend: str = "hf_backbone",
         attention_backend: Optional[str] = None,
+        cache_batch_profile: Optional[str] = None,
+        cache_batch_profile_sha256: Optional[str] = None,
     ) -> None:
         if int(shard_size) < 1:
             raise ValueError("shard_size phải >= 1")
@@ -225,6 +231,8 @@ class ShardedFeatureWriter:
             "target_revision": target_revision,
             "capture_backend": str(capture_backend),
             "attention_backend": attention_backend,
+            "cache_batch_profile": cache_batch_profile,
+            "cache_batch_profile_sha256": cache_batch_profile_sha256,
         }
         manifest_path = self.root / SHARDED_FEATURE_MANIFEST_FILENAME
         existing_pt = sorted(self.root.glob("shard_*.pt"))
@@ -255,8 +263,20 @@ class ShardedFeatureWriter:
                 "source_tokenized_path",
                 "capture_backend",
                 "attention_backend",
+                "cache_batch_profile",
+                "cache_batch_profile_sha256",
             ):
-                if key in manifest and manifest.get(key) != self.metadata[key]:
+                # Profile là một phần correctness/provenance của cache. Nếu
+                # run mới có profile nhưng manifest cũ chưa có key, cũng phải
+                # dừng thay vì resume silently với schedule khác.
+                if (
+                    (key in {"cache_batch_profile", "cache_batch_profile_sha256"} and manifest.get(key) != self.metadata[key])
+                    or (
+                        key not in {"cache_batch_profile", "cache_batch_profile_sha256"}
+                        and key in manifest
+                        and manifest.get(key) != self.metadata[key]
+                    )
+                ):
                     raise ValueError(
                         f"metadata cache không khớp ở {key}: "
                         f"{manifest.get(key)!r} != {self.metadata[key]!r}"
