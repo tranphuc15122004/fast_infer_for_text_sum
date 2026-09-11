@@ -249,9 +249,11 @@ fast_infer__load_longbench() {
   fast_infer_default LONG_BENCH_LOCAL_FILES_ONLY "1"
   fast_infer_default LONG_BENCH_TIMEOUT_SECONDS "900"
   fast_infer_default LONG_BENCH_STRICT "1"
-  fast_infer_default LONG_BENCH_EAGLE_TOTAL_TOKEN "32"
-  fast_infer_default LONG_BENCH_EAGLE_DEPTH "8"
-  fast_infer_default LONG_BENCH_EAGLE_TOP_K "4"
+  # Upstream EAGLE3 Llama-3.1 defaults; override explicitly for a hardware
+  # ablation, but do not silently shrink the tree and call it the baseline.
+  fast_infer_default LONG_BENCH_EAGLE_TOTAL_TOKEN "60"
+  fast_infer_default LONG_BENCH_EAGLE_DEPTH "5"
+  fast_infer_default LONG_BENCH_EAGLE_TOP_K "10"
   fast_infer_default LONG_BENCH_LONGSPEC_MODEL_NAME "llama8b"
   fast_infer_default LONG_BENCH_SPECEXTEND_MODEL_NAME "llama3_1_8b"
   fast_infer_default LONG_BENCH_MAGICDEC_MODEL_NAME "${MODEL_TARGET:-}"

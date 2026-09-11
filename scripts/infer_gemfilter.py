@@ -12,13 +12,14 @@ then runs correctness checks (non-empty output, finite logits, determinism).
 from __future__ import annotations
 
 import argparse
-import time
 from pathlib import Path
 
 import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.benchmark_runtime import measure_call
+from common.input_utils import truncate_input_ids
 from common.paths import snapshot_dir
 
 
@@ -46,6 +47,8 @@ def main() -> None:
                         help="jsonl of records (id/prompt) to generate over; "
                              "overrides --prompt")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-input-tokens", type=int, default=0,
+                        help="truncate prompts before selection (0 = no limit)")
     parser.add_argument("--topk", type=int, default=1024)
     parser.add_argument("--select-layer-idx", type=int, default=None,
                         help="GemFilter selection layer (default: 13 for Llama-3.1-8B, 19 for Nemo/Phi-3.5)")
@@ -93,24 +96,30 @@ def main() -> None:
 
     for si, sample in enumerate(prompts):
         input_ids = tokenizer(sample["prompt"], return_tensors="pt").input_ids.to(device)
+        if args.max_input_tokens > 0 and input_ids.shape[1] > args.max_input_tokens:
+            input_ids = truncate_input_ids(input_ids, args.max_input_tokens).contiguous()
         attn_mask = torch.ones_like(input_ids)
         for run in range(args.num_runs):
             torch.manual_seed(run)
             # baseline (standard greedy)
-            with torch.inference_mode():
-                t0 = time.perf_counter()
-                base_text = my_greedy_generate_standard(
+            base_text, base_timing = measure_call(
+                lambda: my_greedy_generate_standard(
                     input_ids, attn_mask, model, tokenizer, max_gen_len=args.max_gen_len
-                )
-                base_s = time.perf_counter() - t0
-
-                t0 = time.perf_counter()
-                gem_text = my_greedy_generate_selection(
+                ),
+                device=device,
+            )
+            gem_text, gem_timing = measure_call(
+                lambda: my_greedy_generate_selection(
                     input_ids, attn_mask, model, tokenizer,
                     max_gen_len=args.max_gen_len,
                     select_layer_idx=args.select_layer_idx,
-                )
-                gem_s = time.perf_counter() - t0
+                ),
+                device=device,
+            )
+            base_s = float(base_timing["e2e_ms"]) / 1000.0
+            gem_s = float(gem_timing["e2e_ms"]) / 1000.0
+            base_tokens = len(tokenizer(base_text, add_special_tokens=False).input_ids)
+            gem_tokens = len(tokenizer(gem_text, add_special_tokens=False).input_ids)
 
             record = {
                 "method": "gemfilter",
@@ -118,7 +127,7 @@ def main() -> None:
                 "model": model_path,
                 "input_tokens": int(input_ids.shape[1]),
                 "retained_tokens": None,
-                "output_tokens": None,
+                "output_tokens": gem_tokens,
                 "batch_size": 1,
                 "selector_latency_ms": None,
                 "ttft_ms": None,
@@ -135,6 +144,9 @@ def main() -> None:
                 "base_time_s": round(base_s, 4),
                 "gemfilter_time_s": round(gem_s, 4),
                 "dense_e2e_ms": round(base_s * 1e3, 3),
+                "dense_output_tokens": base_tokens,
+                "speedup_scope": "paired_dense",
+                "speedup_valid": base_tokens == gem_tokens,
             }
             # ROUGE-1/2/L cho cả 2 nhánh (nếu data có reference/answer);
             # base_text lưu dưới prefix "base_" để phân biệt với gemfilter_text.

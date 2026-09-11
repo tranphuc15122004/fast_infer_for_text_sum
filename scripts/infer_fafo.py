@@ -43,6 +43,7 @@ def build_pipeline_config(
     max_new_tokens: int,
     kv_method: str = "stream-llm",
     use_flash: bool = False,
+    max_input_tokens: int = 0,
 ) -> dict[str, Any]:
     """Load an upstream FAFO config and apply run-specific values."""
 
@@ -53,6 +54,7 @@ def build_pipeline_config(
     params["model_name"] = model
     params["n_new_tokens"] = max(1, int(max_new_tokens))
     params["use_flash"] = bool(use_flash)
+    params["max_input_tokens"] = max(0, int(max_input_tokens))
     return config
 
 
@@ -171,8 +173,10 @@ def _parse_log(log: str) -> dict[str, float | int | None]:
     throughput = float(average_match[-1]) if average_match else None
     if stat_match:
         _, _, stat_tokens, stat_time = stat_match[-1]
-        if output_tokens is None:
-            output_tokens = int(stat_tokens)
+        # ``OVERALL GEN`` includes the hidden compile warmup that the smoke
+        # adapter prepends.  The last STAT row is the measured request and is
+        # therefore the authoritative token/time pair for this record.
+        output_tokens = int(stat_tokens)
         if e2e_s is None:
             e2e_s = float(stat_time)
         if throughput is None and e2e_s > 0:
@@ -193,6 +197,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default="What is 2 + 2? Give the answer briefly.")
     parser.add_argument("--max-samples", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=0,
+        help="truncate the upstream prompt before FAFO inference (0 = no limit)",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -243,6 +253,7 @@ def main() -> None:
                     args.max_new_tokens,
                     args.kv_method,
                     args.use_flash,
+                    args.max_input_tokens,
                 ),
                 indent=2,
             ),

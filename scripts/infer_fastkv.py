@@ -17,15 +17,15 @@ kernel was actually used.
 from __future__ import annotations
 
 import argparse
-import json
-import time
 from argparse import Namespace
 from pathlib import Path
 
 import torch
 
-from common import io_util, rouge, verify
+from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
+from common.paired_generation import timed_generate
 from common.paths import snapshot_dir
 
 
@@ -56,6 +56,8 @@ def main() -> None:
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-input-tokens", type=int, default=0,
+                        help="truncate prompts before dense and FastKV generation (0 = no limit)")
     parser.add_argument("--window-size", type=int, default=1024)
     parser.add_argument("--max-capacity-prompts", type=int, default=2048)
     parser.add_argument("--kernel-size", type=int, default=63)
@@ -63,6 +65,8 @@ def main() -> None:
     parser.add_argument("--eviction-mode", default="proportional",
                         choices=["constant", "proportional"])
     parser.add_argument("--num-runs", type=int, default=2)
+    parser.add_argument("--skip-dense", action="store_true",
+                        help="skip the paired unpatched target reference")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -96,8 +100,55 @@ def main() -> None:
     model_path = resolve_model(args.model)
     print(f"Model: {model_path} | method={args.method} attn={args.attn_implementation}")
 
-    # Patch transformers (must happen before model construction).
+    # Load the tokenizer before patching transformers.  The dense reference
+    # must be constructed before FastKV replaces the attention modules.
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if args.data_file:
+        prompts = load_records(args.data_file, args.max_samples)
+    else:
+        prompts = [{"id": "prompt", "prompt": args.prompt}]
+
+    prompt_ids = []
+    for sample in prompts:
+        ids = tokenizer(sample["prompt"], return_tensors="pt").input_ids
+        if args.max_input_tokens > 0:
+            ids = truncate_input_ids(ids, args.max_input_tokens).contiguous()
+        prompt_ids.append((sample, ids))
+    dense_reference: dict[str, dict[str, object]] = {}
+    if not args.skip_dense:
+        print("Loading unpatched dense reference ...")
+        dense_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            attn_implementation=args.attn_implementation,
+            low_cpu_mem_usage=True,
+        ).eval()
+        dense_device = next(dense_model.parameters()).device
+        for sample, ids_cpu in prompt_ids:
+            dense_ids = ids_cpu.to(dense_device)
+            dense_out, dense_ms = timed_generate(
+                dense_model,
+                dense_ids,
+                device=dense_device,
+                max_new_tokens=args.max_new_tokens,
+            )
+            dense_new = dense_out[0, dense_ids.shape[1]:]
+            dense_reference[str(sample["id"])] = {
+                "e2e_ms": dense_ms,
+                "output_tokens": int(dense_new.shape[0]),
+                "text": tokenizer.decode(dense_new, skip_special_tokens=True).strip(),
+            }
+        del dense_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Patch transformers (must happen before optimized model construction).
 
     if "mistral" in model_path.lower() or "ministral" in model_path.lower():
         from baselines.monkeypatch import replace_mistral as replace
@@ -130,35 +181,23 @@ def main() -> None:
     model.eval()
     set_model(model, patch_args)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     device = next(model.parameters()).device
-
-    # Plug-and-play: one generation per record in --data-file, else --prompt.
-    if args.data_file:
-        prompts = load_records(args.data_file, args.max_samples)
-    else:
-        prompts = [{"id": "prompt", "prompt": args.prompt}]
 
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
 
     for si, sample in enumerate(prompts):
-        input_ids = tokenizer(sample["prompt"], return_tensors="pt").input_ids.to(device)
+        input_ids = prompt_ids[si][1].to(device)
         input_len = input_ids.shape[1]
         for run in range(args.num_runs):
             torch.manual_seed(run)
-            with torch.inference_mode():
-                t0 = time.perf_counter()
-                out = model.generate(
-                    input_ids,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    use_cache=True,
-                )
-            elapsed = time.perf_counter() - t0
+            out, elapsed_ms = timed_generate(
+                model,
+                input_ids,
+                device=device,
+                max_new_tokens=args.max_new_tokens,
+            )
+            elapsed = elapsed_ms / 1000.0
             output_ids = out[0, input_len:]
             n_tok = int(output_ids.shape[0])
             text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
@@ -184,6 +223,19 @@ def main() -> None:
                 "run": run,
                 "text": text,
             }
+            reference = dense_reference.get(str(sample["id"]))
+            if reference is not None:
+                record["dense_e2e_ms"] = round(float(reference["e2e_ms"]), 3)
+                record["dense_output_tokens"] = int(reference["output_tokens"])
+                record["dense_text"] = reference["text"]
+                record["speedup_scope"] = "paired_dense"
+                record["speedup_valid"] = (
+                    int(reference["output_tokens"]) == n_tok
+                )
+                if elapsed_ms > 0:
+                    record["speedup"] = round(
+                        float(reference["e2e_ms"]) / elapsed_ms, 4
+                    )
             # ROUGE-1/2/L vs reference summary (nếu data có reference/answer)
             rouge.add_rouge(record, text, sample.get("reference"))
             writer.add(record)
@@ -200,6 +252,7 @@ def main() -> None:
         "num_runs": args.num_runs,
         "mean_tpot_ms": round(io_util.mean([r["tpot_ms"] for r in writer.records if r["tpot_ms"]]), 3),
         "mean_throughput_tok_s": round(io_util.mean([r["throughput_tok_s"] for r in writer.records]), 2),
+        "speedup": metrics.aggregate_speedup(writer.records),
         **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)

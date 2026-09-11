@@ -200,8 +200,14 @@ if _DIRECT_SCRIPT:
     _base = _load_local_module("base", "base.py")
     _lead = _load_local_module("_semantic_lead", "lead.py")
     _random = _load_local_module("_semantic_random_selector", "random.py")
-    _tfidf = _load_local_module("_semantic_tfidf", "tfidf.py")
-    _textrank = _load_local_module("_semantic_textrank", "textrank.py")
+    try:
+        _tfidf = _load_local_module("_semantic_tfidf", "tfidf.py")
+    except ImportError:
+        _tfidf = None
+    try:
+        _textrank = _load_local_module("_semantic_textrank", "textrank.py")
+    except ImportError:
+        _textrank = None
     _mmr = _load_local_module("_semantic_mmr", "mmr.py")
 
     SelectionResult = _base.SelectionResult
@@ -210,8 +216,8 @@ if _DIRECT_SCRIPT:
 
     LeadSelector = _lead.LeadSelector
     RandomSelector = _random.RandomSelector
-    TFIDFCentroidSelector = _tfidf.TFIDFCentroidSelector
-    TextRankSelector = _textrank.TextRankSelector
+    TFIDFCentroidSelector = _tfidf.TFIDFCentroidSelector if _tfidf is not None else None
+    TextRankSelector = _textrank.TextRankSelector if _textrank is not None else None
     MMRSelector = _mmr.MMRSelector
 else:
     from .base import (
@@ -971,11 +977,19 @@ def initialize_selectors(
             )
 
         elif name == "tfidf":
+            if TFIDFCentroidSelector is None:
+                raise ImportError(
+                    "TF-IDF selector requires scipy and scikit-learn in the selected runtime."
+                )
             selector = TFIDFCentroidSelector(
                 **common,
             )
 
         elif name == "textrank":
+            if TextRankSelector is None:
+                raise ImportError(
+                    "TextRank selector requires scikit-learn in the selected runtime."
+                )
             selector = TextRankSelector(
                 top_k_neighbors=textrank_top_k_neighbors,
                 **common,

@@ -21,6 +21,8 @@ def seed_everything(seed: int) -> None:
 
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "scripts"))
+from common.input_utils import truncate_input_ids  # noqa: E402
 
 
 def resolve_cache_max_length(
@@ -188,10 +190,12 @@ def main():
     model, tokenizer = accelerator.prepare(model, tokenizer)
 
     def encode(text):
-        kwargs = {"return_tensors": "pt", "add_special_tokens": True}
-        if args.max_input_tokens > 0:
-            kwargs.update({"truncation": True, "max_length": args.max_input_tokens})
-        return tokenizer(text, **kwargs)["input_ids"]
+        encoded = tokenizer(
+            text, return_tensors="pt", add_special_tokens=True
+        )
+        return truncate_input_ids(
+            encoded["input_ids"], args.max_input_tokens
+        )
 
     # EAGLE keeps ``past_key_values`` on the model between calls.  The old
     # warmup allocated capacity from only the first prompt, so a later longer

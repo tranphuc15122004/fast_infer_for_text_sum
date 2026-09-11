@@ -21,6 +21,7 @@ import torch
 from common import io_util, verify
 from common import metrics, rouge
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
 from common.paths import ROOT
 from common.reproducibility import seed_everything
 
@@ -84,10 +85,10 @@ def _run_canonical(args: argparse.Namespace) -> None:
 
     encoded_records = []
     for sample in records:
-        kwargs = {"return_tensors": "pt", "add_special_tokens": True}
-        if args.max_input_tokens > 0:
-            kwargs.update({"truncation": True, "max_length": args.max_input_tokens})
-        input_ids = tokenizer(sample["prompt"], **kwargs).input_ids.to(device)
+        input_ids = tokenizer(
+            sample["prompt"], return_tensors="pt", add_special_tokens=True
+        ).input_ids
+        input_ids = truncate_input_ids(input_ids, args.max_input_tokens).to(device)
         encoded_records.append((sample, input_ids))
     max_input = max(int(ids.shape[1]) for _, ids in encoded_records)
     max_sequence = max(128, ((max_input + args.max_new_tokens + 127) // 128) * 128)

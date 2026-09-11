@@ -54,6 +54,23 @@ def _version(module_name: str, module: object) -> str:
 
 
 def main() -> int:
+    cache_root = Path(
+        os.environ.get("FAST_INFER_CACHE_ROOT", "/tmp/fast_infer_cache")
+    )
+    os.environ.setdefault(
+        "FLASHINFER_WORKSPACE_BASE", str(cache_root / "flashinfer")
+    )
+    os.environ.setdefault("TRITON_CACHE_DIR", str(cache_root / "triton"))
+    os.environ.setdefault(
+        "TORCH_EXTENSIONS_DIR", str(cache_root / "torch_extensions")
+    )
+    for path in (
+        os.environ["FLASHINFER_WORKSPACE_BASE"],
+        os.environ["TRITON_CACHE_DIR"],
+        os.environ["TORCH_EXTENSIONS_DIR"],
+    ):
+        Path(path).mkdir(parents=True, exist_ok=True)
+
     # Make local baseline packages discoverable without installing them.
     sys.path.insert(0, str(ROOT / "externals" / "dflash"))
     sys.path.insert(0, str(ROOT / "externals" / "LLMLingua"))

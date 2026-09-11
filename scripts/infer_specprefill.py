@@ -17,6 +17,7 @@ from pathlib import Path
 
 from common import io_util, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
 
 
 def main() -> None:
@@ -30,6 +31,8 @@ def main() -> None:
                              "prompts in one vLLM batch")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--max-input-tokens", type=int, default=0,
+                        help="truncate prompts before vLLM submission (0 = no limit)")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
@@ -64,6 +67,15 @@ def main() -> None:
         prompts = load_records(args.data_file, args.max_samples)
     else:
         prompts = [{"id": "prompt", "prompt": args.prompt}]
+
+    if args.max_input_tokens > 0:
+        vllm_tokenizer = llm.get_tokenizer()
+        for prompt in prompts:
+            encoded = vllm_tokenizer(prompt["prompt"], return_tensors="pt")
+            ids = truncate_input_ids(encoded.input_ids, args.max_input_tokens)
+            prompt["prompt"] = vllm_tokenizer.decode(
+                ids[0], skip_special_tokens=False
+            )
 
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []

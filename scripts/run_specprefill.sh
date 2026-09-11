@@ -31,6 +31,7 @@ ARGS=(
   --spec-model "$SPEC_MODEL"
   --spec-config "configs/${SPEC_CONFIG:-config_p1_full_lah8.yaml}"
   --max-tokens "${MAX_TOKENS:-64}"
+  --max-input-tokens "${MAX_INPUT_TOKENS:-0}"
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.8}"
   --output "$OUTPUT_FILE"
 )

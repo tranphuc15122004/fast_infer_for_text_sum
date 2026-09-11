@@ -23,6 +23,7 @@ import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
 from common.model_compat import ensure_rope_theta
 from common.paths import ROOT
 from common.reproducibility import seed_everything
@@ -101,13 +102,10 @@ def _run_representative(args: argparse.Namespace) -> None:
         seed_everything(args.seed)
         prompt = _representative_prompt(sample["prompt"])
         original_ids = tokenizer(prompt, add_special_tokens=False).input_ids
-        encoded = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_input_tokens,
-        )
-        input_ids = encoded.input_ids.to(device)
+        encoded = tokenizer(prompt, return_tensors="pt")
+        input_ids = truncate_input_ids(
+            encoded.input_ids, max_input_tokens
+        ).to(device)
         input_len = int(input_ids.shape[1])
         prompt_length = input_ids.new_tensor([input_len])
 

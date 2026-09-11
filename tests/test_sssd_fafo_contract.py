@@ -290,15 +290,27 @@ def test_fafo_command_uses_upstream_main_and_single_sample_configs():
     assert command[command.index("--eval_config_dir") + 1] == "/tmp/eval.json"
     assert command[command.index("--output_folder_dir") + 1] == "/tmp/fafo-out"
 
-    pipeline = module.build_pipeline_config("meta-llama/Llama-3.1-8B-Instruct", 16, "stream-llm")
+    pipeline = module.build_pipeline_config(
+        "meta-llama/Llama-3.1-8B-Instruct", 16, "stream-llm", max_input_tokens=1024
+    )
     assert pipeline["pipeline_params"]["fafo"] is True
     assert pipeline["pipeline_params"]["n_new_tokens"] == 16
     assert pipeline["pipeline_params"]["kv_cache_method"] == "stream-llm"
+    assert pipeline["pipeline_params"]["max_input_tokens"] == 1024
 
     evaluation = module.build_eval_config("/tmp/one-sample.jsonl", max_new_tokens=16)
     assert evaluation["eval_params"]["dataset"] == "gsm8k"
     assert evaluation["eval_params"]["dataset_path"] == "/tmp/one-sample.jsonl"
     assert evaluation["eval_params"]["max_new_tokens"] == 16
+
+
+def test_fafo_parser_forwards_smoke_context_limit():
+    module = _load_script("infer_fafo.py")
+    args = module._parser().parse_args(
+        ["--max-input-tokens", "1024", "--max-new-tokens", "8", "--smoke", "--output", "x"]
+    )
+
+    assert args.max_input_tokens == 1024
 
 
 def test_fafo_parser_accepts_aggregate_summary_log():
@@ -313,6 +325,18 @@ FAFO LOG - OVERALL GEN: 16 STEPS: 9 AVG COMPRESS RATIO: 1.7777777777777777
     assert parsed["output_tokens"] == 16
     assert parsed["e2e_s"] == 11.303385496139526
     assert parsed["throughput"] == 1.415505116185281
+
+
+def test_fafo_parser_ignores_hidden_warmup_in_overall_token_count():
+    module = _load_script("infer_fafo.py")
+    parsed = module._parse_log(
+        ""
+        "AVERAGE THROUGHPUT2 1.4 STAT [1.4, 1, 8, 5.7]\n"
+        "FAFO LOG - OVERALL GEN: 32 STEPS: 18 AVG COMPRESS RATIO: 1.7\n"
+    )
+
+    assert parsed["output_tokens"] == 8
+    assert parsed["e2e_s"] == 5.7
 
 
 def test_fafo_budget_validation_rejects_lookahead_tokens():

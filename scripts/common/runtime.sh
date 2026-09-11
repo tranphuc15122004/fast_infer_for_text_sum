@@ -53,4 +53,18 @@ fast_infer_require_python312() {
   export FAST_INFER_PYTHON="$selected"
 }
 
+fast_infer_prepare_cache_defaults() {
+  # CUDA extensions such as FlashInfer/Triton write compile metadata during
+  # import.  A mounted server home may be read-only (and local sandboxes
+  # commonly make it so), therefore keep task caches in an explicit writable
+  # location unless the operator already configured one.
+  local cache_root="${FAST_INFER_CACHE_ROOT:-/tmp/fast_infer_cache}"
+  export FAST_INFER_CACHE_ROOT="$cache_root"
+  export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$cache_root/flashinfer}"
+  export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$cache_root/triton}"
+  export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$cache_root/torch_extensions}"
+  mkdir -p "$FLASHINFER_WORKSPACE_BASE" "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
+}
+
 fast_infer_require_python312
+fast_infer_prepare_cache_defaults

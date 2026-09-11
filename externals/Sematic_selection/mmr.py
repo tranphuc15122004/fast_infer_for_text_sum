@@ -51,6 +51,63 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
+
+class _TransformersSentenceEncoder:
+    """Local Transformers fallback for minimal environments without ST."""
+
+    def __init__(self, model_name: str, device: str) -> None:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        self._torch = torch
+        self.device = torch.device(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=True,
+        )
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            local_files_only=True,
+            dtype=torch.float32,
+        ).to(self.device)
+        self.model.eval()
+
+    @staticmethod
+    def _mean_pool(last_hidden_state, attention_mask):
+        mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+        return (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+    def encode(
+        self,
+        sentences,
+        *,
+        batch_size=64,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ):
+        del show_progress_bar
+        if not convert_to_numpy:
+            raise ValueError("fallback encoder only supports numpy output")
+        outputs = []
+        with self._torch.inference_mode():
+            for start in range(0, len(sentences), batch_size):
+                batch = list(sentences[start : start + batch_size])
+                encoded = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                )
+                encoded = {key: value.to(self.device) for key, value in encoded.items()}
+                hidden = self.model(**encoded).last_hidden_state
+                pooled = self._mean_pool(hidden, encoded["attention_mask"])
+                if normalize_embeddings:
+                    pooled = self._torch.nn.functional.normalize(pooled, p=2, dim=1)
+                outputs.append(pooled.cpu().numpy())
+        return np.concatenate(outputs, axis=0) if outputs else np.empty((0, 0))
+
 try:
     # Package-style import.
     from .base import BaseSemanticSelector, SelectionResult
@@ -141,33 +198,36 @@ class MMRSelector(BaseSemanticSelector):
         if embedding_model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-            except ImportError as exc:
-                raise ImportError(
-                    "MMRSelector requires `sentence-transformers`. "
-                    "Install it with `uv add sentence-transformers` (or the "
-                    "equivalent package-manager command), then instantiate the "
-                    "selector again."
-                ) from exc
-
-            try:
-                embedding_model = SentenceTransformer(
+            except ImportError:
+                # Minimal external GPU environments may not install the
+                # sentence-transformers wrapper.  The checkpoint is still
+                # available locally, so use a Transformers mean-pooling
+                # implementation with the same normalized-embedding contract.
+                embedding_model = _TransformersSentenceEncoder(
                     embedding_model_name,
-                    device=embedding_device,
-                    local_files_only=embedding_local_files_only,
+                    embedding_device,
                 )
-            except Exception as exc:
-                cache_hint = (
-                    "local cache only"
-                    if embedding_local_files_only
-                    else "local cache/network"
-                )
-                raise RuntimeError(
-                    f"Could not load sentence encoder "
-                    f"'{embedding_model_name}' using {cache_hint}. "
-                    "Pass another checkpoint/path through "
-                    "`embedding_model_name`, or inject a pre-loaded encoder via "
-                    "`embedding_model=`."
-                ) from exc
+
+            else:
+                try:
+                    embedding_model = SentenceTransformer(
+                        embedding_model_name,
+                        device=embedding_device,
+                        local_files_only=embedding_local_files_only,
+                    )
+                except Exception as exc:
+                    cache_hint = (
+                        "local cache only"
+                        if embedding_local_files_only
+                        else "local cache/network"
+                    )
+                    raise RuntimeError(
+                        f"Could not load sentence encoder "
+                        f"'{embedding_model_name}' using {cache_hint}. "
+                        "Pass another checkpoint/path through "
+                        "`embedding_model_name`, or inject a pre-loaded encoder via "
+                        "`embedding_model=`."
+                    ) from exc
 
         self.embedding_model = embedding_model
 

@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import time
 from pathlib import Path
 
 import torch
 
-from common import io_util, rouge, verify
+from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
+from common.paired_generation import timed_generate
 
 
 def _select_attention_implementation(requested: str) -> str:
@@ -59,6 +60,8 @@ def main() -> None:
                         choices=["auto", "flash_attention_2", "sdpa", "eager"],
                         help="Transformers backend used while loading; auto "
                              "falls back to SDPA on T4/sm75")
+    parser.add_argument("--skip-dense", action="store_true",
+                        help="skip the paired unpatched target reference")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -81,6 +84,49 @@ def main() -> None:
     print(f"Transformers attention backend: {attn_implementation}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if args.data_file:
+        prompts = load_records(args.data_file, args.max_samples)
+    else:
+        prompts = [{"id": "prompt", "prompt": args.prompt}]
+
+    prompt_ids = []
+    for sample in prompts:
+        ids = tokenizer(sample["prompt"], return_tensors="pt").input_ids
+        if args.max_input_tokens > 0:
+            ids = truncate_input_ids(ids, args.max_input_tokens).contiguous()
+        prompt_ids.append((sample, ids))
+    dense_reference: dict[str, dict[str, object]] = {}
+    if not args.skip_dense:
+        print("Loading unpatched dense reference ...")
+        dense_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            _attn_implementation=attn_implementation,
+            max_position_embeddings=args.max_model_len,
+        ).eval()
+        dense_device = next(dense_model.parameters()).device
+        for sample, ids_cpu in prompt_ids:
+            dense_ids = ids_cpu.to(dense_device)
+            dense_out, dense_ms = timed_generate(
+                dense_model,
+                dense_ids,
+                device=dense_device,
+                max_new_tokens=args.max_new_tokens,
+            )
+            dense_new = dense_out[0, dense_ids.shape[1]:]
+            dense_reference[str(sample["id"])] = {
+                "e2e_ms": dense_ms,
+                "output_tokens": int(dense_new.shape[0]),
+                "text": tokenizer.decode(dense_new, skip_special_tokens=True).strip(),
+            }
+        del dense_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float16,
@@ -89,39 +135,25 @@ def main() -> None:
         max_position_embeddings=args.max_model_len,
     )
     model.eval()
-
     patch = MInference(args.attn_type, args.model)
     model = patch(model)
-
-    input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids.to(model.device)
-    input_len = input_ids.shape[1]
-
-    if args.data_file:
-        prompts = load_records(args.data_file, args.max_samples)
-    else:
-        prompts = [{"id": "prompt", "prompt": args.prompt}]
+    device = next(model.parameters()).device
 
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
 
-    for sample in prompts:
-        encoded = tokenizer(sample["prompt"], return_tensors="pt")
-        ids = encoded.input_ids.to(model.device)
-        attention_mask = encoded.attention_mask.to(model.device)
-        if args.max_input_tokens and args.max_input_tokens > 0 \
-                and ids.shape[1] > args.max_input_tokens:
-            ids = ids[:, : args.max_input_tokens]
-            attention_mask = attention_mask[:, : args.max_input_tokens]
+    for si, sample in enumerate(prompts):
+        ids = prompt_ids[si][1].to(device)
+        attention_mask = torch.ones_like(ids)
         ilen = ids.shape[1]
-        with torch.inference_mode():
-            t0 = time.perf_counter()
-            out = model.generate(
-                input_ids=ids,
-                attention_mask=attention_mask,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-            )
-            elapsed = time.perf_counter() - t0
+        out, elapsed_ms = timed_generate(
+            model,
+            ids,
+            device=device,
+            max_new_tokens=args.max_new_tokens,
+            attention_mask=attention_mask,
+        )
+        elapsed = elapsed_ms / 1000.0
 
         output_ids = out[0, ilen:]
         n_tok = int(output_ids.shape[0])
@@ -145,6 +177,17 @@ def main() -> None:
             "sample_id": sample["id"],
             "text": text,
         }
+        reference = dense_reference.get(str(sample["id"]))
+        if reference is not None:
+            record["dense_e2e_ms"] = round(float(reference["e2e_ms"]), 3)
+            record["dense_output_tokens"] = int(reference["output_tokens"])
+            record["dense_text"] = reference["text"]
+            record["speedup_scope"] = "paired_dense"
+            record["speedup_valid"] = int(reference["output_tokens"]) == n_tok
+            if elapsed_ms > 0:
+                record["speedup"] = round(
+                    float(reference["e2e_ms"]) / elapsed_ms, 4
+                )
         # ROUGE-1/2/L vs reference summary (nếu data có reference/answer)
         rouge.add_rouge(record, text, sample.get("reference"))
         writer.add(record)
@@ -161,6 +204,7 @@ def main() -> None:
         "num_samples": len(prompts),
         "mean_e2e_ms": round(io_util.mean([r["e2e_ms"] for r in writer.records]), 3),
         "mean_throughput_tok_s": round(io_util.mean([r["throughput_tok_s"] for r in writer.records]), 2),
+        "speedup": metrics.aggregate_speedup(writer.records),
         **rouge.aggregate_rouge(writer.records),
     }
     writer.finalize(summary)

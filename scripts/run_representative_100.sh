@@ -364,6 +364,9 @@ prepare_run_env() {
       minference)
         set_env MAX_INPUT_TOKENS "${BENCH_MINFERENCE_MAX_INPUT_TOKENS:-3072}"
         ;;
+      fastkv|gemfilter|specprefill)
+        set_env MAX_INPUT_TOKENS "${BENCH_MAX_INPUT_TOKENS:-4096}"
+        ;;
       dflash)
         set_env MAX_INPUT_TOKENS "${BENCH_DFLASH_MAX_INPUT_TOKENS:-1024}"
         ;;

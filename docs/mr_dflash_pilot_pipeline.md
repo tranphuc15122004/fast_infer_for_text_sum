@@ -388,6 +388,46 @@ không phải độ dài context. Bắt đầu với 2 trên một B200 180 GB c
 1 cho 32K, sau đó tăng khi đã kiểm tra peak VRAM.
 `--bucket-buffer-size` giúp ghép các sample gần độ dài nhau.
 
+## Benchmark target generation/cache trên B200
+
+Script `scripts/mr_dflash/target_cache_benchmark.py` không ghi đè cache. Nó
+chạy bốn phép đo trên cùng một prompt:
+
+* `hf_generate`: target `generate()` với `use_cache=True`;
+* `current_causal_lm_full_capture`: full forward bằng
+  `AutoModelForCausalLM`, tương ứng phase cache hiện tại;
+* `backbone_only_full_capture`: full forward bằng `AutoModel`, không tính
+  LM head/logits;
+* `fused_generate_capture`: prefill + decode bằng KV cache, capture hidden
+  trong cùng một lượt.
+
+Script kiểm tra token output của `hf_generate` và `fused_generate_capture`,
+đồng thời so sánh hidden trajectory của full forward với KV path. Có thể chạy
+trên sample đã target-generate:
+
+```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_for_text_sum-main
+export PYTHONPATH="$PWD/src"
+export CUDA_VISIBLE_DEVICES=0
+
+python3 scripts/mr_dflash/target_cache_benchmark.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --input-jsonl /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/val.jsonl \
+  --sample-index 0 \
+  --max-new-tokens 128 \
+  --target-layer-ids 1 9 17 25 33 \
+  --attn-implementation auto \
+  --device cuda --torch-dtype bfloat16 --local-files-only \
+  --report /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/manifests/target_cache_benchmark_auto.json
+```
+
+Để so sánh backend, chạy lại cùng sample với `--attn-implementation sdpa` và
+`--attn-implementation flash_attention_2`. Nếu FlashAttention-2 chưa được
+cài hoặc không tương thích với stack CUDA, script sẽ báo lỗi khi load model;
+không tự ghi nhận đó là một kết quả hợp lệ. Trước khi dùng tối ưu fused, cần
+kiểm tra `comparisons.hf_vs_fused_tokens.exact=true` và hidden comparison nằm
+trong tolerance đã chọn (`--atol`, `--rtol`).
+
 ```bash
 for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \

@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import random
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -117,6 +118,210 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path}:{line_no}: expected a JSON object")
             rows.append(value)
     return rows
+
+
+def _doc_key(row: Mapping[str, Any]) -> str:
+    value = row.get("example_id", row.get("id", ""))
+    return str(value)
+
+
+def _rows_by_doc(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_doc_key(row)].append(dict(row))
+    return dict(grouped)
+
+
+def _resample_rows(rows: Sequence[Mapping[str, Any]], rng: random.Random) -> list[dict[str, Any]]:
+    """Bootstrap documents with replacement while preserving paired actions."""
+    grouped = _rows_by_doc(rows)
+    documents = list(grouped)
+    sampled: list[dict[str, Any]] = []
+    for occurrence, source_id in enumerate(
+        rng.choice(documents) for _ in range(len(documents))
+    ):
+        for row in grouped[source_id]:
+            clone = dict(row)
+            clone["example_id"] = f"{source_id}__bootstrap_{occurrence}"
+            sampled.append(clone)
+    return sampled
+
+
+def _percentile(values: Sequence[float], probability: float) -> float | None:
+    if not values:
+        return None
+    data = sorted(float(value) for value in values)
+    if len(data) == 1:
+        return data[0]
+    position = (len(data) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return data[lower]
+    fraction = position - lower
+    return data[lower] * (1.0 - fraction) + data[upper] * fraction
+
+
+def _extract_result_cell(
+    result: Mapping[str, Any],
+    epsilon: float,
+    alpha: float,
+) -> Mapping[str, Any]:
+    return result["epsilon_results"][f"{float(epsilon):.4f}"]["alpha_results"][f"{float(alpha):.4f}"]
+
+
+def bootstrap_validation(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    selector: str,
+    quality_metrics: Sequence[str],
+    cost_metric: str,
+    epsilons: Sequence[float],
+    alphas: Sequence[float],
+    samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Paired document bootstrap CI for risk-matched headroom and costs."""
+    if samples <= 0:
+        return {"samples_requested": 0, "seed": seed, "cells": []}
+    rng = random.Random(seed)
+    cells: list[dict[str, Any]] = []
+    for epsilon in epsilons:
+        for alpha in alphas:
+            headrooms: list[float] = []
+            fixed_costs: list[float] = []
+            adaptive_costs: list[float] = []
+            for _ in range(samples):
+                replicate = _resample_rows(rows, rng)
+                result = analyze_dataset(
+                    replicate,
+                    selector=selector,
+                    quality_metrics=quality_metrics,
+                    cost_metric=cost_metric,
+                    epsilons=[epsilon],
+                    alphas=[alpha],
+                    required_levels=0,
+                    required_budget_labels=None,
+                    min_documents=0,
+                )
+                cell = _extract_result_cell(result, epsilon, alpha)
+                fixed = cell.get("fixed") or {}
+                adaptive = cell.get("adaptive_oracle") or {}
+                if fixed.get("mean_cost_ms") is None or adaptive.get("mean_cost_ms") is None:
+                    continue
+                fixed_costs.append(float(fixed["mean_cost_ms"]))
+                adaptive_costs.append(float(adaptive["mean_cost_ms"]))
+                if adaptive.get("headroom_vs_best_fixed") is not None:
+                    headrooms.append(float(adaptive["headroom_vs_best_fixed"]))
+            cells.append(
+                {
+                    "epsilon": float(epsilon),
+                    "alpha": float(alpha),
+                    "valid_replicates": len(headrooms),
+                    "headroom_mean": sum(headrooms) / len(headrooms) if headrooms else None,
+                    "headroom_ci_95": [
+                        _percentile(headrooms, 0.025),
+                        _percentile(headrooms, 0.975),
+                    ],
+                    "fixed_cost_ci_95_ms": [
+                        _percentile(fixed_costs, 0.025),
+                        _percentile(fixed_costs, 0.975),
+                    ],
+                    "adaptive_cost_ci_95_ms": [
+                        _percentile(adaptive_costs, 0.025),
+                        _percentile(adaptive_costs, 0.975),
+                    ],
+                }
+            )
+    return {"samples_requested": samples, "seed": seed, "cells": cells}
+
+
+def heldout_validation(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    selector: str,
+    quality_metrics: Sequence[str],
+    cost_metric: str,
+    epsilons: Sequence[float],
+    alphas: Sequence[float],
+    test_fraction: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Select fixed policy on calibration documents and evaluate it on holdout."""
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("heldout fraction must be in (0, 1)")
+    grouped = _rows_by_doc(rows)
+    documents = sorted(grouped)
+    if len(documents) < 2:
+        return {"status": "insufficient_documents", "seed": seed}
+    rng = random.Random(seed)
+    rng.shuffle(documents)
+    test_count = max(1, min(len(documents) - 1, int(round(len(documents) * test_fraction))))
+    test_ids = set(documents[:test_count])
+    calibration_rows = [row for doc_id, doc_rows in grouped.items() if doc_id not in test_ids for row in doc_rows]
+    holdout_rows = [row for doc_id, doc_rows in grouped.items() if doc_id in test_ids for row in doc_rows]
+    calibration = analyze_dataset(
+        calibration_rows,
+        selector=selector,
+        quality_metrics=quality_metrics,
+        cost_metric=cost_metric,
+        epsilons=epsilons,
+        alphas=alphas,
+        required_levels=0,
+        required_budget_labels=None,
+        min_documents=0,
+    )
+    holdout = analyze_dataset(
+        holdout_rows,
+        selector=selector,
+        quality_metrics=quality_metrics,
+        cost_metric=cost_metric,
+        epsilons=epsilons,
+        alphas=alphas,
+        required_levels=0,
+        required_budget_labels=None,
+        min_documents=0,
+    )
+    cells: list[dict[str, Any]] = []
+    for epsilon in epsilons:
+        for alpha in alphas:
+            calibration_cell = _extract_result_cell(calibration, epsilon, alpha)
+            holdout_cell = _extract_result_cell(holdout, epsilon, alpha)
+            calibrated_fixed = calibration_cell.get("fixed") or {}
+            calibrated_label = calibrated_fixed.get("label")
+            holdout_candidate = next(
+                (candidate for candidate in holdout_cell.get("fixed_candidates", []) if candidate.get("label") == calibrated_label),
+                None,
+            )
+            adaptive = holdout_cell.get("adaptive_oracle") or {}
+            fixed_cost = (holdout_candidate or {}).get("mean_cost_ms")
+            adaptive_cost = adaptive.get("mean_cost_ms")
+            cells.append(
+                {
+                    "epsilon": float(epsilon),
+                    "alpha": float(alpha),
+                    "calibration_documents": calibration["documents_usable"],
+                    "holdout_documents": holdout["documents_usable"],
+                    "calibrated_fixed_label": calibrated_label,
+                    "holdout_fixed": holdout_candidate,
+                    "holdout_adaptive_oracle": adaptive,
+                    "holdout_headroom_vs_calibrated_fixed": (
+                        None
+                        if fixed_cost in (None, 0) or adaptive_cost is None
+                        else 1.0 - float(adaptive_cost) / float(fixed_cost)
+                    ),
+                }
+            )
+    return {
+        "status": "complete",
+        "seed": seed,
+        "test_fraction": test_fraction,
+        "calibration_document_ids": sorted(set(_doc_key(row) for row in calibration_rows)),
+        "holdout_document_ids": sorted(test_ids),
+        "calibration": calibration,
+        "holdout": holdout,
+        "cells": cells,
+    }
 
 
 def _quality_violation(
@@ -596,6 +801,42 @@ def _markdown(result: Mapping[str, Any], *, source_paths: Mapping[str, str]) -> 
                 ]
         lines.append("")
     lines += [
+        "## Bootstrap CI và held-out",
+        "",
+        "Bootstrap được thực hiện theo document với replacement và giữ nguyên toàn bộ các điều kiện của mỗi document trong từng replicate. CI 95% là percentile CI; đây là CI thực nghiệm, không phải conformal guarantee ngoài mẫu.",
+        "",
+        "### Bootstrap 95% CI",
+        "",
+        "| Dataset | Epsilon | Alpha | Replicates hợp lệ | Headroom mean | Headroom CI 95% | Fixed cost CI ms | Adaptive cost CI ms |",
+        "|---|---:|---:|---:|---:|---|---|---|",
+    ]
+    for dataset, validation in result.get("validation", {}).items():
+        for cell in validation.get("bootstrap", {}).get("cells", []):
+            ci = cell.get("headroom_ci_95", [None, None])
+            fixed_ci = cell.get("fixed_cost_ci_95_ms", [None, None])
+            adaptive_ci = cell.get("adaptive_cost_ci_95_ms", [None, None])
+            lines.append(
+                f"| {dataset} | {cell['epsilon']:.4f} | {cell['alpha']:.4f} | {cell['valid_replicates']} | {_pct(cell.get('headroom_mean'))} | {_pct(ci[0])}–{_pct(ci[1])} | {_fmt(fixed_ci[0], 2)}–{_fmt(fixed_ci[1], 2)} | {_fmt(adaptive_ci[0], 2)}–{_fmt(adaptive_ci[1], 2)} |"
+            )
+    lines += [
+        "",
+        "### Held-out: fixed policy chọn ở calibration, đánh giá ở holdout",
+        "",
+        "Adaptive oracle trong bảng held-out vẫn là hindsight upper bound trên holdout; policy fixed dùng label được chọn từ calibration và không được chọn lại trên holdout.",
+        "",
+        "| Dataset | Epsilon | Alpha | Calibration docs | Holdout docs | Label từ calibration | Holdout fixed risk | Holdout adaptive cost ms | Headroom adaptive vs calibrated fixed |",
+        "|---|---:|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for dataset, validation in result.get("validation", {}).items():
+        for cell in validation.get("heldout", {}).get("cells", []):
+            fixed = cell.get("holdout_fixed") or {}
+            lines.append(
+                f"| {dataset} | {cell['epsilon']:.4f} | {cell['alpha']:.4f} | {cell['calibration_documents']} | {cell['holdout_documents']} | {cell.get('calibrated_fixed_label', 'none')} | {_pct(fixed.get('risk_rate'))} | {_fmt((cell.get('holdout_adaptive_oracle') or {}).get('mean_cost_ms'), 2)} | {_pct(cell.get('holdout_headroom_vs_calibrated_fixed'))} |"
+            )
+    lines += [
+        "",
+    ]
+    lines += [
         "## Diễn giải trạng thái",
         "",
         "`complete` chỉ được xuất hiện khi đồng thời đủ cỡ mẫu, budget grid và quality metrics. `pilot_incomplete` là trạng thái hợp lệ của preflight/pilot nhưng không phải E26-R pass.",
@@ -638,9 +879,10 @@ def _csv_rows(result: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def run_cli(args: argparse.Namespace) -> dict[str, Any]:
     inputs = dict(args.input)
+    raw_inputs = {name: load_jsonl(path) for name, path in inputs.items()}
     datasets = {
         name: analyze_dataset(
-            load_jsonl(path),
+            raw_inputs[name],
             selector=args.selector,
             quality_metrics=args.quality_metric,
             cost_metric=args.cost_metric,
@@ -650,8 +892,32 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
             required_budget_labels=args.required_budget_label,
             min_documents=args.min_documents,
         )
-        for name, path in inputs.items()
+        for name in inputs
     }
+    validation: dict[str, Any] = {}
+    for name, rows in raw_inputs.items():
+        validation[name] = {
+            "bootstrap": bootstrap_validation(
+                rows,
+                selector=args.selector,
+                quality_metrics=args.quality_metric,
+                cost_metric=args.cost_metric,
+                epsilons=args.epsilon,
+                alphas=args.alpha,
+                samples=args.bootstrap_samples,
+                seed=args.bootstrap_seed,
+            ),
+            "heldout": heldout_validation(
+                rows,
+                selector=args.selector,
+                quality_metrics=args.quality_metric,
+                cost_metric=args.cost_metric,
+                epsilons=args.epsilon,
+                alphas=args.alpha,
+                test_fraction=args.heldout_fraction,
+                seed=args.split_seed,
+            ),
+        }
     result: dict[str, Any] = {
         "experiment": "E26R_risk_matched_dynamic_budget_oracle",
         "selector": args.selector,
@@ -662,8 +928,13 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
         "required_budget_levels": args.required_budget_levels,
         "required_budget_labels": args.required_budget_label,
         "minimum_documents": args.min_documents,
+        "bootstrap_samples": args.bootstrap_samples,
+        "bootstrap_seed": args.bootstrap_seed,
+        "heldout_fraction": args.heldout_fraction,
+        "split_seed": args.split_seed,
         "inputs": inputs,
         "datasets": datasets,
+        "validation": validation,
     }
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -689,6 +960,10 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
                 "required_budget_labels": args.required_budget_label,
                 "required_budget_levels": args.required_budget_levels,
                 "min_documents": args.min_documents,
+                "bootstrap_samples": args.bootstrap_samples,
+                "bootstrap_seed": args.bootstrap_seed,
+                "heldout_fraction": args.heldout_fraction,
+                "split_seed": args.split_seed,
             },
             ensure_ascii=False,
             indent=2,
@@ -715,6 +990,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Expected labels for the full retention-ratio grid; repeat this option.",
     )
     parser.add_argument("--min-documents", type=int, default=DEFAULT_MIN_DOCUMENTS)
+    parser.add_argument("--bootstrap-samples", type=int, default=200)
+    parser.add_argument("--bootstrap-seed", type=int, default=20260911)
+    parser.add_argument("--heldout-fraction", type=float, default=0.30)
+    parser.add_argument("--split-seed", type=int, default=20260911)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
     if args.quality_metric is None:
@@ -729,6 +1008,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("epsilon must be non-negative")
     if any(value < 0 or value > 1 for value in args.alpha):
         parser.error("alpha must be in [0, 1]")
+    if args.bootstrap_samples < 0:
+        parser.error("bootstrap-samples must be non-negative")
+    if not 0.0 < args.heldout_fraction < 1.0:
+        parser.error("heldout-fraction must be in (0, 1)")
     result = run_cli(args)
     print(
         json.dumps(

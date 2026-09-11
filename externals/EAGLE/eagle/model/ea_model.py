@@ -27,6 +27,24 @@ from .cnets1 import Model as Model1
 from .configs import EConfig
 
 
+def normalize_llama3_rope_config(config):
+    """Expose Transformers 5 ``rope_parameters`` to the vendored Llama code.
+
+    Transformers 5 moved Llama-3.1's frequency configuration from the legacy
+    ``rope_scaling`` field to ``rope_parameters``.  The upstream EAGLE KV
+    implementation still dispatches on ``config.rope_scaling``; when the
+    field is absent it silently falls back to plain RoPE, producing different
+    target logits and zero draft acceptance.
+    """
+
+    scaling = getattr(config, "rope_scaling", None)
+    parameters = getattr(config, "rope_parameters", None)
+    if isinstance(parameters, dict) and parameters.get("rope_type") == "llama3":
+        if not isinstance(scaling, dict) or scaling.get("rope_type") != "llama3":
+            config.rope_scaling = dict(parameters)
+    return config
+
+
 class EaModel(nn.Module):
 
     def __init__(
@@ -113,6 +131,7 @@ class EaModel(nn.Module):
     ):
         # assert Type=="LLaMA" or "Mixtral"
         base_config = AutoConfig.from_pretrained(base_model_path)
+        normalize_llama3_rope_config(base_config)
         # Transformers 5 no longer exposes rope_theta as a top-level field,
         # while the vendored EAGLE target and draft modules still use it.
         if not isinstance(getattr(base_config, "rope_theta", None), (int, float)):
@@ -145,6 +164,18 @@ class EaModel(nn.Module):
         else:
             base_model = KVMixtralForCausalLM.from_pretrained(
                 base_model_path, **model_kwargs
+            )
+
+        if isinstance(base_model, tuple):
+            base_model, loading_info = base_model
+            print(
+                "[EAGLE3] target loading info:",
+                {
+                    "missing_keys": len(loading_info.get("missing_keys", [])),
+                    "unexpected_keys": len(loading_info.get("unexpected_keys", [])),
+                    "mismatched_keys": len(loading_info.get("mismatched_keys", [])),
+                    "error_msgs": loading_info.get("error_msgs", [])[:3],
+                },
             )
 
         configpath = os.path.join(ea_model_path, "config.json")

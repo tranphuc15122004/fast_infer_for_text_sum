@@ -18,6 +18,7 @@ import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
 from common.paths import ROOT
 from common.reproducibility import seed_everything
 
@@ -204,7 +205,7 @@ def main() -> None:
         input_ids = encoded.input_ids.to(device)
         if args.max_input_tokens and args.max_input_tokens > 0 \
                 and input_ids.shape[1] > args.max_input_tokens:
-            input_ids = input_ids[:, : args.max_input_tokens]
+            input_ids = truncate_input_ids(input_ids, args.max_input_tokens).contiguous()
         input_len = int(input_ids.shape[1])
 
         if args.skip_reference:

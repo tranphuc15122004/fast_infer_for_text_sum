@@ -17,6 +17,7 @@ from common.benchmark_runtime import (
     runtime_metadata,
 )
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
 from common.reproducibility import seed_everything
 
 
@@ -72,11 +73,8 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def _prompt_batch(tokenizer: Any, prompt: str, *, max_input_tokens: int) -> torch.Tensor:
-    kwargs: dict[str, Any] = {"return_tensors": "pt"}
-    if max_input_tokens > 0:
-        kwargs.update({"truncation": True, "max_length": max_input_tokens})
-    encoded = tokenizer(prompt, **kwargs)
-    return encoded.input_ids
+    encoded = tokenizer(prompt, return_tensors="pt")
+    return truncate_input_ids(encoded.input_ids, max_input_tokens)
 
 
 def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> Any:

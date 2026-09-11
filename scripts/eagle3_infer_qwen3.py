@@ -36,11 +36,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from eagle.model.ea_model import EaModel  # noqa: E402
-from eagle.model.kv_cache import initialize_past_key_values  # noqa: E402
-
 from common import metrics, rouge  # noqa: E402
+from common.input_utils import truncate_input_ids  # noqa: E402
 from common.reproducibility import seed_everything  # noqa: E402
+
+
+EAGLE_LLAMA3_SYSTEM_PROMPT = (
+    "You are a helpful, respectful and honest assistant. Always answer as "
+    "helpfully as possible, while being safe.  Your answers should not include "
+    "any harmful, unethical, racist, sexist, toxic, dangerous, or illegal "
+    "content. Please ensure that your responses are socially unbiased and "
+    "positive in nature.\n\nIf a question does not make any sense, or is not "
+    "factually coherent, explain why instead of answering something not "
+    "correct. If you don't know the answer to a question, please don't share "
+    "false information."
+)
+
+
+def build_eagle_messages(prompt: str) -> list[dict[str, str]]:
+    """Use the system+user chat contract from upstream Llama-3 EAGLE."""
+
+    return [
+        {"role": "system", "content": EAGLE_LLAMA3_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
 
 def resolve_eagle_tree_config(
@@ -84,7 +103,7 @@ def load_questions(question_file: Path, begin: int, end: int) -> list[dict]:
 
 def build_input_ids(tokenizer, prompt: str, device) -> torch.Tensor:
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
+        build_eagle_messages(prompt),
         tokenize=True,
         add_generation_prompt=True,
         enable_thinking=False,
@@ -100,6 +119,7 @@ def timed_generate(
     max_new_tokens: int,
     total_token: int,
     spec: bool,
+    is_llama3: bool = True,
 ) -> tuple[torch.Tensor, int, int, float, list[int]]:
     """Run EAGLE (spec=True) or naive (spec=False) decoding.
 
@@ -117,6 +137,7 @@ def timed_generate(
             max_length=max_length,
             log=True,
             return_stats=True,
+            is_llama3=is_llama3,
         )
         steps = len(acceptance_lengths)
     else:
@@ -127,6 +148,7 @@ def timed_generate(
             max_length=max_length,
             log=True,
             return_stats=True,
+            is_llama3=is_llama3,
         )
         steps = int(idx) + 1
         acceptance_lengths = []
@@ -143,6 +165,67 @@ def decode_answer(tokenizer, output_ids: torch.Tensor, input_len: int) -> str:
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
+
+
+def target_logits_parity(
+    eagle_target,
+    reference_target,
+    input_ids: torch.Tensor,
+) -> dict[str, float | int | bool]:
+    """Compare the vendored KV target with stock Transformers on one prompt."""
+
+    with torch.inference_mode():
+        eagle_logits = eagle_target(input_ids, use_cache=False).logits[:, -1, :]
+        reference_logits = reference_target(input_ids, use_cache=False).logits[:, -1, :]
+    delta = (eagle_logits.float() - reference_logits.float()).abs()
+    eagle_top = int(eagle_logits.argmax(dim=-1)[0])
+    reference_top = int(reference_logits.argmax(dim=-1)[0])
+    return {
+        "max_abs_logit_delta": float(delta.max().item()),
+        "mean_abs_logit_delta": float(delta.mean().item()),
+        "eagle_top_token": eagle_top,
+        "reference_top_token": reference_top,
+        "top_token_match": eagle_top == reference_top,
+    }
+
+
+def target_hidden_diagnostics(
+    eagle_target,
+    reference_target,
+    input_ids: torch.Tensor,
+) -> dict[str, float]:
+    """Locate the first divergence between the vendored and stock target."""
+
+    with torch.inference_mode():
+        eagle_out = eagle_target(
+            input_ids, use_cache=False, output_hidden_states=True
+        )
+        reference_out = reference_target(
+            input_ids, use_cache=False, output_hidden_states=True
+        )
+
+    def max_delta(left: torch.Tensor, right: torch.Tensor) -> float:
+        return float((left.float() - right.float()).abs().max().item())
+
+    values = {
+        "embedding_weight_delta": max_delta(
+            eagle_target.model.embed_tokens.weight,
+            reference_target.model.embed_tokens.weight,
+        ),
+        "lm_head_weight_delta": max_delta(
+            eagle_target.lm_head.weight, reference_target.lm_head.weight
+        ),
+        "custom_logits_delta": max_delta(eagle_out.logits, reference_out.logits),
+    }
+    # The vendored model intentionally exposes three checkpoints (before
+    # layers 2, 16, and 29) rather than every hidden state.
+    for custom_idx, reference_idx in enumerate((2, 16, 29, 32)):
+        if custom_idx < len(eagle_out.hidden_states):
+            values[f"hidden_{reference_idx}_delta"] = max_delta(
+                eagle_out.hidden_states[custom_idx],
+                reference_out.hidden_states[reference_idx],
+            )
+    return values
 
 
 def main() -> None:
@@ -168,6 +251,8 @@ def main() -> None:
     )
     parser.add_argument("--skip-naive", action="store_true",
                         help="Skip the naive autoregressive baseline (no speedup reported)")
+    parser.add_argument("--check-target-parity", action="store_true",
+                        help="compare EaModel target logits with stock Transformers once")
     parser.add_argument("--smoke", action="store_true",
                         help="Run exactly one question with a short generation")
     parser.add_argument("--output", required=True)
@@ -196,6 +281,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("EAGLE3 inference requires a visible CUDA GPU")
 
+    # Keep --help and preflight cheap.  The vendored model imports custom
+    # attention/KV modules and may trigger CUDA extension discovery.
+    from eagle.model.ea_model import EaModel
+    from eagle.model.kv_cache import initialize_past_key_values
+
     questions = load_questions(
         Path(args.question_file), args.question_begin, args.question_end
     )
@@ -211,6 +301,7 @@ def main() -> None:
         top_k=args.top_k,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
+        output_loading_info=args.check_target_parity,
         # EAGLE3 builds tree tensors with .tolist(), so CPU/meta offloading
         # from device_map="auto" is not supported here. Keep both models on
         # the single Tesla T4.
@@ -219,6 +310,46 @@ def main() -> None:
     )
     model.eval()
     tokenizer = model.get_tokenizer()
+
+    parity: dict[str, float | int | bool] | None = None
+    if args.check_target_parity:
+        from transformers import AutoModelForCausalLM
+
+        target_config = model.base_model.config
+        target_attention = model.base_model.model.layers[0].self_attn
+        print(
+            "[EAGLE3] target RoPE config:",
+            {
+                "rope_scaling": getattr(target_config, "rope_scaling", None),
+                "rope_parameters": getattr(target_config, "rope_parameters", None),
+                "rope_theta": getattr(target_config, "rope_theta", None),
+                "rotary_impl": type(target_attention.rotary_emb).__name__,
+                "rotary_type": getattr(target_attention.rotary_emb, "rope_type", None),
+            },
+        )
+        print("Checking vendored EAGLE target logits against stock Transformers ...")
+        reference_target = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            dtype=torch.float16,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+        ).to("cuda").eval()
+        parity = target_logits_parity(
+            model.base_model,
+            reference_target,
+            build_input_ids(tokenizer, "Hello", "cuda"),
+        )
+        print(
+            "[EAGLE3] target hidden diagnostics:",
+            target_hidden_diagnostics(
+                model.base_model,
+                reference_target,
+                build_input_ids(tokenizer, "Hello", "cuda"),
+            ),
+        )
+        del reference_target
+        torch.cuda.empty_cache()
+        print(f"[EAGLE3] target parity: {parity}")
 
     # Tokenize every prompt up front. This also gives us the longest input so
     # the shared KV cache can be sized to fit *all* questions: EAGLE3 allocates
@@ -230,7 +361,10 @@ def main() -> None:
     if args.max_input_tokens and args.max_input_tokens > 0:
         # Cap long prompts (e.g. govreport) so the EAGLE KV cache and eager
         # attention fit a T4 16GB in smoke runs.
-        all_input_ids = [t[:, : args.max_input_tokens] for t in all_input_ids]
+        all_input_ids = [
+            truncate_input_ids(t, args.max_input_tokens).contiguous()
+            for t in all_input_ids
+        ]
     max_input_len = max(t.shape[1] for t in all_input_ids)
     kv_max_length = max_input_len + args.max_new_tokens + args.total_token + 32
     print(f"Max prompt length: {max_input_len}; KV cache max_length: {kv_max_length}")
@@ -253,6 +387,7 @@ def main() -> None:
             max_new_tokens=8,
             max_length=warmup_ids.shape[1] + 8 + args.total_token + 32,
             log=False,
+            is_llama3=True,
         )
         if not args.skip_naive:
             model.naivegenerate(
@@ -261,6 +396,7 @@ def main() -> None:
                 max_new_tokens=8,
                 max_length=warmup_ids.shape[1] + 8 + args.total_token + 32,
                 log=False,
+                is_llama3=True,
             )
     print("Warmup done.")
 
@@ -283,6 +419,7 @@ def main() -> None:
                     out_ids, new_tokens, tree_steps, eagle_time, acceptance_lengths = timed_generate(
                         model, input_ids, args.temperature,
                         args.max_new_tokens, args.total_token, spec=True,
+                        is_llama3=True,
                     )
                     answer = decode_answer(tokenizer, out_ids, input_len)
 
@@ -291,6 +428,7 @@ def main() -> None:
                         _, naive_tokens, _, naive_time, _ = timed_generate(
                             model, input_ids, args.temperature,
                             args.max_new_tokens, args.total_token, spec=False,
+                            is_llama3=True,
                         )
                     else:
                         naive_tokens, naive_time = None, None

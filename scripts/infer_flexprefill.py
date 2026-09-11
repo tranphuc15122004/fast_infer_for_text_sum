@@ -20,13 +20,14 @@ Records follow the baseline_repo_guide.md §13 schema.
 from __future__ import annotations
 
 import argparse
-import time
 from pathlib import Path
 
 import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
+from common.paired_generation import timed_generate
 
 
 def main() -> None:
@@ -99,21 +100,19 @@ def main() -> None:
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
         if args.max_input_tokens and args.max_input_tokens > 0 \
                 and ids.shape[1] > args.max_input_tokens:
-            ids = ids[:, : args.max_input_tokens]
+            ids = truncate_input_ids(ids, args.max_input_tokens).contiguous()
         return ids
 
     def _generate(ids: torch.Tensor) -> tuple[torch.Tensor, float]:
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            out = model.generate(
-                ids,
-                attention_mask=torch.ones_like(ids),
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        torch.cuda.synchronize()
-        return out, time.perf_counter() - t0
+        out, elapsed_ms = timed_generate(
+            model,
+            ids,
+            device=ids.device,
+            max_new_tokens=args.max_new_tokens,
+            attention_mask=torch.ones_like(ids),
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        return out, elapsed_ms / 1000.0
 
     warmup_ids = _build_input("Hello")
     with torch.inference_mode():
@@ -179,6 +178,8 @@ def main() -> None:
             record["dense_e2e_ms"] = round(d_elapsed * 1e3, 3)
             record["dense_output_tokens"] = d_n_tok
             record["dense_text"] = d_text
+            record["speedup_scope"] = "paired_dense"
+            record["speedup_valid"] = d_n_tok == n_tok
 
         rouge.add_rouge(record, text, sample.get("reference"))
         writer.add(record)

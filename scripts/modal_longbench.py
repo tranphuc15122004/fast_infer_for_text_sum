@@ -73,6 +73,20 @@ SOURCE_IGNORE = (
     "*.pyc",
 )
 
+# The canonical LongBench matrix does not import every legacy repository in
+# ``externals``.  Mount only the seven adapters it can dispatch; unrelated
+# work-in-progress files (notably the semantic-selection tree) cannot then
+# invalidate Modal's live-mount build during a GPU run.
+CANONICAL_EXTERNAL_DIRS = (
+    "EAGLE",
+    "FAFO",
+    "LongSpec",
+    "MagicDec",
+    "SSSD",
+    "SpecExtend",
+    "dflash",
+)
+
 
 def _truthy(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes"}
@@ -134,25 +148,24 @@ def _build_image() -> modal.Image:
             "flashinfer-cubin==0.6.12",
         )
 
-    return (
-        image.add_local_dir(
-            ROOT / "scripts",
-            str(REMOTE_ROOT / "scripts"),
+    image = image.add_local_dir(
+        ROOT / "scripts",
+        str(REMOTE_ROOT / "scripts"),
+        copy=False,
+        ignore=SOURCE_IGNORE,
+    )
+    for name in CANONICAL_EXTERNAL_DIRS:
+        image = image.add_local_dir(
+            ROOT / "externals" / name,
+            str(REMOTE_ROOT / "externals" / name),
             copy=False,
             ignore=SOURCE_IGNORE,
         )
-        .add_local_dir(
-            ROOT / "externals",
-            str(REMOTE_ROOT / "externals"),
-            copy=False,
-            ignore=SOURCE_IGNORE,
-        )
-        .add_local_dir(
-            ROOT / "data",
-            str(REMOTE_ROOT / "data"),
-            copy=False,
-            ignore=SOURCE_IGNORE + ("raw", "normalized"),
-        )
+    return image.add_local_dir(
+        ROOT / "data",
+        str(REMOTE_ROOT / "data"),
+        copy=False,
+        ignore=SOURCE_IGNORE + ("raw", "normalized"),
     )
 
 
@@ -171,6 +184,7 @@ def build_modal_env(
     strict: bool = True,
     collect: bool = True,
     python: str | Path | None = None,
+    eagle_target_parity: bool = False,
 ) -> dict[str, str]:
     """Return a server-independent master environment for the child runner."""
 
@@ -198,6 +212,7 @@ def build_modal_env(
         "LONG_BENCH_OUTPUT_DIR": str(output_dir),
         "LONG_BENCH_MODEL": model,
         "LONG_BENCH_EAGLE_MODEL": eagle_model,
+        "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY": "1" if eagle_target_parity else "0",
         "LONG_BENCH_DFLASH_MODEL": dflash_model,
         "LONG_BENCH_DEVICE": "cuda",
         "LONG_BENCH_GPU_IDS": "0",
@@ -361,6 +376,7 @@ def run_benchmark(
     allow_unsupported: bool = False,
     strict: bool = True,
     collect: bool = True,
+    eagle_target_parity: bool = False,
 ) -> dict[str, Any]:
     """Execute one serial benchmark matrix on one Modal GPU."""
 
@@ -383,6 +399,7 @@ def run_benchmark(
         strict=strict,
         collect=collect,
         python=runtime_python,
+        eagle_target_parity=eagle_target_parity,
     )
     environment["VIRTUAL_ENV"] = str(venv_dir)
     environment["PATH"] = os.pathsep.join(
@@ -461,6 +478,7 @@ def main(
     allow_unsupported: bool = False,
     strict: bool = True,
     collect: bool = True,
+    eagle_target_parity: bool = False,
 ) -> None:
     """Parse ``modal run`` flags and submit one remote benchmark job."""
 
@@ -483,6 +501,7 @@ def main(
         allow_unsupported=allow_unsupported,
         strict=strict,
         collect=collect,
+        eagle_target_parity=eagle_target_parity,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result.get("returncode", 1) != 0:

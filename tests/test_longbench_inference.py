@@ -204,6 +204,143 @@ def test_smoke_defaults_to_a_bounded_context_but_full_keeps_unlimited_inputs(mon
     assert run_longbench_200.resolve_max_input_tokens("smoke", 0) == 0
 
 
+def test_prompt_cap_preserves_both_context_head_and_instruction_suffix():
+    from common.input_utils import truncate_input_ids
+
+    ids = torch.arange(20).reshape(1, 20)
+    capped = truncate_input_ids(ids, 8, suffix_tokens=3)
+
+    assert capped.tolist() == [[0, 1, 2, 3, 4, 17, 18, 19]]
+    assert capped.shape == (1, 8)
+
+
+def test_prompt_cap_keeps_short_inputs_unchanged():
+    from common.input_utils import truncate_input_ids
+
+    ids = torch.arange(5).reshape(1, 5)
+
+    assert torch.equal(truncate_input_ids(ids, 8), ids)
+
+
+def test_vanilla_prompt_batch_preserves_instruction_suffix_when_capped():
+    from types import SimpleNamespace
+
+    from common.vanilla_inference import _prompt_batch
+
+    class FakeTokenizer:
+        def __call__(self, prompt, **kwargs):
+            return SimpleNamespace(input_ids=torch.arange(20).reshape(1, 20))
+
+    result = _prompt_batch(FakeTokenizer(), "document ... Summary:", max_input_tokens=8)
+
+    assert result.tolist() == [[0, 1, 2, 3, 16, 17, 18, 19]]
+
+
+def test_timed_generation_returns_output_and_synchronized_wall_time():
+    from common.paired_generation import timed_generate
+
+    class FakeModel:
+        def generate(self, input_ids, **kwargs):
+            extra = torch.full(
+                (input_ids.shape[0], kwargs["max_new_tokens"]),
+                7,
+                dtype=input_ids.dtype,
+            )
+            return torch.cat((input_ids, extra), dim=1)
+
+    ids = torch.tensor([[1, 2]])
+    output, elapsed_ms = timed_generate(
+        FakeModel(), ids, device=torch.device("cpu"), max_new_tokens=3
+    )
+
+    assert output.tolist() == [[1, 2, 7, 7, 7]]
+    assert elapsed_ms >= 0.0
+
+
+def test_speedup_ignores_pairs_with_different_output_lengths():
+    from common.metrics import aggregate_speedup
+
+    records = [
+        {
+            "dense_e2e_ms": 100.0,
+            "e2e_ms": 10.0,
+            "speedup_valid": False,
+        },
+        {
+            "dense_e2e_ms": 120.0,
+            "e2e_ms": 60.0,
+            "speedup_valid": True,
+        },
+    ]
+
+    assert aggregate_speedup(records)["esr"] == 2.0
+
+
+def test_eagle_help_does_not_import_heavy_model_modules():
+    result = subprocess.run(
+        [sys.executable, "scripts/eagle3_infer_qwen3.py", "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert "--base-model" in result.stdout
+
+
+def test_magicdec_parser_has_unique_options():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/infer_magicdec.py",
+            "--model-pth",
+            "checkpoint.pth",
+            "--model-name",
+            "model",
+            "--output",
+            "out.jsonl",
+            "--help",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_eagle_llama3_prompt_matches_upstream_chat_contract():
+    from eagle3_infer_qwen3 import EAGLE_LLAMA3_SYSTEM_PROMPT, build_eagle_messages
+
+    messages = build_eagle_messages("Summarize this document.")
+
+    assert messages[0] == {
+        "role": "system",
+        "content": EAGLE_LLAMA3_SYSTEM_PROMPT,
+    }
+    assert messages[1] == {
+        "role": "user",
+        "content": "Summarize this document.",
+    }
+
+
+def test_eagle_normalizes_transformers5_llama3_rope_parameters():
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(ROOT / "externals" / "EAGLE"))
+    from eagle.model.ea_model import normalize_llama3_rope_config
+
+    config = SimpleNamespace(
+        rope_scaling=None,
+        rope_parameters={"rope_type": "llama3", "factor": 8.0},
+    )
+
+    normalize_llama3_rope_config(config)
+
+    assert config.rope_scaling == config.rope_parameters
+
+
 def test_longbench_uses_long_form_output_and_profile_timeout_defaults(monkeypatch):
     import run_longbench_200
 
@@ -402,6 +539,20 @@ def test_dflash_external_reference_keeps_optional_timings_null():
 
     assert round_optional(None) is None
     assert round_optional(1.23456) == 1.235
+
+
+def test_magicdec_preflight_requires_checkpoint_before_launch(monkeypatch):
+    import common.longbench_adapter as adapter
+
+    monkeypatch.setattr(adapter.importlib.util, "find_spec", lambda name: object())
+    result = adapter.preflight_baseline(
+        "magicdec",
+        config={"model": "meta-llama/Meta-Llama-3.1-8B-Instruct"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_checkpoint"
+    assert "checkpoint" in result["reason"]
 
 
 def test_specextend_cache_capacity_uses_longest_prompt_and_generation_budget():

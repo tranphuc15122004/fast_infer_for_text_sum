@@ -24,6 +24,7 @@ export PYTHONPATH="$ROOT/externals/GemFilter${PYTHONPATH:+:$PYTHONPATH}"
 ARGS=(
   --topk "${TOPK:-1024}"
   --max-gen-len "${MAX_GEN_LEN:-32}"
+  --max-input-tokens "${MAX_INPUT_TOKENS:-0}"
   --num-runs "${NUM_RUNS:-2}"
   --output "$OUTPUT_FILE"
 )

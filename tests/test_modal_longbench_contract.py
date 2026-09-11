@@ -117,6 +117,15 @@ def test_modal_source_mount_excludes_outputs_and_local_runtime_artifacts():
     assert "checkpoints" in patterns
 
 
+def test_modal_mounts_only_canonical_longbench_external_repositories():
+    runner = load_modal_runner()
+
+    assert {"EAGLE", "FAFO", "LongSpec", "MagicDec", "SSSD", "SpecExtend", "dflash"} == set(
+        runner.CANONICAL_EXTERNAL_DIRS
+    )
+    assert "Sematic_selection" not in runner.CANONICAL_EXTERNAL_DIRS
+
+
 def test_modal_optional_cuda_extensions_have_a_devel_image_path():
     runner = load_modal_runner()
 

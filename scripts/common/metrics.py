@@ -380,6 +380,8 @@ def aggregate_speedup(records: Sequence[Mapping]) -> dict:
         dense_values: list[float] = []
         method_values: list[float] = []
         for record in records:
+            if record.get("speedup_valid") is False:
+                continue
             dense = _first_positive(record, (dense_key,))
             method = _first_positive(record, method_keys)
             if dense is None or method is None:

@@ -109,6 +109,12 @@ def get_model_answers(
             prompt, conversation = build_model_prompt(pipeline_config['model_name'], tokenizer, prompt, conversation)
         prompts.append(prompt)
         input_ids = tokenizer([prompt]).input_ids
+        max_input_tokens = int(pipeline_config.get("max_input_tokens", 0) or 0)
+        if max_input_tokens > 0 and len(input_ids[0]) > max_input_tokens:
+            # Keep the end of a long LongBench prompt: it contains the
+            # question/instruction after the document, while the beginning is
+            # mostly context that FAFO's smoke profile intentionally caps.
+            input_ids = [input_ids[0][-max_input_tokens:]]
         do_sample = temperature >= 1e-4 
         start_time = time.time()
         if pipeline_config['fafo']:

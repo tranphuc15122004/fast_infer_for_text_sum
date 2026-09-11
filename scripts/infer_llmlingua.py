@@ -27,6 +27,8 @@ import torch
 
 from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
+from common.input_utils import truncate_input_ids
+from common.paired_generation import timed_generate
 from common.paths import ROOT, snapshot_dir
 
 
@@ -113,10 +115,9 @@ def main() -> None:
         if args.max_input_tokens and args.max_input_tokens > 0:
             # Cap very long documents (e.g. govreport) so the target model's
             # full attention fits a T4 16GB in smoke runs.
-            enc = tokenizer(
-                source, truncation=True, max_length=args.max_input_tokens
-            )
-            source = tokenizer.decode(enc["input_ids"], skip_special_tokens=True)
+            enc = tokenizer(source, return_tensors="pt")
+            capped = truncate_input_ids(enc.input_ids, args.max_input_tokens)
+            source = tokenizer.decode(capped[0], skip_special_tokens=True)
         doc_id = doc["id"]
         keyword = doc["keyword"]  # distinctive entity expected to survive
 
@@ -150,15 +151,17 @@ def main() -> None:
         dense_output_tokens = None
         dense_reference_status = "measured"
         if _fits_model_context(dense_input_len, args.max_new_tokens, model):
-            t0 = time.perf_counter()
-            with torch.inference_mode():
-                dense_out = model.generate(
-                    dense_input_ids,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                )
-            dense_e2e_s = time.perf_counter() - t0
+            dense_out, dense_e2e_ms = timed_generate(
+                model,
+                dense_input_ids,
+                device=dense_input_ids.device,
+                max_new_tokens=args.max_new_tokens,
+            )
+            dense_e2e_s = dense_e2e_ms / 1000.0
             dense_output_tokens = int(dense_out[0, dense_input_len:].shape[0])
+            dense_text = tokenizer.decode(
+                dense_out[0, dense_input_len:], skip_special_tokens=True
+            ).strip()
         else:
             dense_reference_status = "skipped_context_limit"
             print(
@@ -173,14 +176,13 @@ def main() -> None:
         ).to(device)
         input_len = input_ids.shape[1]
 
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            out = model.generate(
-                input_ids,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-            )
-        e2e_s = time.perf_counter() - t0
+        out, e2e_ms = timed_generate(
+            model,
+            input_ids,
+            device=input_ids.device,
+            max_new_tokens=args.max_new_tokens,
+        )
+        e2e_s = e2e_ms / 1000.0
 
         output_ids = out[0, input_len:]
         output_tokens = int(output_ids.shape[0])
@@ -188,7 +190,7 @@ def main() -> None:
 
         record = {
             "method": "llmlingua",
-            "model": args.compressor_model,
+            "model": target_model,
             "dataset": Path(args.doc_file).name,
             "input_tokens": origin_tokens,
             "retained_tokens": compressed_tokens,
@@ -209,8 +211,14 @@ def main() -> None:
                 else None
             ),
             "dense_output_tokens": dense_output_tokens,
+            "dense_text": dense_text if dense_output_tokens is not None else None,
             "dense_reference_status": dense_reference_status,
             "pipeline_e2e_ms": round((compress_s + e2e_s) * 1e3, 3),
+            "speedup_scope": "paired_dense_plus_compression",
+            "speedup_valid": (
+                dense_output_tokens is not None
+                and dense_output_tokens == output_tokens
+            ),
             "summary": summary_text,
         }
         # ROUGE-1/2/L vs reference summary (nếu data có trường reference/answer)

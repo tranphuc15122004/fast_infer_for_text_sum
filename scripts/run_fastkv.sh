@@ -22,6 +22,7 @@ export FASTKV_DATA_ROOT="${FASTKV_DATA_ROOT:-${HF_HOME:-$HOME/.cache/huggingface
 
 ARGS=(
   --max-new-tokens "${MAX_NEW_TOKENS:-64}"
+  --max-input-tokens "${MAX_INPUT_TOKENS:-0}"
   --window-size "${WINDOW_SIZE:-1024}"
   --max-capacity-prompts "${MAX_CAPACITY_PROMPTS:-2048}"
   --retain-rate "${RETAIN_RATE:-0.1}"

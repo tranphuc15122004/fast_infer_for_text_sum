@@ -395,6 +395,15 @@ def preflight_baseline(
         }
         if not result["requirements"]["source"]["available"] and result["status"] == "ready":
             result.update(status="missing_dependency", reason="vendored MagicDec source is missing")
+        elif not ok and result["status"] == "ready":
+            result.update(
+                status="missing_checkpoint",
+                reason=(
+                    reason
+                    if reason and reason != "not configured"
+                    else "MagicDec checkpoint is not configured"
+                ),
+            )
         elif not result["requirements"]["flashinfer"]["available"] and result["status"] == "ready":
             result.update(status="missing_dependency", reason="flashinfer is required by MagicDec SnapKV")
 
@@ -595,11 +604,11 @@ def build_adapter_command(
             "--max-input-tokens",
             str(max_input),
             "--total-token",
-            str(cfg.get("eagle_total_token", 32)),
+            str(cfg.get("eagle_total_token", 60)),
             "--depth",
-            str(cfg.get("eagle_depth", 8)),
+            str(cfg.get("eagle_depth", 5)),
             "--top-k",
-            str(cfg.get("eagle_top_k", 4)),
+            str(cfg.get("eagle_top_k", 10)),
             "--temperature",
             temperature,
             "--seed",
@@ -609,6 +618,8 @@ def build_adapter_command(
         ] + (["--smoke"] if smoke else [])
         if bool(cfg.get("skip_reference")):
             command.append("--skip-naive")
+        if bool(cfg.get("eagle_check_target_parity")):
+            command.append("--check-target-parity")
         return command
 
     if baseline == "specextend":
@@ -685,6 +696,8 @@ def build_adapter_command(
             str(max_samples),
             "--max-new-tokens",
             str(max_new_tokens),
+            "--max-input-tokens",
+            str(max_input),
             "--kv-method",
             str(cfg.get("fafo_kv_method", "stream-llm")),
             "--seed",
@@ -732,9 +745,12 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
         "magicdec_model_name": values.get("LONG_BENCH_MAGICDEC_MODEL_NAME") or values.get("MODEL_MAGICDEC_NAME") or values.get("MODEL_TARGET"),
         "fafo_kv_method": values.get("LONG_BENCH_FAFO_KV_METHOD") or values.get("FAFO_KV_METHOD", "stream-llm"),
         "fafo_use_flash": values.get("FAFO_USE_FLASH", "0") == "1",
-        "eagle_total_token": int(values.get("LONG_BENCH_EAGLE_TOTAL_TOKEN", "32")),
-        "eagle_depth": int(values.get("LONG_BENCH_EAGLE_DEPTH", "8")),
-        "eagle_top_k": int(values.get("LONG_BENCH_EAGLE_TOP_K", "4")),
+        "eagle_total_token": int(values.get("LONG_BENCH_EAGLE_TOTAL_TOKEN", "60")),
+        "eagle_depth": int(values.get("LONG_BENCH_EAGLE_DEPTH", "5")),
+        "eagle_top_k": int(values.get("LONG_BENCH_EAGLE_TOP_K", "10")),
+        "eagle_check_target_parity": values.get(
+            "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY", "0"
+        ) == "1",
     }
 
 
