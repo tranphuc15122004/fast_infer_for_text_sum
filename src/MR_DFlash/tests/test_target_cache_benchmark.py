@@ -38,3 +38,50 @@ def test_benchmark_token_report_detects_exact_and_non_exact_outputs() -> None:
         "candidate_length": 4,
         "first_mismatch": 1,
     }
+
+
+def test_benchmark_defaults_to_both_attention_backends() -> None:
+    from target_cache_benchmark import resolve_attention_implementations
+
+    assert resolve_attention_implementations(None, None) == ["sdpa", "flash_attention_2"]
+    assert resolve_attention_implementations("sdpa", None) == ["sdpa"]
+    assert resolve_attention_implementations(None, ["eager", "sdpa"]) == ["eager", "sdpa"]
+
+
+def test_benchmark_rejects_conflicting_backend_options() -> None:
+    import pytest
+
+    from target_cache_benchmark import resolve_attention_implementations
+
+    with pytest.raises(ValueError, match="không được dùng đồng thời"):
+        resolve_attention_implementations("sdpa", ["flash_attention_2"])
+
+
+def test_benchmark_builds_cross_backend_speed_and_output_report() -> None:
+    from target_cache_benchmark import compare_backend_results
+
+    reports = {
+        "sdpa": {
+            "status": "success",
+            "hf_generate": {"generated_ids": [1, 2], "runs": [{"seconds": 4.0}]},
+            "current_causal_lm_full_capture": {"runs": [{"seconds": 6.0}]},
+            "backbone_only_full_capture": {"runs": [{"seconds": 3.0}]},
+            "fused_generate_capture": {"runs": [{"seconds": 5.0}]},
+            "summary": {"fused_generate_capture_s": 5.0},
+        },
+        "flash_attention_2": {
+            "status": "success",
+            "hf_generate": {"generated_ids": [1, 2], "runs": [{"seconds": 2.0}]},
+            "current_causal_lm_full_capture": {"runs": [{"seconds": 3.0}]},
+            "backbone_only_full_capture": {"runs": [{"seconds": 1.5}]},
+            "fused_generate_capture": {"runs": [{"seconds": 2.5}]},
+            "summary": {"fused_generate_capture_s": 2.5},
+        },
+    }
+
+    comparison = compare_backend_results(reports)
+
+    assert comparison["reference_backend"] == "sdpa"
+    assert comparison["flash_attention_2_vs_sdpa"]["hf_generate_speedup"] == 2.0
+    assert comparison["flash_attention_2_vs_sdpa"]["fused_generate_capture_speedup"] == 2.0
+    assert comparison["cross_backend_output"]["flash_attention_2"]["exact"] is True

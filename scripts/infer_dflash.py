@@ -30,6 +30,14 @@ DFLASH_ROOT = ROOT / "externals" / "dflash"
 if str(DFLASH_ROOT) not in sys.path:
     sys.path.insert(0, str(DFLASH_ROOT))
 
+_CANONICAL_LONGBENCH_DATASETS = {
+    "gov_report",
+    "qmsum",
+    "multi_news",
+    "lcc",
+    "repobench-p",
+}
+
 
 def round_optional(value: float | None, digits: int = 3) -> float | None:
     """Round an optional metric without fabricating an external reference."""
@@ -95,6 +103,15 @@ def _chat_prompt(tokenizer, prompt: str) -> str:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+
+
+def _format_prompt(tokenizer, sample: dict) -> str:
+    """Avoid applying a second chat template to rendered LongBench prompts."""
+
+    raw = sample.get("raw") or {}
+    if raw.get("dataset") in _CANONICAL_LONGBENCH_DATASETS:
+        return sample["prompt"]
+    return _chat_prompt(tokenizer, sample["prompt"])
 
 
 def _run_generation(dflash_generate, draft, target, input_ids, *, max_new_tokens,
@@ -200,7 +217,7 @@ def main() -> None:
     checks: list[tuple[bool, str]] = []
 
     for sample in prompts:
-        prompt = _chat_prompt(tokenizer, sample["prompt"])
+        prompt = _format_prompt(tokenizer, sample)
         encoded = tokenizer(prompt, return_tensors="pt")
         input_ids = encoded.input_ids.to(device)
         if args.max_input_tokens and args.max_input_tokens > 0 \
@@ -285,6 +302,11 @@ def main() -> None:
             "baseline_text": baseline_text,
             "block_size": block_size,
             "acceptance_lengths": list(result.acceptance_lengths),
+            "speedup_scope": "paired_dflash_block_size_1" if baseline is not None else None,
+            "speedup_valid": (
+                baseline is not None
+                and baseline_n_tok == n_tok
+            ),
         }
         if record["task_type"] == "code_completion":
             metrics.add_code_completion(record, text, sample.get("reference"))

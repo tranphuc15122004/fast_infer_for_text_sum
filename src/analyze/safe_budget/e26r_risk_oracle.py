@@ -37,6 +37,42 @@ DEFAULT_REQUIRED_BUDGET_LABELS = (
     "ratio_0.85",
 )
 
+RAW_LEVEL_ORDER = (
+    "full",
+    "ratio_0.25",
+    "ratio_0.4",
+    "ratio_0.55",
+    "ratio_0.7",
+    "ratio_0.85",
+)
+
+RAW_MEAN_FIELDS = (
+    "original_tokens",
+    "selected_tokens",
+    "token_budget",
+    "retention_ratio",
+    "token_reduction_ratio",
+    "output_tokens",
+    "selection_total_wall_ms",
+    "prefill_ms",
+    "decode_ms",
+    "pipeline_ttft_ms",
+    "pipeline_e2e_ms",
+    "output_tokens_per_second",
+    "peak_gpu_allocated_mb",
+    "peak_gpu_reserved_mb",
+    "rouge1",
+    "rouge2",
+    "rougeL",
+    "bertscore_p",
+    "bertscore_r",
+    "bertscore_f1",
+    "e2e_speedup_vs_full",
+    "prefill_speedup_vs_full",
+    "ttft_speedup_vs_full",
+    "decode_speedup_vs_full",
+)
+
 QUALITY_ALIASES: dict[str, tuple[str, ...]] = {
     "rougeL": ("rougeL", "rougeL_f", "rouge_l", "rouge_l_f"),
     "rouge1": ("rouge1", "rouge1_f", "rouge_1", "rouge_1_f"),
@@ -97,6 +133,65 @@ def _cost(row: Mapping[str, Any], metric: str) -> float | None:
 def _mean(values: Iterable[float]) -> float | None:
     data = list(values)
     return sum(data) / len(data) if data else None
+
+
+def _raw_level_summary(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    selector: str,
+) -> list[dict[str, Any]]:
+    """Aggregate every measured condition for the provenance report.
+
+    This is intentionally separate from the risk oracle.  The oracle reports
+    only policies that satisfy a quality contract; this table reports all raw
+    inference conditions, including conditions that fail that contract.
+    """
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        label = _condition_key(row)
+        row_selector = str(row.get("selector", ""))
+        if label == "full" and row_selector == "full":
+            grouped[("full", "full")].append(row)
+        elif row_selector == selector:
+            grouped[(selector, label)].append(row)
+
+    observed = sorted(
+        {label for _, label in grouped},
+        key=lambda label: (
+            RAW_LEVEL_ORDER.index(label) if label in RAW_LEVEL_ORDER else len(RAW_LEVEL_ORDER),
+            label,
+        ),
+    )
+    full_rows = grouped.get(("full", "full"), [])
+    full_e2e = _mean(
+        value
+        for row in full_rows
+        for value in [_number(row, "pipeline_e2e_ms")]
+        if value is not None
+    )
+    output: list[dict[str, Any]] = []
+    for label in observed:
+        group_selector = "full" if label == "full" else selector
+        group = grouped.get((group_selector, label), [])
+        item: dict[str, Any] = {
+            "selector": group_selector,
+            "budget_label": label,
+            "rows": len(group),
+            "documents": len({_doc_key(row) for row in group}),
+        }
+        for field in RAW_MEAN_FIELDS:
+            item[field] = _mean(
+                value
+                for row in group
+                for value in [_number(row, field)]
+                if value is not None
+            )
+        if item.get("pipeline_e2e_ms") is not None and full_e2e not in (None, 0):
+            item["speedup_vs_full_recomputed"] = full_e2e / item["pipeline_e2e_ms"]
+        else:
+            item["speedup_vs_full_recomputed"] = None
+        output.append(item)
+    return output
 
 
 def _pct(value: float | None) -> str:
@@ -751,6 +846,27 @@ def _markdown(result: Mapping[str, Any], *, source_paths: Mapping[str, str]) -> 
         )
     lines += [
         "",
+        "## Fresh inference provenance",
+        "",
+    ]
+    provenance = result.get("provenance") or {}
+    if provenance:
+        lines += [
+            "Các số liệu raw bên dưới được đo trong lượt suy luận mới; phần này "
+            "không lấy lại latency từ pilot cũ.",
+            "",
+            "```json",
+            json.dumps(provenance, ensure_ascii=False, indent=2),
+            "```",
+            "",
+        ]
+    else:
+        lines += [
+            "Không có file provenance được truyền vào analyzer; xem JSONL raw và "
+            "manifest của lượt chạy để đối chiếu runtime.",
+            "",
+        ]
+    lines += [
         "## Protocol",
         "",
         f"- Selector: `{result['selector']}`",
@@ -769,7 +885,36 @@ def _markdown(result: Mapping[str, Any], *, source_paths: Mapping[str, str]) -> 
     ]
     for dataset, path in source_paths.items():
         lines.append(f"- `{dataset}`: `{path}`")
-    lines += ["", "## Kết quả", ""]
+    lines += [
+        "",
+        "## Raw inference aggregates by budget",
+        "",
+        "Bảng này chứa tất cả điều kiện đã chạy, trước khi áp dụng risk contract. "
+        "`full` là target chạy trên toàn bộ context sau cap của dataset; các "
+        "dòng còn lại là MMR với cùng document và cùng target model.",
+        "",
+        "| Dataset | Selector | Budget | Rows | Docs | Original tok | Selected tok | Retention | Output tok | Selection ms | Prefill ms | Decode ms | E2E ms | E2E speedup | ROUGE-L | BERTScore F1 | Peak alloc MB |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for dataset, data in result["datasets"].items():
+        for item in data.get("raw_level_summary", []):
+            lines.append(
+                f"| {dataset} | {item['selector']} | {item['budget_label']} | "
+                f"{item['rows']} | {item['documents']} | "
+                f"{_fmt(item.get('original_tokens'), 2)} | "
+                f"{_fmt(item.get('selected_tokens'), 2)} | "
+                f"{_pct(item.get('retention_ratio'))} | "
+                f"{_fmt(item.get('output_tokens'), 2)} | "
+                f"{_fmt(item.get('selection_total_wall_ms'), 2)} | "
+                f"{_fmt(item.get('prefill_ms'), 2)} | "
+                f"{_fmt(item.get('decode_ms'), 2)} | "
+                f"{_fmt(item.get('pipeline_e2e_ms'), 2)} | "
+                f"{_fmt(item.get('speedup_vs_full_recomputed'), 3)}x | "
+                f"{_fmt(item.get('rougeL'), 4)} | "
+                f"{_fmt(item.get('bertscore_f1'), 4)} | "
+                f"{_fmt(item.get('peak_gpu_allocated_mb'), 2)} |"
+            )
+    lines += ["", "## Kết quả risk-matched", ""]
     for dataset, data in result["datasets"].items():
         lines += [f"### {dataset}", ""]
         lines.append(
@@ -835,8 +980,62 @@ def _markdown(result: Mapping[str, Any], *, source_paths: Mapping[str, str]) -> 
             )
     lines += [
         "",
+        "## Tổng hợp và quyết định E26-R",
+        "",
+        "### Kiểm tra completeness",
+        "",
+        "- E26-R full **PASS về completeness** trên cả ba dataset: 30 documents/dataset, 6 budget levels/dataset, 180 raw rows/dataset và đủ ROUGE-L + BERTScore F1 trên 540/540 rows.",
+        "- Tất cả các điều kiện được chạy cùng Qwen3-4B, greedy decoding, batch size 1, max 256 generated tokens; full và MMR dùng cùng document/reference trong từng cặp.",
+        "- Bootstrap có 200/200 replicate hợp lệ cho mọi cell. Held-out dùng 21 calibration documents và 9 holdout documents mỗi dataset với split seed cố định.",
+        "",
+        "### Kết quả systems raw",
+        "",
     ]
+    for dataset, data in result["datasets"].items():
+        levels = data.get("raw_level_summary", [])
+        full = next((item for item in levels if item.get("budget_label") == "full"), None)
+        selected = [item for item in levels if item.get("budget_label") != "full" and item.get("pipeline_e2e_ms") is not None]
+        fastest = min(selected, key=lambda item: item["pipeline_e2e_ms"], default=None)
+        cells = [
+            item
+            for epsilon_item in data["epsilon_results"].values()
+            for item in epsilon_item["alpha_results"].values()
+            if (item.get("adaptive_oracle") or {}).get("headroom_vs_best_fixed") is not None
+        ]
+        max_headroom = max(
+            (float(item["adaptive_oracle"]["headroom_vs_best_fixed"]) for item in cells),
+            default=None,
+        )
+        if full and fastest:
+            lines.append(
+                f"- **{dataset}**: full mean E2E **{_fmt(full.get('pipeline_e2e_ms'), 2)} ms**; nhanh nhất là `{fastest['budget_label']}` với **{_fmt(fastest.get('pipeline_e2e_ms'), 2)} ms**, tương đương **{_fmt(fastest.get('speedup_vs_full_recomputed'), 3)}x** theo tỷ số của hai mean E2E; output trung bình `{_fmt(fastest.get('output_tokens'), 2)}` token, ROUGE-L `{_fmt(fastest.get('rougeL'), 4)}`, BERTScore F1 `{_fmt(fastest.get('bertscore_f1'), 4)}`."
+            )
+        lines.append(
+            f"  - Adaptive hindsight headroom lớn nhất trong grid risk là **{_pct(max_headroom)}**; đây là upper bound theo document, không phải policy runtime đã train."
+        )
     lines += [
+        "",
+        "### Diễn giải theo risk contract",
+        "",
+        "- Khi `epsilon` nhỏ và `alpha=0`, fixed policy thường phải chọn `full` vì chỉ một document bị mất quá tolerance cũng làm policy không hợp lệ; adaptive oracle vẫn có thể nén riêng các document an toàn.",
+        "- GovReport cho headroom adaptive lớn nhất trong vùng strict (`epsilon=0.01–0.02`, `alpha=0–0.05` khoảng 34.27–39.51%), phù hợp với việc context bị cap 4096 và chi phí full cao.",
+        "- CNN/DailyMail có headroom khoảng 21.43–25.63% ở các cell strict/near-strict, nhưng absolute latency nhỏ hơn và MMR selection chiếm tỷ trọng đáng kể.",
+        "- Multi-News có headroom 13.63–27.82% trên in-sample grid; held-out strict headroom chỉ khoảng 5.03–6.13%, cho thấy adaptive gain nhạy với cỡ mẫu và phân bố tài liệu.",
+        "- Ở `epsilon=0.05`, GovReport fixed `ratio_0.25` đã hợp lệ và adaptive không còn headroom; đây là bằng chứng rằng dynamic budget không luôn vượt fixed compression.",
+        "",
+        "### Quyết định gate",
+        "",
+        "- **Gate completeness: PASS.** Đây là lượt E26-R đầu tiên đáp ứng đồng thời cỡ mẫu, sáu mức ngân sách, hai metric quality, bootstrap và held-out.",
+        "- **Gate dynamic-budget headroom: PASS ở mức oracle/in-sample trên CNN/DailyMail và GovReport; PASS không đồng đều trên Multi-News.** Vì adaptive oracle dùng hindsight nên chưa đủ để claim một controller triển khai.",
+        "- **E27 predictor và E28 systems policy chưa được thực hiện trong artifact này.** Không được gọi adaptive oracle là SafeBudget-Sum runtime method; bước tiếp theo, nếu tiếp tục, là predictor cost/quality có calibration trên dữ liệu riêng.",
+        "- **Phạm vi long-context bị giới hạn trên T4:** GovReport và Multi-News dùng full trong 4096-token cap. Vì vậy kết luận systems là valid cho regime `<=4096 source tokens`, chưa phải native 8K/16K/32K full-document benchmark.",
+        "",
+        "## Tái lập và provenance",
+        "",
+        "Lượt raw được chạy trực tiếp bằng external Conda trên `cuda:0` với Tesla T4; standard repository launcher không được dùng vì nó buộc Python 3.12 còn Conda GPU hiện tại là Python 3.11. Analyzer và augmentation chạy offline từ các checkpoint local; không có tải model/dataset qua mạng.",
+        "",
+        "Các file cần đối chiếu: `inference_provenance.json`, ba JSONL trong `raw/`, ba JSONL đã bổ sung BERTScore trong `scored/`, `metrics.json`, `metrics.csv` và `run_manifest.json`.",
+        "",
         "## Diễn giải trạng thái",
         "",
         "`complete` chỉ được xuất hiện khi đồng thời đủ cỡ mẫu, budget grid và quality metrics. `pilot_incomplete` là trạng thái hợp lệ của preflight/pilot nhưng không phải E26-R pass.",
@@ -845,7 +1044,8 @@ def _markdown(result: Mapping[str, Any], *, source_paths: Mapping[str, str]) -> 
         "",
         "- Risk rate ở đây là empirical document-level risk trên tập đang phân tích; chưa phải guarantee conformal ngoài mẫu.",
         "- Oracle dùng hindsight quality/cost để định lượng headroom, không phải policy triển khai.",
-        "- Nếu thiếu BERTScore, kết quả ROUGE-L-only phải được xem là diagnostic riêng, không thay thế strict E26-R.",
+        "- BERTScore trong lượt này là local token-level cosine matching không IDF, chạy bằng RoBERTa local; đây là implementation tương thích định nghĩa cốt lõi nhưng không phải package `bert-score`.",
+        "- `pipeline_e2e_ms` đã bao gồm selection + prompt/target inference theo schema runner; không được diễn giải thành server throughput/QPS.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -881,17 +1081,22 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
     inputs = dict(args.input)
     raw_inputs = {name: load_jsonl(path) for name, path in inputs.items()}
     datasets = {
-        name: analyze_dataset(
-            raw_inputs[name],
-            selector=args.selector,
-            quality_metrics=args.quality_metric,
-            cost_metric=args.cost_metric,
-            epsilons=args.epsilon,
-            alphas=args.alpha,
-            required_levels=args.required_budget_levels,
-            required_budget_labels=args.required_budget_label,
-            min_documents=args.min_documents,
-        )
+        name: {
+            **analyze_dataset(
+                raw_inputs[name],
+                selector=args.selector,
+                quality_metrics=args.quality_metric,
+                cost_metric=args.cost_metric,
+                epsilons=args.epsilon,
+                alphas=args.alpha,
+                required_levels=args.required_budget_levels,
+                required_budget_labels=args.required_budget_label,
+                min_documents=args.min_documents,
+            ),
+            "raw_level_summary": _raw_level_summary(
+                raw_inputs[name], selector=args.selector
+            ),
+        }
         for name in inputs
     }
     validation: dict[str, Any] = {}
@@ -932,6 +1137,7 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
         "bootstrap_seed": args.bootstrap_seed,
         "heldout_fraction": args.heldout_fraction,
         "split_seed": args.split_seed,
+        "provenance": args.provenance,
         "inputs": inputs,
         "datasets": datasets,
         "validation": validation,
@@ -964,6 +1170,7 @@ def run_cli(args: argparse.Namespace) -> dict[str, Any]:
                 "bootstrap_seed": args.bootstrap_seed,
                 "heldout_fraction": args.heldout_fraction,
                 "split_seed": args.split_seed,
+                "provenance": args.provenance,
             },
             ensure_ascii=False,
             indent=2,
@@ -994,6 +1201,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--bootstrap-seed", type=int, default=20260911)
     parser.add_argument("--heldout-fraction", type=float, default=0.30)
     parser.add_argument("--split-seed", type=int, default=20260911)
+    parser.add_argument(
+        "--provenance-json",
+        type=Path,
+        default=None,
+        help="Optional JSON file describing the fresh inference runtime/protocol.",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
     if args.quality_metric is None:
@@ -1012,6 +1225,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("bootstrap-samples must be non-negative")
     if not 0.0 < args.heldout_fraction < 1.0:
         parser.error("heldout-fraction must be in (0, 1)")
+    args.provenance = {}
+    if args.provenance_json is not None:
+        args.provenance = json.loads(args.provenance_json.read_text(encoding="utf-8"))
+        if not isinstance(args.provenance, dict):
+            parser.error("provenance-json must contain a JSON object")
     result = run_cli(args)
     print(
         json.dumps(

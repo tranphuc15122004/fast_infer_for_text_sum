@@ -116,7 +116,11 @@ def get_model_answers(
             # mostly context that FAFO's smoke profile intentionally caps.
             input_ids = [input_ids[0][-max_input_tokens:]]
         do_sample = temperature >= 1e-4 
-        start_time = time.time()
+        # Generation launches asynchronous CUDA work.  Synchronize both ends
+        # so the measured interval is device time, not host enqueue time.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
         if pipeline_config['fafo']:
             output_ids = model.generate(
                 torch.as_tensor(input_ids).cuda(),
@@ -144,7 +148,9 @@ def get_model_answers(
         input_len = len(input_ids[0])
         max_total_len = input_len + int(pipeline_config['n_new_tokens'])
         output_ids = output_ids[:, :max_total_len]
-        end_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
         gap_time = end_time - start_time 
         tokens = output_ids.numel() - len(input_ids[0])
         # The first question warms up torch.compile / flex-attention kernels;

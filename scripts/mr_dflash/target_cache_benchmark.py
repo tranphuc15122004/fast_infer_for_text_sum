@@ -33,6 +33,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -82,6 +83,101 @@ def compare_token_ids(reference: Iterable[int], candidate: Iterable[int]) -> dic
         "candidate_length": len(candidate),
         "first_mismatch": first_mismatch,
     }
+
+
+def resolve_attention_implementations(
+    single: Optional[str],
+    multiple: Optional[Sequence[str]],
+) -> list[str]:
+    """Resolve CLI backend options; mặc định chạy cả SDPA và FlashAttention-2."""
+
+    if single is not None and multiple:
+        raise ValueError("không được dùng đồng thời --attn-implementation và --attn-implementations")
+    if multiple:
+        values = [str(value) for value in multiple]
+    elif single is not None:
+        values = [str(single)]
+    else:
+        values = ["sdpa", "flash_attention_2"]
+    if not values:
+        raise ValueError("cần ít nhất một attention backend")
+    return list(dict.fromkeys(values))
+
+
+def _median_seconds(section: dict[str, Any]) -> Optional[float]:
+    values = [float(run["seconds"]) for run in section.get("runs", [])]
+    return float(statistics.median(values)) if values else None
+
+
+def _speedup(reference: Optional[float], candidate: Optional[float]) -> Optional[float]:
+    if reference is None or candidate is None or candidate <= 0:
+        return None
+    return reference / candidate
+
+
+def compare_backend_results(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Tạo bảng so sánh backend từ các report đã chạy thành công."""
+
+    successful = [name for name, report in reports.items() if report.get("status") == "success"]
+    if not successful:
+        return {"reference_backend": None, "cross_backend_output": {}, "speed": {}}
+    reference = "sdpa" if "sdpa" in successful else successful[0]
+    reference_report = reports[reference]
+    reference_ids = reference_report.get("hf_generate", {}).get("generated_ids", [])
+    cross_output = {
+        name: compare_token_ids(
+            reference_ids,
+            report.get("hf_generate", {}).get("generated_ids", []),
+        )
+        for name, report in reports.items()
+        if report.get("status") == "success"
+    }
+    metric_sections = {
+        "hf_generate": "hf_generate",
+        "current_causal_lm_full_capture": "current_causal_lm_full_capture",
+        "backbone_only_full_capture": "backbone_only_full_capture",
+        "fused_generate_capture": "fused_generate_capture",
+    }
+    reference_times = {
+        name: _median_seconds(reference_report.get(section, {}))
+        for name, section in metric_sections.items()
+    }
+    speed: dict[str, dict[str, Optional[float]]] = {}
+    for name in successful:
+        times = {
+            metric: _median_seconds(reports[name].get(section, {}))
+            for metric, section in metric_sections.items()
+        }
+        speed[name] = {
+            f"{metric}_s": value for metric, value in times.items()
+        }
+        speed[name].update(
+            {
+                f"{metric}_speedup_vs_{reference}": _speedup(reference_times[metric], value)
+                for metric, value in times.items()
+            }
+        )
+    comparison: dict[str, Any] = {
+        "reference_backend": reference,
+        "cross_backend_output": cross_output,
+        "speed": speed,
+    }
+    if "sdpa" in successful and "flash_attention_2" in successful:
+        flash_times = speed["flash_attention_2"]
+        comparison["flash_attention_2_vs_sdpa"] = {
+            "hf_generate_speedup": flash_times["hf_generate_speedup_vs_sdpa"],
+            "current_causal_lm_full_capture_speedup": flash_times[
+                "current_causal_lm_full_capture_speedup_vs_sdpa"
+            ],
+            "backbone_only_full_capture_speedup": flash_times[
+                "backbone_only_full_capture_speedup_vs_sdpa"
+            ],
+            "fused_generate_capture_speedup": flash_times[
+                "fused_generate_capture_speedup_vs_sdpa"
+            ],
+            "output_exact": cross_output["flash_attention_2"]["exact"],
+        }
+    return comparison
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -395,7 +491,10 @@ def _cleanup_model(model: Optional[torch.nn.Module], device: torch.device) -> No
         torch.cuda.empty_cache()
 
 
-def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+def _run_single_benchmark(
+    args: argparse.Namespace,
+    attention_backend: str,
+) -> dict[str, Any]:
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     device = _resolve_device(args.device)
@@ -430,7 +529,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "target_model_path": args.target_model_path,
         "device": str(device),
         "torch_dtype": args.torch_dtype,
-        "requested_attention_backend": args.attn_implementation,
+        "status": "success",
+        "attention_backend": attention_backend,
         "target_layer_ids": list(layer_ids),
         "input": {**input_meta, "tokens": int(input_ids.shape[1])},
         "max_new_tokens": int(args.max_new_tokens),
@@ -443,7 +543,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         args.target_model_path,
         dtype=dtype,
         device=device,
-        attn_implementation=args.attn_implementation,
+        attn_implementation=attention_backend,
         local_files_only=load_local,
         target_revision=args.target_revision,
     )
@@ -534,7 +634,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         args.target_model_path,
         dtype=dtype,
         device=device,
-        attn_implementation=args.attn_implementation,
+        attn_implementation=attention_backend,
         local_files_only=load_local,
         target_revision=args.target_revision,
     )
@@ -566,21 +666,62 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         backbone_capture.close()
         _cleanup_model(backbone, device)
 
-    current_seconds = current_cache_runs[0]["seconds"] + baseline_runs[0]["seconds"]
-    fused_seconds = fused_runs[0]["seconds"]
-    backbone_seconds = backbone_runs[0]["seconds"]
+    baseline_seconds = _median_seconds(result["hf_generate"])
+    current_capture_seconds = _median_seconds(result["current_causal_lm_full_capture"])
+    fused_seconds = _median_seconds(result["fused_generate_capture"])
+    backbone_seconds = _median_seconds(result["backbone_only_full_capture"])
+    current_seconds = (
+        (baseline_seconds or 0.0) + (current_capture_seconds or 0.0)
+        if baseline_seconds is not None and current_capture_seconds is not None
+        else None
+    )
     result["summary"] = {
         "current_generate_plus_full_capture_s": current_seconds,
         "fused_generate_capture_s": fused_seconds,
         "backbone_only_capture_s": backbone_seconds,
         "fused_speedup_vs_current_generate_plus_capture": (
-            current_seconds / fused_seconds if fused_seconds > 0 else None
+            _speedup(current_seconds, fused_seconds)
         ),
         "backbone_speedup_vs_current_full_capture": (
-            current_cache_runs[0]["seconds"] / backbone_seconds if backbone_seconds > 0 else None
+            _speedup(current_capture_seconds, backbone_seconds)
         ),
     }
     return result
+
+
+def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    """Chạy tuần tự mọi backend và tổng hợp kết quả.
+
+    Model được load/giải phóng theo từng backend để không cần giữ hai bản
+    Qwen3-4B trên GPU cùng lúc. Nếu một backend không khả dụng (ví dụ thiếu
+    FlashAttention-2), report backend đó là ``error`` nhưng vẫn giữ kết quả
+    của backend còn lại.
+    """
+
+    backends = resolve_attention_implementations(
+        args.attn_implementation,
+        args.attn_implementations,
+    )
+    reports: dict[str, dict[str, Any]] = {}
+    for backend in backends:
+        try:
+            reports[backend] = _run_single_benchmark(args, backend)
+        except Exception as exc:
+            reports[backend] = {
+                "status": "error",
+                "attention_backend": backend,
+                "error": repr(exc),
+            }
+            print(f"[benchmark] backend={backend} ERROR: {exc!r}", file=sys.stderr)
+            gc.collect()
+            if args.device != "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    return {
+        "status": "success" if all(report.get("status") == "success" for report in reports.values()) else "partial",
+        "requested_attention_backends": backends,
+        "backends": reports,
+        "comparison": compare_backend_results(reports),
+    }
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -596,7 +737,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--attn-implementation",
         choices=["auto", "sdpa", "flash_attention_2", "eager"],
-        default="auto",
+        default=None,
+        help="chạy riêng một backend; nếu bỏ qua sẽ chạy cả SDPA và FlashAttention-2",
+    )
+    parser.add_argument(
+        "--attn-implementations",
+        nargs="+",
+        choices=["auto", "sdpa", "flash_attention_2", "eager"],
+        default=None,
+        help="danh sách backend chạy tuần tự trong một invocation",
     )
     parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--device", default="auto")
@@ -634,4 +783,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

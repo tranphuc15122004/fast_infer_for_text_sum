@@ -86,10 +86,16 @@ def run_ar_eval(model_id, questions, model, tokenizer, pipeline_config, eval_con
             else:
                 gen_kwargs.update(do_sample=False)
 
-            start_time = time.time()
+            # Match FAFO's device-synchronized timing contract.  Without the
+            # barriers, the host timer mostly measures CUDA enqueue overhead.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
             # Plain auto-regressive generation (stock HF decode; no lookahead).
             output_ids = model.generate(input_ids, attention_mask=attention_mask, **gen_kwargs)
-            gap_time = time.time() - start_time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            gap_time = time.perf_counter() - start_time
 
             tokens = output_ids.numel() - len(input_ids[0])
             # Skip the first question (warmup) so one-time kernel compilation /

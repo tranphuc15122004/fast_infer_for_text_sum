@@ -416,17 +416,20 @@ python3 scripts/mr_dflash/target_cache_benchmark.py \
   --sample-index 0 \
   --max-new-tokens 128 \
   --target-layer-ids 1 9 17 25 33 \
-  --attn-implementation auto \
+  --attn-implementations sdpa flash_attention_2 \
   --device cuda --torch-dtype bfloat16 --local-files-only \
   --report /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/manifests/target_cache_benchmark_auto.json
 ```
 
-Để so sánh backend, chạy lại cùng sample với `--attn-implementation sdpa` và
-`--attn-implementation flash_attention_2`. Nếu FlashAttention-2 chưa được
-cài hoặc không tương thích với stack CUDA, script sẽ báo lỗi khi load model;
-không tự ghi nhận đó là một kết quả hợp lệ. Trước khi dùng tối ưu fused, cần
-kiểm tra `comparisons.hf_vs_fused_tokens.exact=true` và hidden comparison nằm
-trong tolerance đã chọn (`--atol`, `--rtol`).
+`--attn-implementations sdpa flash_attention_2` chạy tuần tự cả hai backend
+trong một invocation và tạo report tổng hợp ở `comparison`. Nếu
+FlashAttention-2 chưa được cài hoặc không tương thích với stack CUDA, backend
+đó được ghi là `status=error`, còn kết quả SDPA vẫn được giữ để chẩn đoán;
+không tự ghi nhận backend lỗi là một kết quả hợp lệ. Có thể chạy riêng một
+backend bằng `--attn-implementation sdpa` hoặc `--attn-implementation
+flash_attention_2`. Trước khi dùng tối ưu fused, cần
+kiểm tra `backends.<backend>.comparisons.hf_vs_fused_tokens.exact=true` và
+hidden comparison nằm trong tolerance đã chọn (`--atol`, `--rtol`).
 
 ```bash
 for split in train val test; do

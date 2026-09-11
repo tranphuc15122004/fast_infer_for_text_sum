@@ -47,6 +47,21 @@ def test_dflash_adapter_registers_vendored_module_path():
     assert str(ROOT / "externals" / "dflash") in sys.path
 
 
+def test_dflash_does_not_double_wrap_canonical_longbench_prompt():
+    module = _load_script("infer_dflash.py")
+
+    class Tokenizer:
+        def apply_chat_template(self, *args, **kwargs):
+            raise AssertionError("canonical LongBench prompt was re-templated")
+
+    sample = {
+        "prompt": "Summarize the rendered LongBench prompt.",
+        "raw": {"dataset": "lcc"},
+    }
+
+    assert module._format_prompt(Tokenizer(), sample) == sample["prompt"]
+
+
 def test_magicdec_adapter_registers_package_parent_path():
     module = _load_script("infer_magicdec.py")
 

@@ -313,6 +313,13 @@ def test_fafo_parser_forwards_smoke_context_limit():
     assert args.max_input_tokens == 1024
 
 
+def test_fafo_smoke_budget_matches_repository_smoke_budget():
+    module = _load_script("infer_fafo.py")
+
+    assert module.resolve_smoke_budget(32) == 8
+    assert module.resolve_smoke_budget(4) == 4
+
+
 def test_fafo_parser_accepts_aggregate_summary_log():
     module = _load_script("infer_fafo.py")
     parsed = module._parse_log(
@@ -354,6 +361,16 @@ def test_fafo_smoke_adds_hidden_compile_warmup_record():
 
     assert len(runtime_records) == 2
     assert runtime_records[0]["id"].startswith("__fafo_warmup__")
+    assert runtime_records[1]["id"] == "sample-1"
+
+
+def test_fafo_representative_single_sample_also_adds_hidden_compile_warmup():
+    module = _load_script("infer_fafo.py")
+
+    records = [{"id": "sample-1", "prompt": "hello", "reference": None}]
+    runtime_records = module.prepare_fafo_records(records, smoke=False)
+
+    assert len(runtime_records) == 2
     assert runtime_records[1]["id"] == "sample-1"
 
 

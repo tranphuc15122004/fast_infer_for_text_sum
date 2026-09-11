@@ -44,6 +44,11 @@ thêm entry vào `DATASETS` trong `externals/dflash/dflash/benchmark.py`.
 In bảng speedup + acceptance histogram (không ghi JSONL của riêng script này;
 bảng in ra terminal).
 
+Khi chạy qua LongBench adapter, DFlash ghi riêng DSR/decode speedup và ESR/e2e
+speedup. DFlash có thêm chi phí prefill cho draft + target; với output ngắn
+(ví dụ 32 token), ESR có thể thấp hơn 1 dù DSR vẫn lớn hơn 1. Đây là latency
+thực, không được loại bỏ khỏi e2e; output dài hơn mới cho thấy crossover.
+
 ## Troubleshooting
 
 - `--enable-thinking` bị cấm với draft Qwen3-4B/8B.

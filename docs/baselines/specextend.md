@@ -7,6 +7,10 @@ long-document summarization. Dựa trên `externals/SpecExtend`.
 
 - Env: **venv chung** tại `.venv` (Python 3.12, dependency từ `requirements.txt`).
 - `bash scripts/setup_venv.sh --offline`
+- Nhánh Llama 3.1 + EAGLE-3 cần import được `flash_attn`; nếu thiếu, code
+  upstream vẫn có thể chạy PyTorch prefix/tree fallback nhưng đó không phải
+  backend benchmark và thường cho speedup giả `<1`. LongBench preflight hiện
+  chặn cell này thay vì âm thầm đo fallback.
 - Full cần wheel `flash-attn` tương thích CUDA/GPU có sẵn trong wheelhouse local.
 
 ## Model
@@ -65,3 +69,6 @@ tự gắn). Đặt vào `data/` và trỏ `INPUT_FILE="data/<file>.jsonl"`.
   không có FlashAttention-2; tree kernel vẫn cần kiểm chứng riêng nếu backend
   Triton không compile được.
 - `eval_classic.py`/`eval_eagle.py` chạy sweep nhiều độ dài (dành cho GPU lớn).
+- Trên Modal, bật `MODAL_INSTALL_FLASH_ATTN=1` chỉ khi image đã có wheel/source
+  tương thích Torch/CUDA; nếu build wheel thất bại, giữ cell ở trạng thái
+  `missing_dependency` và không dùng số liệu PyTorch fallback để báo speedup.

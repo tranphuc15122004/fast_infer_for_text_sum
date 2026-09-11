@@ -49,7 +49,13 @@ from common.longbench_adapter import (  # noqa: E402
 )
 
 
-EXTERNAL_REFERENCE_BASELINES = {"eagle3", "dflash", "specextend"}
+EXTERNAL_REFERENCE_BASELINES = {
+    "eagle3",
+    "dflash",
+    "specextend",
+    "magicdec",
+    "fafo",
+}
 
 
 def _split(value: str | Sequence[str] | None) -> list[str]:
@@ -160,15 +166,48 @@ def _attach_external_reference_metrics(
             if reference.get(source) is not None:
                 row[f"external_reference_{source}"] = reference[source]
 
+        # A throughput ratio is meaningful only when both methods generated
+        # the same number of public output tokens.  FAFO can expose draft /
+        # lookahead tokens and older smoke runs compared 32 FAFO tokens with
+        # 8 Vanilla tokens, which produces a plausible but invalid speedup.
+        method_tokens = row.get("output_tokens")
+        reference_tokens = reference.get("output_tokens")
+        try:
+            method_tokens_int = int(method_tokens)
+            reference_tokens_int = int(reference_tokens)
+        except (TypeError, ValueError):
+            same_output_budget = False
+        else:
+            same_output_budget = (
+                method_tokens_int > 0
+                and reference_tokens_int > 0
+                and method_tokens_int == reference_tokens_int
+            )
+        row["speedup_valid"] = same_output_budget
+        if not same_output_budget:
+            row["speedup_invalid_reason"] = (
+                "output_token_count_mismatch_or_missing"
+            )
+
         spec_decode = row.get("decode_ms")
         ref_decode = reference.get("decode_ms")
-        if spec_decode and ref_decode and float(spec_decode) > 0:
+        if (
+            same_output_budget
+            and spec_decode
+            and ref_decode
+            and float(spec_decode) > 0
+        ):
             value = round(float(ref_decode) / float(spec_decode), 4)
             row["external_decode_speedup"] = value
             decode_pairs.append((float(ref_decode), float(spec_decode)))
         spec_e2e = row.get("e2e_ms")
         ref_e2e = reference.get("e2e_ms")
-        if spec_e2e and ref_e2e and float(spec_e2e) > 0:
+        if (
+            same_output_budget
+            and spec_e2e
+            and ref_e2e
+            and float(spec_e2e) > 0
+        ):
             value = round(float(ref_e2e) / float(spec_e2e), 4)
             row["external_e2e_speedup"] = value
             e2e_pairs.append((float(ref_e2e), float(spec_e2e)))

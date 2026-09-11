@@ -341,6 +341,36 @@ def test_eagle_normalizes_transformers5_llama3_rope_parameters():
     assert config.rope_scaling == config.rope_parameters
 
 
+def test_eagle_refreshes_zero_filled_llama3_rope_buffer():
+    from transformers import LlamaConfig
+
+    from eagle.model.modeling_llama_kv import LlamaAttention
+
+    config = LlamaConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        rope_theta=500000.0,
+        rope_scaling={
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        },
+    )
+    attention = LlamaAttention(config)
+    assert attention._uses_hf_llama3_rope
+
+    with torch.no_grad():
+        attention.rotary_emb.inv_freq.zero_()
+    attention._refresh_llama3_rope_buffers()
+
+    assert attention.rotary_emb.inv_freq[0].item() == 1.0
+    assert attention.rotary_emb.inv_freq.abs().max().item() > 0.0
+
+
 def test_longbench_uses_long_form_output_and_profile_timeout_defaults(monkeypatch):
     import run_longbench_200
 
@@ -555,6 +585,26 @@ def test_magicdec_preflight_requires_checkpoint_before_launch(monkeypatch):
     assert "checkpoint" in result["reason"]
 
 
+def test_specextend_preflight_rejects_slow_attention_fallback(monkeypatch):
+    import common.longbench_adapter as adapter
+
+    monkeypatch.setattr(
+        adapter,
+        "_module_importable",
+        lambda name: (False, "flash_attn is not installed")
+        if name == "flash_attn"
+        else (True, None),
+    )
+    result = adapter.preflight_baseline(
+        "specextend",
+        config={"model": "meta-llama/Meta-Llama-3.1-8B-Instruct"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert "fallback" in result["reason"]
+
+
 def test_specextend_cache_capacity_uses_longest_prompt_and_generation_budget():
     sys.path.insert(0, str(ROOT / "externals" / "SpecExtend" / "specextend"))
     from run_eagle import resolve_cache_max_length
@@ -706,12 +756,12 @@ def test_longbench_joins_external_reference_metrics_by_sample_id(tmp_path):
     reference = tmp_path / "vanilla_fa.jsonl"
     speculative = tmp_path / "eagle.jsonl"
     reference.write_text(
-        '{"sample_id":"x","decode_ms":100.0,"e2e_ms":200.0}\n'
+        '{"sample_id":"x","decode_ms":100.0,"e2e_ms":200.0,"output_tokens":32}\n'
         '{"type":"summary","method":"vanilla_fa"}\n',
         encoding="utf-8",
     )
     speculative.write_text(
-        '{"sample_id":"x","decode_ms":50.0,"e2e_ms":80.0}\n'
+        '{"sample_id":"x","decode_ms":50.0,"e2e_ms":80.0,"output_tokens":32}\n'
         '{"type":"summary","method":"eagle3"}\n',
         encoding="utf-8",
     )
@@ -727,6 +777,34 @@ def test_longbench_joins_external_reference_metrics_by_sample_id(tmp_path):
     assert row["external_decode_speedup"] == 2.0
     assert row["external_e2e_speedup"] == 2.5
     assert row["speedup_scope"] == "external_reference"
+    assert row["speedup_valid"] is True
+
+
+def test_longbench_rejects_external_speedup_when_output_budgets_differ(tmp_path):
+    from run_longbench_200 import _attach_external_reference_metrics
+
+    reference = tmp_path / "vanilla_fa.jsonl"
+    speculative = tmp_path / "fafo.jsonl"
+    reference.write_text(
+        '{"sample_id":"x","decode_ms":100.0,"e2e_ms":200.0,"output_tokens":8}\n'
+        '{"type":"summary","method":"vanilla_fa"}\n',
+        encoding="utf-8",
+    )
+    speculative.write_text(
+        '{"sample_id":"x","decode_ms":50.0,"e2e_ms":80.0,"output_tokens":32}\n'
+        '{"type":"summary","method":"fafo"}\n',
+        encoding="utf-8",
+    )
+
+    attached = _attach_external_reference_metrics(
+        speculative, reference, reference_baseline="vanilla_fa"
+    )
+
+    assert attached == 1
+    row = json.loads(speculative.read_text(encoding="utf-8").splitlines()[0])
+    assert row["speedup_valid"] is False
+    assert "external_decode_speedup" not in row
+    assert "external_e2e_speedup" not in row
 
 
 def test_eagle_converter_preserves_canonical_id_and_reference(tmp_path):

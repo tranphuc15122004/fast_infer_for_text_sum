@@ -294,11 +294,18 @@ class LMBackend:
           
     
     @torch.inference_mode()
-    def clear_kv(self):
-        for b in self.model.layers:
-            b.attention.kv_cache.kv_cache.zero_()
-            if self.is_spec:
-                b.attention.kv_cache.draft_cache.zero_()
+    def clear_kv(self, clear_memory: bool = False):
+        # The page tables and cache lengths fence every request's readable KV
+        # range.  ``encode`` overwrites every page used by the new prompt, so
+        # clearing the full model KV tensors here is unnecessary.  The old
+        # zero_() loop touched the complete [layers, pages, heads, dim] cache
+        # on every request and was included in the e2e/prefill timer.
+        # Keep an opt-in full clear for debugging stale-cache issues.
+        if clear_memory:
+            for b in self.model.layers:
+                b.attention.kv_cache.kv_cache.zero_()
+                if self.is_spec:
+                    b.attention.kv_cache.draft_cache.zero_()
         self.cachelens.zero_()
         self.qo_indptr = torch.arange(self.batch_size+1, dtype=torch.int32, device=self.device)
         self.paged_kv_indptr = torch.arange(self.batch_size+1, dtype=torch.int32, device=self.device)

@@ -189,45 +189,6 @@ def target_logits_parity(
     }
 
 
-def target_hidden_diagnostics(
-    eagle_target,
-    reference_target,
-    input_ids: torch.Tensor,
-) -> dict[str, float]:
-    """Locate the first divergence between the vendored and stock target."""
-
-    with torch.inference_mode():
-        eagle_out = eagle_target(
-            input_ids, use_cache=False, output_hidden_states=True
-        )
-        reference_out = reference_target(
-            input_ids, use_cache=False, output_hidden_states=True
-        )
-
-    def max_delta(left: torch.Tensor, right: torch.Tensor) -> float:
-        return float((left.float() - right.float()).abs().max().item())
-
-    values = {
-        "embedding_weight_delta": max_delta(
-            eagle_target.model.embed_tokens.weight,
-            reference_target.model.embed_tokens.weight,
-        ),
-        "lm_head_weight_delta": max_delta(
-            eagle_target.lm_head.weight, reference_target.lm_head.weight
-        ),
-        "custom_logits_delta": max_delta(eagle_out.logits, reference_out.logits),
-    }
-    # The vendored model intentionally exposes three checkpoints (before
-    # layers 2, 16, and 29) rather than every hidden state.
-    for custom_idx, reference_idx in enumerate((2, 16, 29, 32)):
-        if custom_idx < len(eagle_out.hidden_states):
-            values[f"hidden_{reference_idx}_delta"] = max_delta(
-                eagle_out.hidden_states[custom_idx],
-                reference_out.hidden_states[reference_idx],
-            )
-    return values
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model", required=True)
@@ -300,7 +261,11 @@ def main() -> None:
         depth=args.depth,
         top_k=args.top_k,
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
+        # Transformers 5's meta-device loader reports a clean state-dict
+        # audit for this vendored EAGLE class but leaves its parameters at
+        # initialization values.  Materialize the custom target normally so
+        # the upstream checkpoint tensors are copied into it.
+        low_cpu_mem_usage=False,
         output_loading_info=args.check_target_parity,
         # EAGLE3 builds tree tensors with .tolist(), so CPU/meta offloading
         # from device_map="auto" is not supported here. Keep both models on
@@ -317,6 +282,8 @@ def main() -> None:
 
         target_config = model.base_model.config
         target_attention = model.base_model.model.layers[0].self_attn
+        if hasattr(target_attention, "_refresh_llama3_rope_buffers"):
+            target_attention._refresh_llama3_rope_buffers()
         print(
             "[EAGLE3] target RoPE config:",
             {
@@ -324,7 +291,10 @@ def main() -> None:
                 "rope_parameters": getattr(target_config, "rope_parameters", None),
                 "rope_theta": getattr(target_config, "rope_theta", None),
                 "rotary_impl": type(target_attention.rotary_emb).__name__,
+                "rotary_module": type(target_attention.rotary_emb).__module__,
                 "rotary_type": getattr(target_attention.rotary_emb, "rope_type", None),
+                "uses_llama3_rope": getattr(target_attention, "_uses_llama3_rope", None),
+                "inv_freq_head": target_attention.rotary_emb.inv_freq[:4].detach().float().cpu().tolist(),
             },
         )
         print("Checking vendored EAGLE target logits against stock Transformers ...")
@@ -338,14 +308,6 @@ def main() -> None:
             model.base_model,
             reference_target,
             build_input_ids(tokenizer, "Hello", "cuda"),
-        )
-        print(
-            "[EAGLE3] target hidden diagnostics:",
-            target_hidden_diagnostics(
-                model.base_model,
-                reference_target,
-                build_input_ids(tokenizer, "Hello", "cuda"),
-            ),
         )
         del reference_target
         torch.cuda.empty_cache()

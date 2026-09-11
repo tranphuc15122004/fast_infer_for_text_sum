@@ -27,6 +27,7 @@ from common.reproducibility import seed_everything
 
 FAFO_ROOT = ROOT / "externals" / "FAFO"
 FAFO_PIPELINE_MAIN = "pipeline/fafo/main.py"
+FAFO_SMOKE_MAX_NEW_TOKENS = 8
 
 
 def _config_path(kv_method: str) -> Path:
@@ -118,13 +119,27 @@ def generated_tokens_within_budget(generated_tokens: int, max_new_tokens: int) -
 def prepare_fafo_records(
     records: list[dict[str, Any]], *, smoke: bool
 ) -> list[dict[str, Any]]:
-    """Add one hidden compile warmup when smoke has only one real request."""
+    """Add one hidden compile warmup when one real request is benchmarked.
 
-    if not smoke or len(records) != 1:
+    FAFO excludes the first request only when the evaluator receives more than
+    one question.  A one-sample representative run therefore used to include
+    torch.compile/flex-attention setup in the measured latency, even though a
+    multi-sample run did not.  Keep the warmup independent of ``smoke`` so the
+    timing contract is stable for both profiles.
+    """
+
+    del smoke  # retained in the API for callers/tests that pass profile state
+    if len(records) != 1:
         return records
     warmup = dict(records[0])
     warmup["id"] = f"__fafo_warmup__{records[0]['id']}"
     return [warmup, *records]
+
+
+def resolve_smoke_budget(max_new_tokens: int) -> int:
+    """Use the repository-wide smoke generation budget for fair pairing."""
+
+    return min(max(1, int(max_new_tokens)), FAFO_SMOKE_MAX_NEW_TOKENS)
 
 
 def _write_fafo_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -220,7 +235,7 @@ def main() -> None:
     seed_everything(args.seed)
     if args.smoke:
         args.max_samples = 1
-        args.max_new_tokens = min(args.max_new_tokens, 32)
+        args.max_new_tokens = resolve_smoke_budget(args.max_new_tokens)
 
     data_file = _resolve_repo_path(args.data_file)
     if data_file:
@@ -315,7 +330,7 @@ def main() -> None:
         "status": "success"
         if process_returncode == 0 and budget_ok
         else "failed",
-        "scope": "aggregate",
+        "scope": "sample" if len(records) == 1 else "aggregate",
         "model": args.model,
         "input_tokens": None,
         "retained_tokens": None,
@@ -334,6 +349,8 @@ def main() -> None:
         "verification_latency_ms": None,
         "rejected_draft_ratio": None,
         "sample_ids": [sample["id"] for sample in records],
+        "sample_id": records[0]["id"] if len(records) == 1 else None,
+        "warmup_injected": len(runtime_records) > len(records),
         "kv_method": args.kv_method,
         "smoke": args.smoke,
         "returncode": process_returncode,

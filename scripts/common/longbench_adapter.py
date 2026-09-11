@@ -260,12 +260,18 @@ def preflight_baseline(
     }
 
     if baseline == "vanilla_fa":
-        installed = importlib.util.find_spec("flash_attn") is not None
-        result["requirements"]["flash_attn"] = {"available": installed}
+        installed, import_reason = _module_importable("flash_attn")
+        result["requirements"]["flash_attn"] = {
+            "available": installed,
+            "reason": import_reason,
+        }
         if not installed and result["status"] == "ready":
             result.update(
                 status="missing_dependency",
-                reason="flash_attn is required by vanilla_fa; no fallback is allowed",
+                reason=(
+                    "flash_attn is required by vanilla_fa; no fallback is allowed "
+                    f"({import_reason})"
+                ),
             )
 
     if baseline == "eagle3":
@@ -327,6 +333,21 @@ def preflight_baseline(
         }
         if not result["requirements"]["source"]["available"] and result["status"] == "ready":
             result.update(status="missing_dependency", reason="vendored SpecExtend source is missing")
+        flash_attn_available, flash_attn_reason = _module_importable("flash_attn")
+        result["requirements"]["flash_attn"] = {
+            "available": flash_attn_available,
+            "reason": flash_attn_reason
+            if not flash_attn_available
+            else None,
+        }
+        if not flash_attn_available and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=(
+                    "flash_attn is required by the LongBench SpecExtend path; "
+                    "without it the adapter silently uses a slow fallback"
+                ),
+            )
 
     if baseline == "sssd":
         speculator_available, speculator_reason = _sssd_speculator_available(

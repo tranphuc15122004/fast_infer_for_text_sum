@@ -72,3 +72,10 @@ checkpoint phải được convert dưới thư mục có tên `llama-3.1-8b`, c
 - `flashinfer` wheel phải khớp torch/CUDA và phải có sẵn trong cache/wheelhouse
   local của server.
 - Model nhỏ (TinyLlama/llama-68m) hoặc int8 mới vừa T4 16GB.
+- Canonical LongBench reset page table và cache length trước mỗi prompt nhưng
+  không xoá toàn bộ tensor KV mặc định. Việc xoá toàn bộ cache đã được giữ ở
+  chế độ opt-in `LMBackend.clear_kv(clear_memory=True)` để debug stale-cache;
+  nếu đưa lệnh `zero_()` vào đường đo mặc định, latency sẽ bị phóng đại theo
+  kích thước cache.
+- Speedup external chỉ hợp lệ khi MagicDec và Vanilla sinh cùng số output
+  token; runner tự đánh dấu `speedup_valid=false` nếu budget/token count lệch.

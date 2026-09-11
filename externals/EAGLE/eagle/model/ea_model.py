@@ -45,6 +45,64 @@ def normalize_llama3_rope_config(config):
     return config
 
 
+def reload_target_checkpoint_weights(model, model_path):
+    """Load target shards directly into the vendored model parameters.
+
+    Transformers 5's conversion loader can report a clean load for this
+    legacy EAGLE class while leaving its parameters at construction values.
+    The upstream model code predates that loader, so use the checkpoint's
+    own tensor names and copy each tensor into the already-constructed model.
+    This path is intentionally limited to Transformers 5; the original
+    Transformers 4 runtime keeps the upstream loading behavior.
+    """
+
+    import transformers
+
+    if int(transformers.__version__.split(".", 1)[0]) < 5:
+        return
+
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    if os.path.isdir(model_path):
+        snapshot = model_path
+    else:
+        snapshot = snapshot_download(
+            model_path,
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+        )
+
+    index_path = os.path.join(snapshot, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, "r") as handle:
+            weight_map = json.load(handle)["weight_map"]
+        shard_names = sorted(set(weight_map.values()))
+    else:
+        shard_names = ["model.safetensors"]
+
+    loaded = 0
+    for shard_name in shard_names:
+        shard_path = os.path.join(snapshot, shard_name)
+        if not os.path.isfile(shard_path):
+            continue
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for key in shard.keys():
+                try:
+                    parameter = model.get_parameter(key)
+                except AttributeError:
+                    continue
+                tensor = shard.get_tensor(key)
+                with torch.no_grad():
+                    parameter.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+                loaded += 1
+
+    if loaded == 0:
+        raise RuntimeError(
+            f"Direct target reload found no safetensors parameters in {snapshot}"
+        )
+    print(f"[EAGLE3] direct target checkpoint reload: {loaded} tensors")
+
+
 class EaModel(nn.Module):
 
     def __init__(
@@ -177,6 +235,8 @@ class EaModel(nn.Module):
                     "error_msgs": loading_info.get("error_msgs", [])[:3],
                 },
             )
+
+        reload_target_checkpoint_weights(base_model, base_model_path)
 
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):

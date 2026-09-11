@@ -1,7 +1,7 @@
 # EAGLE-3
 
-Learned speculative decoding (EAGLE-3, Qwen3) — lossless under target
-verification. Dựa trên `externals/EAGLE`.
+Learned speculative decoding (EAGLE-3, Llama 3.1 8B Instruct) — lossless
+under target verification. Dựa trên `externals/EAGLE`.
 
 ## Env & cài đặt
 
@@ -12,8 +12,8 @@ verification. Dựa trên `externals/EAGLE`.
 
 | Vai trò | Model | Ghi chú |
 |---|---|---|
-| Base | `MODEL_TARGET` | đặt snapshot local trong master nếu server offline |
-| Draft | `MODEL_EAGLE_DRAFT` | đặt snapshot local trong master nếu server offline |
+| Base | `MODEL_TARGET` | `meta-llama/Meta-Llama-3.1-8B-Instruct` hoặc snapshot local |
+| Draft | `MODEL_EAGLE_DRAFT` | `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` hoặc snapshot local |
 
 ## Chạy smoke / thật
 
@@ -51,6 +51,19 @@ DATA_FILE="data/user_prompts.jsonl" bash scripts/run.sh eagle3
 
 `outputs/eagle3_qwen3_qa.jsonl` — per-question: new_tokens, tree_steps,
 accept_length, eagle/naive tok/s, speedup + summary cuối.
+
+Trên Transformers 5, loader legacy của EAGLE có thể báo load thành công nhưng
+không copy đủ tensor target và để buffer RoPE non-persistent ở trạng thái
+zero-filled. `ea_model.py` vì vậy có bước reload trực tiếp từ safetensors và
+`modeling_llama_kv.py` materialize lại Llama-3.1 RoPE trước forward. Có thể
+kiểm tra parity một lần bằng:
+
+```bash
+python scripts/eagle3_infer_qwen3.py --check-target-parity ...
+```
+
+Chỉ dùng speedup sau khi parity báo `top_token_match: True`; smoke có output
+rất ngắn nên tok/s chỉ là kiểm tra chức năng, không phải số liệu benchmark.
 
 ## Troubleshooting
 

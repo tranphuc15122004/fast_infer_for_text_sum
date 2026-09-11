@@ -36,3 +36,9 @@ bash scripts/run.sh fafo --smoke
 - Eval upstream GSM8K thêm prompt few-shot và trả timing/log aggregate; adapter
   chỉ dùng prompt đầu vào của workspace làm một câu hỏi smoke, không sửa file
   dataset/config vendored.
+- Khi chỉ chạy một mẫu, adapter tự thêm một mẫu ẩn để loại thời gian
+  `torch.compile`/FlexAttention của lần đầu; thời gian báo cáo lấy từ mẫu thật.
+  Smoke dùng chung budget 8 output token với Vanilla. Không so sánh speedup
+  nếu hai record có số output token khác nhau.
+- Timing upstream đã đồng bộ CUDA trước và sau `generate`; vì vậy throughput là
+  thời gian thực thi trên GPU thay vì chỉ là thời gian enqueue phía host.

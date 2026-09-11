@@ -606,33 +606,50 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
+        self._uses_llama3_rope = False
+        self._uses_hf_llama3_rope = False
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.config.rope_theta
             )
         else:
-            try:
-                scaling_type = self.config.rope_scaling["type"]
-                scaling_factor = self.config.rope_scaling["factor"]
-                if scaling_type == "linear":
-                    self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                        self.head_dim,
-                        max_position_embeddings=self.max_position_embeddings,
-                        scaling_factor=scaling_factor,
-                        base=self.config.rope_theta,
-                    )
-                elif scaling_type == "dynamic":
-                    self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                        self.head_dim,
-                        max_position_embeddings=self.max_position_embeddings,
-                        scaling_factor=scaling_factor,
-                        base=self.config.rope_theta,
-                    )
-                else:
-                    raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-            except:
-                # print("For LLaMA 31")
-                self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
+            scaling_type = self.config.rope_scaling.get(
+                "rope_type", self.config.rope_scaling.get("type")
+            )
+            scaling_factor = self.config.rope_scaling.get("factor", 1.0)
+            if scaling_type == "llama3":
+                # Transformers 5 owns the canonical Llama-3.1 RoPE
+                # implementation. Reuse it for the vendored target so the
+                # target and stock HF model share exactly the same
+                # normalization and frequency interpolation.
+                from transformers.models.llama.modeling_llama import (
+                    LlamaRotaryEmbedding as HFLlamaRotaryEmbedding,
+                )
+
+                try:
+                    self.rotary_emb = HFLlamaRotaryEmbedding(config=self.config)
+                    self._uses_hf_llama3_rope = True
+                except TypeError:
+                    # Transformers 4.x exposes the pre-config constructor;
+                    # retain the vendored Llama-3.1 implementation there.
+                    self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
+                self._uses_llama3_rope = True
+            elif scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.config.rope_theta,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.config.rope_theta,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return (
@@ -640,6 +657,38 @@ class LlamaAttention(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
+
+    def _refresh_llama3_rope_buffers(self):
+        """Materialize non-persistent HF RoPE buffers after meta loading.
+
+        Transformers' low-memory loader can leave the non-persistent
+        ``inv_freq`` buffer of ``LlamaRotaryEmbedding`` on ``meta`` (or as a
+        zero-filled buffer) even when all checkpoint parameters are loaded on
+        CUDA.  The stock model rebuilds this buffer during its own init; the
+        vendored EAGLE class must do the same lazily on the first real
+        forward.
+        """
+
+        if not self._uses_hf_llama3_rope:
+            return
+        device = self.q_proj.weight.device
+        current = self.rotary_emb.inv_freq
+        refresh = current.device != device
+        if not refresh:
+            refresh = not bool(torch.isfinite(current).all().item()) or not bool(
+                current.detach().float().abs().max().item() > 0
+            )
+        if not refresh:
+            return
+
+        from transformers.models.llama.modeling_llama import (
+            LlamaRotaryEmbedding as HFLlamaRotaryEmbedding,
+        )
+
+        refreshed = HFLlamaRotaryEmbedding(config=self.config, device=device)
+        self.rotary_emb.inv_freq = refreshed.inv_freq
+        self.rotary_emb.original_inv_freq = refreshed.original_inv_freq
+        self.rotary_emb.attention_scaling = refreshed.attention_scaling
 
     def forward(
             self,
@@ -698,7 +747,8 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        if isinstance(self.rotary_emb, LlamaRotaryEmbedding_L31):
+        if self._uses_llama3_rope:
+            self._refresh_llama3_rope_buffers()
             cos, sin = self.rotary_emb(query_states,position_ids)
             query_states, key_states = apply_rotary_pos_emb_L31(query_states, key_states, cos, sin)
         else:
@@ -1017,8 +1067,11 @@ class LlamaModel(LlamaPreTrainedModel):
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
                 input_shape,
-                # inputs_embeds.dtype,
-                torch.float32,  # [MODIFIED] force to cast to float32
+                # Match Transformers 5 eager attention: the causal mask is
+                # materialized in the same dtype as the hidden states.  The
+                # old vendored code forced float32 here, which changes the
+                # dtype of attention-score addition under fp16.
+                inputs_embeds.dtype,
                 device=inputs_embeds.device,
                 past_key_values_length=past_key_values_length,
             )
@@ -1131,12 +1184,19 @@ class LlamaModel(LlamaPreTrainedModel):
                 use_cache = False
 
         # decoder layers
-        all_hidden_states = () if 1 else None
+        # Keep the upstream EAGLE contract: even with output_hidden_states
+        # disabled it expects a small tuple of intermediate states.  Expose
+        # every layer only for the explicit parity diagnostic.
+        all_hidden_states = ()
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
-            if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
+            if output_hidden_states or idx in {
+                len(self.layers) - 3,
+                len(self.layers) // 2,
+                2,
+            }:
                 all_hidden_states += (hidden_states,)
 
             past_key_value = (
