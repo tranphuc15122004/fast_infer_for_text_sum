@@ -93,6 +93,18 @@ def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> 
     return model.generate(input_ids, attention_mask=attention_mask, **kwargs)
 
 
+def _warmup_args(args: argparse.Namespace, *, max_new_tokens: int = 8) -> argparse.Namespace:
+    """Copy generation args with a short warmup budget.
+
+    Warmup is for kernel/cache initialization, not for measuring long-form
+    generation.  Reusing the benchmark's full output budget here can waste
+    minutes before the first sample when the configured budget is 2048+.
+    """
+    values = vars(args).copy()
+    values["max_new_tokens"] = min(int(args.max_new_tokens), int(max_new_tokens))
+    return argparse.Namespace(**values)
+
+
 def _next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     scores = logits[:, -1, :]
     if temperature > 0:
@@ -106,6 +118,65 @@ def _is_eos(token: torch.Tensor, eos_token_id: int | list[int] | None) -> bool:
         return False
     eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
     return int(token.reshape(-1)[0]) in {int(value) for value in eos_ids}
+
+
+def _build_decode_attention_mask(
+    input_ids: torch.Tensor, *, max_new_tokens: int
+) -> torch.Tensor:
+    """Allocate the complete 1D attention mask once for one request.
+
+    The old decode loop appended one column with ``torch.cat`` at every step.
+    Besides allocating repeatedly, that made long generations progressively
+    more expensive.  A full mask is tiny compared with model activations and
+    can be sliced as the KV cache grows.
+    """
+    total_tokens = int(input_ids.shape[1]) + max(int(max_new_tokens), 0)
+    return torch.ones(
+        (int(input_ids.shape[0]), total_tokens),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+
+
+def _build_static_cache(
+    model: Any,
+    *,
+    max_cache_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Any | None, str]:
+    """Build a preallocated Transformers cache when the runtime supports it.
+
+    ``DynamicCache`` concatenates K/V tensors during every generated token.
+    ``StaticCache`` writes into preallocated storage and is substantially more
+    suitable for the long, single-request generations used by this benchmark.
+    Older Transformers versions may not expose it or may reject a model
+    configuration; those versions retain the public ``generate`` fallback.
+    """
+    try:
+        from transformers.cache_utils import StaticCache
+    except (ImportError, ModuleNotFoundError):
+        return None, "dynamic"
+
+    config = getattr(model, "config", None)
+    if config is None:
+        return None, "dynamic"
+
+    try:
+        cache = StaticCache(
+            config=config,
+            max_cache_len=max(int(max_cache_len), 1),
+            device=device,
+            dtype=dtype,
+        )
+    except RuntimeError as exc:
+        # Never turn a real allocation failure into a slower second attempt.
+        if "out of memory" in str(exc).lower():
+            raise
+        return None, "dynamic"
+    except (AttributeError, TypeError, ValueError):
+        return None, "dynamic"
+    return cache, "static"
 
 
 def _timed_generate(
@@ -126,19 +197,37 @@ def _timed_generate(
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
     request_start = time.perf_counter()
-    attention_mask = torch.ones_like(input_ids, device=device)
+    input_length = int(input_ids.shape[1])
+    attention_mask = _build_decode_attention_mask(
+        input_ids, max_new_tokens=args.max_new_tokens
+    )
+    try:
+        model_dtype = next(model.parameters()).dtype
+    except (AttributeError, StopIteration):
+        model_dtype = _dtype(getattr(args, "dtype", "float32"))
+    static_cache, cache_backend = _build_static_cache(
+        model,
+        max_cache_len=input_length + int(args.max_new_tokens),
+        device=device,
+        dtype=model_dtype,
+    )
     try:
         prefill_start = time.perf_counter()
-        prefill = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-            return_dict=True,
-        )
+        prefill_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask[:, :input_length],
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if static_cache is not None:
+            prefill_kwargs["past_key_values"] = static_cache
+        prefill = model(**prefill_kwargs)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
-        past = prefill.past_key_values
+        past = getattr(prefill, "past_key_values", None)
+        if past is None:
+            past = static_cache
         next_token = _next_token(prefill.logits, args.temperature)
         generated = [next_token]
         eos_id = tokenizer.eos_token_id
@@ -146,17 +235,17 @@ def _timed_generate(
         decode_start = time.perf_counter()
         if not _is_eos(next_token, eos_id):
             for _ in range(max(args.max_new_tokens - 1, 0)):
-                attention_mask = torch.cat(
-                    (attention_mask, torch.ones_like(next_token)), dim=1
-                )
+                current_length = input_length + len(generated)
                 step = model(
                     input_ids=next_token,
-                    attention_mask=attention_mask,
+                    attention_mask=attention_mask[:, :current_length],
                     past_key_values=past,
                     use_cache=True,
                     return_dict=True,
                 )
-                past = step.past_key_values
+                past = getattr(step, "past_key_values", None)
+                if past is None:
+                    past = static_cache
                 next_token = _next_token(step.logits, args.temperature)
                 generated.append(next_token)
                 if _is_eos(next_token, eos_id):
@@ -182,6 +271,8 @@ def _timed_generate(
             if peak_memory_gb is not None
             else None,
             "device": str(device),
+            "kv_cache_backend": cache_backend,
+            "attention_mask_strategy": "preallocated_slice",
         }
     except (AttributeError, IndexError, TypeError, ValueError):
         # Transformers 4.x and 5.x expose different cache classes/arguments.
@@ -196,6 +287,8 @@ def _timed_generate(
                 "ttft_ms": None,
                 "decode_ms": None,
                 "tpot_ms": None,
+                "kv_cache_backend": "generate",
+                "attention_mask_strategy": "generate",
             }
         )
         return output_ids, timing
@@ -260,6 +353,9 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         torch.cuda.synchronize(device)
     model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)
     metadata = runtime_metadata()
+    effective_attention_backend = getattr(
+        getattr(model, "config", None), "_attn_implementation", None
+    )
     config = {
         "device": str(device),
         "gpu_name": metadata.get("gpu_name"),
@@ -270,13 +366,19 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "max_new_tokens": args.max_new_tokens,
         "warmup_runs": args.warmup_runs,
         "batch_size": 1,
+        "extra_metrics": {
+            "requested_attention_backend": args.attention_backend,
+            "effective_attention_backend": effective_attention_backend
+            or "unknown",
+        },
     }
 
     with torch.inference_mode():
         seed_everything(args.seed)
         warmup_ids = _prompt_batch(tokenizer, "Hello", max_input_tokens=0).to(device)
+        warmup_args = _warmup_args(args)
         for _ in range(max(args.warmup_runs, 0)):
-            _generate(model, warmup_ids, args)
+            _generate(model, warmup_ids, warmup_args)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -296,7 +398,11 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             )
         new_ids = output_ids[0, input_tokens:]
         output_tokens = int(new_ids.shape[0])
-        text = tokenizer.decode(new_ids, skip_special_tokens=True)
+        text = tokenizer.decode(
+            new_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
         timing["model_load_ms"] = model_load_ms
         record = build_sample_record(
             method=method,
@@ -306,7 +412,16 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             timing=timing,
-            config=config,
+            config={
+                **config,
+                "extra_metrics": {
+                    **dict(config.get("extra_metrics", {}) or {}),
+                    "kv_cache_backend": timing.get("kv_cache_backend"),
+                    "attention_mask_strategy": timing.get(
+                        "attention_mask_strategy"
+                    ),
+                },
+            },
             text=text,
             reference_output=sample.get("reference"),
         )
@@ -317,7 +432,12 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         print(
             f"[{method}][{record['dataset']}][{sample['id']}] "
             f"input={input_tokens} output={output_tokens} "
-            f"e2e_ms={record['e2e_ms']} tok_s={record['throughput_tok_s']}"
+            f"prefill_ms={record['prefill_ms']} decode_ms={record['decode_ms']} "
+            f"e2e_ms={record['e2e_ms']} tok_s={record['throughput_tok_s']} "
+            f"decode_tok_s={record['decode_throughput_tok_s']} "
+            f"cache={record['extra_metrics'].get('kv_cache_backend')} "
+            f"attn={record['extra_metrics'].get('effective_attention_backend')}",
+            flush=True,
         )
 
     summary = {
@@ -331,6 +451,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "model": args.model,
         "model_load_ms": model_load_ms,
         "attention_backend": args.attention_backend,
+        "effective_attention_backend": effective_attention_backend or "unknown",
         "runtime": metadata,
     }
     writer.finalize(summary)

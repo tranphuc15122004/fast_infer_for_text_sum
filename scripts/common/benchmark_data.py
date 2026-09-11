@@ -281,7 +281,7 @@ def metric_family(task_type: str) -> str:
     raise ValueError(f"Unknown task type: {task_type!r}")
 
 
-def validate_output_dir(output_dir: Path, expected_count: int = 200) -> dict[str, Any]:
+def validate_output_dir(output_dir: Path, expected_count: int = 100) -> dict[str, Any]:
     output_dir = Path(output_dir)
     manifest_path = output_dir / "manifest.json"
     if not manifest_path.is_file():

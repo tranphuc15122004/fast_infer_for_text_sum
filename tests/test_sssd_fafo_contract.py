@@ -295,9 +295,10 @@ def test_fafo_command_uses_upstream_main_and_single_sample_configs():
     assert pipeline["pipeline_params"]["n_new_tokens"] == 16
     assert pipeline["pipeline_params"]["kv_cache_method"] == "stream-llm"
 
-    evaluation = module.build_eval_config("/tmp/one-sample.jsonl")
+    evaluation = module.build_eval_config("/tmp/one-sample.jsonl", max_new_tokens=16)
     assert evaluation["eval_params"]["dataset"] == "gsm8k"
     assert evaluation["eval_params"]["dataset_path"] == "/tmp/one-sample.jsonl"
+    assert evaluation["eval_params"]["max_new_tokens"] == 16
 
 
 def test_fafo_parser_accepts_aggregate_summary_log():
@@ -312,6 +313,24 @@ FAFO LOG - OVERALL GEN: 16 STEPS: 9 AVG COMPRESS RATIO: 1.7777777777777777
     assert parsed["output_tokens"] == 16
     assert parsed["e2e_s"] == 11.303385496139526
     assert parsed["throughput"] == 1.415505116185281
+
+
+def test_fafo_budget_validation_rejects_lookahead_tokens():
+    module = _load_script("infer_fafo.py")
+
+    assert module.generated_tokens_within_budget(8, 8)
+    assert not module.generated_tokens_within_budget(16, 8)
+
+
+def test_fafo_smoke_adds_hidden_compile_warmup_record():
+    module = _load_script("infer_fafo.py")
+
+    records = [{"id": "sample-1", "prompt": "hello", "reference": None}]
+    runtime_records = module.prepare_fafo_records(records, smoke=True)
+
+    assert len(runtime_records) == 2
+    assert runtime_records[0]["id"].startswith("__fafo_warmup__")
+    assert runtime_records[1]["id"] == "sample-1"
 
 
 def test_master_example_documents_llama_sssd_fafo_defaults():

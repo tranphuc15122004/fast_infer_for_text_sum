@@ -40,13 +40,24 @@ cd "$ROOT"
 export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
 
 read -r -a selector_args <<< "${SELECTORS:-random lead tfidf textrank mmr}"
+budget_flag="--token-budgets"
 if [[ "${SMOKE:-0}" == "1" ]]; then
-  read -r -a budget_args <<< "${SMOKE_TOKEN_BUDGETS:-512}"
+  if [[ -n "${RETENTION_RATIOS:-}" ]]; then
+    read -r -a budget_args <<< "${RETENTION_RATIOS}"
+    budget_flag="--retention-ratios"
+  else
+    read -r -a budget_args <<< "${SMOKE_TOKEN_BUDGETS:-512}"
+  fi
   max_new_tokens="${MAX_NEW_TOKENS:-128}"
   max_new_tokens=$((max_new_tokens < 32 ? max_new_tokens : 32))
   limit=1
 else
-  read -r -a budget_args <<< "${TOKEN_BUDGETS:-512 1024 2048}"
+  if [[ -n "${RETENTION_RATIOS:-}" ]]; then
+    read -r -a budget_args <<< "${RETENTION_RATIOS}"
+    budget_flag="--retention-ratios"
+  else
+    read -r -a budget_args <<< "${TOKEN_BUDGETS:-512 1024 2048}"
+  fi
   max_new_tokens="${MAX_NEW_TOKENS:-128}"
   limit="${MAX_SAMPLES:-5}"
 fi
@@ -59,7 +70,7 @@ ARGS=(
   --reference-field "${REFERENCE_FIELD:-reference}"
   --limit "$limit"
   --selectors "${selector_args[@]}"
-  --token-budgets "${budget_args[@]}"
+  "${budget_flag}" "${budget_args[@]}"
   --model "$MODEL"
   --device "${DEVICE:-auto}"
   --dtype "${DTYPE:-auto}"

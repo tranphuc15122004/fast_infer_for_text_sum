@@ -1,16 +1,16 @@
 # Plug-and-play dữ liệu cho các baseline
 
-## Bộ canonical LongBench 1.000 mẫu
+## Bộ canonical LongBench 500 mẫu, tối đa 14k token
 
-Bộ test chính thức của repo nằm ở `data/longbench_200/`, gồm năm file JSONL:
+Bộ test chính thức của repo nằm ở `data/longbench_100_14k/`, gồm năm file JSONL:
 
 | File | Loại | Số mẫu |
 |---|---|---:|
-| `gov_report.jsonl` | summarization | 200 |
-| `qmsum.jsonl` | summarization/query | 200 |
-| `multi_news.jsonl` | summarization | 200 |
-| `lcc.jsonl` | code completion | 200 |
-| `repobench-p.jsonl` | code completion | 200 |
+| `gov_report.jsonl` | summarization | 100 |
+| `qmsum.jsonl` | summarization/query | 100 |
+| `multi_news.jsonl` | summarization | 100 |
+| `lcc.jsonl` | code completion | 100 |
+| `repobench-p.jsonl` | code completion | 100 |
 
 `manifest.json` lưu seed, tokenizer, source count, token statistics, danh sách
 ID và checksum của từng file. Nguồn LongBench được mirror local; builder không
@@ -45,10 +45,11 @@ Build lại từ mirror local:
 python scripts/build_longbench_200.py \
   --source-dir /path/to/LongBench \
   --tokenizer /path/to/Meta-Llama-3.1-8B-Instruct \
-  --output-dir data/longbench_200 \
-  --seed 42
+  --output-dir data/longbench_100_14k \
+  --samples-per-dataset 100 --max-input-tokens 14000 \
+  --allow-partial --seed 42
 python scripts/validate_longbench_200.py \
-  --data-dir data/longbench_200 --expected-count 200
+  --data-dir data/longbench_100_14k --expected-count 100
 ```
 
 Để xem nhanh cấu trúc và nội dung mẫu của cả năm dataset:
@@ -65,7 +66,7 @@ python scripts/show_longbench_200.py \
   --samples 2 --context-chars 300 --field-chars 160
 ```
 
-Khi đánh giá, dùng `DATA_INPUT=data/longbench_200/<dataset>.jsonl`. Loader
+Khi đánh giá, dùng `DATA_INPUT=data/longbench_100_14k/<dataset>.jsonl`. Loader
 chung tự render prompt từ `dataset/context/input`; reference chung là
 `reference_output`. Ba task summarization dùng ROUGE/BLEU; hai task code
 completion dùng `code_exact_match` và `code_edit_similarity`, không dùng ROUGE.

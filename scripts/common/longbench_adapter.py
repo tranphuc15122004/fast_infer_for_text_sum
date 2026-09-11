@@ -1,4 +1,4 @@
-"""Registry and adapters for the canonical LongBench 9-baseline matrix.
+"""Registry and adapters for the canonical LongBench baseline matrix.
 
 The upstream projects do not share one command line or one input format.  This
 module keeps that translation in one place so the orchestrator can remain a
@@ -25,15 +25,22 @@ BASELINES = (
     "vanilla_hf",
     "vanilla_fa",
     "magicdec",
-    "longspec",
     "eagle3",
     "dflash",
     "specextend",
-    "sssd",
     "fafo",
 )
 
-CUDA_BASELINES = set(BASELINES)
+# These adapters remain available for standalone diagnostics, but are excluded
+# from the default LongBench comparison because their current server paths are
+# not comparable/reproducible (LongSpec is offline-incomplete; SSSD lacks its
+# native extension).  Keeping a separate registry lets old targeted tests and
+# one-off debugging commands fail or run explicitly without silently adding
+# either method back to the benchmark matrix.
+SUPPORTED_BASELINES = BASELINES + ("longspec", "sssd")
+DISABLED_MATRIX_BASELINES = ("longspec", "sssd")
+
+CUDA_BASELINES = set(SUPPORTED_BASELINES)
 
 # SSSD native extension resolution mirrors ``infer_sssd.py``: the extension is
 # used either from the pip-installed package in the shared runtime or from an
@@ -68,7 +75,7 @@ def convert_records_for_baseline(
 
     ``None`` means the canonical JSONL can be passed directly.  Conversion
     files are intentionally kept under the run directory and therefore become
-    part of the run artifact without modifying ``data/longbench_200``.
+    part of the run artifact without modifying ``data/longbench_100_14k``.
     """
 
     if baseline == "eagle3":
@@ -213,7 +220,7 @@ def preflight_baseline(
     raised exceptions, allowing a smoke matrix to explain every cell.
     """
 
-    if baseline not in BASELINES:
+    if baseline not in SUPPORTED_BASELINES:
         return {
             "status": "invalid_baseline",
             "reason": f"unknown baseline: {baseline}",
@@ -426,7 +433,7 @@ def build_adapter_command(
     converted checkpoint is still supplied separately from the HF tokenizer.
     """
 
-    if baseline not in BASELINES:
+    if baseline not in SUPPORTED_BASELINES:
         raise ValueError(f"unknown baseline: {baseline}")
     cfg = dict(config or {})
     if data_file is None or output is None:
@@ -516,7 +523,7 @@ def build_adapter_command(
         ] + (["--smoke"] if smoke else [])
 
     if baseline == "dflash":
-        return [
+        command = [
             python,
             str(ROOT / "scripts" / "infer_dflash.py"),
             "--target-model",
@@ -538,6 +545,9 @@ def build_adapter_command(
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])
+        if bool(cfg.get("skip_reference")):
+            command.append("--skip-reference")
+        return command
 
     if baseline == "longspec":
         command = [
@@ -567,7 +577,7 @@ def build_adapter_command(
         return command
 
     if baseline == "eagle3":
-        return [
+        command = [
             python,
             str(ROOT / "scripts" / "eagle3_infer_qwen3.py"),
             "--base-model",
@@ -597,6 +607,9 @@ def build_adapter_command(
             "--output",
             str(output),
         ] + (["--smoke"] if smoke else [])
+        if bool(cfg.get("skip_reference")):
+            command.append("--skip-naive")
+        return command
 
     if baseline == "specextend":
         return [
@@ -727,6 +740,8 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
 
 __all__ = [
     "BASELINES",
+    "SUPPORTED_BASELINES",
+    "DISABLED_MATRIX_BASELINES",
     "baseline_config_from_env",
     "build_adapter_command",
     "convert_records_for_baseline",

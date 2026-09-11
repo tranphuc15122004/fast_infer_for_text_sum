@@ -73,6 +73,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 - **Hướng dẫn từng baseline (cài đặt + infer)**: [`docs/README.md`](docs/README.md)
   → `docs/baselines/*.md`
+- **Chạy LongBench representative trên Modal**: [`docs/modal_longbench.md`](docs/modal_longbench.md)
 - **Định dạng dữ liệu plug-and-play**: [`data/README.md`](data/README.md)
 - **Cấu trúc env / portability**: [`envs/README.md`](envs/README.md)
 - **Thiết kế thí nghiệm / taxonomy baseline**: [`externals/baseline_repo_guide.md`](externals/baseline_repo_guide.md)

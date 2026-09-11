@@ -42,7 +42,14 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
-def _new_manifest(source_dir: Path, tokenizer_ref: str, seed: int) -> dict[str, Any]:
+def _new_manifest(
+    source_dir: Path,
+    tokenizer_ref: str,
+    seed: int,
+    *,
+    samples_per_dataset: int | None = None,
+    max_input_tokens: int = 0,
+) -> dict[str, Any]:
     return {
         "schema_version": "longbench-canonical-v1",
         "seed": seed,
@@ -55,6 +62,11 @@ def _new_manifest(source_dir: Path, tokenizer_ref: str, seed: int) -> dict[str, 
         "datasets": {},
         "selected_ids": {},
         "file_sha256": {},
+        "selection": {
+            "samples_per_dataset": samples_per_dataset,
+            "max_input_tokens": max_input_tokens,
+            "policy": "eligible rows stratified into five input-length bins",
+        },
     }
 
 
@@ -76,6 +88,7 @@ def build_one_dataset(
     seed: int,
     *,
     tokenizer_ref: str = "test-tokenizer",
+    max_input_tokens: int = 0,
 ) -> list[dict[str, Any]]:
     source_path = Path(source_dir) / f"{dataset}.jsonl"
     if not source_path.is_file():
@@ -85,7 +98,23 @@ def build_one_dataset(
         canonicalize_record(dataset, index, row, tokenizer)
         for index, row in enumerate(source_rows)
     ]
-    selected = select_rows(canonical_rows, dataset, target_count, seed)
+    if max_input_tokens < 0:
+        raise ValueError("max_input_tokens must be >= 0")
+    eligible_rows = (
+        canonical_rows
+        if max_input_tokens == 0
+        else [
+            row
+            for row in canonical_rows
+            if int(row["input_tokens"]) <= max_input_tokens
+        ]
+    )
+    if len(eligible_rows) < target_count:
+        raise ValueError(
+            f"{dataset}: only {len(eligible_rows)} rows are <= "
+            f"{max_input_tokens} tokens; cannot select {target_count}"
+        )
+    selected = select_rows(eligible_rows, dataset, target_count, seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{dataset}.jsonl"
     write_jsonl(output_path, selected)
@@ -94,8 +123,24 @@ def build_one_dataset(
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
-        manifest = _new_manifest(Path(source_dir), tokenizer_ref, seed)
+        manifest = _new_manifest(
+            Path(source_dir),
+            tokenizer_ref,
+            seed,
+            samples_per_dataset=target_count,
+            max_input_tokens=max_input_tokens,
+        )
+    manifest.setdefault("selection", {})
+    manifest["selection"].update(
+        {
+            "samples_per_dataset": target_count,
+            "max_input_tokens": max_input_tokens,
+            "policy": "eligible rows stratified into five input-length bins",
+        }
+    )
     manifest["source_counts"][dataset] = len(source_rows)
+    manifest.setdefault("eligible_counts", {})
+    manifest["eligible_counts"][dataset] = len(eligible_rows)
     manifest["selected_counts"][dataset] = len(selected)
     manifest["datasets"][dataset] = token_stats(selected)
     manifest["selected_ids"][dataset] = [row["id"] for row in selected]
@@ -118,6 +163,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("data/longbench_200"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--samples-per-dataset", type=int, default=200)
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=0,
+        help=(
+            "only select rows whose canonical prompt fits this token cap; "
+            "0 keeps all rows"
+        ),
+    )
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -127,6 +181,8 @@ def main() -> int:
     args = parse_args()
     if args.samples_per_dataset <= 0:
         raise SystemExit("--samples-per-dataset must be positive")
+    if args.max_input_tokens < 0:
+        raise SystemExit("--max-input-tokens must be >= 0")
     if args.samples_per_dataset != 200 and not args.allow_partial:
         raise SystemExit("non-200 builds require --allow-partial")
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.force:
@@ -137,7 +193,13 @@ def main() -> int:
     load_prompt_templates()
     tokenizer = resolve_tokenizer(args.tokenizer)
     manifest_path = args.output_dir / "manifest.json"
-    manifest = _new_manifest(args.source_dir, args.tokenizer, args.seed)
+    manifest = _new_manifest(
+        args.source_dir,
+        args.tokenizer,
+        args.seed,
+        samples_per_dataset=args.samples_per_dataset,
+        max_input_tokens=args.max_input_tokens,
+    )
     _save_manifest(manifest_path, manifest)
 
     for index, dataset in enumerate(DATASETS, start=1):
@@ -156,6 +218,7 @@ def main() -> int:
             args.samples_per_dataset,
             args.seed,
             tokenizer_ref=args.tokenizer,
+            max_input_tokens=args.max_input_tokens,
         )
         print(
             f"[dataset {index}/{len(DATASETS)}] {dataset}: selected={len(selected)} "

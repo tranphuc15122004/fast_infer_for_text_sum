@@ -54,3 +54,7 @@ progress.md
 task_plan.md
 
 src/analyze/**/results/
+data/longbench_200/representive_log.txt
+data/longbench_200/smoke_log.txt
+data/debug
+.agents/

@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from common.benchmark_data import DATASETS, read_jsonl, token_stats  # noqa: E402
 
 
-DEFAULT_DATA_DIR = ROOT / "data" / "longbench_200"
+DEFAULT_DATA_DIR = ROOT / "data" / "longbench_100_14k"
 CODE_DATASETS = {"lcc", "repobench-p"}
 
 

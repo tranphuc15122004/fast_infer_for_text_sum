@@ -1,0 +1,20 @@
+# Public Modal image dependencies for the LongBench runner.
+#
+# This is intentionally separate from requirements.txt: the latter contains
+# server-only CUDA wheels and absolute file:// dependencies that do not exist
+# inside a fresh Modal image.
+accelerate==1.14.0
+datasets==5.0.0
+einops==0.8.2
+huggingface_hub==1.21.0
+numpy==2.2.6
+pandas==3.0.3
+protobuf==6.33.6
+psutil==7.2.2
+rouge_score==0.1.2
+safetensors==0.8.0
+sentencepiece==0.2.1
+tokenizers==0.22.2
+torch==2.11.0
+transformers==5.12.1
+tqdm==4.68.3

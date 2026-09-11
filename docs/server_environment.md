@@ -17,7 +17,7 @@ Master config:
 /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 
 LongBench canonical:
-/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_200
+/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k
 
 Legacy representative data:
 /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/representative_100
@@ -52,9 +52,10 @@ python3 scripts/setup_server_env.py --check
 python3 scripts/setup_server_env.py --all
 ```
 
-Script không ghi đè `fast_infer_master.env` đã tồn tại và không xoá dataset
-đã checkout. Nếu master config đã có, operator chỉnh các đường dẫn model,
-draft model, MagicDec `.pth` và SSSD datastore trực tiếp trong file đó.
+Script không ghi đè phần cấu hình operator-owned và không xoá dataset đã
+checkout. Nếu master config đã được tạo bởi script này, `--init` sẽ refresh
+block managed defaults (bao gồm `longbench_100_14k`); các đường dẫn model,
+draft model, MagicDec `.pth` và SSSD datastore vẫn do operator giữ nguyên.
 
 ## Chạy benchmark LongBench
 
@@ -68,7 +69,7 @@ python3 scripts/run_longbench_200.sh \
 ```
 
 Sau khi smoke pass, dùng `--mode representative` hoặc `--mode full`. Kết quả
-được ghi dưới `outputs/longbench_200/<run-id>/`; xem `run_manifest.json` và
+được ghi dưới `outputs/longbench_100_14k/<run-id>/`; xem `run_manifest.json` và
 `logs/` để kiểm tra từng cell.
 
 Các lỗi import/tương thích đã được xử lý trong source vendored và adapter nên

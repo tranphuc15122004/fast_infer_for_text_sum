@@ -2,9 +2,9 @@
 """Thu thập + tổng hợp toàn bộ metric (tốc độ + task-aware quality) từ các run
 baseline trên bộ dữ liệu canonical.
 
-Input : outputs/longbench_200/<baseline>_<dataset>.jsonl (schema §13,
+Input : outputs/longbench_100_14k/<baseline>_<dataset>.jsonl (schema §13,
         hoặc file output đơn lẻ; vẫn tương thích hậu tố legacy).
-Data  : data/longbench_200/<dataset>.jsonl — join reference/task type theo
+Data  : data/longbench_100_14k/<dataset>.jsonl — join reference/task type theo
         record id (doc_id/sample_id/question_id/id).
 Output: metrics_summary.json (đầy đủ) + metrics_summary.csv (bảng rộng)
         + metrics_summary.md (báo cáo đọc được) trong --outputs-dir.
@@ -35,8 +35,8 @@ from typing import Sequence
 from common import io_util, metrics
 from common.paths import ROOT
 
-DEFAULT_OUTPUTS_DIR = ROOT / "outputs" / "longbench_200"
-DEFAULT_DATA_DIR = ROOT / "data" / "longbench_200"
+DEFAULT_OUTPUTS_DIR = ROOT / "outputs" / "longbench_100_14k"
+DEFAULT_DATA_DIR = ROOT / "data" / "longbench_100_14k"
 
 # Thứ tự các text key trong record; prefix semantic tương ứng.
 TEXT_KEYS = [
@@ -381,6 +381,24 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
     speedup = metrics.aggregate_speedup(records)
     if speedup:
         group["speedup"] = speedup
+        scopes = sorted(
+            {
+                str(record["speedup_scope"])
+                for record in records
+                if record.get("speedup_scope")
+            }
+        )
+        if scopes:
+            group["speedup_scope"] = scopes[0] if len(scopes) == 1 else scopes
+        references = sorted(
+            {
+                str(record["external_reference_baseline"])
+                for record in records
+                if record.get("external_reference_baseline")
+            }
+        )
+        if references:
+            group["external_reference_baselines"] = references
     if semantic:
         group["semantic"] = semantic
     code_completion = metrics.aggregate_code_completion(records)

@@ -370,6 +370,31 @@ def test_preprocess_pipeline_plan_contains_debuggable_stages(tmp_path: Path) -> 
     assert all(str(tmp_path / "pilot") in " ".join(stage.command) for stage in plan)
 
 
+def test_cache_batch_option_names_long_context_regime_and_keeps_legacy_alias() -> None:
+    from run_preprocess_pipeline import parse_args
+
+    long_context = parse_args(["--cache-batch-size-long-context", "3"])
+    assert long_context.cache_batch_size_long_context == 3
+
+    legacy = parse_args(["--cache-batch-size-8k", "4"])
+    assert legacy.cache_batch_size_long_context == 4
+
+
+def test_full_context_cache_plan_uses_long_context_batch_size(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        cache_batch_size_long_context=3,
+    )
+    stage = next(stage for stage in build_stage_plan(options) if stage.name == "cache_full_train")
+    assert stage.command[stage.command.index("--batch-size") + 1] == "3"
+
+
 def test_preprocess_pipeline_full_context_preserves_generation_input(tmp_path: Path) -> None:
     from run_preprocess_pipeline import PipelineOptions, build_stage_plan
 

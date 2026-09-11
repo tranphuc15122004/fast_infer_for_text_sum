@@ -171,8 +171,11 @@ batch/context có thể chạy lại với `--resume`.
 
 Trên server có ba B200 dùng GPU vật lý `1,2,3`, thêm
 `--parallel-gpu-ids 1 2 3` vào command. Mỗi GPU chạy một worker target riêng,
-worker ghi shard riêng rồi parent kiểm tra coverage trước khi merge. Có thể
-bắt đầu với `--cache-batch-size-8k 2`; nếu peak VRAM cao thì giảm xuống `1`.
+worker ghi shard riêng rồi parent kiểm tra coverage trước khi merge. Dùng
+`--cache-batch-size-long-context 2` cho 8K; với 32K nên bắt đầu bằng `1`.
+Tham số này là số sample đồng thời trên mỗi GPU cho mọi context dài hơn 3K,
+không phải batch size 8K. Tên cũ `--cache-batch-size-8k` vẫn được hỗ trợ như
+alias tương thích.
 Log worker nằm trong các thư mục `.parallel_*/rank_*/worker.log`.
 
 ## Cách chạy
@@ -439,3 +442,19 @@ Pipeline thực nghiệm đã khóa cho câu hỏi MR-DFlash trên long context 
 Pipeline dùng target-generated JSONL + offline target feature shard; ba config
 công bằng là DFlash-2L, MR-DFlash-2S và
 DFlash-5L trong `configs/pilot_qwen3_4b/`.
+
+Có thể kiểm chứng hidden state của full forward và prefill/decode bằng KV cache
+trên một sample thật:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python3 scripts/mr_dflash/verify_kv_hidden_equivalence.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl \
+  --sample-index 0 --max-length 32768 --decode-tokens 0 \
+  --target-layer-ids 1 9 17 25 33 --device cuda \
+  --torch-dtype bfloat16 --local-files-only
+```
+
+`status=pass` chứng minh hidden ở prompt và các token continuation không đổi
+giữa hai cách chạy trong sai số BF16. Khi đó có thể nghiên cứu fused
+generate+capture để tránh teacher-forcing forward lần hai.

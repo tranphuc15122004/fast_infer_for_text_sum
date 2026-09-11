@@ -121,13 +121,17 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --max-new-tokens 2048 \
   --overflow-policy skip --sample-error-policy skip \
   --parallel-gpu-ids 1 2 3 \
-  --cache-batch-size-8k 2 \
+  --cache-batch-size-long-context 2 \
   --cache-splits train val \
   --resume
 ```
 
-`--cache-batch-size-8k 2` là điểm bắt đầu phù hợp cho B200 180 GB; nếu peak
-VRAM thực tế cao, hạ về `1`, còn không nên tăng cho tới khi pilot đo xong.
+`--cache-batch-size-long-context 2` nghĩa là mỗi worker/GPU cache đồng thời 2
+sample cho mọi regime dài hơn 3K (8K, 16K, 32K, ...). Nó không phải batch size
+8.000 sample hay 8.000 token. Đây là điểm bắt đầu phù hợp cho B200 180 GB;
+nếu peak VRAM thực tế cao, hạ về `1`, còn không nên tăng cho tới khi pilot đo
+xong. Tên cũ `--cache-batch-size-8k` vẫn được hỗ trợ như alias tương thích,
+nhưng không nên dùng cho các run 32K.
 Mỗi stage có worker log ở `.parallel_*/rank_*/worker.log`; trạng thái live ở
 `.parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
 pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
@@ -378,7 +382,10 @@ done
 
 Chạy sau khi đã validate và regenerate đúng context regime. `--batch-size`
 chỉ ảnh hưởng throughput của phase cache, không thay đổi batch/optimizer của
-training. Bắt đầu với 2 trên một B200 100 GB cho 3K; với 8K bắt đầu bằng 1.
+training. Với regime dài hơn 3K, tham số tương ứng trong pipeline là
+`--cache-batch-size-long-context`; giá trị của nó là số sample trên mỗi GPU,
+không phải độ dài context. Bắt đầu với 2 trên một B200 180 GB cho 8K và với
+1 cho 32K, sau đó tăng khi đã kiểm tra peak VRAM.
 `--bucket-buffer-size` giúp ghép các sample gần độ dài nhau.
 
 ```bash
@@ -502,3 +509,35 @@ PYTHONPATH=src python3 scripts/mr_dflash/summarize_pilot.py \
   --eval outputs/mr_dflash_pilot/eval_mr_2s.jsonl \
   --output outputs/mr_dflash_pilot/summary.json
 ```
+
+## Kiểm chứng hidden state với KV cache
+
+Target causal Transformer phải giữ nguyên hidden state ở các vị trí đã xử lý
+khi chuyển từ full forward sang prefill + decode bằng `past_key_values`. Có thể
+kiểm chứng trên một sample thật đã regenerate bằng:
+
+```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_for_text_sum-main
+export PYTHONPATH="$PWD/src"
+export CUDA_VISIBLE_DEVICES=1
+
+python3 scripts/mr_dflash/verify_kv_hidden_equivalence.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl \
+  --sample-index 0 \
+  --max-length 32768 \
+  --decode-tokens 0 \
+  --target-layer-ids 1 9 17 25 33 \
+  --device cuda \
+  --torch-dtype bfloat16 \
+  --local-files-only \\
+  --report /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/manifests/kv_hidden_check_sample_0.json
+```
+
+`--decode-tokens 0` so sánh toàn bộ response; có thể đặt một số dương để
+smoke test nhanh. Script dùng đúng continuation đã được target generate, nên
+hai đường chạy xử lý cùng một chuỗi token. Kết quả `status=pass` ở các layer
+được chọn là điều kiện cần để capture hidden trong lúc decode. Sai số được
+đánh giá ở float32 với mặc định `atol=rtol=0.05`, phù hợp với khác biệt số học
+có thể có khi chạy BF16. Test này xác nhận tính đúng đắn và loại bỏ forward
+lặp lại; nó chưa thay đổi cache pipeline hiện tại.

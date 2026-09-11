@@ -21,7 +21,9 @@ from pathlib import Path
 DEFAULT_SHARED_DATA_DIR = Path(
     "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data"
 )
-DATASETS = ("longbench_200", "representative_100")
+DATASETS = ("longbench_100_14k", "representative_100")
+MANAGED_BEGIN = "# BEGIN setup_server_env.py managed defaults"
+MANAGED_END = "# END setup_server_env.py managed defaults"
 
 
 class SetupError(RuntimeError):
@@ -98,7 +100,7 @@ def _paths(args: argparse.Namespace) -> dict[str, Path]:
         "pointer": repo / "config" / "master.path",
         "example": repo / "docs" / "fast_infer_master.example.env",
         "validator": repo / "scripts" / "validate_longbench_200.py",
-        "shared_longbench": shared / "longbench_200",
+        "shared_longbench": shared / "longbench_100_14k",
         "shared_representative": shared / "representative_100",
     }
 
@@ -107,23 +109,44 @@ def _generated_master_block(paths: dict[str, Path]) -> str:
     # Chỉ ghi các biến thuộc trách nhiệm của bootstrap. Model/checkpoint paths
     # vẫn do operator khai báo trong master config.
     return (
-        "\n\n# BEGIN setup_server_env.py managed defaults\n"
+        f"\n\n{MANAGED_BEGIN}\n"
         f"FI_PYTHON={_shell_value('python3')}\n"
         "FI_DEVICE=cuda\n"
         "FI_OFFLINE=1\n"
         f"DATA_ROOT={_shell_value(paths['shared'])}\n"
         f"LONG_BENCH_DATA_DIR={_shell_value(paths['shared_longbench'])}\n"
-        f"LONG_BENCH_OUTPUT_DIR={_shell_value(paths['repo'] / 'outputs' / 'longbench_200')}\n"
+        f"LONG_BENCH_OUTPUT_DIR={_shell_value(paths['repo'] / 'outputs' / 'longbench_100_14k')}\n"
         "LONG_BENCH_LOCAL_FILES_ONLY=1\n"
-        "# END setup_server_env.py managed defaults\n"
+        f"{MANAGED_END}\n"
     )
+
+
+def _refresh_managed_master(text: str, block: str) -> str | None:
+    """Replace only this script's managed block, preserving operator values."""
+
+    begin = text.find(MANAGED_BEGIN)
+    end_marker = text.find(MANAGED_END, begin if begin >= 0 else 0)
+    if begin < 0 or end_marker < 0:
+        return None
+    start = text.rfind("\n", 0, begin) + 1
+    end = text.find("\n", end_marker)
+    end = len(text) if end < 0 else end + 1
+    return text[:start].rstrip("\n") + block + text[end:]
 
 
 def _init_master(paths: dict[str, Path]) -> None:
     master = paths["master"]
     master.parent.mkdir(parents=True, exist_ok=True)
     if master.exists():
-        print(f"KEEP master config: {master}")
+        current = master.read_text(encoding="utf-8")
+        refreshed = _refresh_managed_master(
+            current, _generated_master_block(paths)
+        )
+        if refreshed is not None and refreshed != current:
+            master.write_text(refreshed, encoding="utf-8")
+            print(f"UPDATE managed master defaults: {master}")
+        else:
+            print(f"KEEP master config: {master}")
         return
     example = paths["example"]
     if not example.is_file():
@@ -189,7 +212,7 @@ def initialize(paths: dict[str, Path]) -> None:
     _init_data_dirs(paths)
     _init_master(paths)
     _init_pointer(paths)
-    _init_link(paths["repo"], paths["shared_longbench"], "longbench_200")
+    _init_link(paths["repo"], paths["shared_longbench"], "longbench_100_14k")
     _init_link(paths["repo"], paths["shared_representative"], "representative_100")
 
 
@@ -267,17 +290,17 @@ def _check_data(paths: dict[str, Path], *, validate: bool, python: str) -> None:
         "--data-dir",
         str(paths["shared_longbench"]),
         "--expected-count",
-        "200",
+        "100",
     ]
     result = subprocess.run(command, text=True, capture_output=True)
     if result.stdout:
         print(result.stdout.rstrip())
     if result.returncode != 0:
         raise SetupError(
-            "LongBench validation thất bại; hãy kiểm tra data/longbench_200.\n"
+            "LongBench validation thất bại; hãy kiểm tra data/longbench_100_14k.\n"
             + result.stderr.strip()
         )
-    print("PASS LongBench canonical data: 5 dataset files, 200 records/dataset")
+    print("PASS LongBench canonical data: 5 dataset files, 100 records/dataset")
 
 
 def _check_dependencies(paths: dict[str, Path], python: str, *, skip: bool) -> None:

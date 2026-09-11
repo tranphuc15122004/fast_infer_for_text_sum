@@ -141,6 +141,7 @@ def decode_answer(tokenizer, output_ids: torch.Tensor, input_len: int) -> str:
     return tokenizer.decode(
         output_ids[0, input_len:],
         skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     ).strip()
 
 

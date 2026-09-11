@@ -23,6 +23,14 @@ def seed_everything(seed: int) -> None:
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def resolve_cache_max_length(
+    max_input_length: int, max_gen_len: int, margin: int = 64
+) -> int:
+    """Capacity for the EAGLE KV cache shared by all benchmark samples."""
+
+    return max(1, int(max_input_length) + int(max_gen_len) + int(margin))
+
+
 def validate_eagle3_runtime() -> None:
     """Fail early when the fp16 Llama-3.1 + EAGLE-3 pair cannot fit."""
     if not torch.cuda.is_available():
@@ -185,11 +193,29 @@ def main():
             kwargs.update({"truncation": True, "max_length": args.max_input_tokens})
         return tokenizer(text, **kwargs)["input_ids"]
 
+    # EAGLE keeps ``past_key_values`` on the model between calls.  The old
+    # warmup allocated capacity from only the first prompt, so a later longer
+    # prompt could fail with ``start + length exceeds dimension size``.  Encode
+    # once, size one shared cache from the longest selected prompt, and use that
+    # capacity for both warmup and actual requests.
+    encoded_inputs = [encode(text).to(accelerator.device) for text in texts]
+    max_input_length = max(int(input_ids.shape[1]) for input_ids in encoded_inputs)
+    cache_max_length = resolve_cache_max_length(
+        max_input_length, args.max_gen_len
+    )
+    print(
+        colored(
+            f"Shared EAGLE cache capacity: max_input={max_input_length} "
+            f"max_new={args.max_gen_len} max_length={cache_max_length}",
+            "yellow",
+        ),
+        flush=True,
+    )
+
     # Warmup GPUs
     print(colored(f'Warming up GPUs...', 'yellow'))
     warmup_runs = int(os.environ.get("SPECEXTEND_WARMUP_RUNS", "3"))
-    for idx, text in enumerate(texts[:1]):
-        input_ids = encode(text).to(accelerator.device)
+    for input_ids in encoded_inputs[:1]:
 
         for _ in range(warmup_runs):
             if use_eagle3:
@@ -197,7 +223,7 @@ def main():
                     input_ids,
                     temperature=0,
                     max_new_tokens=5,
-                    max_length=input_ids.shape[1] + 64,
+                    max_length=cache_max_length,
                     is_llama3=True,
                 )
             else:
@@ -215,10 +241,9 @@ def main():
                 )
     print(colored(f'Warmup complete!', 'yellow'))
 
-    for idx, text in enumerate(texts):
+    for idx, input_ids in enumerate(encoded_inputs):
         seed_everything(seed)
         print(colored(f"\n=== Sample {idx+1}/{len(texts)} ===", 'yellow'))
-        input_ids = encode(text).to(accelerator.device)
 
         if use_eagle3:
             start = time.perf_counter()
@@ -226,7 +251,7 @@ def main():
                 input_ids,
                 temperature=0,
                 max_new_tokens=args.max_gen_len,
-                max_length=input_ids.shape[1] + args.max_gen_len + 64,
+                max_length=cache_max_length,
                 is_llama3=True,
                 log=True,
                 return_stats=True,

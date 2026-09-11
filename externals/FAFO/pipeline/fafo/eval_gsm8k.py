@@ -130,6 +130,14 @@ def get_model_answers(
                 top_k=0.0, top_p=1.0,
                 return_dict_in_generate=False
             )
+        # FAFO's speculative lookahead may return a tensor containing draft
+        # tokens beyond the public generation budget.  Those tokens are not a
+        # valid benchmark result and previously made an 8-token smoke request
+        # report 16 generated tokens.  Clamp the returned sequence before all
+        # timing, throughput and decoded-text accounting.
+        input_len = len(input_ids[0])
+        max_total_len = input_len + int(pipeline_config['n_new_tokens'])
+        output_ids = output_ids[:, :max_total_len]
         end_time = time.time()
         gap_time = end_time - start_time 
         tokens = output_ids.numel() - len(input_ids[0])
@@ -163,6 +171,7 @@ def get_model_answers(
         output = tokenizer.decode(
             output_ids,
             spaces_between_special_tokens=False,
+            clean_up_tokenization_spaces=False,
         )
         if conv is not None and conv.stop_str and output.find(conv.stop_str) > 0:
             output = output[: output.find(conv.stop_str)]

@@ -31,6 +31,13 @@ if str(MAGICDEC_PARENT) not in sys.path:
     sys.path.insert(0, str(MAGICDEC_PARENT))
 
 
+def resolve_generation_budget(max_new_tokens: int, *, warmup: bool = False) -> int:
+    """Keep compile/cache warmup bounded while preserving benchmark budget."""
+
+    budget = max(1, int(max_new_tokens))
+    return min(budget, 8) if warmup else budget
+
+
 def _canonical_next_token(logits, temperature: float):
     """Return one token from either MagicDec IDs or raw model logits.
 
@@ -92,7 +99,12 @@ def _run_canonical(args: argparse.Namespace) -> None:
     torch.cuda.synchronize(device)
     model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)
 
-    def generate(input_ids):
+    def generate(input_ids, *, max_new_tokens=None):
+        generation_budget = (
+            resolve_generation_budget(args.max_new_tokens)
+            if max_new_tokens is None
+            else max(1, int(max_new_tokens))
+        )
         if args.reset_peak_memory:
             torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -107,7 +119,7 @@ def _run_canonical(args: argparse.Namespace) -> None:
         eos = tokenizer.eos_token_id
         eos_ids = eos if isinstance(eos, list) else [eos]
         if int(next_token[0, 0]) not in {int(value) for value in eos_ids if value is not None}:
-            for _ in range(max(args.max_new_tokens - 1, 0)):
+            for _ in range(max(generation_budget - 1, 0)):
                 logits = engine.inference(next_token)
                 next_token = _canonical_next_token(logits, args.temperature)
                 generated.append(next_token)
@@ -129,7 +141,12 @@ def _run_canonical(args: argparse.Namespace) -> None:
     for _ in range(max(args.warmup_runs, 0)):
         seed_everything(args.seed)
         with torch.inference_mode():
-            generate(warmup_ids)
+            generate(
+                warmup_ids,
+                max_new_tokens=resolve_generation_budget(
+                    args.max_new_tokens, warmup=True
+                ),
+            )
 
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
@@ -138,7 +155,11 @@ def _run_canonical(args: argparse.Namespace) -> None:
             seed_everything(args.seed)
             output_ids, timing = generate(input_ids)
             new_ids = output_ids[0, input_ids.shape[1]:]
-            text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            text = tokenizer.decode(
+                new_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
             output_tokens = int(new_ids.shape[0])
             config = {
                 "device": str(device),

@@ -55,7 +55,7 @@ def test_init_creates_shared_master_pointer_and_dataset_links(tmp_path):
     assert master.is_file()
     pointer_lines = (repo / "config" / "master.path").read_text(encoding="utf-8").splitlines()
     assert next(line.strip() for line in pointer_lines if line.strip() and not line.lstrip().startswith("#")) == str(master)
-    for name in ("longbench_200", "representative_100"):
+    for name in ("longbench_100_14k", "representative_100"):
         link = repo / "data" / name
         assert link.is_symlink()
         assert link.resolve() == (shared / name).resolve()
@@ -74,7 +74,7 @@ def test_init_creates_shared_master_pointer_and_dataset_links(tmp_path):
     assert probe.returncode == 0, probe.stdout + probe.stderr
     assert probe.stdout.splitlines() == [
         "python3",
-        str(shared / "longbench_200"),
+        str(shared / "longbench_100_14k"),
         str(shared),
     ]
 
@@ -91,6 +91,28 @@ def test_init_does_not_overwrite_existing_master_config(tmp_path):
     second = _run(tmp_path, "--init")
     assert second.returncode == 0, second.stdout + second.stderr
     assert master.read_text(encoding="utf-8") == original
+
+
+def test_init_refreshes_only_existing_managed_master_defaults(tmp_path):
+    _make_repo(tmp_path)
+    first = _run(tmp_path, "--init")
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    master = tmp_path / "shared-data" / "fast_infer_master.env"
+    old_managed = master.read_text(encoding="utf-8").replace(
+        "longbench_100_14k", "longbench_200"
+    )
+    old_managed += "\nMODEL_TARGET=/models/operator-target\n"
+    master.write_text(old_managed, encoding="utf-8")
+
+    second = _run(tmp_path, "--init")
+    assert second.returncode == 0, second.stdout + second.stderr
+    refreshed = master.read_text(encoding="utf-8")
+    assert "LONG_BENCH_DATA_DIR=" + str(tmp_path / "shared-data" / "longbench_100_14k") in refreshed
+    assert "LONG_BENCH_OUTPUT_DIR=" + str(tmp_path / "repo" / "outputs" / "longbench_100_14k") in refreshed
+    assert "MODEL_TARGET=/models/operator-target" in refreshed
+    managed = refreshed.split("# BEGIN setup_server_env.py managed defaults", 1)[1]
+    assert "longbench_200" not in managed
 
 
 def test_check_is_read_only_when_shared_data_is_missing(tmp_path):

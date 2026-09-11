@@ -56,14 +56,14 @@ def build_pipeline_config(
     return config
 
 
-def build_eval_config(dataset_path: str) -> dict[str, Any]:
+def build_eval_config(dataset_path: str, max_new_tokens: int = 32) -> dict[str, Any]:
     """Build the upstream GSM8K evaluator config for a generated JSONL file."""
 
     return {
         "eval_params": {
             "dataset": "gsm8k",
             "dataset_path": dataset_path,
-            "max_new_tokens": 1024,
+            "max_new_tokens": max(1, int(max_new_tokens)),
             "eval_metrics": ["throughput", "avg_acceptance_len"],
         },
         "management": {
@@ -105,6 +105,24 @@ def _resolve_repo_path(value: str | None) -> Path | None:
         return None
     path = Path(value)
     return path if path.is_absolute() else (ROOT / path).resolve()
+
+
+def generated_tokens_within_budget(generated_tokens: int, max_new_tokens: int) -> bool:
+    """Return whether an upstream lookahead stayed within our token budget."""
+
+    return 0 < int(generated_tokens) <= max(1, int(max_new_tokens))
+
+
+def prepare_fafo_records(
+    records: list[dict[str, Any]], *, smoke: bool
+) -> list[dict[str, Any]]:
+    """Add one hidden compile warmup when smoke has only one real request."""
+
+    if not smoke or len(records) != 1:
+        return records
+    warmup = dict(records[0])
+    warmup["id"] = f"__fafo_warmup__{records[0]['id']}"
+    return [warmup, *records]
 
 
 def _write_fafo_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -216,7 +234,8 @@ def main() -> None:
         dataset_path = temp_root / "one_sample.jsonl"
         pipeline_path = temp_root / "pipeline.json"
         eval_path = temp_root / "eval.json"
-        _write_fafo_dataset(dataset_path, records)
+        runtime_records = prepare_fafo_records(records, smoke=args.smoke)
+        _write_fafo_dataset(dataset_path, runtime_records)
         pipeline_path.write_text(
             json.dumps(
                 build_pipeline_config(
@@ -230,7 +249,12 @@ def main() -> None:
             encoding="utf-8",
         )
         eval_path.write_text(
-            json.dumps(build_eval_config(str(dataset_path)), indent=2),
+            json.dumps(
+                build_eval_config(
+                    str(dataset_path), max_new_tokens=args.max_new_tokens
+                ),
+                indent=2,
+            ),
             encoding="utf-8",
         )
         command = build_command(
@@ -265,11 +289,21 @@ def main() -> None:
     output_tokens = parsed["output_tokens"]
     e2e_ms = round(float(e2e_s) * 1000, 3) if e2e_s is not None else None
     output_number = int(output_tokens) if output_tokens is not None else 0
+    budget_ok = generated_tokens_within_budget(output_number, args.max_new_tokens)
+    if output_number > args.max_new_tokens:
+        print(
+            f"[FAFO] upstream lookahead generated {output_number} tokens, "
+            f"over requested budget {args.max_new_tokens}; marking run failed",
+            file=sys.stderr,
+            flush=True,
+        )
     record = {
         "method": f"fafo_{args.kv_method}",
         "dataset": data_file.name if data_file else "prompt",
         "task_type": records[0].get("raw", {}).get("task_type"),
-        "status": "success" if process_returncode == 0 and output_number > 0 else "failed",
+        "status": "success"
+        if process_returncode == 0 and budget_ok
+        else "failed",
         "scope": "aggregate",
         "model": args.model,
         "input_tokens": None,
@@ -300,6 +334,10 @@ def main() -> None:
     checks: list[tuple[bool, str]] = [
         (process_returncode == 0, f"FAFO process exit code = {process_returncode}"),
         (output_number > 0, f"generated tokens = {output_number} (> 0)"),
+        (
+            budget_ok,
+            f"generated tokens = {output_number} <= budget {args.max_new_tokens}",
+        ),
         (parsed["throughput"] is not None, "FAFO timing/throughput line parsed"),
     ]
     summary = {

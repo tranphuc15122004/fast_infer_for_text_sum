@@ -30,6 +30,43 @@ if str(DFLASH_ROOT) not in sys.path:
     sys.path.insert(0, str(DFLASH_ROOT))
 
 
+def round_optional(value: float | None, digits: int = 3) -> float | None:
+    """Round an optional metric without fabricating an external reference."""
+
+    return round(value, digits) if value is not None else None
+
+
+def normalize_generation_token_ids(config, tokenizer) -> dict[str, tuple[int, int]]:
+    """Repair stale BOS/EOS ids that are outside the loaded tokenizer vocab.
+
+    Some local DFlash configs were copied from a Qwen checkpoint and contain
+    ids such as 151643/151645 while the Llama tokenizer has a 128256-token
+    vocabulary.  Transformers only warns during loading, then generation can
+    silently use invalid stop ids.  Normalize before model construction and
+    return the changes for an auditable runtime log.
+    """
+
+    try:
+        vocab_size = len(tokenizer)
+    except TypeError:
+        vocab_size = int(getattr(config, "vocab_size", 0) or 0)
+
+    def valid(value) -> bool:
+        return isinstance(value, int) and 0 <= value < vocab_size
+
+    changed: dict[str, tuple[int, int]] = {}
+    for name in ("bos_token_id", "eos_token_id"):
+        current = getattr(config, name, None)
+        replacement = getattr(tokenizer, name, None)
+        if replacement is None or not valid(int(replacement)):
+            continue
+        if current is None or not valid(current):
+            old = current
+            setattr(config, name, int(replacement))
+            changed[name] = (old, int(replacement))
+    return changed
+
+
 def _dtype_and_attention() -> tuple[torch.dtype, str]:
     if not torch.cuda.is_available():
         raise SystemExit("DFlash Transformers adapter requires CUDA")
@@ -104,6 +141,11 @@ def main() -> None:
         default=int(os.environ.get("LONG_BENCH_SEED", "42")),
     )
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument(
+        "--skip-reference",
+        action="store_true",
+        help="run only speculative decoding; attach an external Vanilla reference later",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -113,25 +155,39 @@ def main() -> None:
         args.max_new_tokens = min(args.max_new_tokens, 32)
 
     dtype, attn_impl = _dtype_and_attention()
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from dflash.model import DFlashDraftModel, dflash_generate
 
     device = torch.device("cuda:0")
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    target_config = AutoConfig.from_pretrained(args.target_model)
+    target_token_changes = normalize_generation_token_ids(target_config, tokenizer)
+    draft_config = AutoConfig.from_pretrained(args.draft_model)
+    draft_token_changes = normalize_generation_token_ids(draft_config, tokenizer)
+    if target_token_changes or draft_token_changes:
+        print(
+            "[dflash] normalized generation token ids: "
+            f"target={target_token_changes or 'none'} "
+            f"draft={draft_token_changes or 'none'}",
+            flush=True,
+        )
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         dtype=dtype,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,
+        config=target_config,
     ).to(device).eval()
     draft = DFlashDraftModel.from_pretrained(
         args.draft_model,
         dtype=dtype,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,
+        config=draft_config,
     ).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     if args.data_file:
         prompts = load_records(Path(args.data_file), args.max_samples)
@@ -151,13 +207,16 @@ def main() -> None:
             input_ids = input_ids[:, : args.max_input_tokens]
         input_len = int(input_ids.shape[1])
 
-        seed_everything(args.seed)
-        baseline, baseline_elapsed = _run_generation(
-            dflash_generate, draft, target, input_ids,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            block_size=1,
-        )
+        if args.skip_reference:
+            baseline, baseline_elapsed = None, None
+        else:
+            seed_everything(args.seed)
+            baseline, baseline_elapsed = _run_generation(
+                dflash_generate, draft, target, input_ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                block_size=1,
+            )
         seed_everything(args.seed)
         result, elapsed = _run_generation(
             dflash_generate, draft, target, input_ids,
@@ -167,17 +226,30 @@ def main() -> None:
         )
 
         output_ids = result.output_ids[0, input_len:]
-        baseline_ids = baseline.output_ids[0, input_len:]
-        text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-        baseline_text = tokenizer.decode(
-            baseline_ids, skip_special_tokens=True
-        ).strip()
-        n_tok = int(output_ids.shape[0])
-        baseline_n_tok = int(baseline_ids.shape[0])
-        prefill_ms, decode_ms, e2e_ms = _timings(result, elapsed)
-        base_prefill_ms, base_decode_ms, base_e2e_ms = _timings(
-            baseline, baseline_elapsed
+        baseline_ids = (
+            baseline.output_ids[0, input_len:] if baseline is not None else None
         )
+        text = tokenizer.decode(
+            output_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+        baseline_text = None
+        if baseline_ids is not None:
+            baseline_text = tokenizer.decode(
+                baseline_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+        n_tok = int(output_ids.shape[0])
+        baseline_n_tok = int(baseline_ids.shape[0]) if baseline_ids is not None else None
+        prefill_ms, decode_ms, e2e_ms = _timings(result, elapsed)
+        if baseline is not None and baseline_elapsed is not None:
+            base_prefill_ms, base_decode_ms, base_e2e_ms = _timings(
+                baseline, baseline_elapsed
+            )
+        else:
+            base_prefill_ms, base_decode_ms, base_e2e_ms = None, None, None
 
         record = {
             "method": "dflash",
@@ -195,13 +267,13 @@ def main() -> None:
             "prefill_ms": round(prefill_ms, 3),
             "decode_ms": round(decode_ms, 3),
             "e2e_ms": round(e2e_ms, 3),
-            "baseline_ttft_ms": round(base_prefill_ms, 3),
-            "baseline_prefill_ms": round(base_prefill_ms, 3),
-            "baseline_decode_ms": round(base_decode_ms, 3),
-            "baseline_e2e_ms": round(base_e2e_ms, 3),
-            "dense_prefill_ms": round(base_prefill_ms, 3),
-            "dense_decode_ms": round(base_decode_ms, 3),
-            "dense_e2e_ms": round(base_e2e_ms, 3),
+            "baseline_ttft_ms": round_optional(base_prefill_ms),
+            "baseline_prefill_ms": round_optional(base_prefill_ms),
+            "baseline_decode_ms": round_optional(base_decode_ms),
+            "baseline_e2e_ms": round_optional(base_e2e_ms),
+            "dense_prefill_ms": round_optional(base_prefill_ms),
+            "dense_decode_ms": round_optional(base_decode_ms),
+            "dense_e2e_ms": round_optional(base_e2e_ms),
             "tpot_ms": round(decode_ms / n_tok, 3) if n_tok else None,
             "throughput_tok_s": round(n_tok / (decode_ms / 1e3), 2)
             if decode_ms > 0 and n_tok else 0.0,
@@ -220,7 +292,13 @@ def main() -> None:
         writer.add(record)
         print(
             f"[sample {sample['id']}] dflash={e2e_ms:.1f}ms "
-            f"baseline={base_e2e_ms:.1f}ms tokens={n_tok}"
+            + (
+                f"baseline={base_e2e_ms:.1f}ms "
+                if base_e2e_ms is not None
+                else "reference=external "
+            )
+            + f"tokens={n_tok}",
+            flush=True,
         )
         checks.append(verify.check_new_tokens(n_tok))
         checks.append(verify.check_output_text(text))

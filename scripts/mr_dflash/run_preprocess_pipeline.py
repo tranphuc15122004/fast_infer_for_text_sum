@@ -73,11 +73,14 @@ class PipelineOptions:
     torch_dtype: str = "bfloat16"
     target_revision: Optional[str] = None
     cache_batch_size_3k: int = 2
-    cache_batch_size_8k: int = 1
+    # Cấu hình áp dụng cho mọi regime dài hơn 3K (8K, 16K, 32K, ...).
+    # Tên không gắn với một độ dài cụ thể để tránh hiểu nhầm rằng đây là
+    # batch size của đúng 8.192 token.
+    cache_batch_size_long_context: int = 1
     cache_bucket_buffer_3k: int = 16
-    cache_bucket_buffer_8k: int = 8
+    cache_bucket_buffer_long_context: int = 8
     cache_shard_size_3k: int = 64
-    cache_shard_size_8k: int = 32
+    cache_shard_size_long_context: int = 32
     parallel_gpu_ids: tuple[int, ...] = ()
     local_files_only: bool = True
     resume: bool = True
@@ -194,9 +197,9 @@ def _cache_sizes(options: PipelineOptions, regime: str) -> tuple[int, int, int]:
             options.cache_shard_size_3k,
         )
     return (
-        options.cache_batch_size_8k,
-        options.cache_bucket_buffer_8k,
-        options.cache_shard_size_8k,
+        options.cache_batch_size_long_context,
+        options.cache_bucket_buffer_long_context,
+        options.cache_shard_size_long_context,
     )
 
 
@@ -820,11 +823,35 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--target-revision", default=None)
     parser.add_argument("--cache-batch-size-3k", type=int, default=2)
-    parser.add_argument("--cache-batch-size-8k", type=int, default=1)
+    parser.add_argument(
+        "--cache-batch-size-long-context",
+        "--cache-batch-size-8k",
+        dest="cache_batch_size_long_context",
+        type=int,
+        default=1,
+        help=(
+            "số sample cache đồng thời trên mỗi GPU cho mọi context >3K "
+            "(8K/16K/32K/...); --cache-batch-size-8k là alias cũ"
+        ),
+    )
     parser.add_argument("--cache-bucket-buffer-3k", type=int, default=16)
-    parser.add_argument("--cache-bucket-buffer-8k", type=int, default=8)
+    parser.add_argument(
+        "--cache-bucket-buffer-long-context",
+        "--cache-bucket-buffer-8k",
+        dest="cache_bucket_buffer_long_context",
+        type=int,
+        default=8,
+        help="buffer phân bucket cho mọi context >3K; --cache-bucket-buffer-8k là alias cũ",
+    )
     parser.add_argument("--cache-shard-size-3k", type=int, default=64)
-    parser.add_argument("--cache-shard-size-8k", type=int, default=32)
+    parser.add_argument(
+        "--cache-shard-size-long-context",
+        "--cache-shard-size-8k",
+        dest="cache_shard_size_long_context",
+        type=int,
+        default=32,
+        help="số sample mỗi shard cho mọi context >3K; --cache-shard-size-8k là alias cũ",
+    )
     parser.add_argument(
         "--parallel-gpu-ids",
         type=int,
@@ -885,11 +912,11 @@ def main(argv=None) -> int:
         torch_dtype=str(args.torch_dtype),
         target_revision=args.target_revision,
         cache_batch_size_3k=int(args.cache_batch_size_3k),
-        cache_batch_size_8k=int(args.cache_batch_size_8k),
+        cache_batch_size_long_context=int(args.cache_batch_size_long_context),
         cache_bucket_buffer_3k=int(args.cache_bucket_buffer_3k),
-        cache_bucket_buffer_8k=int(args.cache_bucket_buffer_8k),
+        cache_bucket_buffer_long_context=int(args.cache_bucket_buffer_long_context),
         cache_shard_size_3k=int(args.cache_shard_size_3k),
-        cache_shard_size_8k=int(args.cache_shard_size_8k),
+        cache_shard_size_long_context=int(args.cache_shard_size_long_context),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         local_files_only=bool(args.local_files_only),
         resume=bool(args.resume),

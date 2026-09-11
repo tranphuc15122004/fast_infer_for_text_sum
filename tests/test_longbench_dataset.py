@@ -100,6 +100,37 @@ def test_builder_reads_local_jsonl_and_writes_manifest(tmp_path):
     assert (output_dir / "manifest.json").exists()
 
 
+def test_builder_filters_before_balanced_sampling(tmp_path):
+    source_dir = tmp_path / "source"
+    output_dir = tmp_path / "output"
+    source_dir.mkdir()
+    rows = [
+        {"context": "x " * index, "input": "", "answers": ["reference"]}
+        for index in range(1, 16)
+    ]
+    (source_dir / "gov_report.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    from build_longbench_200 import build_one_dataset
+
+    selected = build_one_dataset(
+        "gov_report",
+        source_dir,
+        output_dir,
+        fake_tokenizer,
+        5,
+        42,
+        max_input_tokens=32,
+    )
+    assert len(selected) == 5
+    assert all(row["input_tokens"] <= 32 for row in selected)
+    assert {row["length_bin"] for row in selected} == set(range(5))
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["eligible_counts"]["gov_report"] >= 5
+    assert manifest["selection"]["max_input_tokens"] == 32
+
+
 def _write_valid_output_dir(output: Path, count: int = 5) -> dict:
     output.mkdir()
     manifest = {"selected_counts": {}, "file_sha256": {}}

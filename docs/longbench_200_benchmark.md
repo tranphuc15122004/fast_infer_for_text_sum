@@ -1,8 +1,8 @@
-# Benchmark LongBench canonical 1.000 mẫu
+# Benchmark LongBench canonical 500 mẫu, tối đa 14k token
 
 ## Mục đích
 
-`data/longbench_200/` là test set cố định dùng chung cho các lần đo inference.
+`data/longbench_100_14k/` là test set cố định dùng chung cho các lần đo inference.
 Mọi output phải giữ `id` của record đầu vào để ghép tốc độ và chất lượng theo
 cùng request.
 
@@ -10,14 +10,14 @@ cùng request.
 
 | Dataset | Task type | Source test | Chọn vào benchmark |
 |---|---|---:|---:|
-| `gov_report` | `summarization` | 200 | 200 |
-| `qmsum` | `summarization` | 200 | 200 |
-| `multi_news` | `summarization` | 200 | 200 |
-| `lcc` | `code_completion` | 500 | 200 |
-| `repobench-p` | `code_completion` | 500 | 200 |
+| `gov_report` | `summarization` | 200 | 100 |
+| `qmsum` | `summarization` | 200 | 100 |
+| `multi_news` | `summarization` | 200 | 100 |
+| `lcc` | `code_completion` | 500 | 100 |
+| `repobench-p` | `code_completion` | 500 | 100 |
 
 Ba task đầu giữ toàn bộ test set LongBench. LCC và RepoBench-P được xếp theo
-`input_tokens`, chia 5 bin và lấy 40 mẫu/bin với seed 42. Danh sách ID không
+`input_tokens`, giới hạn 14k token, chia 5 bin và lấy 20 mẫu/bin với seed 42. Danh sách ID không
 được random lại trong lúc chạy baseline.
 
 ## Build offline
@@ -30,11 +30,12 @@ LongBench gốc. Tokenizer phải là cùng tokenizer dùng khi benchmark; khôn
 python scripts/build_longbench_200.py \
   --source-dir /path/to/LongBench \
   --tokenizer /path/to/Meta-Llama-3.1-8B-Instruct \
-  --output-dir data/longbench_200 --seed 42
+  --output-dir data/longbench_100_14k --samples-per-dataset 100 \
+  --max-input-tokens 14000 --allow-partial --seed 42
 python scripts/validate_longbench_200.py \
-  --data-dir data/longbench_200 --expected-count 200
+  --data-dir data/longbench_100_14k --expected-count 100
 python scripts/analyze_longbench_200.py \
-  --data-dir data/longbench_200 --spot-checks 2
+  --data-dir data/longbench_100_14k --spot-checks 2
 ```
 
 Builder chỉ đọc local JSONL, từ chối ghi đè thư mục không rỗng nếu thiếu
@@ -73,15 +74,15 @@ loader chung; các adapter đọc trực tiếp `context` cần dùng cùng rend
   `ttft_ms`, `e2e_ms`, `throughput_tok_s`.
 
 Collector đọc cả tên file canonical `<dataset>.jsonl` và tên legacy
-`<dataset>_representative.jsonl`; mặc định mới là `data/longbench_200`.
+`<dataset>_representative.jsonl`; mặc định mới là `data/longbench_100_14k`.
 
 ## Chạy baseline
 
 Ví dụ chạy một dataset bằng loader chung:
 
 ```bash
-DATA_INPUT=data/longbench_200/gov_report.jsonl \
-RUN_SAMPLES=200 \
+DATA_INPUT=data/longbench_100_14k/gov_report.jsonl \
+RUN_SAMPLES=100 \
 bash scripts/run.sh <baseline>
 ```
 
@@ -108,9 +109,23 @@ Các profile có ý nghĩa sau:
 
 | Profile | Phạm vi mặc định | Chính sách |
 |---|---|---|
-| `smoke` | 9 baseline × 5 dataset × 1 mẫu | CPU/T4 chỉ preflight; B200 chạy inference ngắn |
-| `representative` | 9 baseline × `gov_report,lcc` × 20 mẫu | cần CUDA; 20 mẫu giữ phân tầng 5 length-bin |
-| `full` | 9 baseline × 5 dataset × 200 mẫu | cần CUDA; strict mặc định |
+| `smoke` | 7 baseline × 5 dataset × 1 mẫu | CPU/T4 chỉ preflight; B200 chạy inference ngắn |
+| `representative` | 7 baseline × `gov_report,lcc` × 20 mẫu | cần CUDA; 20 mẫu giữ phân tầng 5 length-bin |
+| `full` | 7 baseline × 5 dataset × 100 mẫu | cần CUDA; strict mặc định |
+
+LongSpec và SSSD không nằm trong ma trận này: LongSpec hiện không chạy offline
+đầy đủ và SSSD còn thiếu native extension. Adapter standalone vẫn được giữ để
+debug riêng. Representative/full mặc định sinh tối đa 2048 token; smoke chỉ
+dùng tối đa 8 token để kiểm tra wiring nhanh. Có thể override bằng
+`--max-new-tokens` hoặc `LONG_BENCH_MAX_NEW_TOKENS`.
+
+Vanilla HF và Vanilla FA đều chạy target-only với `batch_size=1`. Khi cả hai
+đã có output, các baseline speculative (`eagle3`, `dflash`, `specextend`)
+không chạy thêm naive/reference inference; runner mặc định dùng Vanilla FA,
+fallback sang Vanilla HF, rồi join timing theo `sample_id`. Các trường được
+ghi là `external_decode_speedup`/`external_e2e_speedup` với
+`speedup_scope=external_reference`. Có thể chọn reference bằng
+`LONG_BENCH_REFERENCE_BASELINE=vanilla_hf`.
 
 `--preflight-only` tạo đủ file status và manifest mà không load model. Đây là
 chế độ phù hợp để kiểm tra máy T4/CPU. Không được diễn giải
@@ -124,14 +139,14 @@ Runner tạo `run_manifest.json` và thư mục `logs/` ngay khi bắt đầu ru
 mỗi baseline/dataset, terminal in đường dẫn live log tương ứng, ví dụ:
 
 ```text
-outputs/longbench_200/<run-id>/logs/vanilla_hf_gov_report.log
+outputs/longbench_100_14k/<run-id>/logs/vanilla_hf_gov_report.log
 ```
 
 Child process được stream đồng thời ra terminal và file log; không cần chờ
 baseline kết thúc. Có thể theo dõi một cell bằng:
 
 ```bash
-tail -F outputs/longbench_200/<run-id>/logs/vanilla_hf_gov_report.log
+tail -F outputs/longbench_100_14k/<run-id>/logs/vanilla_hf_gov_report.log
 ```
 
 Log giữ nguyên output gốc của baseline, còn terminal thêm prefix
@@ -139,6 +154,15 @@ Log giữ nguyên output gốc của baseline, còn terminal thêm prefix
 cho child Python và vẫn áp dụng timeout của master config. Nếu baseline bị
 treo, xem log live trước khi timeout; sau timeout trạng thái và `log_tail`
 được ghi vào `run_manifest.json`.
+
+Với `vanilla_hf` và `vanilla_fa`, log từng mẫu có thêm
+`prefill_ms`, `decode_ms`, `decode_tok_s`, `cache` và `attn`. Hai baseline này dùng
+`StaticCache` khi Transformers hỗ trợ, đồng thời cấp phát attention mask một
+lần cho cả request. `cache=static` là đường chạy tối ưu; nếu thấy
+`cache=generate` thì runtime đã rơi về compatibility fallback và cần kiểm tra
+version Transformers trước khi benchmark dài. `attn` cho biết backend thực tế
+được model resolve, giúp phát hiện trường hợp `vanilla_fa` được yêu cầu nhưng
+không chạy bằng FlashAttention-2.
 
 ### Tổng hợp metric tự động trong run
 
@@ -148,12 +172,12 @@ ghi vào run dir ba file tổng hợp `metrics_summary.json` (đầy đủ),
 `metrics_summary.csv` (bảng rộng) và `metrics_summary.md` (báo cáo đọc được).
 Kết quả bước tổng hợp (status, exit code, đường dẫn file, log) được ghi vào
 `run_manifest.json` ở field `aggregate`; nếu run sạch (không cell nào fail),
-collector chạy ở chế độ `--strict` để xác nhận đủ 200 mẫu cho mỗi
+collector chạy ở chế độ `--strict` để xác nhận đủ 100 mẫu cho mỗi
 (baseline, dataset) — thiếu mẫu sẽ làm exit code của run khác 0.
 
 - Tắt tổng hợp tự động khi cần: `--no-collect` (hoặc `LONG_BENCH_COLLECT=0`).
   Muốn chạy lại tay: `python scripts/collect_metrics.py --outputs-dir <run_dir>
-  --data-dir data/longbench_200`.
+  --data-dir data/longbench_100_14k`.
 - `--preflight-only` luôn bỏ qua tổng hợp (chỉ có status rows, không có
   inference records); để kiểm tra pipeline local đầy đủ phải chạy collector
   tay như ví dụ bên dưới.
@@ -212,7 +236,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 python scripts/collect_metrics.py \
   --outputs-dir /tmp/longbench_smoke/<run_id> \
-  --data-dir data/longbench_200
+  --data-dir data/longbench_100_14k
 ```
 
 ### Chọn GPU trên máy nhiều GPU (B200)

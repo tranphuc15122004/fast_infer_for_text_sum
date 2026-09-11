@@ -5,6 +5,11 @@ Trên server B200, các launcher dùng trực tiếp `python3` từ PATH; `.venv
 workspace local chỉ dùng để mô phỏng dependency/API trước khi đưa code lên
 server. Thông tin path/runtime canonical: [`docs/server_environment.md`](server_environment.md).
 
+Nếu chạy benchmark trên Modal thay vì server B200, dùng
+[`docs/modal_longbench.md`](modal_longbench.md). Modal có image/dependency và
+cache/output Volume riêng; không dùng trực tiếp master-env chứa path
+`/workspace/storage-shared/...` của server.
+
 ## Nội dung
 
 - **Chung** — chuẩn bị venv Python 3.12 offline, định dạng dữ liệu, lệnh chạy
@@ -76,7 +81,7 @@ cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
 # Tạo thư mục data/config và link còn thiếu; không kiểm tra package/model.
 python3 scripts/setup_server_env.py --init
 
-# Sau khi copy đủ longbench_200 và representative_100 vào shared data:
+# Sau khi copy đủ longbench_100_14k và representative_100 vào shared data:
 python3 scripts/setup_server_env.py --check
 
 # Hoặc thực hiện init + check trong một lần.
@@ -93,8 +98,8 @@ master:      <shared data>/fast_infer_master.env
 
 Nếu chỉ muốn kiểm tra filesystem trước khi dataset được copy, dùng
 `--check --skip-dependencies --skip-data-validation`. Script không ghi đè
-master config đã tồn tại; hãy chỉnh các đường dẫn model/checkpoint trực tiếp
-trong `fast_infer_master.env`.
+master config đã tồn tại; `--init` chỉ refresh block managed defaults của
+script, còn các đường dẫn model/checkpoint operator-owned vẫn giữ nguyên.
 
 Để mô phỏng đúng profile trên máy local, thay interpreter ở command runner:
 
@@ -187,7 +192,7 @@ dùng khi stack FlashAttention tương thích. Kết quả nằm ở `OUTPUT_FIL
 
 Schema, lệnh build/validate, prompt task-specific và metric cho bộ 5 task nằm ở
 [`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md). Collector mặc
-định đọc `data/longbench_200`; code-completion dùng exact/edit similarity thay
+định đọc `data/longbench_100_14k`; code-completion dùng exact/edit similarity thay
 cho ROUGE. `data/representative_100` được giữ như dữ liệu legacy để tái hiện
 run cũ.
 
@@ -200,7 +205,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 ```
 
 `smoke`, `representative`, `full` tương ứng lần lượt 1 mẫu, 20 mẫu đại diện và
-200 mẫu/dataset; chi tiết output, status và lệnh B200 xem trong
+100 mẫu/dataset; chi tiết output, status và lệnh B200 xem trong
 [`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md). Trên máy nhiều
 GPU (B200) dùng `--gpu-ids <index>` hoặc env `LONG_BENCH_GPU_IDS` để chọn GPU,
 `--list-gpus` để xem inventory host trước khi chạy; chi tiết trong mục

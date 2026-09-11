@@ -17,7 +17,7 @@ from common.benchmark_data import validate_output_dir  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--expected-count", type=int, default=200)
+    parser.add_argument("--expected-count", type=int, default=100)
     args = parser.parse_args()
     summary = validate_output_dir(args.data_dir, expected_count=args.expected_count)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

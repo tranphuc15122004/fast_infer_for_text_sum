@@ -52,6 +52,39 @@ def test_longbench_launcher_uses_master_and_shared_runtime():
     assert "run_longbench_200.py" in text
 
 
+def test_evaluation_defaults_use_longbench_100_14k_profile(monkeypatch):
+    monkeypatch.delenv("LONG_BENCH_DATA_DIR", raising=False)
+    monkeypatch.delenv("LONG_BENCH_OUTPUT_DIR", raising=False)
+
+    from run_longbench_200 import _parser
+
+    args = _parser().parse_args([])
+    assert str(args.data_dir) == "data/longbench_100_14k"
+    assert str(args.output_dir) == "outputs/longbench_100_14k"
+
+    expected_defaults = {
+        ROOT / "scripts/common/config.sh": (
+            'fast_infer_default LONG_BENCH_DATA_DIR "data/longbench_100_14k"',
+            'fast_infer_default LONG_BENCH_OUTPUT_DIR "outputs/longbench_100_14k"',
+        ),
+        ROOT / "scripts/collect_metrics.py": (
+            'ROOT / "outputs" / "longbench_100_14k"',
+            'ROOT / "data" / "longbench_100_14k"',
+        ),
+        ROOT / "scripts/show_longbench_200.py": (
+            'ROOT / "data" / "longbench_100_14k"',
+        ),
+        ROOT / "scripts/modal_longbench.py": (
+            'REMOTE_ROOT / "data" / "longbench_100_14k"',
+            'VOLUME_MOUNT / "outputs" / "longbench_100_14k"',
+        ),
+    }
+    for path, snippets in expected_defaults.items():
+        text = path.read_text(encoding="utf-8")
+        for snippet in snippets:
+            assert snippet in text, f"missing new default in {path}: {snippet}"
+
+
 def test_child_log_is_streamed_before_baseline_exits(tmp_path):
     from run_longbench_200 import _run_child
 
@@ -171,6 +204,21 @@ def test_smoke_defaults_to_a_bounded_context_but_full_keeps_unlimited_inputs(mon
     assert run_longbench_200.resolve_max_input_tokens("smoke", 0) == 0
 
 
+def test_longbench_uses_long_form_output_and_profile_timeout_defaults(monkeypatch):
+    import run_longbench_200
+
+    monkeypatch.delenv("LONG_BENCH_MAX_NEW_TOKENS", raising=False)
+    monkeypatch.delenv("LONG_BENCH_REPRESENTATIVE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LONG_BENCH_FULL_TIMEOUT_SECONDS", raising=False)
+
+    profile = run_longbench_200.resolve_profile(
+        mode="representative", cuda_available=True
+    )
+    assert profile["max_new_tokens"] == 2048
+    assert run_longbench_200.resolve_timeout_seconds("representative") == 3600
+    assert run_longbench_200.resolve_timeout_seconds("full") == 21600
+
+
 def test_low_free_gpu_is_rejected_before_model_children_are_spawned():
     from run_longbench_200 import gpu_memory_guard_reason
 
@@ -251,6 +299,35 @@ def test_all_longbench_adapters_forward_the_shared_seed(baseline):
     assert command[command.index("--seed") + 1] == "37"
 
 
+def test_speculative_adapters_skip_internal_reference_when_external_reference_exists():
+    from common.longbench_adapter import build_adapter_command
+
+    common = {
+        "python": "/usr/bin/python3",
+        "model": "/models/llama",
+        "eagle_model": "/models/eagle",
+        "dflash_model": "/models/dflash",
+        "seed": 37,
+        "max_input_tokens": 4096,
+        "smoke": True,
+        "skip_reference": True,
+    }
+    data_file = ROOT / "data/longbench_200/gov_report.jsonl"
+    eagle = build_adapter_command(
+        "eagle3", config=common, data_file=data_file,
+        output=ROOT / "outputs/test-eagle-reference.jsonl", max_samples=1,
+        max_new_tokens=8,
+    )
+    dflash = build_adapter_command(
+        "dflash", config=common, data_file=data_file,
+        output=ROOT / "outputs/test-dflash-reference.jsonl", max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert "--skip-naive" in eagle
+    assert "--skip-reference" in dflash
+
+
 def test_vanilla_generate_passes_attention_mask_to_avoid_pad_eos_ambiguity():
     from types import SimpleNamespace
 
@@ -277,6 +354,157 @@ def test_vanilla_generate_passes_attention_mask_to_avoid_pad_eos_ambiguity():
     assert torch.equal(model.kwargs["attention_mask"], torch.ones_like(input_ids))
 
 
+def test_vanilla_warmup_is_bounded_without_changing_benchmark_budget():
+    from types import SimpleNamespace
+
+    from common.vanilla_inference import _warmup_args
+
+    args = SimpleNamespace(max_new_tokens=2048, temperature=0.0)
+    warmup = _warmup_args(args)
+
+    assert args.max_new_tokens == 2048
+    assert warmup.max_new_tokens == 8
+    assert warmup.temperature == args.temperature
+
+
+def test_magicdec_warmup_is_bounded_without_changing_benchmark_budget():
+    from infer_magicdec import resolve_generation_budget
+
+    assert resolve_generation_budget(2048) == 2048
+    assert resolve_generation_budget(2048, warmup=True) == 8
+    assert resolve_generation_budget(4, warmup=True) == 4
+
+
+def test_dflash_repairs_invalid_generation_token_ids_from_tokenizer():
+    from types import SimpleNamespace
+
+    from infer_dflash import normalize_generation_token_ids
+
+    config = SimpleNamespace(
+        vocab_size=128256,
+        bos_token_id=151643,
+        eos_token_id=151645,
+    )
+    tokenizer = SimpleNamespace(bos_token_id=128000, eos_token_id=128001)
+
+    changed = normalize_generation_token_ids(config, tokenizer)
+
+    assert changed == {
+        "bos_token_id": (151643, 128000),
+        "eos_token_id": (151645, 128001),
+    }
+    assert config.bos_token_id == 128000
+    assert config.eos_token_id == 128001
+
+
+def test_dflash_external_reference_keeps_optional_timings_null():
+    from infer_dflash import round_optional
+
+    assert round_optional(None) is None
+    assert round_optional(1.23456) == 1.235
+
+
+def test_specextend_cache_capacity_uses_longest_prompt_and_generation_budget():
+    sys.path.insert(0, str(ROOT / "externals" / "SpecExtend" / "specextend"))
+    from run_eagle import resolve_cache_max_length
+
+    assert resolve_cache_max_length(9662, 2048) == 11774
+
+
+def test_vanilla_decode_attention_mask_is_preallocated_and_sliced():
+    from common.vanilla_inference import _build_decode_attention_mask
+
+    input_ids = torch.tensor([[5, 6, 7]])
+    mask = _build_decode_attention_mask(input_ids, max_new_tokens=4)
+
+    assert mask.shape == (1, 7)
+    assert mask.dtype == input_ids.dtype
+    assert torch.equal(mask[:, :3], torch.ones((1, 3), dtype=torch.long))
+    assert torch.equal(mask[:, :4], torch.ones((1, 4), dtype=torch.long))
+    # Slicing must be a view into one allocation, not a newly concatenated mask.
+    assert mask[:, :4].untyped_storage().data_ptr() == mask.untyped_storage().data_ptr()
+
+
+def test_vanilla_builds_static_cache_for_supported_transformers():
+    from common.vanilla_inference import _build_static_cache
+    from transformers import LlamaConfig
+
+    model = torch.nn.Module()
+    model.config = LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model.register_parameter("weight", torch.nn.Parameter(torch.empty(0)))
+
+    cache, backend = _build_static_cache(
+        model,
+        max_cache_len=16,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert cache is not None
+    assert type(cache).__name__ == "StaticCache"
+    assert backend == "static"
+
+
+def test_vanilla_timed_decode_reuses_static_cache_and_grows_mask_by_view():
+    from types import SimpleNamespace
+
+    from common.vanilla_inference import _timed_generate
+    from transformers import LlamaConfig
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = LlamaConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+            )
+            self.register_parameter("weight", torch.nn.Parameter(torch.empty(0)))
+            self.calls = []
+
+        def forward(self, **kwargs):
+            self.calls.append(kwargs)
+            seq_len = int(kwargs["input_ids"].shape[1])
+            logits = torch.full((1, seq_len, 11), -1.0)
+            logits[..., 3] = 1.0
+            return SimpleNamespace(
+                logits=logits,
+                past_key_values=kwargs.get("past_key_values"),
+            )
+
+    class FakeTokenizer:
+        eos_token_id = None
+
+    model = FakeModel()
+    input_ids = torch.tensor([[5, 6, 7]])
+    output_ids, timing = _timed_generate(
+        model,
+        input_ids,
+        FakeTokenizer(),
+        SimpleNamespace(max_new_tokens=3, temperature=0.0, dtype="float32"),
+        torch.device("cpu"),
+    )
+
+    assert output_ids.shape == (1, 6)
+    assert timing["kv_cache_backend"] == "static"
+    assert timing["attention_mask_strategy"] == "preallocated_slice"
+    assert [tuple(call["attention_mask"].shape) for call in model.calls] == [
+        (1, 3),
+        (1, 4),
+        (1, 5),
+    ]
+    cache = model.calls[0]["past_key_values"]
+    assert all(call["past_key_values"] is cache for call in model.calls)
+
+
 def test_registry_contains_exactly_requested_baselines():
     from common.longbench_adapter import BASELINES
 
@@ -284,13 +512,70 @@ def test_registry_contains_exactly_requested_baselines():
         "vanilla_hf",
         "vanilla_fa",
         "magicdec",
-        "longspec",
         "eagle3",
         "dflash",
         "specextend",
-        "sssd",
         "fafo",
     )
+
+
+def test_longbench_filters_disabled_legacy_baselines_from_old_master_defaults():
+    from run_longbench_200 import _filter_matrix_baselines
+
+    selected, skipped = _filter_matrix_baselines(
+        ["vanilla_hf", "longspec", "sssd", "dflash"]
+    )
+
+    assert selected == ["vanilla_hf", "dflash"]
+    assert skipped == ["longspec", "sssd"]
+
+
+def test_longbench_selects_vanilla_fa_then_hf_as_external_reference(tmp_path):
+    from run_longbench_200 import _select_external_reference
+
+    vanilla_hf = tmp_path / "vanilla_hf" / "gov_report.jsonl"
+    vanilla_fa = tmp_path / "vanilla_fa" / "gov_report.jsonl"
+    vanilla_hf.parent.mkdir()
+    vanilla_fa.parent.mkdir()
+    vanilla_hf.write_text("{}\n", encoding="utf-8")
+
+    assert _select_external_reference(
+        tmp_path, "gov_report", ["vanilla_hf", "vanilla_fa"]
+    ) == vanilla_hf
+
+    vanilla_fa.write_text("{}\n", encoding="utf-8")
+    assert _select_external_reference(
+        tmp_path, "gov_report", ["vanilla_hf", "vanilla_fa"]
+    ) == vanilla_fa
+
+
+def test_longbench_joins_external_reference_metrics_by_sample_id(tmp_path):
+    from run_longbench_200 import _attach_external_reference_metrics
+
+    reference = tmp_path / "vanilla_fa.jsonl"
+    speculative = tmp_path / "eagle.jsonl"
+    reference.write_text(
+        '{"sample_id":"x","decode_ms":100.0,"e2e_ms":200.0}\n'
+        '{"type":"summary","method":"vanilla_fa"}\n',
+        encoding="utf-8",
+    )
+    speculative.write_text(
+        '{"sample_id":"x","decode_ms":50.0,"e2e_ms":80.0}\n'
+        '{"type":"summary","method":"eagle3"}\n',
+        encoding="utf-8",
+    )
+
+    attached = _attach_external_reference_metrics(
+        speculative, reference, reference_baseline="vanilla_fa"
+    )
+
+    assert attached == 1
+    row = json.loads(speculative.read_text(encoding="utf-8").splitlines()[0])
+    assert row["dense_decode_ms"] == 100.0
+    assert row["dense_e2e_ms"] == 200.0
+    assert row["external_decode_speedup"] == 2.0
+    assert row["external_e2e_speedup"] == 2.5
+    assert row["speedup_scope"] == "external_reference"
 
 
 def test_eagle_converter_preserves_canonical_id_and_reference(tmp_path):

@@ -15,7 +15,7 @@ source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 : "${LONG_BENCH_MODEL:?LONG_BENCH_MODEL is required}"
 DATA_FILE="${LONG_BENCH_DATA_FILE:-${DATA_INPUT:-}}"
-OUTPUT_FILE="${LONG_BENCH_OUTPUT_FILE:-$ROOT/outputs/longbench_200/vanilla_hf.jsonl}"
+OUTPUT_FILE="${LONG_BENCH_OUTPUT_FILE:-$ROOT/outputs/longbench_100_14k/vanilla_hf.jsonl}"
 : "${DATA_FILE:?LONG_BENCH_DATA_FILE or DATA_INPUT is required}"
 
 ARGS=(--model "$LONG_BENCH_MODEL" --data-file "$DATA_FILE"

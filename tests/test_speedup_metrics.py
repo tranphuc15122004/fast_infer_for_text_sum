@@ -83,6 +83,25 @@ def test_compute_group_reports_speedups_only_for_paired_timing_fields():
     assert "speedup" not in unpaired
 
 
+def test_compute_group_preserves_external_speedup_scope():
+    group = collect_metrics.compute_group(
+        [
+            {
+                "e2e_ms": 80.0,
+                "dense_e2e_ms": 160.0,
+                "decode_ms": 30.0,
+                "dense_decode_ms": 60.0,
+                "speedup_scope": "external_reference",
+                "external_reference_baseline": "vanilla_fa",
+            }
+        ],
+        {},
+    )
+
+    assert group["speedup_scope"] == "external_reference"
+    assert group["external_reference_baselines"] == ["vanilla_fa"]
+
+
 def test_normalize_record_maps_native_eagle_and_gemfilter_pairs():
     eagle = collect_metrics.normalize_record(
         {

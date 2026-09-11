@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrate the canonical LongBench × 9-baseline experiment matrix.
+"""Orchestrate the canonical LongBench × 7-baseline experiment matrix.
 
 This runner owns experiment selection, deterministic input subsets, preflight
 statuses, child-process logs and a manifest.  Baseline implementations remain
@@ -40,11 +40,16 @@ from common.benchmark_runtime import (  # noqa: E402
 from common.data_loader import normalize  # noqa: E402
 from common.longbench_adapter import (  # noqa: E402
     BASELINES,
+    DISABLED_MATRIX_BASELINES,
+    SUPPORTED_BASELINES,
     baseline_config_from_env,
     build_adapter_command,
     convert_records_for_baseline,
     preflight_baseline,
 )
+
+
+EXTERNAL_REFERENCE_BASELINES = {"eagle3", "dflash", "specextend"}
 
 
 def _split(value: str | Sequence[str] | None) -> list[str]:
@@ -56,6 +61,142 @@ def _split(value: str | Sequence[str] | None) -> list[str]:
     for item in value:
         result.extend(str(item).replace(",", " ").split())
     return result
+
+
+def _filter_matrix_baselines(values: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Remove known non-comparable legacy baselines from the matrix.
+
+    Older master env files still contain LongSpec and SSSD.  They are kept as
+    standalone adapters, but must not abort or silently contaminate a current
+    LongBench run: LongSpec is offline-incomplete and SSSD needs a native
+    extension that is unavailable in the current server image.
+    """
+
+    disabled = set(DISABLED_MATRIX_BASELINES)
+    selected: list[str] = []
+    skipped: list[str] = []
+    for value in values:
+        if value in disabled:
+            if value not in skipped:
+                skipped.append(value)
+            continue
+        selected.append(value)
+    return selected, skipped
+
+
+def _select_external_reference(
+    run_dir: Path, dataset: str, baselines: Sequence[str]
+) -> Path | None:
+    """Select an already-computed batch-1 Vanilla record file.
+
+    FlashAttention is preferred because it is the closest target-only
+    reference for the speculative paths; Vanilla HF remains a deterministic
+    fallback when FA was not requested or failed before writing output.
+    """
+
+    preferred = os.environ.get("LONG_BENCH_REFERENCE_BASELINE", "vanilla_fa")
+    order = [preferred, "vanilla_fa", "vanilla_hf"]
+    seen: set[str] = set()
+    for baseline in order:
+        if baseline in seen or baseline not in baselines:
+            continue
+        seen.add(baseline)
+        candidate = run_dir / baseline / f"{dataset}.jsonl"
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def _attach_external_reference_metrics(
+    path: Path,
+    reference_path: Path,
+    *,
+    reference_baseline: str,
+) -> int:
+    """Join Vanilla timing onto speculative records without another infer.
+
+    The join is by ``sample_id``.  Existing paired fields are preserved; this
+    function adds explicit ``external_*`` fields and uses the common
+    ``dense_*`` aliases so the collector can aggregate DSR/ESR consistently.
+    """
+
+    if not path.is_file() or not reference_path.is_file():
+        return 0
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    references = {
+        str(row.get("sample_id")): row
+        for row in (
+            json.loads(line)
+            for line in reference_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if row.get("type") != "summary" and row.get("sample_id") is not None
+    }
+
+    attached = 0
+    decode_pairs: list[tuple[float, float]] = []
+    e2e_pairs: list[tuple[float, float]] = []
+    for row in rows:
+        if row.get("type") == "summary":
+            continue
+        reference = references.get(str(row.get("sample_id")))
+        if reference is None:
+            continue
+
+        row["external_reference_baseline"] = reference_baseline
+        row["speedup_scope"] = "external_reference"
+        for source, target in (
+            ("prefill_ms", "dense_prefill_ms"),
+            ("ttft_ms", "dense_ttft_ms"),
+            ("decode_ms", "dense_decode_ms"),
+            ("e2e_ms", "dense_e2e_ms"),
+        ):
+            if row.get(target) is None and reference.get(source) is not None:
+                row[target] = reference[source]
+            if reference.get(source) is not None:
+                row[f"external_reference_{source}"] = reference[source]
+
+        spec_decode = row.get("decode_ms")
+        ref_decode = reference.get("decode_ms")
+        if spec_decode and ref_decode and float(spec_decode) > 0:
+            value = round(float(ref_decode) / float(spec_decode), 4)
+            row["external_decode_speedup"] = value
+            decode_pairs.append((float(ref_decode), float(spec_decode)))
+        spec_e2e = row.get("e2e_ms")
+        ref_e2e = reference.get("e2e_ms")
+        if spec_e2e and ref_e2e and float(spec_e2e) > 0:
+            value = round(float(ref_e2e) / float(spec_e2e), 4)
+            row["external_e2e_speedup"] = value
+            e2e_pairs.append((float(ref_e2e), float(spec_e2e)))
+        attached += 1
+
+    for row in rows:
+        if row.get("type") != "summary":
+            continue
+        row["speedup_scope"] = "external_reference"
+        row["external_reference_baseline"] = reference_baseline
+        if decode_pairs:
+            row["external_decode_speedup"] = round(
+                sum(ref for ref, _ in decode_pairs)
+                / sum(spec for _, spec in decode_pairs),
+                4,
+            )
+        if e2e_pairs:
+            row["external_e2e_speedup"] = round(
+                sum(ref for ref, _ in e2e_pairs)
+                / sum(spec for _, spec in e2e_pairs),
+                4,
+            )
+
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return attached
 
 
 def resolve_profile(
@@ -73,7 +214,7 @@ def resolve_profile(
     return {
         "mode": mode,
         "samples": {"smoke": 1, "representative": 20, "full": 200}[mode],
-        "max_new_tokens": {"smoke": 8, "representative": 64, "full": 64}[mode],
+        "max_new_tokens": {"smoke": 8, "representative": 2048, "full": 2048}[mode],
         "cuda_available": bool(cuda_available),
         "allow_unsupported": bool(allow_unsupported),
     }
@@ -91,6 +232,24 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except ValueError as exc:
         raise SystemExit(f"{name} must be a number") from exc
+
+
+def resolve_timeout_seconds(mode: str, cli_value: int | None = None) -> int:
+    """Use a timeout that covers real long-form cells, not only smoke runs."""
+
+    if cli_value is not None:
+        if cli_value <= 0:
+            raise SystemExit("--timeout-seconds must be positive")
+        return cli_value
+    if mode == "smoke":
+        value = _env_int("LONG_BENCH_TIMEOUT_SECONDS", 900)
+    elif mode == "representative":
+        value = _env_int("LONG_BENCH_REPRESENTATIVE_TIMEOUT_SECONDS", 3600)
+    else:
+        value = _env_int("LONG_BENCH_FULL_TIMEOUT_SECONDS", 21600)
+    if value <= 0:
+        raise SystemExit("LongBench timeout must be positive")
+    return value
 
 
 def resolve_max_input_tokens(mode: str, cli_value: int | None) -> int:
@@ -142,6 +301,35 @@ def _source_manifest_hash(data_dir: Path) -> str | None:
     if not manifest.is_file():
         return None
     return hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+
+def _dataset_profile_count(data_dir: Path) -> int:
+    """Read the common per-dataset row count from a validated profile.
+
+    The original profile has 200 rows per dataset, but derived profiles such
+    as LongBench-100 must remain runnable without changing the source data.
+    The manifest is the authority so a hand-truncated directory cannot be
+    mistaken for a reproducible benchmark profile.
+    """
+
+    manifest_path = data_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        counts = manifest["selected_counts"]
+        values = {int(counts[dataset]) for dataset in DATASETS}
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"Invalid LongBench manifest selected_counts: {manifest_path}"
+        ) from exc
+    if len(values) != 1:
+        raise SystemExit(
+            "LongBench profile must contain the same number of rows per dataset; "
+            f"got {sorted(values)}"
+        )
+    count = values.pop()
+    if count <= 0:
+        raise SystemExit(f"LongBench profile row count must be positive, got {count}")
+    return count
 
 
 def _load_selected(
@@ -791,14 +979,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["smoke", "representative", "full"], default=os.environ.get("LONG_BENCH_MODE", "smoke"))
     parser.add_argument("--baselines", default=os.environ.get("LONG_BENCH_BASELINES", " ".join(BASELINES)))
     parser.add_argument("--datasets", default=os.environ.get("LONG_BENCH_DATASETS", " ".join(DATASETS)))
-    parser.add_argument("--data-dir", type=Path, default=os.environ.get("LONG_BENCH_DATA_DIR", "data/longbench_200"))
-    parser.add_argument("--output-dir", type=Path, default=os.environ.get("LONG_BENCH_OUTPUT_DIR", "outputs/longbench_200"))
+    parser.add_argument("--data-dir", type=Path, default=os.environ.get("LONG_BENCH_DATA_DIR", "data/longbench_100_14k"))
+    parser.add_argument("--output-dir", type=Path, default=os.environ.get("LONG_BENCH_OUTPUT_DIR", "outputs/longbench_100_14k"))
     parser.add_argument("--model", default=os.environ.get("LONG_BENCH_MODEL") or os.environ.get("MODEL_TARGET"))
     parser.add_argument("--max-samples", "--samples-per-dataset", dest="max_samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--warmup-runs", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=None)
+    parser.add_argument("--timeout-seconds", type=int, default=None)
     parser.add_argument(
         "--min-free-gb",
         type=float,
@@ -868,19 +1057,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_root = _resolve(args.output_dir)
     if not data_dir.is_dir():
         raise SystemExit(f"LongBench data directory not found: {data_dir}")
+    dataset_profile_count = _dataset_profile_count(data_dir)
     try:
-        # Validate the source before launching any model.  The canonical set is
-        # always 200 rows/dataset; this also verifies checksums and task types.
-        validate_output_dir(data_dir, expected_count=200)
+        # Validate the source before launching any model.  The manifest allows
+        # both the canonical 200-row profile and derived profiles such as the
+        # balanced 100-row/14k test set.
+        validate_output_dir(data_dir, expected_count=dataset_profile_count)
     except (ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Invalid canonical LongBench data: {exc}") from exc
 
-    baselines = _split(args.baselines)
-    datasets = _split(args.datasets)
-    unknown_baselines = sorted(set(baselines) - set(BASELINES))
-    unknown_datasets = sorted(set(datasets) - set(DATASETS))
+    requested_baselines = _split(args.baselines)
+    unknown_baselines = sorted(set(requested_baselines) - set(SUPPORTED_BASELINES))
     if unknown_baselines:
         raise SystemExit(f"Unknown baseline(s): {', '.join(unknown_baselines)}")
+    baselines, skipped_baselines = _filter_matrix_baselines(requested_baselines)
+    if skipped_baselines:
+        print(
+            "[matrix] skipping disabled/non-comparable baseline(s): "
+            + ", ".join(skipped_baselines)
+        )
+    datasets = _split(args.datasets)
+    unknown_datasets = sorted(set(datasets) - set(DATASETS))
     if unknown_datasets:
         raise SystemExit(f"Unknown dataset(s): {', '.join(unknown_datasets)}")
     if not baselines or not datasets:
@@ -890,15 +1087,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         configured = _split(os.environ.get("LONG_BENCH_REPRESENTATIVE_DATASETS", "gov_report lcc"))
         if configured:
             datasets = configured
-    sample_count = args.max_samples or {
+    default_sample_count = {
         "smoke": _env_int("LONG_BENCH_SMOKE_SAMPLES", 1),
         "representative": _env_int("LONG_BENCH_REPRESENTATIVE_SAMPLES", 20),
         "full": _env_int("LONG_BENCH_FULL_SAMPLES", 200),
     }[args.mode]
+    # A full run over a derived LongBench-100 profile should naturally use all
+    # 100 rows.  Explicit --max-samples remains authoritative for smaller
+    # smoke/representative subsets or for controlled ablations.
+    sample_count = args.max_samples or min(default_sample_count, dataset_profile_count)
     max_new_tokens = args.max_new_tokens or {
         "smoke": _env_int("LONG_BENCH_SMOKE_MAX_NEW_TOKENS", 8),
-        "representative": _env_int("LONG_BENCH_MAX_NEW_TOKENS", 64),
-        "full": _env_int("LONG_BENCH_MAX_NEW_TOKENS", 64),
+        "representative": _env_int("LONG_BENCH_MAX_NEW_TOKENS", 2048),
+        "full": _env_int("LONG_BENCH_MAX_NEW_TOKENS", 2048),
     }[args.mode]
     seed = args.seed if args.seed is not None else _env_int("LONG_BENCH_SEED", 42)
     temperature = args.temperature if args.temperature is not None else float(os.environ.get("LONG_BENCH_TEMPERATURE", "0"))
@@ -917,7 +1118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if gpu_guard_reason and not args.preflight_only:
         print(f"[gpu] VRAM guard: {gpu_guard_reason}", file=sys.stderr)
         return 2
-    timeout_seconds = _env_int("LONG_BENCH_TIMEOUT_SECONDS", 900)
+    timeout_seconds = resolve_timeout_seconds(args.mode, args.timeout_seconds)
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -932,8 +1133,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "output_dir": str(run_dir),
         "source_manifest_sha256": _source_manifest_hash(data_dir),
         "model": args.model,
+        "requested_baselines": requested_baselines,
         "baselines": baselines,
+        "skipped_baselines": skipped_baselines,
         "datasets": datasets,
+        "dataset_profile_count": dataset_profile_count,
         "sample_count": sample_count,
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
@@ -964,6 +1168,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_jsonl(subset_path, source_rows)
         for baseline in baselines:
             output_path = run_dir / baseline / f"{dataset}.jsonl"
+            external_reference_path = None
+            external_reference_baseline = None
+            if baseline in EXTERNAL_REFERENCE_BASELINES:
+                external_reference_path = _select_external_reference(
+                    run_dir, dataset, baselines
+                )
+                if external_reference_path is not None:
+                    external_reference_baseline = external_reference_path.parent.name
             cfg = baseline_config_from_env(baseline)
             cfg.update(
                 model=args.model or cfg.get("model"),
@@ -975,6 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 smoke=args.mode == "smoke",
                 max_new_tokens=max_new_tokens,
             )
+            cfg["skip_reference"] = external_reference_path is not None
             check = preflight_baseline(
                 baseline,
                 config=cfg,
@@ -987,6 +1200,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "preflight": check,
                 "output": str(output_path),
             }
+            if external_reference_path is not None:
+                cell.update(
+                    external_reference=str(external_reference_path),
+                    external_reference_baseline=external_reference_baseline,
+                    speedup_scope="external_reference",
+                )
             if args.preflight_only:
                 status = check["status"] if check["status"] != "ready" else "preflight_only"
                 reason = check["reason"] or "preflight completed; inference was not requested"
@@ -1081,6 +1300,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if normalized_count == 0:
                     child["status"] = "failed"
                     child["reason"] = "child exited successfully but wrote no result records"
+                elif external_reference_path is not None:
+                    attached = _attach_external_reference_metrics(
+                        output_path,
+                        external_reference_path,
+                        reference_baseline=str(external_reference_baseline),
+                    )
+                    child["external_reference_records"] = attached
+                    if attached == 0:
+                        child["external_reference_warning"] = (
+                            "no sample_id matched the selected Vanilla reference"
+                        )
             cell.update(child)
             if child["status"] != "success":
                 failures += 1
