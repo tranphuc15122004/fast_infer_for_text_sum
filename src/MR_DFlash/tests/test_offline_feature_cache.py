@@ -133,6 +133,81 @@ def test_hf_capture_batch_keeps_all_valid_offsets() -> None:
     assert torch.equal(values[0][:, 0], torch.tensor([2.0, 3.0, 4.0]))
 
 
+def test_hf_capture_calls_backbone_without_causal_lm_head() -> None:
+    from types import SimpleNamespace
+
+    from MR_DFlash.capture import HFTargetCapture
+
+    class TinyBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, input_ids, **_kwargs):
+            self.calls += 1
+            base = input_ids.to(torch.float32).unsqueeze(-1)
+            return SimpleNamespace(hidden_states=[base, base + 1, base + 2])
+
+    class CausalLMWrapper:
+        def __init__(self, backbone):
+            self.model = backbone
+
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("cache capture không được chạy lm_head")
+
+    backbone = TinyBackbone().eval()
+    capturer = object.__new__(HFTargetCapture)
+    capturer.device = torch.device("cpu")
+    capturer.layer_ids = [0, 1]
+    capturer._hooks = []
+    capturer._captured_layers = {}
+    capturer.backbone = backbone
+    capturer.model = CausalLMWrapper(backbone)
+
+    values = capturer.capture_batch(
+        torch.tensor([[1, 2, 3]], dtype=torch.long),
+        attention_mask=torch.ones(1, 3, dtype=torch.long),
+    )
+    assert backbone.calls == 1
+    assert values[0].shape == (3, 2)
+
+
+def test_sharded_writer_async_io_roundtrip(tmp_path: Path) -> None:
+    from MR_DFlash.offline_features import (
+        ShardedDFlashFeatureDataset,
+        ShardedFeatureWriter,
+    )
+
+    root = tmp_path / "features"
+    common = {
+        "target_model_path": "tiny-target",
+        "feature_layer_ids": [1, 2],
+        "hidden_size": 3,
+        "feature_width": 6,
+        "max_length": 8,
+        "requested_torch_dtype": "bfloat16",
+    }
+    writer = ShardedFeatureWriter(
+        root,
+        shard_size=2,
+        io_threads=2,
+        io_queue_size=2,
+        resume=False,
+        **common,
+    )
+    for sample_id, length in (("a", 4), ("b", 5), ("c", 3)):
+        assert writer.add(_sample(sample_id, length, 6))
+    manifest = writer.close()
+
+    assert manifest["num_samples"] == 3
+    assert manifest["sample_ids"] == ["a", "b", "c"]
+    assert len(manifest["shards"]) == 2
+    dataset = ShardedDFlashFeatureDataset(str(root), max_len=8)
+    assert len(dataset) == 3
+    assert dataset.lengths == [4, 5, 3]
+    assert not list(root.glob(".*.tmp"))
+
+
 def test_cache_script_uses_batched_target_capture(tmp_path: Path, monkeypatch) -> None:
     import sys
     from types import SimpleNamespace
@@ -213,6 +288,156 @@ def test_cache_script_uses_batched_target_capture(tmp_path: Path, monkeypatch) -
     assert stats["captured"] == 2
     assert FakeCapturer.instances[0].batch_calls == 1
     assert json.loads((output / "manifest.json").read_text())["num_samples"] == 2
+
+
+def test_cache_script_can_consume_pretokenized_shards(tmp_path: Path, monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import cache_target_features
+    from MR_DFlash.tokenized_data import write_tokenized_manifest
+
+    class TinyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    class FakeCapturer:
+        instances = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.tokenizer = TinyTokenizer()
+            self.device = torch.device("cpu")
+            self.layer_ids = [0, 1]
+            self.context_feature_dim = 6
+            self.model = SimpleNamespace(config=SimpleNamespace(hidden_size=3))
+            self.batch_calls = 0
+            self.__class__.instances.append(self)
+
+        def capture_batch(self, _input_ids, attention_mask):
+            self.batch_calls += 1
+            return [
+                torch.ones(int(length), 6, dtype=torch.bfloat16)
+                for length in attention_mask.sum(dim=-1).tolist()
+            ]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(cache_target_features, "HFTargetCapture", FakeCapturer, raising=False)
+    tokenized = tmp_path / "tokenized"
+    tokenized.mkdir()
+    samples = [
+        {
+            "id": "a",
+            "input_ids": torch.tensor([1, 2, 3, 4]),
+            "loss_mask": torch.ones(4),
+            "length": 4,
+        },
+        {
+            "id": "b",
+            "input_ids": torch.tensor([5, 6, 7]),
+            "loss_mask": torch.ones(3),
+            "length": 3,
+        },
+    ]
+    torch.save({"samples": samples}, tokenized / "shard_00000.pt")
+    write_tokenized_manifest(
+        tokenized,
+        shards=[{"path": "shard_00000.pt", "count": 2}],
+        num_samples=2,
+        target_model="tiny-target",
+        feature_layer_ids=[0, 1],
+        chat_template="tiny",
+        max_length=64,
+        supervision_mode="last_assistant",
+    )
+
+    output = tmp_path / "cache"
+    stats = cache_target_features.cache_dataset(
+        target_model_path="tiny-target",
+        tokenized_path=str(tokenized),
+        output_path=str(output),
+        max_length=64,
+        batch_size=2,
+        shard_size=2,
+        layer_ids=[0, 1],
+        device="cpu",
+    )
+    assert stats["captured"] == 2
+    assert FakeCapturer.instances[0].batch_calls == 1
+    assert json.loads((output / "manifest.json").read_text())["num_samples"] == 2
+
+
+def test_cache_workload_eta_reuses_lengths_but_refreshes_resume_progress(tmp_path: Path) -> None:
+    import sys
+
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from cache_target_features import _estimate_workload
+    from progress import ProgressReporter
+
+    class TinyTokenizer:
+        def apply_chat_template(self, conversation, **_kwargs):
+            values = []
+            for message in conversation:
+                values.extend([10 if message["role"] == "user" else 11])
+                values.extend(self(message["content"], add_special_tokens=False)["input_ids"])
+            return values
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": [20 + (ord(char) % 20) for char in str(text)]}
+
+    data = tmp_path / "regenerated.jsonl"
+    data.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "id": sample_id,
+                    "conversations": [
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                }
+            )
+            for sample_id, question in (("a", "short"), ("b", "longer"))
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "workload.json"
+    first = _estimate_workload(
+        data_path=str(data),
+        tokenizer=TinyTokenizer(),
+        max_length=64,
+        supervision_mode="last_assistant",
+        shard_index=0,
+        num_shards=1,
+        num_samples=None,
+        existing_ids=set(),
+        report_path=report,
+        reporter=ProgressReporter(None),
+    )
+    resumed = _estimate_workload(
+        data_path=str(data),
+        tokenizer=TinyTokenizer(),
+        max_length=64,
+        supervision_mode="last_assistant",
+        shard_index=0,
+        num_shards=1,
+        num_samples=None,
+        existing_ids={"a"},
+        report_path=report,
+        reporter=ProgressReporter(None),
+    )
+
+    assert first["valid_samples"] == resumed["valid_samples"] == 2
+    assert first["existing_samples"] == 0
+    assert resumed["existing_samples"] == 1
+    assert resumed["existing_tokens"] > 0
 
 
 def test_cache_script_does_not_swallow_cuda_oom(tmp_path: Path, monkeypatch) -> None:

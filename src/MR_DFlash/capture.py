@@ -1,4 +1,4 @@
-"""Capture offline target features cho train DFlash (bản HF, thay SGLang).
+"""Capture offline target features cho train DFlash (HF backbone, thay SGLang).
 
 Tương ứng ``scripts/prepare_hidden_states.py`` + capture contract DFlash của
 SpecForge nhưng chạy thẳng bằng Hugging Face ``AutoModelForCausalLM`` (không
@@ -14,8 +14,9 @@ cần SGLang server). Với mỗi mẫu hội thoại:
   ``input_ids`` / ``loss_mask`` / ``hidden_states``.
 
 Note: hidden states của toàn chuỗi được lưu (kể cả prompt) vì block draft cần
-context feature của mọi vị trí trước anchor. Capture không cần lm_head/embed
-của target (chúng được nạp ở bước train).
+context feature của mọi vị trí trước anchor. Capture gọi ``AutoModel``/backbone
+trực tiếp, nên không tính LM head/logits. Target embedding và LM head chỉ được
+nạp ở bước train.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ def _extract_context_feature(
 
 
 class HFTargetCapture:
-    """Capture feature target bằng HF model (eval, no-grad)."""
+    """Capture feature target bằng HF backbone (eval, no-grad)."""
 
     def __init__(
         self,
@@ -72,8 +73,16 @@ class HFTargetCapture:
         device: str = "auto",
         local_files_only: Optional[bool] = None,
         target_revision: Optional[str] = None,
+        attention_backend: str = "auto",
     ) -> None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModel, AutoTokenizer
+
+        valid_backends = {"auto", "eager", "sdpa", "flash_attention_2"}
+        if attention_backend not in valid_backends:
+            raise ValueError(
+                "attention_backend phải thuộc "
+                f"{sorted(valid_backends)}, got {attention_backend!r}"
+            )
 
         dtype = {
             "float32": torch.float32,
@@ -97,13 +106,29 @@ class HFTargetCapture:
         }
         if target_revision:
             load_kwargs["revision"] = target_revision
-        self.tokenizer = AutoTokenizer.from_pretrained(target_model_path, **load_kwargs)
-        self.model = AutoModelForCausalLM.from_pretrained(
+        tokenizer_kwargs = dict(load_kwargs)
+        if attention_backend != "auto":
+            # HF maps this to the optimized SDPA/FlashAttention implementation
+            # inside the transformer backbone. ``auto`` keeps the model config
+            # default, which is the safest fallback for older checkpoints.
+            load_kwargs["attn_implementation"] = attention_backend
+        self.tokenizer = AutoTokenizer.from_pretrained(target_model_path, **tokenizer_kwargs)
+        # SpecForge's hidden-state capture never needs the LM head/logits. Load
+        # the base transformer directly so the cache path does not allocate or
+        # compute a [batch, seq, vocab] logits tensor for every sample.
+        self.model = AutoModel.from_pretrained(
             target_model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             **load_kwargs,
         ).to(self.device)
         self.model.eval()
+        self.attention_backend = attention_backend
+
+        # CausalLM checkpoints expose the transformer as ``model`` while
+        # AutoModel checkpoints expose it directly. Keeping this seam makes the
+        # capture implementation work with both forms and with remote-code
+        # models that follow either convention.
+        self.backbone = getattr(self.model, "model", self.model)
 
         num_layers = int(self.model.config.num_hidden_layers)
         self.layer_ids = resolve_layer_ids(layer_ids, num_layers)
@@ -112,7 +137,7 @@ class HFTargetCapture:
         )
         self._captured_layers: Dict[int, torch.Tensor] = {}
         self._hooks = []
-        target_layers = getattr(getattr(self.model, "model", None), "layers", None)
+        target_layers = getattr(self.backbone, "layers", None)
         if target_layers is not None:
             for layer_id in self.layer_ids:
                 self._hooks.append(
@@ -187,12 +212,17 @@ class HFTargetCapture:
             raise ValueError("lengths capture_batch không hợp lệ")
 
         self._captured_layers.clear()
+        backbone = getattr(self, "backbone", self.model)
         with torch.inference_mode():
-            outputs = self.model(
+            # Call only the transformer backbone. This preserves the exact
+            # teacher-forced hidden states at every valid offset while avoiding
+            # the unnecessary LM-head projection used by CausalLM.forward().
+            outputs = backbone(
                 input_ids=ids,
                 attention_mask=attention_mask,
                 output_hidden_states=not self._hooks,
                 use_cache=False,
+                return_dict=True,
             )
         if self._hooks:
             if len(self._captured_layers) != len(self.layer_ids):
@@ -227,6 +257,7 @@ def capture_dataset(
     device: str = "auto",
     local_files_only: Optional[bool] = None,
     supervision_mode: str = "all_assistant",
+    attention_backend: str = "auto",
 ) -> Dict[str, int]:
     """Capture toàn bộ dataset → các file ``.ckpt`` dưới ``output_path``.
 
@@ -240,6 +271,7 @@ def capture_dataset(
         torch_dtype=torch_dtype,
         device=device,
         local_files_only=local_files_only,
+        attention_backend=attention_backend,
     )
     out_dir = Path(output_path)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -317,6 +349,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
+    parser.add_argument(
+        "--attention-backend",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        default="auto",
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument(
@@ -342,6 +379,7 @@ def main(argv=None) -> None:
         device=args.device,
         local_files_only=args.local_files_only,
         supervision_mode=args.supervision_mode,
+        attention_backend=args.attention_backend,
     )
     print(f"[capture] xong: {stats}")
 

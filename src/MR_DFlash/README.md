@@ -120,7 +120,7 @@ prepare_server_data.py
   -> regenerate_pilot.py bằng target frozen
   -> validate_pilot_dataset.py
   -> tokenize_dataset.py (tokenized_3k hoặc tokenized cho 8K)
-  -> cache_target_features.py (target hidden states theo shard)
+  -> cache_target_features.py (đọc tokenized shard, capture backbone hidden theo shard)
   -> run_train.py với data.feature_mode=offline
 ```
 
@@ -178,6 +178,46 @@ không phải batch size 8K. Tên cũ `--cache-batch-size-8k` vẫn được h�
 alias tương thích.
 Log worker nằm trong các thư mục `.parallel_*/rank_*/worker.log`.
 
+Để theo dõi chi tiết từng GPU trong lúc regenerate/cache, đọc heartbeat bằng:
+
+```bash
+python3 scripts/mr_dflash/watch_parallel_stage.py \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --interval 5
+```
+
+Thêm `--tqdm` nếu muốn hiển thị một progress bar trực quan cho từng GPU.
+
+Mỗi `rank_*/progress.json` ghi phase, sample hiện tại, token đã sinh, budget,
+PID, GPU và VRAM. Output regenerate mặc định flush từng sample để resume không
+đợi buffer lớn. Có thể dừng sạch bằng `--worker-stop-file PATH` rồi `touch
+PATH`; không dùng `kill -9` nếu muốn parent dọn các worker con.
+
+### Ước lượng thời gian cache
+
+Ở phase cache, mỗi worker thực hiện một preflight tokenizer nhẹ và ghi
+`workload.json` cạnh cache. File này chứa số dòng, số sample hợp lệ và tổng
+token thực tế của shard. Khi bắt đầu capture, heartbeat bổ sung:
+
+```text
+total_samples, completed_samples, remaining_samples
+total_tokens, completed_tokens, remaining_tokens
+throughput_tokens_per_second, eta_seconds, eta_human
+```
+
+Parent parallel stage cộng các worker vào `status.json` và ghi định kỳ vào
+`pipeline_logs/cache_<regime>_<split>.log` dạng:
+
+```text
+[parallel] progress mode=cache completed=123/5000 tokens=... rate=... tok/s eta=2h14m
+```
+
+ETA được tính theo token đã capture trong lần chạy hiện tại; khi `--resume`,
+sample đã có vẫn được tính vào phần hoàn thành nhưng không làm phồng
+throughput. ETA của stage song song lấy worker còn lâu nhất, còn throughput là
+tổng throughput hiện tại. Đây là ước lượng runtime cache, không bao gồm phase
+regenerate trước đó.
+
 ## Cách chạy
 
 ### 1. CPU smoke (máy dev, không GPU)
@@ -215,17 +255,29 @@ tương thích torch `cu130`, nên lệnh trên cố ý chạy CPU.
 
 ### 2. Cache target feature offline (một lần, khuyến nghị cho train lặp lại)
 
-Sau khi đã có target-generated JSONL, dùng cache sharded để các baseline đọc
-cùng hidden states mà không chạy target lại:
+Sau khi đã có target-generated JSONL và tokenized shard, dùng cache sharded để
+các baseline đọc cùng hidden states mà không chạy target lại. Cache hiện tối ưu
+theo pattern của SpecForge:
+
+- gọi trực tiếp backbone `AutoModel`, không tính LM-head/logits không cần thiết;
+- đọc `tokenized-path` đã chuẩn bị trước, không render/tokenize lại từng JSONL
+  trong phase capture;
+- ghi shard atomically qua hàng đợi I/O bất đồng bộ có giới hạn, để chồng lấp
+  serialization với target forward;
+- dùng `sdpa` mặc định và cho phép kiểm thử `flash_attention_2` khi server
+  có kernel tương thích.
 
 ```bash
 PYTHONPATH=src python scripts/mr_dflash/cache_target_features.py \
   --target-model-path Qwen/Qwen3-4B \
   --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/train.jsonl \
+  --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/tokenized_3k/train \
   --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_3k/train \
   --target-layer-ids 1 9 17 25 33 \
   --max-length 3072 --batch-size 2 --shard-size 64 \
-  --supervision-mode last_assistant --device cuda --local-files-only --resume
+  --supervision-mode last_assistant --attention-backend sdpa \
+  --io-threads 2 --io-queue-size 4 \
+  --device cuda --local-files-only --resume
 ```
 
 Script lưu hidden state tại mọi offset hợp lệ (prompt và response), cùng

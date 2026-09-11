@@ -411,8 +411,10 @@ def preflight_baseline(
         result["requirements"]["source"] = {
             "available": (ROOT / "externals" / "MagicDec").is_dir()
         }
+        flashinfer_available, flashinfer_reason = _module_importable("flashinfer")
         result["requirements"]["flashinfer"] = {
-            "available": importlib.util.find_spec("flashinfer") is not None
+            "available": flashinfer_available,
+            "reason": flashinfer_reason if not flashinfer_available else None,
         }
         if not result["requirements"]["source"]["available"] and result["status"] == "ready":
             result.update(status="missing_dependency", reason="vendored MagicDec source is missing")
@@ -425,8 +427,14 @@ def preflight_baseline(
                     else "MagicDec checkpoint is not configured"
                 ),
             )
-        elif not result["requirements"]["flashinfer"]["available"] and result["status"] == "ready":
-            result.update(status="missing_dependency", reason="flashinfer is required by MagicDec SnapKV")
+        elif not flashinfer_available and result["status"] == "ready":
+            result.update(
+                status="missing_dependency",
+                reason=(
+                    "flashinfer is required by MagicDec SnapKV"
+                    + (f": {flashinfer_reason}" if flashinfer_reason else "")
+                ),
+            )
 
     if baseline in {"sssd", "fafo"} and result["status"] == "ready":
         result.update(

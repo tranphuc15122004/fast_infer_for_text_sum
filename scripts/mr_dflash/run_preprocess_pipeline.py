@@ -81,7 +81,14 @@ class PipelineOptions:
     cache_bucket_buffer_long_context: int = 8
     cache_shard_size_3k: int = 64
     cache_shard_size_long_context: int = 32
+    cache_attention_backend: str = "sdpa"
+    cache_io_threads: int = 2
+    cache_io_queue_size: int = 4
     parallel_gpu_ids: tuple[int, ...] = ()
+    progress_interval_tokens: int = 256
+    regenerate_output_batch_size: int = 1
+    worker_stall_timeout_seconds: float = 0.0
+    worker_stop_file: Optional[str] = None
     local_files_only: bool = True
     resume: bool = True
     dry_run: bool = False
@@ -351,6 +358,13 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     options.sample_error_policy,
                     "--supervision-mode",
                     options.supervision_mode,
+                    "--progress-interval-tokens",
+                    str(options.progress_interval_tokens),
+                    "--output-batch-size",
+                    str(options.regenerate_output_batch_size),
+                    "--stall-timeout-seconds",
+                    str(options.worker_stall_timeout_seconds),
+                    *(["--stop-file", options.worker_stop_file] if options.worker_stop_file else []),
                     *(["--preserve-full-input"] if options.full_context else []),
                     *(["--target-revision", options.target_revision] if options.target_revision else []),
                     *(_local_files_args(options)),
@@ -433,6 +447,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         options.target_model_path,
                         "--data-path",
                         str(regenerated / f"{split}.jsonl"),
+                        "--tokenized-path",
+                        str(tokenized / split),
                         "--output-path",
                         str(output_dir),
                         "--max-length",
@@ -445,6 +461,12 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(bucket_buffer),
                         "--shard-size",
                         str(shard_size),
+                        "--attention-backend",
+                        options.cache_attention_backend,
+                        "--io-threads",
+                        str(options.cache_io_threads),
+                        "--io-queue-size",
+                        str(options.cache_io_queue_size),
                         "--device",
                         options.device,
                         "--torch-dtype",
@@ -465,6 +487,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     *(str(value) for value in options.parallel_gpu_ids),
                     "--input",
                     str(regenerated / f"{split}.jsonl"),
+                    "--tokenized-path",
+                    str(tokenized / split),
                     "--output",
                     str(output_dir),
                     "--manifest",
@@ -475,16 +499,27 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     options.target_model_path,
                     "--max-length",
                     str(max_length),
+                    "--target-layer-ids",
+                    *(str(layer) for layer in options.target_layer_ids),
                     "--batch-size",
                     str(batch_size),
                     "--bucket-buffer-size",
                     str(bucket_buffer),
                     "--shard-size",
                     str(shard_size),
+                    "--attention-backend",
+                    options.cache_attention_backend,
+                    "--io-threads",
+                    str(options.cache_io_threads),
+                    "--io-queue-size",
+                    str(options.cache_io_queue_size),
                     "--torch-dtype",
                     options.torch_dtype,
                     "--supervision-mode",
                     options.supervision_mode,
+                    "--stall-timeout-seconds",
+                    str(options.worker_stall_timeout_seconds),
+                    *(["--stop-file", options.worker_stop_file] if options.worker_stop_file else []),
                     *(["--target-revision", options.target_revision] if options.target_revision else []),
                     *(_local_files_args(options)),
                     *(_resume_args(options)),
@@ -511,8 +546,19 @@ def _options_payload(options: PipelineOptions) -> dict[str, Any]:
 
 
 def pipeline_config_hash(options: PipelineOptions) -> str:
+    payload_options = _options_payload(options)
+    # Đây là các control-plane knobs: chỉ ảnh hưởng quan sát/cleanup và cách
+    # flush JSONL, không thay đổi nội dung target trajectory/cache. Loại khỏi
+    # artifact hash để cập nhật cơ chế heartbeat vẫn resume được data-root cũ.
+    for key in (
+        "progress_interval_tokens",
+        "regenerate_output_batch_size",
+        "worker_stall_timeout_seconds",
+        "worker_stop_file",
+    ):
+        payload_options.pop(key, None)
     payload = json.dumps(
-        _options_payload(options),
+        payload_options,
         ensure_ascii=False,
         sort_keys=True,
         default=str,
@@ -659,6 +705,27 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
     environment.setdefault("PYTHONUNBUFFERED", "1")
     return_code: Optional[int] = None
     process: Optional[subprocess.Popen[str]] = None
+
+    previous_handlers: dict[int, Any] = {}
+
+    def forward_signal(signum: int, _frame: Any) -> None:
+        # run_stage có session riêng cho stage. Forward signal xuống parallel
+        # stage để nó tiếp tục forward tới từng worker/model process.
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signum)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise KeyboardInterrupt(f"stage interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, forward_signal)
+
+    def restore_signal_handlers() -> None:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
     try:
         with log_path.open("a", encoding="utf-8") as log_handle:
             log_handle.write(f"\n=== attempt { _now() } ===\n")
@@ -681,10 +748,12 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
                 log_handle.flush()
                 print(f"[{stage.name}] {line.rstrip()}", flush=True)
             return_code = process.wait()
+        restore_signal_handlers()
         if return_code != 0:
             raise RuntimeError(f"command trả về exit code {return_code}")
         _check_artifacts(stage)
     except BaseException as exc:
+        restore_signal_handlers()
         if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -853,11 +922,52 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="số sample mỗi shard cho mọi context >3K; --cache-shard-size-8k là alias cũ",
     )
     parser.add_argument(
+        "--cache-attention-backend",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        default="sdpa",
+        help="backend attention của backbone khi cache target; sdpa là mặc định an toàn",
+    )
+    parser.add_argument(
+        "--cache-io-threads",
+        type=int,
+        default=2,
+        help="số thread ghi shard trên mỗi cache worker; 0 = ghi đồng bộ",
+    )
+    parser.add_argument(
+        "--cache-io-queue-size",
+        type=int,
+        default=4,
+        help="số shard tối đa chờ ghi trên mỗi cache worker",
+    )
+    parser.add_argument(
         "--parallel-gpu-ids",
         type=int,
         nargs="+",
         default=[],
         help="data-parallel GPU vật lý; ví dụ 1 2 3 (không dùng GPU 0 nếu không truyền)",
+    )
+    parser.add_argument(
+        "--progress-interval-tokens",
+        type=int,
+        default=256,
+        help="số token giữa hai heartbeat của mỗi worker generate",
+    )
+    parser.add_argument(
+        "--regenerate-output-batch-size",
+        type=int,
+        default=1,
+        help="số sample gom trước khi worker flush output regenerate; mặc định 1",
+    )
+    parser.add_argument(
+        "--worker-stall-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="timeout heartbeat worker; 0 tắt để không ngắt generation dài hợp lệ",
+    )
+    parser.add_argument(
+        "--worker-stop-file",
+        default=None,
+        help="file điều khiển dừng sạch; worker bị dừng ở vòng poll kế tiếp",
     )
     parser.add_argument("--only-stage", action="append", default=[], help="chỉ chạy stage này; có thể lặp flag")
     parser.add_argument("--from-stage", default=None)
@@ -888,6 +998,12 @@ def main(argv=None) -> int:
         raise ValueError("parallel-gpu-ids không được âm")
     if len(args.parallel_gpu_ids) != len(set(args.parallel_gpu_ids)):
         raise ValueError("parallel-gpu-ids không được trùng")
+    if args.progress_interval_tokens < 1 or args.regenerate_output_batch_size < 1:
+        raise ValueError("progress-interval-tokens và regenerate-output-batch-size phải >= 1")
+    if args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
+        raise ValueError("cache-io-threads và cache-io-queue-size không được âm")
+    if args.worker_stall_timeout_seconds < 0:
+        raise ValueError("worker-stall-timeout-seconds không được âm")
     options = PipelineOptions(
         repo_root=Path(args.repo_root).resolve(),
         data_root=Path(args.data_root),
@@ -917,7 +1033,14 @@ def main(argv=None) -> int:
         cache_bucket_buffer_long_context=int(args.cache_bucket_buffer_long_context),
         cache_shard_size_3k=int(args.cache_shard_size_3k),
         cache_shard_size_long_context=int(args.cache_shard_size_long_context),
+        cache_attention_backend=str(args.cache_attention_backend),
+        cache_io_threads=int(args.cache_io_threads),
+        cache_io_queue_size=int(args.cache_io_queue_size),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
+        progress_interval_tokens=int(args.progress_interval_tokens),
+        regenerate_output_batch_size=int(args.regenerate_output_batch_size),
+        worker_stall_timeout_seconds=float(args.worker_stall_timeout_seconds),
+        worker_stop_file=str(args.worker_stop_file) if args.worker_stop_file else None,
         local_files_only=bool(args.local_files_only),
         resume=bool(args.resume),
         dry_run=bool(args.dry_run),

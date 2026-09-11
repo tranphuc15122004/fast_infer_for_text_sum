@@ -51,11 +51,18 @@ REMOTE_PYTHONPATH = os.pathsep.join(
 DEFAULT_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_EAGLE_MODEL = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 DEFAULT_DFLASH_MODEL = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
+DEFAULT_MAGICDEC_MODEL_PTH = (
+    VOLUME_MOUNT / "checkpoints" / "magicdec" / "llama-3.1-8b" / "model.pth"
+)
 DEFAULT_BASELINES = "vanilla_hf"
 DEFAULT_DATASETS = "gov_report lcc"
 DEFAULT_VOLUME_NAME = "fast-infer-text-sum-cache"
 DEFAULT_GPU = "A100-80GB"
 DEFAULT_CUDA_IMAGE = "nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04"
+# There is no upstream FA2 wheel for the exact torch 2.11/cu13/cp312 tuple
+# used by the Modal image.  Keep the community wheel opt-in: source builds
+# remain the default, while CI/experiments can select an ABI-matched artifact
+# explicitly with MODAL_FLASH_ATTN_WHEEL.
 
 # These paths can be mounted as live source files, but local artifacts should
 # never become part of the image upload or overwrite the persistent Volume.
@@ -132,20 +139,43 @@ def _build_image() -> modal.Image:
             "MODAL_INSTALL_FLASHINFER",
         )
     ):
-        image = image.env({"CC": "gcc", "CXX": "g++"}).pip_install(
+        # CUDA extensions can exhaust the build VM when Ninja auto-selects
+        # every vCPU.  Keep the default conservative; callers can override it
+        # with MODAL_FLASH_ATTN_MAX_JOBS when building a larger image.
+        image = image.env(
+            {
+                "CC": "gcc",
+                "CXX": "g++",
+                "MAX_JOBS": os.environ.get("MODAL_FLASH_ATTN_MAX_JOBS", "4"),
+            }
+        ).pip_install(
             "wheel==0.45.1", "ninja==1.13.0"
         )
     if _truthy("MODAL_INSTALL_FLASH_ATTN"):
-        image = image.pip_install(
-            "flash-attn==2.8.3.post1",
-            extra_options="--no-build-isolation",
-        )
+        flash_attn_wheel = os.environ.get("MODAL_FLASH_ATTN_WHEEL", "").strip()
+        if flash_attn_wheel:
+            image = image.pip_install(
+                flash_attn_wheel,
+                extra_options="--no-deps",
+            )
+        else:
+            image = image.pip_install(
+                "flash-attn==2.8.3.post1",
+                extra_options="--no-build-isolation",
+            )
     if _truthy("MODAL_INSTALL_VLLM"):
         image = image.pip_install("vllm==0.24.0")
     if _truthy("MODAL_INSTALL_FLASHINFER"):
         image = image.pip_install(
             "flashinfer-python==0.6.12",
             "flashinfer-cubin==0.6.12",
+            "apache-tvm-ffi==0.1.13.post3",
+            "nvidia-ml-py==13.610.43",
+            # The public package metadata currently asks pip to solve a
+            # different Torch/CUDA stack.  The Modal image already pins the
+            # tested torch 2.11/cu13 runtime, so never let this optional
+            # extension downgrade or replace it.
+            extra_options="--no-deps",
         )
 
     image = image.add_local_dir(
@@ -179,6 +209,8 @@ def build_modal_env(
     datasets: str,
     output_dir: Path,
     data_dir: Path = REMOTE_DATA_DIR,
+    magicdec_model_pth: str | Path | None = None,
+    magicdec_model_name: str | None = None,
     seed: int = 42,
     warmup_runs: int = 3,
     strict: bool = True,
@@ -193,6 +225,10 @@ def build_modal_env(
         data_dir = REMOTE_ROOT / data_dir
 
     cache = str(REMOTE_HF_HOME)
+    resolved_magicdec_model_pth = str(
+        magicdec_model_pth or DEFAULT_MAGICDEC_MODEL_PTH
+    )
+    resolved_magicdec_model_name = str(magicdec_model_name or model)
     return {
         "FI_PYTHON": str(python or sys.executable),
         "FI_DEVICE": "cuda",
@@ -214,6 +250,11 @@ def build_modal_env(
         "LONG_BENCH_EAGLE_MODEL": eagle_model,
         "LONG_BENCH_EAGLE_CHECK_TARGET_PARITY": "1" if eagle_target_parity else "0",
         "LONG_BENCH_DFLASH_MODEL": dflash_model,
+        "LONG_BENCH_MAGICDEC_MODEL_PTH": resolved_magicdec_model_pth,
+        "LONG_BENCH_MAGICDEC_MODEL_NAME": resolved_magicdec_model_name,
+        # Compatibility aliases used by the standalone MagicDec launcher.
+        "CHECKPOINT_MAGICDEC": resolved_magicdec_model_pth,
+        "MODEL_MAGICDEC_NAME": resolved_magicdec_model_name,
         "LONG_BENCH_DEVICE": "cuda",
         "LONG_BENCH_GPU_IDS": "0",
         "LONG_BENCH_BASELINES": baselines,
@@ -365,6 +406,8 @@ def run_benchmark(
     eagle_model: str,
     dflash_model: str,
     data_dir: str = "data/longbench_100_14k",
+    magicdec_model_pth: str = "",
+    magicdec_model_name: str = "",
     max_samples: int = -1,
     max_new_tokens: int = -1,
     max_input_tokens: int = -1,
@@ -382,6 +425,9 @@ def run_benchmark(
 
     output_dir = REMOTE_OUTPUT_DIR
     resolved_data_dir = _remote_path(data_dir, default=REMOTE_DATA_DIR)
+    resolved_magicdec_model_pth = _remote_path(
+        magicdec_model_pth, default=DEFAULT_MAGICDEC_MODEL_PTH
+    )
     selected_run_id = run_id or _new_run_id()
     venv_dir = VOLUME_MOUNT / "venv"
     runtime_python = ensure_runtime_venv(venv_dir, sys.executable)
@@ -394,6 +440,8 @@ def run_benchmark(
         datasets=datasets,
         output_dir=output_dir,
         data_dir=resolved_data_dir,
+        magicdec_model_pth=resolved_magicdec_model_pth,
+        magicdec_model_name=magicdec_model_name or model,
         seed=seed,
         warmup_runs=warmup_runs,
         strict=strict,
@@ -467,6 +515,8 @@ def main(
     eagle_model: str = DEFAULT_EAGLE_MODEL,
     dflash_model: str = DEFAULT_DFLASH_MODEL,
     data_dir: str = "data/longbench_100_14k",
+    magicdec_model_pth: str = "",
+    magicdec_model_name: str = "",
     max_samples: int = -1,
     max_new_tokens: int = -1,
     max_input_tokens: int = -1,
@@ -490,6 +540,8 @@ def main(
         eagle_model=eagle_model,
         dflash_model=dflash_model,
         data_dir=data_dir,
+        magicdec_model_pth=magicdec_model_pth,
+        magicdec_model_name=magicdec_model_name,
         max_samples=max_samples,
         max_new_tokens=max_new_tokens,
         max_input_tokens=max_input_tokens,

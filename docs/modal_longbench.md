@@ -34,9 +34,50 @@ MODAL_INSTALL_FLASH_ATTN=1 MODAL_GPU=A100-80GB \
   --baselines "vanilla_hf vanilla_fa"
 ```
 
+Với image hiện tại (`torch 2.11.0+cu130`, Python 3.12), PyPI chỉ cung cấp
+source distribution cho `flash-attn==2.8.3.post1`, nên Modal sẽ phải compile
+CUDA extension khá lâu. Có thể dùng wheel đã build đúng ABI cho smoke/
+benchmark A100 bằng cách truyền URL sau:
+
+```bash
+export MODAL_FLASH_ATTN_WHEEL='https://github.com/adithyaxx/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+MODAL_HF_SECRET=huggingface MODAL_INSTALL_FLASH_ATTN=1 \
+MODAL_FLASH_ATTN_WHEEL="$MODAL_FLASH_ATTN_WHEEL" MODAL_GPU=A100-80GB \
+  modal run scripts/modal_longbench.py --mode representative \
+  --baselines "vanilla_hf specextend" --datasets lcc --max-samples 1 \
+  --max-new-tokens 32 --max-input-tokens 4096 \
+  --run-id specextend-flashattn-smoke
+```
+
+Đây là wheel cộng đồng, không phải artifact upstream; chỉ dùng khi đã kiểm
+tra `import flash_attn` và version trong runtime. Nếu không muốn dùng wheel
+này, bỏ `MODAL_FLASH_ATTN_WHEEL` để build từ source chính thức.
+
 `MODAL_INSTALL_VLLM=1` và `MODAL_INSTALL_FLASHINFER=1` là các cờ opt-in tương
 tự cho baseline tương ứng. Không bật chúng nếu baseline không cần, vì image
 sẽ lớn và build lâu hơn.
+
+MagicDec cần checkpoint đã convert, không thể dùng trực tiếp HF checkpoint.
+Modal runner mặc định tìm file tại:
+`/mnt/fast-infer/checkpoints/magicdec/llama-3.1-8b/model.pth`. Người dùng cần
+chủ động upload artifact này vào Volume (đặc biệt nếu checkpoint là dữ liệu
+riêng tư):
+
+```bash
+modal volume put fast-infer-text-sum-cache \
+  checkpoints/magicdec/llama-3.1-8b/ \
+  checkpoints/magicdec/llama-3.1-8b/
+```
+
+Sau đó kiểm tra MagicDec bằng FlashInfer mà không để pip thay Torch/CUDA:
+
+```bash
+MODAL_HF_SECRET=huggingface MODAL_INSTALL_FLASHINFER=1 \
+MODAL_GPU=A100-80GB modal run scripts/modal_longbench.py \
+  --mode representative --baselines magicdec --datasets lcc \
+  --max-samples 1 --max-new-tokens 32 --max-input-tokens 4096 \
+  --run-id magicdec-flashinfer-smoke
+```
 
 ## Kiểm tra trước khi tốn GPU/model download
 

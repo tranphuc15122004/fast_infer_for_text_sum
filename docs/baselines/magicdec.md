@@ -62,6 +62,12 @@ checkpoint phải được convert dưới thư mục có tên `llama-3.1-8b`, c
 `LONG_BENCH_MAGICDEC_MODEL_PTH`. Tokenizer path khai báo qua
 `LONG_BENCH_MAGICDEC_MODEL_NAME` (mặc định là `LONG_BENCH_MODEL`).
 
+Trên Modal, runner mặc định tìm checkpoint tại
+`/mnt/fast-infer/checkpoints/magicdec/llama-3.1-8b/model.pth`; cần upload
+checkpoint vào Volume trước khi chạy. MagicDec dùng FlashInfer trực tiếp trong
+`Engine/SnapKV`, vì vậy phải bật `MODAL_INSTALL_FLASHINFER=1`. Image Modal cài
+FlashInfer với `--no-deps` để không tự thay Torch 2.11/CUDA 13 bằng stack khác.
+
 ## Output
 
 `outputs/magicdec_smoke.jsonl` — returncode + log tail của benchmark.

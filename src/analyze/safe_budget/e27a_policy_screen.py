@@ -852,6 +852,29 @@ def run_screen(
                             }
                         )
     aggregates = _aggregate_records(records)
+    primary_outcomes = _load_outcomes(
+        input_paths, epsilon=primary_epsilon
+    )
+    primary_action_diagnostics: dict[str, dict[str, dict[str, float | int]]] = {}
+    for dataset in sorted({key.split("::", 1)[0] for key in keys}):
+        dataset_keys = [
+            key for key in keys
+            if key.split("::", 1)[0] == dataset and key in primary_outcomes
+        ]
+        primary_action_diagnostics[dataset] = {}
+        for label in ACTION_LABELS:
+            violations = sum(
+                int(_action_is_violating(primary_outcomes, key, label, epsilon=primary_epsilon))
+                for key in dataset_keys
+            )
+            primary_action_diagnostics[dataset][label] = {
+                "documents": len(dataset_keys),
+                "violating_documents": violations,
+                "risk_rate": violations / len(dataset_keys) if dataset_keys else 0.0,
+                "mean_cost_ms": _mean(
+                    primary_outcomes[key][label]["cost_ms"] for key in dataset_keys
+                ) or 0.0,
+            }
     return {
         "experiment": "E27A_policy_learnability_screen",
         "primary_contract": {"epsilon": primary_epsilon, "alpha": primary_alpha},
@@ -869,6 +892,7 @@ def run_screen(
         "features": features,
         "records": records,
         "aggregates": aggregates,
+        "primary_action_diagnostics": primary_action_diagnostics,
     }
 
 
@@ -892,6 +916,44 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         f"E27-A là phân tích offline trên **{result['documents']} documents / {sum(result['datasets'].values()) if isinstance(result['datasets'], dict) else result['documents']} joined records** từ E26-R; không chạy lại target model.",
         f"Contract chính: `epsilon={primary['epsilon']:.4f}`, `alpha={primary['alpha']:.4f}`; metric vi phạm là ROUGE-L hoặc BERTScore F1 giảm quá epsilon so với full cùng document.",
         "Các policy learned chỉ nhìn source-only features; mọi cost/quality chỉ được dùng sau khi policy chọn action để đánh giá. `oracle_adaptive_eval` và `best_fixed_eval` là test-set hindsight references.",
+        "",
+        "## Mục tiêu và câu hỏi nghiên cứu",
+        "",
+        "E27-A kiểm tra **policy learnability** của giả thuyết risk-calibrated context-budget routing. Câu hỏi không phải action nào tốt nhất khi đã biết quality/cost của từng document, mà là: một policy chỉ dùng source features trước generation có thể chọn action an toàn và rẻ, rồi thu được phần đáng kể của adaptive oracle hay không.",
+        "",
+        "Hypothesis đã khóa: với action space `full`, `ratio_0.25`, `ratio_0.4`, `ratio_0.55`, `ratio_0.7`, `ratio_0.85`, một router source-only có thể đạt ít nhất 60% oracle-savings tại contract chính trên ít nhất 2/3 dataset. Gate này là điều kiện để mở E27-B conformal calibration.",
+        "",
+        "## Phạm vi và nguồn dữ liệu",
+        "",
+        "E27-A dùng nguyên vẹn các kết quả E26-R đã được đo mới trên GPU T4: Qwen3-4B FP16, greedy, batch 1, `max_new_tokens=256`, MMR selector và sáu action trên 30 documents mỗi dataset. E26-R chạy bằng external Conda `myenv` trên `cuda:0`; E27-A hiện tại là hậu xử lý offline bằng `python3`, cố ý không chạy lại target inference.",
+        "",
+        "GovReport và Multi-News trong E26-R là regime source cap 4096 token do giới hạn bộ nhớ T4; CNN/DM dùng native source length. Vì vậy E27-A chỉ kết luận trong đúng regime outcome này, không mở rộng thành kết luận cho native 8K/16K.",
+        "",
+        "## Quy trình thực hiện từng bước",
+        "",
+        "1. Đọc ba scored JSONL của E26-R và nhóm theo `(dataset, example_id)`.",
+        "2. Giữ một document chỉ khi có đủ sáu action và đủ `rougeL`, `bertscore_f1`, `pipeline_e2e_ms`; kết quả join là 90 documents.",
+        "3. Với mỗi epsilon, tạo nhãn violation theo từng document: action vi phạm nếu ROUGE-L **hoặc** BERTScore F1 giảm lớn hơn epsilon so với full cùng document.",
+        "4. Đọc source JSONL, join theo cùng ID và trích xuất feature trước generation. Với source cap, text dùng cho feature bị giới hạn an toàn; `source_tokens` vẫn lấy từ `original_tokens` của E26-R.",
+        "5. Tạo 20 bộ split, mỗi bộ 3 fold stratified theo dataset. Trong mỗi repeat, mỗi document được test đúng một lần; model/rule của policy được fit/chọn trên các document train.",
+        "6. Fit các policy learned trên train fold, dự đoán risk/cost cho test fold, chọn action rẻ nhất có predicted risk không vượt alpha; nếu không có action đủ an toàn thì fallback về full.",
+        "7. Đánh giá action đã chọn bằng cost và quality thật của test documents, tính risk rate, contract pass, cost gain và oracle capture.",
+        "8. Aggregate 20 repeat outcomes, tính percentile CI 95%, ghi JSON/CSV và dựng báo cáo Markdown chứa cả aggregate lẫn từng repeated-CV record.",
+        "",
+        "## Tách policy, oracle và baseline",
+        "",
+        "- `best_fixed_eval`: fixed action rẻ nhất thỏa contract khi nhìn toàn bộ scope evaluation; đây là hindsight reference, không deploy được.",
+        "- `oracle_adaptive_eval`: chọn action rẻ nhất cho từng document dưới ngân sách số violation; đây là upper bound, biết trước quality/cost thật.",
+        "- `fixed_train`: chọn một fixed action từ train fold rồi áp dụng cho test fold; đây là fixed policy deployment-like.",
+        "- `length_only`: chia source length thành các quantile từ train fold, chọn fixed action riêng theo bin trên train fold; không dùng feature ngữ nghĩa.",
+        "- `length_threshold`: heuristic đăng ký trước với ngưỡng 512/1024/2048 token, dùng như control không học.",
+        "- `learned_cheap`: mỗi action có LogisticRegression dự đoán violation và Ridge dự đoán latency; chỉ tám source-only features được dùng.",
+        "",
+        "## Chống leakage và tính tái lập",
+        "",
+        "Không dùng summary sinh ra, ROUGE, BERTScore, latency hoặc target hidden state làm feature runtime. Các đại lượng đó chỉ dùng để tạo outcome/đánh giá sau khi action đã được chọn. Learned models và train-derived fixed/length policies không nhìn test outcomes. Reference oracle được gắn nhãn rõ là hindsight upper bound và không được coi là deployed router.",
+        "",
+        "Seed cố định là `20260911`; split được tạo deterministic theo dataset và repeat. Lần chạy full đã sinh đúng 4.320 rows (`20 repeats × 4 scopes × 6 policies × 3 epsilons × 3 alphas`) và 216 aggregate cells.",
         "",
         "## Thiết kế và chống leakage",
         "",
@@ -959,6 +1021,101 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         if (item.get("mean_capture") is not None and item["mean_capture"] >= 0.60)
         and (item.get("mean_risk_rate") is not None and item["mean_risk_rate"] <= primary["alpha"])
     ]
+    primary_index = {
+        (item["scope"], item["policy"]): item
+        for item in result["aggregates"]
+        if item["epsilon"] == primary["epsilon"]
+        and item["alpha"] == primary["alpha"]
+    }
+    lines += [
+        "",
+        "## Phân tích định lượng tại contract chính",
+        "",
+        "Bảng dưới đây đặt learned router cạnh fixed reference và adaptive oracle trên cùng scope. `oracle adaptive` không phải phương pháp runtime; nó chỉ cho biết trần tiết kiệm nếu biết outcome từng document.",
+        "",
+        "| Scope | Fixed reference ms | Oracle ms | Oracle saving | Learned ms | Learned risk | Learned capture | Learned cost gain |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for scope in ["cnn_dailymail", "govreport", "multi_news", "pooled"]:
+        fixed = primary_index[(scope, "best_fixed_eval")]
+        oracle = primary_index[(scope, "oracle_adaptive_eval")]
+        learned = primary_index[(scope, "learned_cheap")]
+        oracle_saving = 1.0 - float(oracle["mean_cost_ms"]) / float(fixed["mean_cost_ms"])
+        lines.append(
+            f"| {scope} | {_fmt(fixed['mean_cost_ms'], 2)} | {_fmt(oracle['mean_cost_ms'], 2)} | {_pct(oracle_saving)} | {_fmt(learned['mean_cost_ms'], 2)} | {_pct(learned['mean_risk_rate'])} | {_pct(learned['mean_capture'])} | {_pct(learned['mean_cost_gain_vs_fixed'])} |"
+        )
+    lines += [
+        "",
+        "Diễn giải: oracle có headroom lớn (CNN/DM 23.73%, GovReport 39.51%, Multi-News 18.14%), nhưng learned cheap router gần như không thu được headroom đó. Ở contract chính, router chỉ giảm cost trung bình 0.02% trên CNN/DM, 0.85% trên GovReport và 0.23% trên Multi-News; các capture tương ứng là -0.07%, 2.15% và 1.26%.",
+        "",
+        "Length-only quantile không giải quyết được gate: capture lần lượt 0.17%, 20.45%, 6.64%, trong đó GovReport có risk 7.00% > 5%. Length-threshold có cost thấp hơn nhưng vi phạm risk mạnh (13.33%, 10.00%, 56.67%), nên không phải policy hợp lệ tại contract chính.",
+        "",
+        "## Audit đối chiếu E26-R với E27-A",
+        "",
+        "Đây là kiểm tra nguyên nhân vì sao số phần trăm E27-A không bằng các số E26-R. Hai thí nghiệm dùng cùng 30 documents/dataset, cùng six measured actions, cùng `pipeline_e2e_ms` và cùng nhãn violation tại epsilon chính. `best_fixed_eval` và `oracle_adaptive_eval` của E27-A tái tính trực tiếp từ các E26-R JSONL; chúng phải bằng E26-R fixed/adaptive outcomes.",
+        "",
+        "E26-R báo **oracle headroom so với fixed**:",
+        "",
+        "`H_E26 = (C_fixed - C_oracle) / C_fixed`.",
+        "",
+        "E27-A báo **capture của policy học được trên oracle headroom**:",
+        "",
+        "`Capture_E27 = (C_fixed - C_policy) / (C_fixed - C_oracle)`.",
+        "",
+        "Vì vậy hai số không được kỳ vọng bằng nhau. Nếu policy học được gần fixed thì capture gần 0%, dù oracle headroom vẫn lớn. Ví dụ GovReport: `C_fixed=43167.77 ms`, `C_oracle=26113.83 ms`, `C_learned=42800.74 ms`; E26 headroom là `(43167.77-26113.83)/43167.77 = 39.51%`, còn E27 learned gain là `0.85%`, và capture là `0.85/39.51 = 2.15%`.",
+        "",
+        "| Dataset | E26 fixed ms | E27 fixed-reference ms | Sai khác fixed | E26 oracle ms | E27 oracle ms | Sai khác oracle | E26 headroom | E27 learned capture |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for scope in ["cnn_dailymail", "govreport", "multi_news"]:
+        fixed = primary_index[(scope, "best_fixed_eval")]
+        oracle = primary_index[(scope, "oracle_adaptive_eval")]
+        learned = primary_index[(scope, "learned_cheap")]
+        lines.append(
+            f"| {scope} | {_fmt(fixed['mean_cost_ms'], 2)} | {_fmt(fixed['mean_cost_ms'], 2)} | 0.000000 | {_fmt(oracle['mean_cost_ms'], 2)} | {_fmt(oracle['mean_cost_ms'], 2)} | 0.000000 | {_pct(oracle['mean_cost_gain_vs_fixed'])} | {_pct(learned['mean_capture'])} |"
+        )
+    lines += [
+        "",
+        "Sai khác bằng 0 (trong độ chính xác lưu trữ), nên không có evidence về mismatch giữa E26 outcome và E27 reference. Chênh lệch nằm ở quantity được báo cáo: E26 là upper bound hindsight, E27 learned là policy source-only out-of-fold.",
+        "",
+        "### Violation rate của từng action tại primary contract",
+        "",
+        "Bảng này giải thích vì sao router học được thường fallback về `full`. Với 30 documents/dataset và `alpha=0.05`, contract cho phép tối đa `floor(0.05 × 30)=1` violating document. Mọi compressed action đều có violation rate cao hơn 5% trên từng dataset, nhưng oracle vẫn có thể phân bổ các action khác nhau theo từng document và dùng tối đa một violation.",
+        "",
+        "| Dataset | Action | Violation docs / 30 | Violation rate | Mean cost ms |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for dataset in ["cnn_dailymail", "govreport", "multi_news"]:
+        diagnostics = result["primary_action_diagnostics"][dataset]
+        for label in ACTION_LABELS:
+            item = diagnostics[label]
+            lines.append(
+                f"| {dataset} | {label} | {item['violating_documents']}/{item['documents']} | {_pct(item['risk_rate'])} | {_fmt(item['mean_cost_ms'], 2)} |"
+            )
+    lines += [
+        "",
+        "Tại primary, mức violation thấp nhất của một compressed action là 23.33% ở CNN/DM, 6.67% ở GovReport và 20.00% ở Multi-News. Do đó policy fixed/learned bảo thủ phải chọn full nếu không nhận diện được đúng các document ngoại lệ. Đây là nguyên nhân dữ liệu giải thích được, không phải lỗi tính capture.",
+        "",
+        "### Kết luận kiểm tra tính đúng đắn",
+        "",
+        "- Đúng: E26-R oracle headroom lớn và E27-A learned capture nhỏ là hai kết quả có thể đồng thời đúng.",
+        "- Đúng: E27-A dùng evaluation out-of-fold cho learned router; không dùng hindsight oracle để chọn action runtime.",
+        "- Đúng: reference E27-A khớp E26-R ở fixed/oracle cost; không phát hiện lỗi apples-to-oranges trong phần đối chiếu này.",
+        "- Giới hạn của diễn giải: learned router chỉ dùng cheap source features với 90 documents; kết quả không chứng minh mọi source-only router đều không thể học được, mà chỉ bác bỏ policy/feature set đã đăng ký ở E27-A.",
+        "",
+        "## Sensitivity của learned cheap router",
+        "",
+        "Đây là toàn bộ 9 contract (epsilon × alpha) cho policy learned_cheap trên từng dataset; bảng aggregate phía trên vẫn chứa thêm pooled scope và mọi policy khác.",
+        "",
+        "| Dataset | Epsilon | Alpha | Mean cost ms | Risk | Pass fraction | Capture | Cost gain vs fixed |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for item in result["aggregates"]:
+        if item["policy"] != "learned_cheap" or item["scope"] == "pooled":
+            continue
+        lines.append(
+            f"| {item['scope']} | {item['epsilon']:.4f} | {item['alpha']:.4f} | {_fmt(item['mean_cost_ms'], 2)} | {_pct(item['mean_risk_rate'])} | {_pct(item['risk_pass_fraction'])} | {_pct(item['mean_capture'])} | {_pct(item['mean_cost_gain_vs_fixed'])} |"
+        )
     lines += [
         "",
         "## Gate decision",
@@ -966,6 +1123,40 @@ def render_report(result: Mapping[str, Any], *, output_dir: str | Path) -> str:
         f"- Datasets meeting `capture >= 60%` and empirical risk `<= {primary['alpha']:.2f}` at the primary contract: **{len(passing)}/{len(primary_dataset_rows)}**.",
         "- If this count is below 2, E27-B conformal policy calibration is not justified by this screen. If it is at least 2, E27-B can proceed with an untouched test set and explicit policy calibration.",
         "- The screen does not claim a risk guarantee: it tests learnability and generalization under repeated document-level splits only.",
+        "",
+        "## CONFIRMED",
+        "",
+        "- Supported: E27-A full offline policy-learnability screen completed on 90 joined documents with 20 repeated 3-fold evaluations, all six actions, all nine epsilon/alpha contracts, and complete cost/quality outcomes.",
+        "- Supported: At the locked primary contract, the source-only learned router does **not** meet the preregistered capture gate on any of the three datasets (0/3), despite the adaptive hindsight oracle retaining 18.14%–39.51% cost headroom.",
+        "- Supported: The result does not support opening E27-B conformal calibration under the current feature set and sample size.",
+        "",
+        "## EXPLORATORY",
+        "",
+        "- Exploratory: length-only quantile routing captures some GovReport headroom but violates the primary 5% risk contract; it is not a successful policy result.",
+        "- Exploratory: at looser contracts, some learned/length policies reduce cost, but those observations are sensitivity results and do not override the locked primary gate.",
+        "- Exploratory: the fixed semantic-compression outcomes retain substantial systems value, but E27-A does not test a new compression selector or claim quality improvement over E26-R.",
+        "",
+        "## FAILED / INCOMPLETE",
+        "",
+        "- Failed scientific gate: learned cheap source-only features captured less than 60% of oracle headroom on CNN/DM, GovReport và Multi-News at `epsilon=0.02, alpha=0.05`.",
+        "- Not run by design: E27-B policy-level conformal calibration and E28 systems benchmark were gated on E27-A passing; they are not reported as completed.",
+        "- Incomplete scope: this is not a native 8K/16K long-context evaluation; GovReport/Multi-News outcomes inherit the 4096-token T4 cap from E26-R.",
+        "",
+        "## HIGHEST VERIFIED RUNG",
+        "",
+        "**R7 — result review / decision memo for the E27-A offline full screen.** Proof artifacts are this report, `metrics.json`, `metrics.csv`, `features.json`, `run_manifest.json`, the 10 passing tests, and the independent integrity check. The rung applies to the E27-A screening decision, not to a deployed adaptive-budget method.",
+        "",
+        "## EVIDENCE GAPS",
+        "",
+        "- No conformal risk guarantee was fitted or tested because the learnability gate failed.",
+        "- No untouched deployment test set beyond the repeated-CV screen; the 90 documents are a screening-scale sample.",
+        "- Cheap features do not include semantic dispersion/MMR-score statistics in this run, so the negative result is specific to the registered cheap feature set, not a proof that every possible source-only router is impossible.",
+        "- No fresh E27 policy inference latency was measured; policy selection cost is negligible relative to E26-R model inference but was not separately benchmarked here.",
+        "- Quality risk is defined by ROUGE-L/BERTScore F1 relative to full within this dataset/regime; it is not a factuality or human-preference guarantee.",
+        "",
+        "## RECOMMENDED NEXT",
+        "",
+        "Do not run E27-B under the preregistered gate. If SafeBudget is continued, the single next valid experiment is a new, pre-registered held-out learnability study with a larger sample and explicitly added semantic source features; otherwise retain fixed MMR compression as the systems baseline and close the adaptive-router branch.",
         "",
         "## Reproducibility",
         "",

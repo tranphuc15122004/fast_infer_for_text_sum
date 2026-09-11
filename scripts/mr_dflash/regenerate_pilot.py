@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 
 from _common import read_jsonl, write_json, write_jsonl
+from progress import ProgressReporter, install_exception_hook
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -119,6 +121,26 @@ def _ensure_durable_empty_file(path: Path) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.flush()
         os.fsync(handle.fileno())
+
+
+class _ProgressLogitsProcessor:
+    """Heartbeat mỗi vài token, không thay đổi logits hay output target."""
+
+    def __init__(self, reporter: ProgressReporter, *, prompt_tokens: int, sample_id: str, budget: int) -> None:
+        self.reporter = reporter
+        self.prompt_tokens = int(prompt_tokens)
+        self.sample_id = str(sample_id)
+        self.budget = int(budget)
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        generated_tokens = max(0, int(input_ids.shape[-1]) - self.prompt_tokens)
+        self.reporter.maybe_tokens(
+            generated_tokens,
+            sample_id=self.sample_id,
+            prompt_tokens=self.prompt_tokens,
+            generation_budget=self.budget,
+        )
+        return scores
 
 
 def _apply_chat(tokenizer: Any, messages: List[Dict[str, str]], *, generation: bool, enable_thinking: bool = False):
@@ -228,6 +250,23 @@ def main(argv=None) -> None:
         action="store_true",
         help="giữ output hiện có và bỏ qua sample id đã regenerate",
     )
+    parser.add_argument(
+        "--progress-path",
+        default=None,
+        help="JSON heartbeat per-worker; bỏ trống nếu chạy standalone",
+    )
+    parser.add_argument(
+        "--progress-interval-tokens",
+        type=int,
+        default=256,
+        help="số token giữa hai heartbeat trong model.generate",
+    )
+    parser.add_argument(
+        "--output-batch-size",
+        type=int,
+        default=1,
+        help="số sample gom trước khi flush output; 1 giúp quan sát/resume an toàn",
+    )
     args = parser.parse_args(argv)
     if bool(args.target_model_path) == bool(args.responses_jsonl):
         raise ValueError("chọn đúng một trong --target-model-path hoặc --responses-jsonl")
@@ -237,6 +276,18 @@ def main(argv=None) -> None:
         raise ValueError("max-new-tokens không được lớn hơn max-length")
     if args.num_shards < 1 or args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
+    if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
+        raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
+    reporter = ProgressReporter(args.progress_path, interval_tokens=args.progress_interval_tokens)
+    previous_hook = install_exception_hook(reporter)
+    reporter.update(
+        "starting",
+        input=str(args.input),
+        output=str(args.output),
+        shard_index=int(args.shard_index),
+        num_shards=int(args.num_shards),
+        completed_samples=0,
+    )
     torch.manual_seed(args.seed)
     responses = _load_responses(args.responses_jsonl) if args.responses_jsonl else {}
     tokenizer = model = None
@@ -250,6 +301,7 @@ def main(argv=None) -> None:
         }
         if args.target_revision:
             load_kwargs["revision"] = args.target_revision
+        reporter.update("loading_model", target_model_path=str(args.target_model_path))
         tokenizer = AutoTokenizer.from_pretrained(args.target_model_path, **load_kwargs)
         dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.torch_dtype]
         model = AutoModelForCausalLM.from_pretrained(
@@ -260,6 +312,14 @@ def main(argv=None) -> None:
         ).to(device).eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
+        reporter.update(
+            "model_ready",
+            target_model_path=str(args.target_model_path),
+            device=str(device),
+            dtype=args.torch_dtype,
+        )
+    else:
+        reporter.update("responses_ready", response_count=len(responses))
 
     output = Path(args.output)
     skipped_report = Path(args.skipped_report) if args.skipped_report else output.with_name(output.stem + ".skipped.jsonl")
@@ -322,6 +382,13 @@ def main(argv=None) -> None:
         if args.limit is not None and stats["written"] >= args.limit:
             break
         sample_id = str(row.get("id", ""))
+        reporter.update(
+            "reading_sample",
+            row_index=int(index),
+            sample_id=sample_id or f"row_{index}",
+            completed_samples=len(existing),
+            written=int(stats["written"]),
+        )
         if not sample_id:
             record_skip(f"row_{index}", kind="invalid", error="sample thiếu id")
             continue
@@ -347,6 +414,7 @@ def main(argv=None) -> None:
         prompt_ids_len = None
         generation_budget = int(args.max_new_tokens)
         budget_clipped = False
+        generated_token_count: Optional[int] = None
         if tokenizer is not None:
             try:
                 if not args.preserve_full_input:
@@ -376,10 +444,35 @@ def main(argv=None) -> None:
                 continue
             if assistant is None:
                 try:
+                    reporter.reset_tokens()
+                    reporter.update(
+                        "generating",
+                        row_index=int(index),
+                        sample_id=sample_id,
+                        prompt_tokens=int(prompt_ids_len),
+                        generation_budget=int(generation_budget),
+                        generated_tokens=0,
+                        completed_samples=len(existing),
+                    )
                     with torch.inference_mode():
                         kwargs = {"max_new_tokens": generation_budget, "do_sample": False}
                         if args.temperature > 0:
                             kwargs.update({"do_sample": True, "temperature": args.temperature})
+                        # LogitsProcessor chỉ đọc input_ids và trả scores
+                        # nguyên vẹn; vì vậy heartbeat không làm đổi output.
+                        if args.progress_path:
+                            from transformers import LogitsProcessorList
+
+                            kwargs["logits_processor"] = LogitsProcessorList(
+                                [
+                                    _ProgressLogitsProcessor(
+                                        reporter,
+                                        prompt_tokens=prompt_ids_len,
+                                        sample_id=sample_id,
+                                        budget=generation_budget,
+                                    )
+                                ]
+                            )
                         generated_ids = model.generate(
                             prompt_ids,
                             attention_mask=torch.ones_like(prompt_ids),
@@ -395,6 +488,15 @@ def main(argv=None) -> None:
                         prompt_tokens=prompt_ids_len,
                     )
                     continue
+                generated_token_count = max(0, int(generated_ids.shape[-1]) - int(prompt_ids_len))
+                reporter.update(
+                    "generation_done",
+                    row_index=int(index),
+                    sample_id=sample_id,
+                    prompt_tokens=int(prompt_ids_len),
+                    generation_budget=int(generation_budget),
+                    generated_tokens=generated_token_count,
+                )
                 assistant = tokenizer.decode(generated_ids[0, prompt_ids_len:], skip_special_tokens=True).strip()
         if not assistant:
             record_skip(sample_id or f"row_{index}", kind="invalid", error="response rỗng", prompt_tokens=prompt_ids_len)
@@ -419,12 +521,36 @@ def main(argv=None) -> None:
         stats["written"] += 1
         if budget_clipped:
             stats["clipped_outputs"] += 1
-        if len(generated) >= 32:
+        reporter.update(
+            "writing_output",
+            row_index=int(index),
+            sample_id=sample_id,
+            generated_tokens=generated_token_count,
+            pending_output_rows=len(generated),
+            completed_samples=len(existing),
+        )
+        if len(generated) >= args.output_batch_size:
             _append_jsonl_durable(output, generated)
+            written_now = len(generated)
             generated.clear()
-            print(f"[regenerate_pilot] written={stats['written']}")
+            reporter.update(
+                "sample_done",
+                row_index=int(index),
+                sample_id=sample_id,
+                completed_samples=len(existing),
+                written=int(stats["written"]),
+                flushed_rows=written_now,
+            )
+            print(f"[regenerate_pilot] written={stats['written']} last_id={sample_id}", flush=True)
     if generated:
+        pending = len(generated)
         _append_jsonl_durable(output, generated)
+        reporter.update(
+            "sample_done",
+            completed_samples=len(existing),
+            written=int(stats["written"]),
+            flushed_rows=pending,
+        )
     _ensure_durable_empty_file(output)
     _ensure_durable_empty_file(skipped_report)
     stats["covered_rows"] = len(existing)
@@ -451,6 +577,14 @@ def main(argv=None) -> None:
         },
     )
     print(f"[regenerate_pilot] {stats}")
+    reporter.update(
+        "done",
+        completed_samples=len(existing),
+        written=int(stats["written"]),
+        skipped=int(stats["skipped_invalid"] + stats["skipped_overflow"] + stats["skipped_errors"]),
+        input_rows=int(stats["input_rows"]),
+    )
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

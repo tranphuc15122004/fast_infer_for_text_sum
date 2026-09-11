@@ -16,6 +16,7 @@ không nạp toàn bộ feature store vào RAM.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from collections import OrderedDict
@@ -112,8 +113,11 @@ def write_sharded_feature_manifest(
     shards: Sequence[Dict[str, Any]],
     sample_ids: Sequence[str],
     source_data_path: Optional[str] = None,
+    source_tokenized_path: Optional[str] = None,
     target_revision: Optional[str] = None,
     stored_feature_dtype: Optional[str] = None,
+    capture_backend: str = "hf_backbone",
+    attention_backend: Optional[str] = None,
     stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Ghi manifest schema ``mr_dflash_feature_sharded_v1``."""
@@ -134,6 +138,9 @@ def write_sharded_feature_manifest(
         "sample_ids": [str(x) for x in sample_ids],
         "shards": [dict(item) for item in shards],
         "source_data_path": source_data_path,
+        "source_tokenized_path": source_tokenized_path,
+        "capture_backend": str(capture_backend),
+        "attention_backend": attention_backend,
         "stats": dict(stats or {}),
     }
     _atomic_json_write(root / SHARDED_FEATURE_MANIFEST_FILENAME, payload)
@@ -191,11 +198,18 @@ class ShardedFeatureWriter:
         max_length: int,
         requested_torch_dtype: str,
         source_data_path: Optional[str] = None,
+        source_tokenized_path: Optional[str] = None,
         target_revision: Optional[str] = None,
         resume: bool = False,
+        io_threads: int = 0,
+        io_queue_size: int = 0,
+        capture_backend: str = "hf_backbone",
+        attention_backend: Optional[str] = None,
     ) -> None:
         if int(shard_size) < 1:
             raise ValueError("shard_size phải >= 1")
+        if int(io_threads) < 0 or int(io_queue_size) < 0:
+            raise ValueError("io_threads và io_queue_size không được âm")
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.shard_size = int(shard_size)
@@ -207,7 +221,10 @@ class ShardedFeatureWriter:
             "max_length": int(max_length),
             "requested_torch_dtype": requested_torch_dtype,
             "source_data_path": source_data_path,
+            "source_tokenized_path": source_tokenized_path,
             "target_revision": target_revision,
+            "capture_backend": str(capture_backend),
+            "attention_backend": attention_backend,
         }
         manifest_path = self.root / SHARDED_FEATURE_MANIFEST_FILENAME
         existing_pt = sorted(self.root.glob("shard_*.pt"))
@@ -230,6 +247,16 @@ class ShardedFeatureWriter:
                 "max_length",
             ):
                 if manifest.get(key) != self.metadata[key]:
+                    raise ValueError(
+                        f"metadata cache không khớp ở {key}: "
+                        f"{manifest.get(key)!r} != {self.metadata[key]!r}"
+                    )
+            for key in (
+                "source_tokenized_path",
+                "capture_backend",
+                "attention_backend",
+            ):
+                if key in manifest and manifest.get(key) != self.metadata[key]:
                     raise ValueError(
                         f"metadata cache không khớp ở {key}: "
                         f"{manifest.get(key)!r} != {self.metadata[key]!r}"
@@ -275,8 +302,32 @@ class ShardedFeatureWriter:
                 self.shards.append({"path": shard_path.name, "count": len(ids), "ids": ids, "lengths": lengths})
                 self.sample_ids.extend(ids)
         self.existing_ids = set(self.sample_ids)
+        self._next_shard_index = len(self.shards)
+        for shard in self.shards:
+            name = str(shard.get("path", ""))
+            if name.startswith("shard_") and name.endswith(".pt"):
+                try:
+                    self._next_shard_index = max(
+                        self._next_shard_index,
+                        int(name[len("shard_") : -len(".pt")]) + 1,
+                    )
+                except ValueError:
+                    pass
         self._pending: List[Dict[str, Any]] = []
         self._pending_ids: set[str] = set()
+        self._io_threads = int(io_threads)
+        self._io_queue_size = int(io_queue_size) if int(io_queue_size) > 0 else max(1, self._io_threads * 2)
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(
+                max_workers=self._io_threads,
+                thread_name_prefix="mr-dflash-cache-writer",
+            )
+            if self._io_threads > 0
+            else None
+        )
+        # Futures are drained in submission order. A slower later shard can
+        # therefore never reorder sample_ids in the durable manifest.
+        self._inflight: List[tuple[Future[Dict[str, Any]], List[str]]] = []
         self._stored_dtype: Optional[str] = (
             str(manifest.get("stored_feature_dtype"))
             if manifest is not None and manifest.get("stored_feature_dtype")
@@ -286,8 +337,12 @@ class ShardedFeatureWriter:
 
     @property
     def total_samples(self) -> int:
-        """Số sample đã ghi hoặc đang chờ flush."""
-        return len(self.sample_ids) + len(self._pending)
+        """Số sample đã ghi, đang ghi hoặc đang chờ flush."""
+        return (
+            len(self.sample_ids)
+            + len(self._pending)
+            + sum(len(ids) for _future, ids in self._inflight)
+        )
 
     def add(self, sample: Dict[str, Any]) -> bool:
         """Thêm sample; trả False nếu id đã có khi resume."""
@@ -312,15 +367,57 @@ class ShardedFeatureWriter:
     def flush(self) -> None:
         if not self._pending:
             return
-        name = f"shard_{len(self.shards):05d}.pt"
-        descriptor = write_feature_shard(self.root / name, self._pending)
-        self.shards.append(descriptor)
-        ids = [str(item["id"]) for item in self._pending]
-        self.sample_ids.extend(ids)
-        self.existing_ids.update(ids)
+        pending = self._pending
         self._pending = []
+        ids = [str(item["id"]) for item in pending]
         self._pending_ids.clear()
-        self._write_manifest()
+
+        if self._executor is None:
+            name = f"shard_{self._next_shard_index:05d}.pt"
+            self._next_shard_index += 1
+            descriptor = write_feature_shard(self.root / name, pending)
+            self.shards.append(descriptor)
+            self.sample_ids.extend(ids)
+            self.existing_ids.update(ids)
+            self._write_manifest()
+            return
+
+        # Bound the number of outstanding writes. This is the same producer /
+        # asynchronous-I/O pattern used by SpecForge: GPU capture can proceed
+        # while the previous shard is serialized to the shared filesystem.
+        self._drain_completed(wait=False)
+        while len(self._inflight) >= self._io_queue_size:
+            self._drain_completed(wait=True)
+        name = f"shard_{self._next_shard_index:05d}.pt"
+        self._next_shard_index += 1
+        future = self._executor.submit(write_feature_shard, self.root / name, pending)
+        self._inflight.append((future, ids))
+        # Reserve IDs immediately so a resumed/read-ahead input stream cannot
+        # enqueue duplicates before the writer future becomes durable.
+        self.existing_ids.update(ids)
+        self._drain_completed(wait=False)
+
+    def _drain_completed(self, *, wait: bool) -> None:
+        """Publish completed async shards to the manifest in FIFO order."""
+        while self._inflight:
+            future, ids = self._inflight[0]
+            if not wait and not future.done():
+                break
+            descriptor = future.result()
+            self._inflight.pop(0)
+            self.shards.append(descriptor)
+            self.sample_ids.extend(ids)
+            self._write_manifest()
+
+    def abort(self) -> None:
+        """Dừng writer khi capture lỗi, giữ shard đã rename để resume."""
+        if self._executor is None:
+            return
+        for future, _ids in self._inflight:
+            future.cancel()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor = None
+        self._inflight.clear()
 
     def _write_manifest(self) -> Dict[str, Any]:
         return write_sharded_feature_manifest(
@@ -335,8 +432,16 @@ class ShardedFeatureWriter:
     def close(self, *, stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if stats is not None:
             self.stats = dict(stats)
-        self.flush()
-        return self._write_manifest()
+        try:
+            self.flush()
+            if self._executor is not None:
+                self._drain_completed(wait=True)
+                self._executor.shutdown(wait=True)
+                self._executor = None
+            return self._write_manifest()
+        except Exception:
+            self.abort()
+            raise
 
 
 class ShardedDFlashFeatureDataset:

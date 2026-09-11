@@ -585,6 +585,31 @@ def test_magicdec_preflight_requires_checkpoint_before_launch(monkeypatch):
     assert "checkpoint" in result["reason"]
 
 
+def test_magicdec_preflight_rejects_unimportable_flashinfer(tmp_path, monkeypatch):
+    import common.longbench_adapter as adapter
+
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(
+        adapter,
+        "_module_importable",
+        lambda name: (False, "flashinfer native extension failed to import")
+        if name == "flashinfer"
+        else (True, None),
+    )
+    result = adapter.preflight_baseline(
+        "magicdec",
+        config={
+            "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            "magicdec_model_pth": str(checkpoint),
+        },
+        cuda_available=True,
+    )
+
+    assert result["status"] == "missing_dependency"
+    assert "flashinfer" in result["reason"]
+
+
 def test_specextend_preflight_rejects_slow_attention_fallback(monkeypatch):
     import common.longbench_adapter as adapter
 

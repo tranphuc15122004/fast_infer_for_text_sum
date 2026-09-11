@@ -31,7 +31,7 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 | `regenerate_{3k,8k}_{split}` | `regenerated_3k/*.jsonl` hoặc `regenerated/*.jsonl`, `*.skipped.jsonl`, regeneration manifests | Sinh assistant response deterministic bằng Qwen3-4B và ghi riêng sample không xử lý được |
 | `validate_{3k,8k}_{split}` | `manifests/validation_*.json` | Kiểm tra assistant cuối, target provenance, token length |
 | `tokenize_{3k,8k}_{split}` | `tokenized*/{split}/shard_*.pt`, `manifest.json` | Lưu `input_ids`, `loss_mask`, length; không lưu hidden |
-| `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Chạy target forward và lưu hidden `[1,9,17,25,33]` tại mọi offset |
+| `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Đọc tokenized shard, chạy backbone target và lưu hidden `[1,9,17,25,33]` tại mọi offset |
 
 Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
 `pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
@@ -136,6 +136,105 @@ Mỗi stage có worker log ở `.parallel_*/rank_*/worker.log`; trạng thái li
 `.parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
 pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
 
+### Theo dõi và dừng an toàn từng GPU
+
+Từ phiên bản có `mr_dflash_worker_progress_v1`, mỗi worker còn ghi:
+
+```text
+<work-root>/rank_00/progress.json
+<work-root>/rank_01/progress.json
+<work-root>/rank_02/progress.json
+```
+
+`progress.json` được thay thế atomically và chứa `pid`, GPU vật lý, phase hiện
+tại (`loading_model`, `generating`, `generation_done`, `capturing`,
+`batch_done`, `done`/`failed`), sample ID, số token đã sinh/budget, số sample
+đã hoàn tất và VRAM. Parent tổng hợp các file này vào `status.json` mỗi giây.
+Đọc live bằng watcher:
+
+```bash
+python3 scripts/mr_dflash/watch_parallel_stage.py \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --interval 5
+```
+
+Nếu terminal hỗ trợ carriage-return, thêm `--tqdm` để mỗi GPU có một thanh
+tiến trình riêng:
+
+```bash
+python3 scripts/mr_dflash/watch_parallel_stage.py \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --interval 5 --tqdm
+```
+
+Kiểm tra một lần dùng `--once`. Nếu `phase=generating` và `tokens` tăng, worker
+đang decode bình thường dù `output.jsonl` chưa có sample mới. Output regenerate
+mặc định flush sau từng sample (`--regenerate-output-batch-size 1`), nên sample
+đã hoàn thành được ghi bền vững ngay; không còn phải đợi 32 sample như phiên
+bản cũ. Heartbeat decode mặc định mỗi 256 token; giảm bằng
+`--progress-interval-tokens 64` khi cần chẩn đoán chi tiết hơn, nhưng heartbeat
+quá dày sẽ làm tăng I/O.
+
+Có thể yêu cầu dừng sạch trong lúc parent còn chạy bằng stop file. File phải
+được truyền ngay từ lúc khởi động:
+
+```bash
+STOP=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/.stop_parallel
+python3 scripts/mr_dflash/run_preprocess_pipeline.py ... \
+  --parallel-gpu-ids 1 2 3 --worker-stop-file "$STOP"
+# Ở terminal khác:
+touch "$STOP"
+```
+
+Sau khi stage dừng và muốn resume lại, xóa stop file trước:
+
+```bash
+rm -f "$STOP"
+```
+
+Pipeline sẽ gửi signal xuống process group của parallel stage, parallel stage
+gửi tiếp xuống từng worker và không merge artifact dở dang. `Ctrl-C`/SIGTERM
+cũng đi theo đường này. `SIGKILL` (`kill -9`) không thể được tiến trình bắt;
+trong trường hợp đó phải kiểm tra PID trong `status.json`/log và dừng worker cũ
+trước khi chạy `--resume`. Launcher mới sẽ từ chối khởi tạo worker trùng nếu
+status còn chỉ ra PID cũ đang sống.
+
+### Vì sao phiên chạy cũ trông như bị treo?
+
+Lệnh trước đó dùng `--max-new-tokens 32768` và worker cũ chỉ flush output sau
+32 sample. Với sample đầu tiên, target có thể hợp lệ khi mất rất lâu để decode
+đến khi gặp EOS hoặc chạm budget; vì vậy VRAM khoảng 22 GB nhưng chưa có
+`output.jsonl` không đủ để kết luận OOM hay cache sai. Cần xem
+`rank_*/worker.log` và `rank_*/progress.json`, đặc biệt `phase`, `sample_id`,
+`generated_tokens` và `updated_at_unix`.
+
+Cache vẫn được kiểm soát độc lập với heartbeat: response chỉ được đưa vào
+`regenerated/*.jsonl` sau khi `generate()` hoàn tất; hidden chỉ được đưa vào
+feature writer sau khi target forward hoàn tất; shard/manifest được ghi
+atomically và parent chỉ merge khi coverage ID đủ 100%. Khi bị dừng giữa mẫu,
+`--resume` chỉ bỏ qua ID đã ghi bền vững, nên mẫu đang dở sẽ được chạy lại,
+không được coi là đã cache xong. Với cache feature, các shard mồ côi sau khi
+bị dừng cũng được `ShardedFeatureWriter` phục hồi ở lần resume tiếp theo.
+
+Sau khi cache hoàn tất, audit độc lập cả tensor và coverage bằng lệnh (không
+chạy lại target):
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/verify_feature_cache.py \
+  --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl \
+  --cache-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train \
+  --tokenizer /workspace/storage-shared/models/Qwen3-4B \
+  --max-length 32768 \
+  --expected-target-model /workspace/storage-shared/models/Qwen3-4B \
+  --expected-feature-layer-ids 1 9 17 25 33 \
+  --local-files-only \
+  --report /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/manifests/cache_audit_full_train.json
+```
+
+Audit phải báo `valid=True`, đủ sample và `checked_offsets` bằng tổng độ dài
+tokenized của các sample. Tùy chọn `--tokenizer` còn kiểm tra token/mask; nếu
+chỉ cần kiểm tra shard nhanh có thể bỏ tùy chọn này.
+
 Trước khi chạy thật, in toàn bộ command mà không đọc source/model:
 
 ```bash
@@ -199,8 +298,9 @@ Có. Config pilot B200 hiện tại dùng **phase cache offline trước train**
 
 ```text
 regenerated JSONL (đã có output của Qwen target)
+    -> tokenized shard (đã tạo một lần trước cache)
     -> cache_target_features.py
-    -> target Qwen frozen forward theo batch
+    -> target backbone frozen forward theo batch (không chạy LM head/logits)
     -> hook lấy [1,9,17,25,33] tại mọi offset hợp lệ
     -> sharded feature cache + manifest
     -> DFlash/MR-DFlash train chỉ đọc cache
@@ -217,7 +317,8 @@ target embedding và frozen lm_head khi train. Full logits sẽ làm dung lượ
 tăng thêm nhiều lần mà không đem lại thông tin cần thiết cho pipeline này.
 
 Cache sharded dùng nhiều sample trong một file `.pt`, có `manifest.json`, LRU
-reader và `--resume`. Cache `.ckpt` một-file/mẫu trong `capture.py` vẫn được
+reader, `--resume` và writer I/O bất đồng bộ có giới hạn hàng đợi. Cache
+`.ckpt` một-file/mẫu trong `capture.py` vẫn được
 giữ cho backward compatibility và smoke nhỏ. Khi một config explicit
 `data.hidden_states_path` trỏ tới cache chưa hoàn chỉnh, `run_train.py` sẽ
 dừng và chỉ rõ lệnh cache; nó không tự chạy một pass target đắt tiền trong lúc
@@ -388,6 +489,20 @@ không phải độ dài context. Bắt đầu với 2 trên một B200 180 GB c
 1 cho 32K, sau đó tăng khi đã kiểm tra peak VRAM.
 `--bucket-buffer-size` giúp ghép các sample gần độ dài nhau.
 
+Pipeline tự truyền `--tokenized-path` cho cache. Nếu chạy script cache
+riêng, nên truyền cả JSONL để provenance/audit và tokenized shard để tránh
+tokenize lần thứ hai:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py --target-model-path /workspace/storage-shared/models/Qwen3-4B --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/tokenized_full/train --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train --target-layer-ids 1 9 17 25 33 --max-length 32768 --batch-size 1 --bucket-buffer-size 8 --shard-size 32 --attention-backend sdpa --io-threads 2 --io-queue-size 4 --supervision-mode last_assistant --device cuda --local-files-only --resume
+```
+
+Ở đây `sdpa` là backend mặc định an toàn; PyTorch có thể chọn fused
+scaled-dot-product kernel phù hợp với build CUDA. Chỉ dùng
+`--attention-backend flash_attention_2` sau khi đã xác nhận package/kernels
+trên server. Manifest cache ghi lại backend capture, còn feature semantics
+không đổi: hidden vẫn là teacher-forced hidden tại mọi offset hợp lệ.
+
 ## Benchmark target generation/cache trên B200
 
 Script `scripts/mr_dflash/target_cache_benchmark.py` không ghi đè cache. Nó
@@ -436,10 +551,12 @@ for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
     --target-model-path "$TARGET_MODEL" \
     --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated_3k/${split}.jsonl \
+    --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/tokenized_3k/${split} \
     --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_3k/${split} \
     --target-layer-ids 1 9 17 25 33 \
     --max-length 3072 --batch-size 2 --bucket-buffer-size 16 \
     --shard-size 64 --supervision-mode last_assistant \
+    --attention-backend sdpa --io-threads 2 --io-queue-size 4 \
     --device cuda --local-files-only --resume
 done
 
@@ -447,10 +564,12 @@ for split in train val test; do
   PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
     --target-model-path "$TARGET_MODEL" \
     --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/regenerated/${split}.jsonl \
+    --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/tokenized/${split} \
     --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_8k/${split} \
     --target-layer-ids 1 9 17 25 33 \
     --max-length 8192 --batch-size 1 --bucket-buffer-size 8 \
     --shard-size 32 --supervision-mode last_assistant \
+    --attention-backend sdpa --io-threads 2 --io-queue-size 4 \
     --device cuda --local-files-only --resume
 done
 ```

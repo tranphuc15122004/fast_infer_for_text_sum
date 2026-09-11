@@ -39,10 +39,35 @@ def test_modal_master_env_uses_remote_cache_and_online_huggingface():
     assert env["LONG_BENCH_MODEL"] == "meta-llama/Meta-Llama-3.1-8B-Instruct"
     assert env["LONG_BENCH_EAGLE_MODEL"] == "org/eagle"
     assert env["LONG_BENCH_DFLASH_MODEL"] == "org/dflash"
+    assert env["LONG_BENCH_MAGICDEC_MODEL_PTH"] == (
+        "/mnt/fast-infer/checkpoints/magicdec/llama-3.1-8b/model.pth"
+    )
+    assert env["LONG_BENCH_MAGICDEC_MODEL_NAME"] == (
+        "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    )
     assert env["LONG_BENCH_OUTPUT_DIR"] == "/mnt/fast-infer/outputs/longbench_100_14k"
     assert "/workspace/storage-shared" not in "\n".join(
         f"{key}={value}" for key, value in env.items()
     )
+
+
+def test_modal_master_env_allows_magicdec_checkpoint_override(tmp_path):
+    runner = load_modal_runner()
+
+    env = runner.build_modal_env(
+        model="org/model",
+        eagle_model="org/eagle",
+        dflash_model="org/dflash",
+        mode="representative",
+        baselines="magicdec",
+        datasets="lcc",
+        output_dir=Path("/mnt/fast-infer/outputs/longbench_100_14k"),
+        magicdec_model_pth=tmp_path / "model.pth",
+        magicdec_model_name="org/tokenizer",
+    )
+
+    assert env["LONG_BENCH_MAGICDEC_MODEL_PTH"] == str(tmp_path / "model.pth")
+    assert env["LONG_BENCH_MAGICDEC_MODEL_NAME"] == "org/tokenizer"
 
 
 def test_modal_master_env_can_point_children_at_a_persistent_venv(tmp_path):
