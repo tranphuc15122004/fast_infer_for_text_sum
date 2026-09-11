@@ -83,6 +83,7 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --full-context \
   --full-context-length 32768 \
   --max-new-tokens 2048 \
+  --allow-short \
   --overflow-policy skip \
   --sample-error-policy skip \
   --resume \
@@ -104,6 +105,12 @@ trong cùng process có thể làm sai kết quả; stage dừng an toàn và ch
 `--resume` sau khi giảm batch/context. Các JSON/manifest được ghi atomically,
 output JSONL có `fsync`, và pipeline có lock theo `data-root` để không có hai
 job cùng ghi một cache.
+
+`--allow-short` là tùy chọn cần thiết khi source hợp lệ ít hơn số lượng yêu
+cầu. Ví dụ source ShareGPT hiện có 49.861 dòng hợp lệ thay vì 50.000; khi bật
+cờ này pipeline dùng đúng 49.861 dòng, không nhân bản, và ghi số lượng thực tế
+vào `source_manifest.json`/`split_manifest.json`. Nếu bắt buộc đủ 50K + 50K,
+bỏ cờ này để pipeline dừng rõ ràng tại `prepare` cho tới khi bổ sung source.
 
 Mode full-context là bộ dữ liệu/cache gốc để audit hoặc train long-context.
 Các config pilot 3K/8K hiện tại vẫn dùng artifact regime tương ứng và nên

@@ -58,6 +58,10 @@ class PipelineOptions:
     arxiv_source: str = DEFAULT_ARXIV_SOURCE
     sharegpt_count: int = 50_000
     arxiv_count: int = 50_000
+    # Mặc định strict để không vô tình chạy benchmark thiếu dữ liệu. Khi bật,
+    # prepare/build dùng toàn bộ số mẫu hợp lệ thực tế nếu source ngắn hơn yêu
+    # cầu và ghi số lượng đó vào manifest (không nhân bản sample).
+    allow_short: bool = False
     max_lengths: tuple[int, ...] = (3072, 8192)
     full_context: bool = False
     full_context_length: int = 32768
@@ -245,6 +249,7 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
         str(options.arxiv_count),
         "--seed",
         str(options.seed),
+        *(["--allow-short"] if options.allow_short else []),
         "--tokenizer",
         options.target_model_path,
         *(_resume_args(options)),
@@ -964,6 +969,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--arxiv-source", default=DEFAULT_ARXIV_SOURCE)
     parser.add_argument("--sharegpt-count", type=int, default=50_000)
     parser.add_argument("--arxiv-count", type=int, default=50_000)
+    parser.add_argument(
+        "--allow-short",
+        action="store_true",
+        help=(
+            "cho phép dùng ít hơn số lượng yêu cầu nếu source không đủ; "
+            "manifest ghi số lượng thực tế, không nhân bản dữ liệu"
+        ),
+    )
     parser.add_argument("--max-lengths", type=int, nargs="+", default=[3072, 8192])
     parser.add_argument(
         "--full-context",
@@ -1170,6 +1183,7 @@ def main(argv=None) -> int:
         arxiv_source=str(args.arxiv_source),
         sharegpt_count=int(args.sharegpt_count),
         arxiv_count=int(args.arxiv_count),
+        allow_short=bool(args.allow_short),
         max_lengths=tuple(int(value) for value in args.max_lengths),
         full_context=bool(args.full_context),
         full_context_length=int(args.full_context_length),

@@ -223,3 +223,22 @@ def test_parallel_cache_worker_receives_batch_profile(tmp_path: Path) -> None:
     )
     command = _build_worker_command(args, tmp_path / "rank_00", 0, 2)
     assert command[command.index("--batch-profile") + 1] == str(profile)
+
+
+def test_pipeline_allow_short_is_explicitly_forwarded_to_prepare(tmp_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan, parse_args
+
+    assert parse_args([]).allow_short is False
+    args = parse_args(["--allow-short"])
+    assert args.allow_short is True
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        allow_short=True,
+    )
+    prepare = next(stage for stage in build_stage_plan(options) if stage.name == "prepare")
+    assert "--allow-short" in prepare.command
