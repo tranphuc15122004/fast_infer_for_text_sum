@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
-from _common import REPO_ROOT, read_jsonl, write_json, write_jsonl
+from _common import REPO_ROOT, read_jsonl, resolve_parallel_work_root, write_json, write_jsonl
 from progress import format_duration, read_progress
 
 
@@ -658,7 +658,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("stall-timeout-seconds không được âm")
     if args.work_root is None:
         output = Path(args.output)
-        args.work_root = str(output.parent / f".parallel_{args.mode}_{output.stem}")
+        args.work_root = str(resolve_parallel_work_root(output, args.mode))
     return args
 
 

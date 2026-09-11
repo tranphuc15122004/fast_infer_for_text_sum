@@ -131,6 +131,27 @@ def append_jsonl_durable(path: str | Path, rows: Iterable[Dict[str, Any]]) -> in
     return count
 
 
+def resolve_parallel_work_root(output: str | Path, mode: str) -> Path:
+    """Resolve a visible worker directory, preserving legacy resume paths.
+
+    New runs use a visible, descriptive directory such as
+    ``parallel_regenerate_train``.  Older runs used the hidden
+    ``.parallel_regenerate_train`` convention; if that directory is the only
+    existing work-root, keep using it so an interrupted legacy run remains
+    resumable instead of silently launching a duplicate job.
+    """
+    if mode not in {"regenerate", "cache"}:
+        raise ValueError(f"parallel mode không hợp lệ: {mode!r}")
+    output_path = Path(output)
+    visible = output_path.parent / f"parallel_{mode}_{output_path.stem}"
+    legacy = output_path.parent / f".parallel_{mode}_{output_path.stem}"
+    if visible.exists():
+        return visible
+    if legacy.exists():
+        return legacy
+    return visible
+
+
 def normalize_role(role: Any) -> str:
     value = str(role or "").strip().lower()
     aliases = {

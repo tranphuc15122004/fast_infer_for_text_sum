@@ -176,13 +176,13 @@ worker ghi shard riêng rồi parent kiểm tra coverage trước khi merge. Dù
 Tham số này là số sample đồng thời trên mỗi GPU cho mọi context dài hơn 3K,
 không phải batch size 8K. Tên cũ `--cache-batch-size-8k` vẫn được hỗ trợ như
 alias tương thích.
-Log worker nằm trong các thư mục `.parallel_*/rank_*/worker.log`.
+Log worker nằm trong các thư mục `parallel_*/rank_*/worker.log`.
 
 Để theo dõi chi tiết từng GPU trong lúc regenerate/cache, đọc heartbeat bằng:
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
-  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json \
   --interval 5
 ```
 

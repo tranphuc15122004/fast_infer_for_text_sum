@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - server production là Linux
 
 from _common import (
     REPO_ROOT as DEFAULT_REPO_ROOT,
+    resolve_parallel_work_root,
     write_json,
 )
 from prepare_server_data import (
@@ -339,7 +340,7 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     "--manifest",
                     str(manifest),
                     "--work-root",
-                    str(regenerated / f".parallel_regenerate_{split}"),
+                    str(resolve_parallel_work_root(regenerated / f"{split}.jsonl", "regenerate")),
                     "--target-model-path",
                     options.target_model_path,
                     "--max-length",
@@ -494,7 +495,7 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     "--manifest",
                     str(manifest),
                     "--work-root",
-                    str(output_dir.parent / f".parallel_cache_{split}"),
+                    str(resolve_parallel_work_root(output_dir, "cache")),
                     "--target-model-path",
                     options.target_model_path,
                     "--max-length",

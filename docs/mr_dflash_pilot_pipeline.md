@@ -132,8 +132,8 @@ sample cho mọi regime dài hơn 3K (8K, 16K, 32K, ...). Nó không phải batc
 nếu peak VRAM thực tế cao, hạ về `1`, còn không nên tăng cho tới khi pilot đo
 xong. Tên cũ `--cache-batch-size-8k` vẫn được hỗ trợ như alias tương thích,
 nhưng không nên dùng cho các run 32K.
-Mỗi stage có worker log ở `.parallel_*/rank_*/worker.log`; trạng thái live ở
-`.parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
+Mỗi stage có worker log ở `parallel_*/rank_*/worker.log`; trạng thái live ở
+`parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
 pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
 
 ### Theo dõi và dừng an toàn từng GPU
@@ -154,7 +154,7 @@ tại (`loading_model`, `generating`, `generation_done`, `capturing`,
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
-  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json \
   --interval 5
 ```
 
@@ -163,7 +163,7 @@ tiến trình riêng:
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
-  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json \
+  --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json \
   --interval 5 --tqdm
 ```
 

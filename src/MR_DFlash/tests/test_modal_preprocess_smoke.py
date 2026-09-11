@@ -27,8 +27,8 @@ def test_modal_smoke_plan_uses_full_context_and_tracker_paths() -> None:
     assert plan["cache"][plan["cache"].index("--batch-size") + 1] == "1"
     layer_flag = plan["cache"].index("--target-layer-ids")
     assert plan["cache"][layer_flag + 1 : layer_flag + 6] == ["1", "9", "17", "25", "33"]
-    assert str(plan["regenerate_status"]).endswith(".parallel_regenerate_train/status.json")
-    assert str(plan["cache_status"]).endswith(".parallel_cache_train/status.json")
+    assert str(plan["regenerate_status"]).endswith("parallel_regenerate_train/status.json")
+    assert str(plan["cache_status"]).endswith("parallel_cache_train/status.json")
 
 
 def test_modal_smoke_report_requires_tracking_and_cache_audit() -> None:

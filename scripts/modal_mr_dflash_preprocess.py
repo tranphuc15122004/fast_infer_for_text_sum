@@ -59,8 +59,8 @@ def build_smoke_plan(
     cache_root = run_root / "target_features" / "train"
     cache_manifest = cache_root / "manifest.json"
     stop_file = run_root / ".stop_parallel"
-    regenerate_work = run_root / "regenerated" / ".parallel_regenerate_train"
-    cache_work = run_root / "target_features" / ".parallel_cache_train"
+    regenerate_work = run_root / "regenerated" / "parallel_regenerate_train"
+    cache_work = run_root / "target_features" / "parallel_cache_train"
     progress_interval = "8"
 
     regenerate = [

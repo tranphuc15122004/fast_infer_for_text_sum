@@ -2,7 +2,7 @@
 
 Ví dụ:
 ``python3 scripts/mr_dflash/watch_parallel_stage.py \
-  --status data/mr_dflash_pilot_full/regenerated_full/.parallel_regenerate_train/status.json``
+  --status data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json``
 
 Script chỉ đọc status/heartbeat, không attach vào CUDA và không thay đổi job.
 """

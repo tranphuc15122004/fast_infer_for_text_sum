@@ -395,6 +395,40 @@ def test_full_context_cache_plan_uses_long_context_batch_size(tmp_path: Path) ->
     assert stage.command[stage.command.index("--batch-size") + 1] == "3"
 
 
+def test_parallel_work_roots_are_visible_and_descriptive(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        parallel_gpu_ids=(0, 1),
+    )
+    plan = build_stage_plan(options)
+    regenerate = next(stage for stage in plan if stage.name == "regenerate_full_train")
+    cache = next(stage for stage in plan if stage.name == "cache_full_train")
+    assert str(tmp_path / "pilot" / "regenerated_full" / "parallel_regenerate_train") in regenerate.command
+    assert str(tmp_path / "pilot" / "target_features_qwen3_4b_full" / "parallel_cache_train") in cache.command
+    assert ".parallel_" not in " ".join(regenerate.command + cache.command)
+
+
+def test_parallel_work_root_keeps_legacy_path_for_resume(tmp_path: Path) -> None:
+    from _common import resolve_parallel_work_root
+
+    output = tmp_path / "regenerated_full" / "train.jsonl"
+    expected = output.parent / "parallel_regenerate_train"
+    legacy = output.parent / ".parallel_regenerate_train"
+    assert resolve_parallel_work_root(output, "regenerate") == expected
+
+    legacy.mkdir(parents=True)
+    assert resolve_parallel_work_root(output, "regenerate") == legacy
+
+    expected.mkdir(parents=True)
+    assert resolve_parallel_work_root(output, "regenerate") == expected
+
+
 def test_preprocess_pipeline_full_context_preserves_generation_input(tmp_path: Path) -> None:
     from run_preprocess_pipeline import PipelineOptions, build_stage_plan
 
