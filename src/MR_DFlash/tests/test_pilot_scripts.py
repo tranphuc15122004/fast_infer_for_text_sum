@@ -457,6 +457,27 @@ def test_preprocess_pipeline_full_context_preserves_generation_input(tmp_path: P
     assert str(tmp_path / "pilot" / "regenerated_full" / "train.jsonl") in stage.command
 
 
+def test_preprocess_pipeline_forwards_true_generation_batch_size(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+        full_context=True,
+        full_context_length=32768,
+        regenerate_generation_batch_size=8,
+        regenerate_output_batch_size=8,
+        parallel_gpu_ids=(0, 1),
+    )
+    stage = next(
+        stage for stage in build_stage_plan(options) if stage.name == "regenerate_full_train"
+    )
+
+    assert stage.command[stage.command.index("--generation-batch-size") + 1] == "8"
+    assert stage.command[stage.command.index("--output-batch-size") + 1] == "8"
+
+
 def test_generation_budget_clips_only_response_not_full_prompt() -> None:
     from regenerate_pilot import resolve_generation_budget
 

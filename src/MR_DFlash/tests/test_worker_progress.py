@@ -56,6 +56,33 @@ def test_progress_estimate_reports_eta_from_run_tokens() -> None:
     assert estimate["eta_human"] == "30.0s"
 
 
+def test_progress_reporter_preserves_worker_context(tmp_path: Path) -> None:
+    from progress import ProgressReporter, read_progress
+
+    reporter = ProgressReporter(tmp_path / "progress.json")
+    reporter.set_context(total_samples=17)
+    reporter.update("starting", completed_samples=0)
+    reporter.update("reading_sample", completed_samples=3, sample_id="s3")
+
+    payload = read_progress(tmp_path / "progress.json")
+    assert payload["total_samples"] == 17
+    assert payload["completed_samples"] == 3
+
+
+def test_regenerate_progress_counts_rows_assigned_to_worker(tmp_path: Path) -> None:
+    from regenerate_pilot import _count_shard_rows
+
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        "".join(json.dumps({"id": f"s{i}"}) + "\n" for i in range(10)),
+        encoding="utf-8",
+    )
+
+    assert _count_shard_rows(input_path, shard_index=0, num_shards=3) == 4
+    assert _count_shard_rows(input_path, shard_index=1, num_shards=3) == 3
+    assert _count_shard_rows(input_path, shard_index=2, num_shards=3) == 3
+
+
 def test_parallel_aggregate_uses_slowest_worker_eta() -> None:
     from parallel_stage import aggregate_progress
 

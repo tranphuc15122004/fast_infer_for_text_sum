@@ -367,6 +367,7 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             "--temperature", str(args.temperature),
             "--seed", str(args.seed),
             "--device", worker_device,
+            "--generation-batch-size", str(args.generation_batch_size),
             "--torch-dtype", args.torch_dtype,
             "--shard-index", str(rank),
             "--num-shards", str(num_shards),
@@ -517,11 +518,17 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
                 },
             )
             if now - last_progress_log_at >= 30.0:
+                total_tokens = int(aggregate["total_tokens"])
+                token_progress = (
+                    f"{aggregate['completed_tokens']}/{total_tokens}"
+                    if total_tokens > 0
+                    else "unknown"
+                )
                 print(
                     "[parallel] progress "
                     f"mode={args.mode} "
                     f"completed={aggregate['completed_samples']}/{aggregate['total_samples']} "
-                    f"tokens={aggregate['completed_tokens']}/{aggregate['total_tokens']} "
+                    f"tokens={token_progress} "
                     f"rate={aggregate['throughput_tokens_per_second'] or 0:.1f} tok/s "
                     f"eta={aggregate['eta_human']}",
                     flush=True,
@@ -600,6 +607,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--preserve-full-input", action="store_true")
+    parser.add_argument(
+        "--generation-batch-size",
+        type=int,
+        default=1,
+        help="batch inference thật trong model.generate; khác output-batch-size",
+    )
     parser.add_argument("--overflow-policy", choices=["error", "skip"], default="error")
     parser.add_argument("--sample-error-policy", choices=["error", "skip"], default="error")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -662,6 +675,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("target-layer-ids không được âm")
     if args.batch_size < 1 or args.bucket_buffer_size < args.batch_size or args.shard_size < 1:
         raise ValueError("batch/bucket-buffer/shard-size không hợp lệ")
+    if args.generation_batch_size < 1:
+        raise ValueError("generation-batch-size phải >= 1")
     if args.io_threads < 0 or args.io_queue_size < 0:
         raise ValueError("io-threads và io-queue-size không được âm")
     if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
@@ -736,6 +751,7 @@ def main(argv=None) -> int:
         "supervision_mode": args.supervision_mode,
         "progress_interval_tokens": int(args.progress_interval_tokens),
         "output_batch_size": int(args.output_batch_size),
+        "generation_batch_size": int(args.generation_batch_size),
         "stall_timeout_seconds": float(args.stall_timeout_seconds),
         "stop_file": str(args.stop_file) if args.stop_file else None,
         "num_shards": len(args.gpu_ids),
@@ -752,6 +768,7 @@ def main(argv=None) -> int:
             "target_model_path",
             "max_length",
             "max_new_tokens",
+            "generation_batch_size",
             "target_layer_ids",
             "attention_backend",
             "batch_profile",

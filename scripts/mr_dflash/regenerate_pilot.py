@@ -18,12 +18,33 @@ from typing import Any, Dict, Iterable, List, Optional
 import torch
 
 from _common import read_jsonl, write_json, write_jsonl
+from MR_DFlash.generation_batching import left_pad_prompt_ids, select_generation_group
 from progress import ProgressReporter, install_exception_hook
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
     """OOM không được skip: CUDA context có thể đã ở trạng thái không an toàn."""
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _count_shard_rows(
+    input_path: str | Path,
+    *,
+    shard_index: int,
+    num_shards: int,
+    limit: int | None = None,
+) -> int:
+    """Đếm trước workload của worker để progress không hiển thị ``0/0``."""
+    if num_shards < 1 or shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("shard_index phải nằm trong [0, num_shards)")
+    total = 0
+    for index, _row in enumerate(read_jsonl(input_path)):
+        if index % num_shards != shard_index:
+            continue
+        total += 1
+        if limit is not None and total >= int(limit):
+            break
+    return total
 
 
 def resolve_generation_budget(
@@ -126,11 +147,20 @@ def _ensure_durable_empty_file(path: Path) -> None:
 class _ProgressLogitsProcessor:
     """Heartbeat mỗi vài token, không thay đổi logits hay output target."""
 
-    def __init__(self, reporter: ProgressReporter, *, prompt_tokens: int, sample_id: str, budget: int) -> None:
+    def __init__(
+        self,
+        reporter: ProgressReporter,
+        *,
+        prompt_tokens: int,
+        sample_id: str,
+        budget: int,
+        batch_size: int = 1,
+    ) -> None:
         self.reporter = reporter
         self.prompt_tokens = int(prompt_tokens)
         self.sample_id = str(sample_id)
         self.budget = int(budget)
+        self.batch_size = int(batch_size)
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         generated_tokens = max(0, int(input_ids.shape[-1]) - self.prompt_tokens)
@@ -139,6 +169,7 @@ class _ProgressLogitsProcessor:
             sample_id=self.sample_id,
             prompt_tokens=self.prompt_tokens,
             generation_budget=self.budget,
+            batch_size=self.batch_size,
         )
         return scores
 
@@ -197,6 +228,105 @@ def _load_responses(path: str) -> Dict[str, str]:
         text = row.get("assistant", row.get("response", row.get("text", "")))
         if sample_id and text:
             responses[sample_id] = str(text)
+    return responses
+
+
+def _generate_prepared_batch(
+    model: Any,
+    tokenizer: Any,
+    items: List[Dict[str, Any]],
+    *,
+    reporter: ProgressReporter,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> List[str]:
+    """Generate một nhóm prompt đã validate/tokenize.
+
+    Tất cả item trong nhóm có cùng ``generation_budget``. Left padding giúp
+    decoder-only model xử lý batch có prompt dài ngắn khác nhau mà vẫn tách
+    đúng phần token mới sinh khỏi prefix.
+    """
+    if not items:
+        return []
+    budget = int(items[0]["generation_budget"])
+    if any(int(item["generation_budget"]) != budget for item in items):
+        raise ValueError("generation batch chứa các sample khác generation budget")
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("tokenizer cần pad_token_id hoặc eos_token_id để batch generation")
+    prompt_ids, attention_mask = left_pad_prompt_ids(
+        [item["prompt_ids"] for item in items],
+        pad_token_id=int(pad_token_id),
+    )
+    prompt_ids = prompt_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    padded_prompt_length = int(prompt_ids.shape[-1])
+    sample_id = str(items[0]["sample_id"])
+    reporter.reset_tokens()
+    reporter.update(
+        "generating_batch",
+        sample_id=sample_id,
+        batch_size=len(items),
+        batch_sample_ids=[str(item["sample_id"]) for item in items],
+        prompt_tokens=max(int(item["prompt_tokens"]) for item in items),
+        padded_prompt_tokens=padded_prompt_length,
+        generation_budget=budget,
+        generated_tokens=0,
+        completed_samples=int(items[0].get("completed_samples", 0)),
+    )
+    kwargs: Dict[str, Any] = {
+        "max_new_tokens": budget,
+        "do_sample": False,
+        "use_cache": True,
+        "pad_token_id": int(pad_token_id),
+    }
+    if args.temperature > 0:
+        kwargs.update({"do_sample": True, "temperature": args.temperature})
+    if args.progress_path:
+        from transformers import LogitsProcessorList
+
+        kwargs["logits_processor"] = LogitsProcessorList(
+            [
+                _ProgressLogitsProcessor(
+                    reporter,
+                    prompt_tokens=padded_prompt_length,
+                    sample_id=sample_id,
+                    budget=budget,
+                    batch_size=len(items),
+                )
+            ]
+        )
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            prompt_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+    if generated_ids.ndim != 2 or int(generated_ids.shape[0]) != len(items):
+        raise RuntimeError(
+            "target generate trả shape không khớp batch: "
+            f"shape={tuple(generated_ids.shape)} batch={len(items)}"
+        )
+    responses: List[str] = []
+    for row, item in enumerate(items):
+        if int(generated_ids.shape[1]) >= padded_prompt_length:
+            new_ids = generated_ids[row, padded_prompt_length:]
+        else:  # pragma: no cover - guard cho model backend bất thường
+            new_ids = generated_ids[row]
+        response = tokenizer.decode(new_ids.tolist(), skip_special_tokens=True).strip()
+        responses.append(response)
+    reporter.update(
+        "generation_batch_done",
+        sample_id=sample_id,
+        batch_size=len(items),
+        batch_sample_ids=[str(item["sample_id"]) for item in items],
+        prompt_tokens=max(int(item["prompt_tokens"]) for item in items),
+        padded_prompt_tokens=padded_prompt_length,
+        generation_budget=budget,
+        generated_tokens=max(0, int(generated_ids.shape[1]) - padded_prompt_length),
+    )
     return responses
 
 
@@ -262,6 +392,12 @@ def main(argv=None) -> None:
         help="số token giữa hai heartbeat trong model.generate",
     )
     parser.add_argument(
+        "--generation-batch-size",
+        type=int,
+        default=1,
+        help="batch inference thật trong model.generate; 1 giữ behavior legacy",
+    )
+    parser.add_argument(
         "--output-batch-size",
         type=int,
         default=1,
@@ -276,10 +412,19 @@ def main(argv=None) -> None:
         raise ValueError("max-new-tokens không được lớn hơn max-length")
     if args.num_shards < 1 or args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
+    if args.generation_batch_size < 1:
+        raise ValueError("generation-batch-size phải >= 1")
     if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
         raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
     reporter = ProgressReporter(args.progress_path, interval_tokens=args.progress_interval_tokens)
     previous_hook = install_exception_hook(reporter)
+    shard_total_samples = _count_shard_rows(
+        args.input,
+        shard_index=int(args.shard_index),
+        num_shards=int(args.num_shards),
+        limit=args.limit,
+    )
+    reporter.set_context(total_samples=shard_total_samples)
     reporter.update(
         "starting",
         input=str(args.input),
@@ -375,6 +520,118 @@ def main(argv=None) -> None:
         else:
             stats["skipped_errors"] += 1
 
+    generation_pending: List[Dict[str, Any]] = []
+
+    def emit_result(
+        item: Dict[str, Any],
+        assistant: str,
+        generated_token_count: Optional[int],
+    ) -> None:
+        """Đóng gói một response và flush theo output-batch-size."""
+        sample_id = str(item["sample_id"])
+        prompt_messages = item["prompt_messages"]
+        generation_budget = int(item["generation_budget"])
+        prompt_ids_len = item.get("prompt_tokens")
+        budget_clipped = bool(item.get("budget_clipped", False))
+        row = item["row"]
+        if not assistant:
+            record_skip(
+                sample_id,
+                kind="invalid",
+                error="response rỗng",
+                prompt_tokens=prompt_ids_len,
+            )
+            return
+        final_row = {
+            **row,
+            "conversations": prompt_messages + [{"role": "assistant", "content": assistant}],
+            "metadata": {
+                **(row.get("metadata") or {}),
+                "generation_model": args.target_model_path or "external_response_server",
+                "generation_temperature": args.temperature,
+                "enable_thinking": bool(args.enable_thinking),
+                "max_new_tokens": args.max_new_tokens,
+                "actual_max_new_tokens": generation_budget,
+                "generation_budget_clipped": budget_clipped,
+                "prompt_tokens": prompt_ids_len,
+            },
+        }
+        generated.append(final_row)
+        existing.add(sample_id)
+        stats["written"] += 1
+        if budget_clipped:
+            stats["clipped_outputs"] += 1
+        reporter.update(
+            "writing_output",
+            row_index=int(item["row_index"]),
+            sample_id=sample_id,
+            generated_tokens=generated_token_count,
+            pending_output_rows=len(generated),
+            completed_samples=len(existing),
+        )
+        if len(generated) >= args.output_batch_size:
+            _append_jsonl_durable(output, generated)
+            written_now = len(generated)
+            generated.clear()
+            reporter.update(
+                "sample_done",
+                row_index=int(item["row_index"]),
+                sample_id=sample_id,
+                completed_samples=len(existing),
+                written=int(stats["written"]),
+                flushed_rows=written_now,
+            )
+            print(
+                f"[regenerate_pilot] written={stats['written']} last_id={sample_id}",
+                flush=True,
+            )
+
+    def flush_generation_pending(*, force: bool = False) -> None:
+        """Generate các item đang chờ, cùng budget và có padding chung."""
+        effective_batch_size = (
+            1 if args.temperature > 0 else int(args.generation_batch_size)
+        )
+        while generation_pending and (force or len(generation_pending) >= effective_batch_size):
+            group = list(
+                select_generation_group(
+                    generation_pending,
+                    max_batch_size=effective_batch_size,
+                )
+            )
+            if not group:
+                raise RuntimeError("không chọn được generation batch từ pending items")
+            # Chọn candidate theo độ dài để giảm padding, nhưng trả kết quả
+            # theo thứ tự input để standalone regenerate vẫn giữ JSONL order.
+            group.sort(key=lambda item: int(item["row_index"]))
+            try:
+                responses_batch = _generate_prepared_batch(
+                    model,
+                    tokenizer,
+                    group,
+                    reporter=reporter,
+                    device=device,
+                    args=args,
+                )
+            except Exception as exc:
+                if _is_cuda_oom(exc):
+                    raise
+                for item in group:
+                    record_skip(
+                        str(item["sample_id"]),
+                        kind="error",
+                        error=f"target generation lỗi: {exc!r}",
+                        prompt_tokens=int(item["prompt_tokens"]),
+                    )
+                responses_batch = [""] * len(group)
+            group_ids = {id(item) for item in group}
+            generation_pending[:] = [
+                item for item in generation_pending if id(item) not in group_ids
+            ]
+            for item, assistant in zip(group, responses_batch):
+                if assistant:
+                    generated_token_count = None
+                    emit_result(item, assistant, generated_token_count)
+
     for index, row in enumerate(read_jsonl(args.input)):
         if index % args.num_shards != args.shard_index:
             continue
@@ -397,11 +654,19 @@ def main(argv=None) -> None:
             continue
         messages = list(row.get("conversations") or [])
         if not messages:
-            record_skip(sample_id or f"row_{index}", kind="invalid", error="sample không có conversations")
-            continue
-        if any(str(message.get("role", "")).lower() == "assistant" for message in messages if isinstance(message, dict)):
             record_skip(
-                sample_id or f"row_{index}",
+                sample_id,
+                kind="invalid",
+                error="sample không có conversations",
+            )
+            continue
+        if any(
+            str(message.get("role", "")).lower() == "assistant"
+            for message in messages
+            if isinstance(message, dict)
+        ):
+            record_skip(
+                sample_id,
                 kind="invalid",
                 error=(
                     f"sample {sample_id!r} đã chứa assistant response; "
@@ -411,27 +676,24 @@ def main(argv=None) -> None:
             continue
         prompt_messages = messages
         assistant = responses.get(sample_id)
-        prompt_ids_len = None
+        prompt_ids_len: Optional[int] = None
         generation_budget = int(args.max_new_tokens)
         budget_clipped = False
-        generated_token_count: Optional[int] = None
         if tokenizer is not None:
             try:
                 if not args.preserve_full_input:
                     budget = max(1, args.max_length - args.max_new_tokens)
                     prompt_messages = _truncate_prompt(tokenizer, messages, budget)
-                prompt_ids = _as_ids(_apply_chat(tokenizer, prompt_messages, generation=True)).to(device)
+                prompt_ids = _as_ids(
+                    _apply_chat(tokenizer, prompt_messages, generation=True)
+                ).to(device)
                 if prompt_ids.ndim == 1:
                     prompt_ids = prompt_ids.unsqueeze(0)
                 prompt_ids_len = int(prompt_ids.shape[-1])
             except Exception as exc:
                 if _is_cuda_oom(exc):
                     raise
-                record_skip(
-                    sample_id,
-                    kind="error",
-                    error=f"tokenize prompt lỗi: {exc!r}",
-                )
+                record_skip(sample_id, kind="error", error=f"tokenize prompt lỗi: {exc!r}")
                 continue
             try:
                 generation_budget, budget_clipped = resolve_generation_budget(
@@ -440,108 +702,53 @@ def main(argv=None) -> None:
                     args.max_new_tokens,
                 )
             except ValueError as exc:
-                record_skip(sample_id or f"row_{index}", kind="overflow", error=f"sample {sample_id!r}: {exc}", prompt_tokens=prompt_ids_len)
-                continue
-            if assistant is None:
-                try:
-                    reporter.reset_tokens()
-                    reporter.update(
-                        "generating",
-                        row_index=int(index),
-                        sample_id=sample_id,
-                        prompt_tokens=int(prompt_ids_len),
-                        generation_budget=int(generation_budget),
-                        generated_tokens=0,
-                        completed_samples=len(existing),
-                    )
-                    with torch.inference_mode():
-                        kwargs = {"max_new_tokens": generation_budget, "do_sample": False}
-                        if args.temperature > 0:
-                            kwargs.update({"do_sample": True, "temperature": args.temperature})
-                        # LogitsProcessor chỉ đọc input_ids và trả scores
-                        # nguyên vẹn; vì vậy heartbeat không làm đổi output.
-                        if args.progress_path:
-                            from transformers import LogitsProcessorList
-
-                            kwargs["logits_processor"] = LogitsProcessorList(
-                                [
-                                    _ProgressLogitsProcessor(
-                                        reporter,
-                                        prompt_tokens=prompt_ids_len,
-                                        sample_id=sample_id,
-                                        budget=generation_budget,
-                                    )
-                                ]
-                            )
-                        generated_ids = model.generate(
-                            prompt_ids,
-                            attention_mask=torch.ones_like(prompt_ids),
-                            **kwargs,
-                        )
-                except Exception as exc:
-                    if _is_cuda_oom(exc):
-                        raise
-                    record_skip(
-                        sample_id or f"row_{index}",
-                        kind="error",
-                        error=f"target generation lỗi: {exc!r}",
-                        prompt_tokens=prompt_ids_len,
-                    )
-                    continue
-                generated_token_count = max(0, int(generated_ids.shape[-1]) - int(prompt_ids_len))
-                reporter.update(
-                    "generation_done",
-                    row_index=int(index),
-                    sample_id=sample_id,
-                    prompt_tokens=int(prompt_ids_len),
-                    generation_budget=int(generation_budget),
-                    generated_tokens=generated_token_count,
+                record_skip(
+                    sample_id,
+                    kind="overflow",
+                    error=f"sample {sample_id!r}: {exc}",
+                    prompt_tokens=prompt_ids_len,
                 )
-                assistant = tokenizer.decode(generated_ids[0, prompt_ids_len:], skip_special_tokens=True).strip()
-        if not assistant:
-            record_skip(sample_id or f"row_{index}", kind="invalid", error="response rỗng", prompt_tokens=prompt_ids_len)
+                continue
+            item = {
+                "row": row,
+                "row_index": int(index),
+                "sample_id": sample_id,
+                "prompt_messages": prompt_messages,
+                "prompt_ids": prompt_ids.flatten(),
+                "prompt_tokens": int(prompt_ids_len),
+                "generation_budget": int(generation_budget),
+                "budget_clipped": bool(budget_clipped),
+                "completed_samples": len(existing),
+            }
+            if assistant is None:
+                generation_pending.append(item)
+                # Look-ahead buffer amortizes model.generate while remaining
+                # bounded in CPU/GPU memory. The group itself is still capped
+                # by generation_batch_size.
+                pending_limit = max(1, int(args.generation_batch_size) * 4)
+                if len(generation_pending) >= pending_limit:
+                    flush_generation_pending()
+                continue
+            emit_result(item, assistant, None)
             continue
-        final_messages = prompt_messages + [{"role": "assistant", "content": assistant}]
-        final_row = {
-            **row,
-            "conversations": final_messages,
-            "metadata": {
-                **(row.get("metadata") or {}),
-                "generation_model": args.target_model_path or "external_response_server",
-                "generation_temperature": args.temperature,
-                "enable_thinking": bool(args.enable_thinking),
-                "max_new_tokens": args.max_new_tokens,
-                "actual_max_new_tokens": generation_budget,
-                "generation_budget_clipped": bool(budget_clipped),
+        if not assistant:
+            record_skip(sample_id, kind="invalid", error="response rỗng")
+            continue
+        emit_result(
+            {
+                "row": row,
+                "row_index": int(index),
+                "sample_id": sample_id,
+                "prompt_messages": prompt_messages,
+                "generation_budget": generation_budget,
+                "budget_clipped": budget_clipped,
                 "prompt_tokens": prompt_ids_len,
             },
-        }
-        generated.append(final_row)
-        existing.add(sample_id)
-        stats["written"] += 1
-        if budget_clipped:
-            stats["clipped_outputs"] += 1
-        reporter.update(
-            "writing_output",
-            row_index=int(index),
-            sample_id=sample_id,
-            generated_tokens=generated_token_count,
-            pending_output_rows=len(generated),
-            completed_samples=len(existing),
+            assistant,
+            None,
         )
-        if len(generated) >= args.output_batch_size:
-            _append_jsonl_durable(output, generated)
-            written_now = len(generated)
-            generated.clear()
-            reporter.update(
-                "sample_done",
-                row_index=int(index),
-                sample_id=sample_id,
-                completed_samples=len(existing),
-                written=int(stats["written"]),
-                flushed_rows=written_now,
-            )
-            print(f"[regenerate_pilot] written={stats['written']} last_id={sample_id}", flush=True)
+
+    flush_generation_pending(force=True)
     if generated:
         pending = len(generated)
         _append_jsonl_durable(output, generated)
@@ -570,6 +777,8 @@ def main(argv=None) -> None:
             "preserve_full_input": bool(args.preserve_full_input),
             "overflow_policy": args.overflow_policy,
             "sample_error_policy": args.sample_error_policy,
+            "generation_batch_size": int(args.generation_batch_size),
+            "output_batch_size": int(args.output_batch_size),
             "skipped_report": str(skipped_report),
             "shard_index": int(args.shard_index),
             "num_shards": int(args.num_shards),

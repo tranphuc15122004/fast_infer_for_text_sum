@@ -172,11 +172,23 @@ class ProgressReporter:
         self.path = Path(path) if path else None
         self.interval_tokens = max(1, int(interval_tokens))
         self._last_token_write: Optional[int] = None
+        self._context: dict[str, Any] = {}
+
+    def set_context(self, **fields: Any) -> None:
+        """Giữ các field bất biến qua mọi heartbeat của cùng worker.
+
+        Mỗi lần ``update`` ghi một JSON snapshot mới. Vì vậy các metadata như
+        tổng số sample phải được giữ ở reporter; nếu chỉ ghi ở heartbeat đầu,
+        heartbeat sau sẽ làm mất chúng và parent sẽ hiển thị ``0/0``.
+        """
+        self._context.update(fields)
 
     def update(self, phase: str, **fields: Any) -> dict[str, Any] | None:
         if self.path is None:
             return None
-        return write_progress(self.path, phase=phase, **fields)
+        payload = dict(self._context)
+        payload.update(fields)
+        return write_progress(self.path, phase=phase, **payload)
 
     def maybe_tokens(self, generated_tokens: int, **fields: Any) -> dict[str, Any] | None:
         generated_tokens = int(generated_tokens)

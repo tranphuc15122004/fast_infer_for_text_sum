@@ -38,6 +38,44 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 | `profile_cache_batch_{regime}` *(auto-batch)* | `manifests/cache_batch_profile_<regime>.json` | Đo batch an toàn theo bucket độ dài trên GPU profile; không ghi feature |
 | `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Đọc tokenized shard, chạy backbone target và lưu hidden `[1,9,17,25,33]` tại mọi offset |
 
+## Smoke phase 1 trên 20 sample
+
+Để kiểm tra toàn bộ đường đi từ prompt canonical đến feature cache mà không
+đụng vào dataset lớn, dùng script riêng sau. Input phải là JSONL prompt-only
+đã chuẩn hóa, thường là `normalized/pilot_prompts.jsonl`; script không sửa
+input và ghi toàn bộ artifact vào `--output-root` mới:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_phase1_smoke.py \
+  --input /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/normalized/pilot_prompts.jsonl \
+  --output-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_phase1_smoke_20 \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --num-samples 20 \
+  --max-length 8192 \
+  --max-new-tokens 256 \
+  --device cuda \
+  --local-files-only \
+  --resume
+```
+
+Script lấy reservoir sample deterministic theo `--seed`, sau đó chạy:
+`regenerate_smoke_train → validate_smoke_train → tokenize_smoke_train →
+cache_smoke_train`. Output gồm `normalized/smoke_prompts.jsonl`, các thư mục
+`regenerated_smoke/`, `tokenized_smoke/`, `target_features_smoke/`, cùng
+`manifests/`, `pipeline_logs/`, `pipeline_state/`, `pipeline_plan.json` và
+`pipeline_summary.json`. Chạy lại cùng lệnh sẽ giữ subset và resume từng
+stage; đổi `--output-root` khi muốn một thí nghiệm mới.
+
+Kiểm tra command trước khi chạy model:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_phase1_smoke.py \
+  --input /path/to/normalized/pilot_prompts.jsonl \
+  --output-root /tmp/mr_dflash_phase1_smoke_20 \
+  --target-model-path /path/to/Qwen3-4B \
+  --dry-run
+```
+
 Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
 `pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
 `pipeline_summary.json`. Lỗi hệ thống hoặc CUDA OOM dừng tại stage để bảo toàn
@@ -84,6 +122,8 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --full-context-length 32768 \
   --max-new-tokens 2048 \
   --allow-short \
+  --regenerate-generation-batch-size 8 \
+  --regenerate-output-batch-size 8 \
   --overflow-policy skip \
   --sample-error-policy skip \
   --resume \
@@ -111,6 +151,14 @@ cầu. Ví dụ source ShareGPT hiện có 49.861 dòng hợp lệ thay vì 50.0
 cờ này pipeline dùng đúng 49.861 dòng, không nhân bản, và ghi số lượng thực tế
 vào `source_manifest.json`/`split_manifest.json`. Nếu bắt buộc đủ 50K + 50K,
 bỏ cờ này để pipeline dừng rõ ràng tại `prepare` cho tới khi bổ sung source.
+
+`--regenerate-generation-batch-size` là batch inference thật trên mỗi GPU;
+`--regenerate-output-batch-size` chỉ là số dòng gom trước khi ghi JSONL. Với
+B200 180 GB, bắt đầu bằng giá trị 8 cho generation; nếu heartbeat hoặc VRAM
+cho thấy không an toàn, giảm xuống 4. Worker gom các prompt gần độ dài và
+cùng generation budget, dùng left-padding/attention mask, nên không cắt input
+hay đổi output greedy. Khi `temperature > 0`, worker tự hạ batch inference về
+1 để giữ semantics sampling.
 
 Mode full-context là bộ dữ liệu/cache gốc để audit hoặc train long-context.
 Các config pilot 3K/8K hiện tại vẫn dùng artifact regime tương ứng và nên

@@ -34,10 +34,16 @@ def format_status(payload: dict[str, Any]) -> str:
     if aggregate:
         rate = aggregate.get("throughput_tokens_per_second")
         rate_text = "unknown" if rate is None else f"{float(rate):.1f}tok/s"
+        total_tokens = aggregate.get("total_tokens")
+        token_text = (
+            f"{aggregate.get('completed_tokens', 0)}/{total_tokens}"
+            if isinstance(total_tokens, (int, float)) and int(total_tokens) > 0
+            else "unknown"
+        )
         lines.append(
             "aggregate "
             f"samples={aggregate.get('completed_samples', 0)}/{aggregate.get('total_samples', 0)} "
-            f"tokens={aggregate.get('completed_tokens', 0)}/{aggregate.get('total_tokens', 0)} "
+            f"tokens={token_text} "
             f"rate={rate_text} eta={aggregate.get('eta_human', 'unknown')}"
         )
     workers = payload.get("workers") or []

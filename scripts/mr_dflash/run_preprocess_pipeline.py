@@ -101,6 +101,9 @@ class PipelineOptions:
     cache_profile_bucket_step: int = 8192
     parallel_gpu_ids: tuple[int, ...] = ()
     progress_interval_tokens: int = 256
+    # Batch inference thật trong ``model.generate``; khác với
+    # regenerate_output_batch_size là batch chỉ dùng khi flush JSONL.
+    regenerate_generation_batch_size: int = 1
     regenerate_output_batch_size: int = 1
     worker_stall_timeout_seconds: float = 0.0
     worker_stop_file: Optional[str] = None
@@ -327,6 +330,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 str(options.seed),
                 "--device",
                 options.device,
+                "--generation-batch-size",
+                str(options.regenerate_generation_batch_size),
                 "--torch-dtype",
                 options.torch_dtype,
                 *(["--preserve-full-input"] if options.full_context else []),
@@ -366,6 +371,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(options.temperature),
                     "--seed",
                     str(options.seed),
+                    "--generation-batch-size",
+                    str(options.regenerate_generation_batch_size),
                     "--torch-dtype",
                     options.torch_dtype,
                     "--overflow-policy",
@@ -1116,6 +1123,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="số token giữa hai heartbeat của mỗi worker generate",
     )
     parser.add_argument(
+        "--regenerate-generation-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "batch inference thật của model.generate trên mỗi GPU; "
+            "sample được gom theo generation budget và độ dài"
+        ),
+    )
+    parser.add_argument(
         "--regenerate-output-batch-size",
         type=int,
         default=1,
@@ -1161,8 +1177,15 @@ def main(argv=None) -> int:
         raise ValueError("parallel-gpu-ids không được âm")
     if len(args.parallel_gpu_ids) != len(set(args.parallel_gpu_ids)):
         raise ValueError("parallel-gpu-ids không được trùng")
-    if args.progress_interval_tokens < 1 or args.regenerate_output_batch_size < 1:
-        raise ValueError("progress-interval-tokens và regenerate-output-batch-size phải >= 1")
+    if (
+        args.progress_interval_tokens < 1
+        or args.regenerate_generation_batch_size < 1
+        or args.regenerate_output_batch_size < 1
+    ):
+        raise ValueError(
+            "progress-interval-tokens, regenerate-generation-batch-size và "
+            "regenerate-output-batch-size phải >= 1"
+        )
     if args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
         raise ValueError("cache-io-threads và cache-io-queue-size không được âm")
     if args.cache_profile_gpu_id < 0:
@@ -1221,6 +1244,7 @@ def main(argv=None) -> int:
         cache_profile_bucket_step=int(args.cache_profile_bucket_step),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         progress_interval_tokens=int(args.progress_interval_tokens),
+        regenerate_generation_batch_size=int(args.regenerate_generation_batch_size),
         regenerate_output_batch_size=int(args.regenerate_output_batch_size),
         worker_stall_timeout_seconds=float(args.worker_stall_timeout_seconds),
         worker_stop_file=str(args.worker_stop_file) if args.worker_stop_file else None,
