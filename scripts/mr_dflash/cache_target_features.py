@@ -31,6 +31,7 @@ import torch
 
 from _common import append_jsonl_durable, read_jsonl
 from MR_DFlash.cache_batching import CacheBatchSchedule
+from MR_DFlash.cache_throughput import CacheThroughputProfile
 from MR_DFlash.capture import HFTargetCapture
 from progress import ProgressReporter, estimate_fields, install_exception_hook
 
@@ -265,6 +266,7 @@ def cache_dataset(
     skipped_report: Optional[str] = None,
     progress_path: Optional[str] = None,
     batch_profile: Optional[str] = None,
+    throughput_profile: Optional[str] = None,
 ) -> Dict[str, int]:
     """Chạy target capture theo batch và ghi cache sharded resumable."""
     if data_path is None and tokenized_path is None:
@@ -273,11 +275,32 @@ def cache_dataset(
         raise ValueError("batch_size phải >= 1")
     if io_threads < 0 or io_queue_size < 0:
         raise ValueError("io_threads và io_queue_size không được âm")
+    if batch_profile and throughput_profile:
+        raise ValueError("chỉ được dùng một trong batch_profile hoặc throughput_profile")
     batch_schedule = CacheBatchSchedule.from_path(batch_profile) if batch_profile else None
+    throughput_schedule = (
+        CacheThroughputProfile.from_path(throughput_profile)
+        if throughput_profile
+        else None
+    )
+    if throughput_schedule is not None:
+        # Trong throughput mode, profile là giới hạn batch chính thức. Giá trị
+        # ``batch_size`` cũ chỉ điều khiển HF mode khi không có profile.
+        throughput_schedule.validate(
+            max_length=max_length,
+            batch_limit=throughput_schedule.max_batch_size,
+        )
+    profile_max_batch = max(
+        batch_size,
+        batch_schedule.max_batch_size if batch_schedule is not None else 0,
+        throughput_schedule.max_batch_size if throughput_schedule is not None else 0,
+    )
     if bucket_buffer_size is None:
         bucket_buffer_size = max(
             batch_size,
-            batch_schedule.max_batch_size if batch_schedule else batch_size * 8,
+            profile_max_batch
+            if (batch_schedule or throughput_schedule)
+            else batch_size * 8,
         )
     if bucket_buffer_size < batch_size:
         raise ValueError("bucket_buffer_size phải >= batch_size")
@@ -286,6 +309,13 @@ def cache_dataset(
         # để schedule auto-batch không bị giảm hiệu quả chỉ vì người dùng
         # còn giữ giá trị buffer cố định cũ.
         bucket_buffer_size = batch_schedule.max_batch_size
+    if (
+        throughput_schedule is not None
+        and bucket_buffer_size < throughput_schedule.max_batch_size
+    ):
+        # Giữ đủ candidate trong buffer để scheduler token-budget có thể
+        # chọn batch lớn nhất an toàn theo padded length thực tế.
+        bucket_buffer_size = throughput_schedule.max_batch_size
     if num_shards < 1 or shard_index < 0 or shard_index >= num_shards:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
 
@@ -347,6 +377,21 @@ def cache_dataset(
                 for bucket in batch_schedule.buckets
             ],
         )
+    if throughput_schedule is not None:
+        reporter.update(
+            "throughput_profile_ready",
+            throughput_profile=str(throughput_profile),
+            throughput_profile_sha256=throughput_schedule.profile_sha256,
+            throughput_buckets=[
+                {
+                    "min_length": int(bucket.min_length),
+                    "max_length": int(bucket.max_length),
+                    "batch_size": int(bucket.batch_size),
+                    "token_budget": int(bucket.token_budget),
+                }
+                for bucket in throughput_schedule.buckets
+            ],
+        )
     pad_token_id = getattr(capturer.tokenizer, "pad_token_id", None)
     if pad_token_id is None:
         pad_token_id = getattr(capturer.tokenizer, "eos_token_id", 0) or 0
@@ -367,9 +412,13 @@ def cache_dataset(
         io_queue_size=io_queue_size,
         capture_backend="hf_backbone",
         attention_backend=attention_backend,
-        cache_batch_profile=batch_profile,
+        cache_batch_profile=throughput_profile or batch_profile,
         cache_batch_profile_sha256=(
-            batch_schedule.profile_sha256 if batch_schedule is not None else None
+            throughput_schedule.profile_sha256
+            if throughput_schedule is not None
+            else batch_schedule.profile_sha256
+            if batch_schedule is not None
+            else None
         ),
     )
     stats = {
@@ -570,7 +619,17 @@ def cache_dataset(
     rows = iter_cache_rows()
 
     def next_batch_size(sample_length: Optional[int] = None) -> int:
-        if batch_schedule is not None:
+        if throughput_schedule is not None:
+            if sample_length is None:
+                raise ValueError("throughput profile cần sample_length để chọn bucket")
+            requested = throughput_schedule.batch_for_length(sample_length)
+            # Buffer đã được sort giảm dần theo length trước khi gọi helper,
+            # vì vậy length của sample đầu là padded length thật của batch.
+            selected = throughput_schedule.cap_batch_size(
+                padded_length=sample_length,
+                requested_batch_size=requested,
+            )
+        elif batch_schedule is not None:
             if sample_length is None:
                 raise ValueError("auto-batch cần sample_length để chọn bucket")
             selected = batch_schedule.batch_size_for_length(sample_length)
@@ -737,6 +796,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help="profile JSON do profile_cache_batches.py tạo; chọn batch theo length bucket",
     )
+    parser.add_argument(
+        "--throughput-profile",
+        "--cache-throughput-profile",
+        "--cache-profile",
+        dest="throughput_profile",
+        default=None,
+        help=(
+            "profile token-budget JSON; batch được cap theo padded token count "
+            "của batch thực tế"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -771,6 +841,7 @@ def main(argv=None) -> None:
         skipped_report=args.skipped_report,
         progress_path=args.progress_path,
         batch_profile=args.batch_profile,
+        throughput_profile=args.throughput_profile,
     )
 
 
