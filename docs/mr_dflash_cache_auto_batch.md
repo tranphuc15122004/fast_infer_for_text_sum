@@ -21,12 +21,17 @@ PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --full-context --full-context-length 32768 --max-new-tokens 2048 \
   --cache-backend specforge_sglang \
   --cache-attention-backend flashinfer \
+  --cache-auto-batch --cache-auto-batch-target-vram-gb 170 \
+  --cache-auto-batch-max-size 128 \
   --cache-concurrency 64 --cache-max-total-tokens 262144 \
   --cache-memory-fraction 0.99 --cache-startup-stagger-seconds 3 \
   --parallel-gpu-ids 0 1 2 3 --cache-splits train val --resume
 ```
 
-`0.99` cố ý tận dụng gần toàn bộ 180GB. Nếu worker bị CUDA OOM hoặc bị hệ
+Khi bật `--cache-auto-batch`, worker tự nâng static-pool lên gần `170/180`
+(xấp xỉ `0.944`) dù lệnh vẫn giữ các giá trị compatibility `64` và `262144`;
+batch cache tăng theo từng bucket length tới `--cache-auto-batch-max-size`.
+Nếu worker bị CUDA OOM hoặc bị hệ
 điều hành kill với exit code `-9`, launcher ghi `retry_hint.json` trong
 `parallel_cache_<split>/`; các shard đã durable vẫn giữ nguyên. Chạy lại cùng
 lệnh với `--resume`, giảm `--cache-concurrency`/`--cache-max-total-tokens`
@@ -39,8 +44,11 @@ sample của toàn input, còn heartbeat chi tiết từng worker nằm trong
 
 ## Mục đích
 
-`--cache-auto-batch` là đường tương thích cho HF backbone cũ và chạy một stage
-profile trước `cache_*`. Profiler dùng
+Với backend `specforge_sglang`, `--cache-auto-batch` là adaptive runtime mode:
+profile token-budget chỉ làm điểm khởi đầu, sau đó batch tăng dần theo từng
+bucket length. Static pool được cấu hình theo mục tiêu VRAM; không cần chạy
+stage profiler riêng. `--cache-auto-batch` vẫn là đường tương thích cho HF
+backbone cũ và khi đó chạy một stage profile trước `cache_*`. Profiler dùng
 tokenized train shard và target model thật trên một GPU, đo lần lượt các batch
 candidate (mặc định `1,2,4,8`) tại cận trên của từng bucket độ dài. Bucket chỉ
 được chọn batch nếu `peak_memory_reserved` không vượt hard limit VRAM.
@@ -51,7 +59,7 @@ Kết quả được ghi tại:
 <data-root>/manifests/cache_batch_profile_<regime>.json
 ```
 
-Sau đó cache worker dùng schedule cố định trong toàn bộ run. Không có cơ chế
+Sau đó cache worker HF dùng schedule cố định trong toàn bộ run. Không có cơ chế
 thử lại bằng batch khác sau khi đã bắt đầu ghi feature shard; nếu batch 1 không
 an toàn, profile dừng trước cache. Cache manifest cũng ghi
 `cache_batch_profile` để audit/resume không dùng nhầm schedule.

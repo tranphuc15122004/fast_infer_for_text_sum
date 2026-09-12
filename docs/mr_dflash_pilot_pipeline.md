@@ -8,8 +8,9 @@ giữ effective batch/fairness đồng thời chừa headroom VRAM.
 Backend cache tốc độ cao theo cơ chế offline SGLang của SpecForge và profile
 token-budget B200 được mô tả tại
 [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md). Bật
-`--cache-backend specforge_sglang` để dùng đường này; `--cache-auto-batch` là
-đường tương thích cho HF backbone.
+`--cache-backend specforge_sglang` để dùng đường này; với B200 nên thêm
+`--cache-auto-batch --cache-auto-batch-target-vram-gb 170`. Với HF backbone,
+`--cache-auto-batch` vẫn giữ đường profiler tương thích cũ.
 
 Tài liệu này khóa thực nghiệm công bằng trên cùng target `Qwen/Qwen3-4B`:
 
@@ -173,12 +174,13 @@ vào `source_manifest.json`/`split_manifest.json`. Nếu bắt buộc đủ 50K 
 bỏ cờ này để pipeline dừng rõ ràng tại `prepare` cho tới khi bổ sung source.
 
 `--regenerate-generation-batch-size` là batch inference thật trên mỗi GPU;
-`--regenerate-output-batch-size` chỉ là số dòng gom trước khi ghi JSONL. Với
-B200 180 GB, bắt đầu bằng giá trị 8 cho generation; nếu heartbeat hoặc VRAM
-cho thấy không an toàn, giảm xuống 4. Worker gom các prompt gần độ dài và
-cùng generation budget, dùng left-padding/attention mask, nên không cắt input
-hay đổi output greedy. Khi `temperature > 0`, worker tự hạ batch inference về
-1 để giữ semantics sampling.
+`--regenerate-output-batch-size` chỉ là số dòng gom trước khi ghi JSONL. Có
+thể bật `--regenerate-auto-batch --regenerate-auto-batch-target-vram-gb 170`
+để worker tự tăng batch theo bucket prompt/budget, bắt đầu từ giá trị này và
+backoff khi OOM. `--regenerate-auto-batch-max-size` mặc định là 128. Worker
+gom các prompt gần độ dài và cùng generation budget, dùng left-padding/attention
+mask, nên không cắt input hay đổi output greedy. Khi `temperature > 0`, worker
+vẫn hạ batch inference về 1 để giữ semantics sampling.
 
 Mode full-context là bộ dữ liệu/cache gốc để audit hoặc train long-context.
 Các config pilot 3K/8K hiện tại vẫn dùng artifact regime tương ứng và nên
@@ -216,13 +218,13 @@ Mỗi stage có worker log ở `parallel_*/rank_*/worker.log`; trạng thái liv
 `parallel_*/status.json`. Nếu một worker lỗi, merge không được publish và
 pipeline dừng để bảo toàn coverage; chạy lại đúng lệnh sẽ tiếp tục từng worker.
 
-Muốn chọn batch tự động theo VRAM, dùng `--cache-auto-batch` và bắt đầu từ
-stage `profile_cache_batch_full`. Profiler đo trên GPU profile các bucket
-`1-8192`, `8193-16384`, `16385-24576`, `24577-32768`, sau đó mọi worker dùng
-schedule cố định trong file
-`manifests/cache_batch_profile_full.json`. Với B200 180 GB có thể đặt hard
-limit `--cache-profile-vram-limit-gb 170`; chi tiết lệnh và cách dùng lại
-profile xem [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md).
+Muốn cache SpecForge tự tận dụng VRAM, dùng
+`--cache-auto-batch --cache-auto-batch-target-vram-gb 170
+--cache-auto-batch-max-size 128`. Profile token-budget built-in chỉ là điểm
+khởi đầu; worker sẽ tăng batch theo bucket length trên từng GPU, còn static
+pool được chặn ở khoảng 170GB. Với HF legacy, `--cache-auto-batch` vẫn chạy
+stage profiler cố định như trước. Chi tiết xem
+[`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md).
 
 ### Theo dõi và dừng an toàn từng GPU
 
@@ -582,8 +584,10 @@ done
 
 Chạy sau khi đã validate và regenerate đúng context regime. `--batch-size`
 chỉ ảnh hưởng throughput của phase cache, không thay đổi batch/optimizer của
-training. Đường khuyến nghị trên 4×B200 là `specforge_sglang`; nó tự chọn
-batch theo token-budget 64/32/16/4 và dùng static pool 0.99 VRAM. Các tham số
+training. Đường khuyến nghị trên 4×B200 là `specforge_sglang`; thêm
+`--cache-auto-batch --cache-auto-batch-target-vram-gb 170` để profile
+token-budget 64/32/16/4 chỉ làm điểm khởi đầu, batch tiếp tục tăng và static
+pool dùng khoảng 170GB/GPU. Các tham số
 `--cache-concurrency`, `--cache-max-total-tokens` và
 `--cache-memory-fraction` chỉ là performance knobs; có thể giảm sau OOM rồi
 resume mà không đổi hidden states đã ghi.
@@ -599,7 +603,9 @@ PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
   --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/tokenized_full/train \
   --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train \
   --target-layer-ids 1 9 17 25 33 --max-length 32768 \
-  --cache-backend specforge_sglang --cache-concurrency 64 \
+  --cache-backend specforge_sglang --cache-auto-batch \
+  --cache-auto-batch-target-vram-gb 170 --cache-auto-batch-max-size 128 \
+  --cache-concurrency 64 \
   --cache-max-total-tokens 262144 --cache-memory-fraction 0.99 \
   --attention-backend flashinfer --io-threads 4 --io-queue-size 8 \
   --shard-size 128 --supervision-mode last_assistant --device cuda \

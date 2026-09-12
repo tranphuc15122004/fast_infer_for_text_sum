@@ -95,6 +95,9 @@ class PipelineOptions:
     # cho mọi worker theo bucket độ dài. ``cache_batch_profile`` cho phép
     # truyền profile đã tạo từ trước và bỏ qua stage profile.
     cache_auto_batch: bool = False
+    cache_auto_batch_target_vram_gb: float = 170.0
+    cache_auto_batch_max_size: int = 128
+    cache_auto_batch_growth_factor: float = 2.0
     cache_batch_profile: Optional[str] = None
     cache_profile_gpu_id: int = 0
     cache_profile_max_batch_size: int = 8
@@ -114,6 +117,10 @@ class PipelineOptions:
     # Batch inference thật trong ``model.generate``; khác với
     # regenerate_output_batch_size là batch chỉ dùng khi flush JSONL.
     regenerate_generation_batch_size: int = 1
+    regenerate_auto_batch: bool = False
+    regenerate_auto_batch_target_vram_gb: float = 170.0
+    regenerate_auto_batch_max_size: int = 128
+    regenerate_auto_batch_growth_factor: float = 2.0
     regenerate_output_batch_size: int = 1
     worker_stall_timeout_seconds: float = 0.0
     worker_stop_file: Optional[str] = None
@@ -342,6 +349,19 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 options.device,
                 "--generation-batch-size",
                 str(options.regenerate_generation_batch_size),
+                *(
+                    [
+                        "--auto-batch",
+                        "--auto-batch-target-vram-gb",
+                        str(options.regenerate_auto_batch_target_vram_gb),
+                        "--auto-batch-max-size",
+                        str(options.regenerate_auto_batch_max_size),
+                        "--auto-batch-growth-factor",
+                        str(options.regenerate_auto_batch_growth_factor),
+                    ]
+                    if options.regenerate_auto_batch
+                    else []
+                ),
                 "--torch-dtype",
                 options.torch_dtype,
                 *(["--preserve-full-input"] if options.full_context else []),
@@ -383,6 +403,19 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(options.seed),
                     "--generation-batch-size",
                     str(options.regenerate_generation_batch_size),
+                    *(
+                        [
+                            "--auto-batch",
+                            "--auto-batch-target-vram-gb",
+                            str(options.regenerate_auto_batch_target_vram_gb),
+                            "--auto-batch-max-size",
+                            str(options.regenerate_auto_batch_max_size),
+                            "--auto-batch-growth-factor",
+                            str(options.regenerate_auto_batch_growth_factor),
+                        ]
+                        if options.regenerate_auto_batch
+                        else []
+                    ),
                     "--torch-dtype",
                     options.torch_dtype,
                     "--overflow-policy",
@@ -566,6 +599,20 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(options.cache_max_total_tokens),
                         "--cache-memory-fraction",
                         str(options.cache_memory_fraction),
+                        *(
+                            [
+                                "--auto-batch",
+                                "--auto-batch-target-vram-gb",
+                                str(options.cache_auto_batch_target_vram_gb),
+                                "--auto-batch-max-size",
+                                str(options.cache_auto_batch_max_size),
+                                "--auto-batch-growth-factor",
+                                str(options.cache_auto_batch_growth_factor),
+                            ]
+                            if options.cache_auto_batch
+                            and options.cache_backend == "specforge_sglang"
+                            else []
+                        ),
                         "--io-threads",
                         str(options.cache_io_threads),
                         "--io-queue-size",
@@ -630,6 +677,20 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(options.cache_max_total_tokens),
                     "--cache-memory-fraction",
                     str(options.cache_memory_fraction),
+                    *(
+                        [
+                            "--auto-batch",
+                            "--auto-batch-target-vram-gb",
+                            str(options.cache_auto_batch_target_vram_gb),
+                            "--auto-batch-max-size",
+                            str(options.cache_auto_batch_max_size),
+                            "--auto-batch-growth-factor",
+                            str(options.cache_auto_batch_growth_factor),
+                        ]
+                        if options.cache_auto_batch
+                        and options.cache_backend == "specforge_sglang"
+                        else []
+                    ),
                     "--cache-startup-stagger-seconds",
                     str(options.cache_startup_stagger_seconds),
                     "--io-threads",
@@ -696,6 +757,14 @@ def pipeline_config_hash(options: PipelineOptions) -> str:
         "cache_max_total_tokens",
         "cache_memory_fraction",
         "cache_startup_stagger_seconds",
+        "cache_auto_batch",
+        "cache_auto_batch_target_vram_gb",
+        "cache_auto_batch_max_size",
+        "cache_auto_batch_growth_factor",
+        "regenerate_auto_batch",
+        "regenerate_auto_batch_target_vram_gb",
+        "regenerate_auto_batch_max_size",
+        "regenerate_auto_batch_growth_factor",
     ):
         payload_options.pop(key, None)
     payload = json.dumps(
@@ -1427,9 +1496,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--cache-auto-batch",
         action="store_true",
         help=(
-            "profile batch size trên một GPU trước cache, sau đó chọn batch "
-            "cố định theo bucket độ dài"
+            "SpecForge: tăng batch động theo bucket length; HF: tạo profile "
+            "batch trước cache"
         ),
+    )
+    parser.add_argument(
+        "--cache-auto-batch-target-vram-gb",
+        type=float,
+        default=170.0,
+        help="mục tiêu VRAM cache mỗi GPU; mặc định 170GB trên B200 180GB",
+    )
+    parser.add_argument(
+        "--cache-auto-batch-max-size",
+        type=int,
+        default=128,
+        help="batch cache tối đa trên mỗi bucket length",
+    )
+    parser.add_argument(
+        "--cache-auto-batch-growth-factor",
+        type=float,
+        default=2.0,
+        help="hệ số tăng batch cache sau mỗi batch thành công",
     )
     parser.add_argument(
         "--cache-batch-profile",
@@ -1489,6 +1576,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--regenerate-auto-batch",
+        action="store_true",
+        help="tự tăng batch model.generate theo peak VRAM và backoff khi OOM",
+    )
+    parser.add_argument(
+        "--regenerate-auto-batch-target-vram-gb",
+        type=float,
+        default=170.0,
+        help="mục tiêu peak VRAM regenerate mỗi GPU; mặc định 170GB",
+    )
+    parser.add_argument(
+        "--regenerate-auto-batch-max-size",
+        type=int,
+        default=128,
+        help="batch regenerate tối đa trên mỗi bucket prompt/budget",
+    )
+    parser.add_argument(
+        "--regenerate-auto-batch-growth-factor",
+        type=float,
+        default=2.0,
+        help="hệ số tăng batch regenerate sau mỗi batch thành công",
+    )
+    parser.add_argument(
         "--regenerate-output-batch-size",
         type=int,
         default=1,
@@ -1543,6 +1653,14 @@ def main(argv=None) -> int:
             "progress-interval-tokens, regenerate-generation-batch-size và "
             "regenerate-output-batch-size phải >= 1"
         )
+    if args.regenerate_auto_batch_max_size < args.regenerate_generation_batch_size:
+        raise ValueError(
+            "regenerate-auto-batch-max-size phải >= regenerate-generation-batch-size"
+        )
+    if args.regenerate_auto_batch_growth_factor <= 1.0:
+        raise ValueError("regenerate-auto-batch-growth-factor phải > 1")
+    if args.regenerate_auto_batch_target_vram_gb <= 0.0:
+        raise ValueError("regenerate-auto-batch-target-vram-gb phải > 0")
     if args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
         raise ValueError("cache-io-threads và cache-io-queue-size không được âm")
     if args.cache_profile_gpu_id < 0:
@@ -1559,11 +1677,12 @@ def main(argv=None) -> int:
         raise ValueError("cache-memory-fraction phải thuộc (0, 1]")
     if args.cache_startup_stagger_seconds < 0:
         raise ValueError("cache-startup-stagger-seconds không được âm")
-    if args.cache_backend == "specforge_sglang" and args.cache_auto_batch:
-        raise ValueError(
-            "SpecForge cache đã dùng throughput profile token-budget; "
-            "không kết hợp --cache-auto-batch legacy"
-        )
+    if args.cache_auto_batch_max_size < 1:
+        raise ValueError("cache-auto-batch-max-size phải >= 1")
+    if args.cache_auto_batch_growth_factor <= 1.0:
+        raise ValueError("cache-auto-batch-growth-factor phải > 1")
+    if args.cache_auto_batch_target_vram_gb <= 0.0:
+        raise ValueError("cache-auto-batch-target-vram-gb phải > 0")
     if args.cache_throughput_profile and not Path(args.cache_throughput_profile).is_file():
         raise FileNotFoundError(
             f"không tìm thấy cache throughput profile: {args.cache_throughput_profile}"
@@ -1604,6 +1723,9 @@ def main(argv=None) -> int:
         cache_io_threads=int(args.cache_io_threads),
         cache_io_queue_size=int(args.cache_io_queue_size),
         cache_auto_batch=bool(args.cache_auto_batch),
+        cache_auto_batch_target_vram_gb=float(args.cache_auto_batch_target_vram_gb),
+        cache_auto_batch_max_size=int(args.cache_auto_batch_max_size),
+        cache_auto_batch_growth_factor=float(args.cache_auto_batch_growth_factor),
         cache_batch_profile=str(args.cache_batch_profile) if args.cache_batch_profile else None,
         cache_profile_gpu_id=int(args.cache_profile_gpu_id),
         cache_profile_max_batch_size=int(args.cache_profile_max_batch_size),
@@ -1627,6 +1749,10 @@ def main(argv=None) -> int:
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         progress_interval_tokens=int(args.progress_interval_tokens),
         regenerate_generation_batch_size=int(args.regenerate_generation_batch_size),
+        regenerate_auto_batch=bool(args.regenerate_auto_batch),
+        regenerate_auto_batch_target_vram_gb=float(args.regenerate_auto_batch_target_vram_gb),
+        regenerate_auto_batch_max_size=int(args.regenerate_auto_batch_max_size),
+        regenerate_auto_batch_growth_factor=float(args.regenerate_auto_batch_growth_factor),
         regenerate_output_batch_size=int(args.regenerate_output_batch_size),
         worker_stall_timeout_seconds=float(args.worker_stall_timeout_seconds),
         worker_stop_file=str(args.worker_stop_file) if args.worker_stop_file else None,

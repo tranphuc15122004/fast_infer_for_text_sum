@@ -222,6 +222,157 @@ def test_pipeline_defaults_to_aggressive_specforge_cache_profile(tmp_path: Path)
     assert cache.command[cache.command.index("--cache-memory-fraction") + 1] == "0.99"
 
 
+def test_pipeline_forwards_adaptive_batch_to_specforge_and_regenerate(tmp_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        cache_backend="specforge_sglang",
+        cache_auto_batch=True,
+        cache_auto_batch_target_vram_gb=170.0,
+        cache_auto_batch_max_size=128,
+        cache_auto_batch_growth_factor=2.0,
+        regenerate_auto_batch=True,
+        regenerate_generation_batch_size=4,
+        regenerate_auto_batch_target_vram_gb=170.0,
+        regenerate_auto_batch_max_size=64,
+        parallel_gpu_ids=(0, 1),
+    )
+    plan = build_stage_plan(options)
+    regenerate = next(stage for stage in plan if stage.name == "regenerate_full_train")
+    cache = next(stage for stage in plan if stage.name == "cache_full_train")
+    for command, expected_max in (
+        (regenerate.command, "64"),
+        (cache.command, "128"),
+    ):
+        assert "--auto-batch" in command
+        assert command[command.index("--auto-batch-target-vram-gb") + 1] == "170.0"
+        assert command[command.index("--auto-batch-max-size") + 1] == expected_max
+        assert command[command.index("--auto-batch-growth-factor") + 1] == "2.0"
+
+
+def test_parallel_worker_forwards_adaptive_batch_flags(tmp_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from parallel_stage import _build_worker_command, parse_args
+
+    args = parse_args(
+        [
+            "--mode", "cache",
+            "--gpu-ids", "0", "1",
+            "--input", str(tmp_path / "input.jsonl"),
+            "--tokenized-path", str(tmp_path / "tokenized"),
+            "--output", str(tmp_path / "cache"),
+            "--manifest", str(tmp_path / "manifest.json"),
+            "--target-model-path", "tiny-target",
+            "--max-length", "32768",
+            "--target-layer-ids", "0", "1",
+            "--cache-backend", "specforge_sglang",
+            "--auto-batch",
+            "--auto-batch-target-vram-gb", "170",
+            "--auto-batch-max-size", "128",
+        ]
+    )
+    command = _build_worker_command(args, tmp_path / "rank_00", 0, 2)
+    assert "--auto-batch" in command
+    assert command[command.index("--auto-batch-target-vram-gb") + 1] == "170.0"
+    assert command[command.index("--auto-batch-max-size") + 1] == "128"
+
+
+def test_specforge_auto_cache_grows_batches_from_profile(tmp_path: Path, monkeypatch) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import cache_target_features
+    from MR_DFlash.tokenized_data import write_tokenized_manifest
+
+    class TinyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    class FakeCapturer:
+        def __init__(self, *_args, **_kwargs):
+            self.tokenizer = TinyTokenizer()
+            self.device = torch.device("cpu")
+            self.layer_ids = [0, 1]
+            self.context_feature_dim = 4
+            self.model = type("Model", (), {"config": type("Config", (), {"hidden_size": 2})()})()
+            self.batch_sizes = []
+
+        def capture_batch(self, input_ids, attention_mask):
+            self.batch_sizes.append(int(input_ids.shape[0]))
+            return [
+                torch.ones(int(length), 4, dtype=torch.bfloat16)
+                for length in attention_mask.sum(dim=-1).tolist()
+            ]
+
+        def close(self):
+            return None
+
+    capturer = FakeCapturer()
+    monkeypatch.setattr(cache_target_features, "_build_capturer", lambda **_kwargs: capturer)
+    tokenized = tmp_path / "tokenized"
+    tokenized.mkdir()
+    samples = [
+        {"id": f"s{index}", "input_ids": torch.arange(6), "loss_mask": torch.ones(6), "length": 6}
+        for index in range(8)
+    ]
+    torch.save({"samples": samples}, tokenized / "shard_00000.pt")
+    write_tokenized_manifest(
+        tokenized,
+        shards=[{"path": "shard_00000.pt", "count": 8}],
+        num_samples=8,
+        target_model="tiny-target",
+        feature_layer_ids=[0, 1],
+        chat_template="tiny",
+        max_length=64,
+        supervision_mode="last_assistant",
+    )
+    profile = tmp_path / "throughput.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "schema_version": "mr_dflash_cache_throughput_profile_v1",
+                "target_model_path": "tiny-target",
+                "feature_layer_ids": [0, 1],
+                "max_length": 64,
+                "requested_torch_dtype": "bfloat16",
+                "attention_backend": "flashinfer",
+                "buckets": [
+                    {"min_length": 1, "max_length": 64, "batch_size": 2, "token_budget": 64}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache_target_features.cache_dataset(
+        target_model_path="tiny-target",
+        tokenized_path=str(tokenized),
+        output_path=str(tmp_path / "cache"),
+        max_length=64,
+        batch_size=1,
+        bucket_buffer_size=2,
+        shard_size=16,
+        layer_ids=[0, 1],
+        device="cpu",
+        throughput_profile=str(profile),
+        cache_backend="specforge_sglang",
+        cache_max_total_tokens=64,
+        auto_batch=True,
+        auto_batch_max_size=8,
+    )
+    assert capturer.batch_sizes == [2, 4, 2]
+
+
 def test_parallel_cache_worker_receives_batch_profile(tmp_path: Path) -> None:
     script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
     if str(script_dir) not in sys.path:

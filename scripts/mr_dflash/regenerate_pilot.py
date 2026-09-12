@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import torch
 
 from _common import read_jsonl, write_json, write_jsonl
+from auto_batch import AdaptiveBatchController
 from MR_DFlash.generation_batching import left_pad_prompt_ids, select_generation_group
 from progress import ProgressReporter, install_exception_hook
 
@@ -25,6 +26,27 @@ from progress import ProgressReporter, install_exception_hook
 def _is_cuda_oom(exc: BaseException) -> bool:
     """OOM không được skip: CUDA context có thể đã ở trạng thái không an toàn."""
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _reset_peak_vram(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _peak_vram_gb(device: torch.device) -> Optional[float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    torch.cuda.synchronize(device)
+    reserved = torch.cuda.max_memory_reserved(device)
+    allocated = torch.cuda.max_memory_allocated(device)
+    return float(max(reserved, allocated)) / 2**30
+
+
+def _generation_batch_key(item: Dict[str, Any]) -> str:
+    """Bucket theo budget và prompt length để không trộn batch quá khác nhau."""
+    prompt_tokens = max(1, int(item.get("prompt_tokens", 1)))
+    prompt_bucket = ((prompt_tokens + 4095) // 4096) * 4096
+    return f"budget={int(item['generation_budget'])}:prompt_bucket={prompt_bucket}"
 
 
 def _count_shard_rows(
@@ -298,6 +320,7 @@ def _generate_prepared_batch(
                 )
             ]
         )
+    _reset_peak_vram(device)
     with torch.inference_mode():
         generated_ids = model.generate(
             prompt_ids,
@@ -327,6 +350,9 @@ def _generate_prepared_batch(
         generation_budget=budget,
         generated_tokens=max(0, int(generated_ids.shape[1]) - padded_prompt_length),
     )
+    # Namespace is used instead of changing the public return type; external
+    # callers/tests historically expect this helper to return ``List[str]``.
+    args._last_peak_vram_gb = _peak_vram_gb(device)
     return responses
 
 
@@ -398,6 +424,29 @@ def main(argv=None) -> None:
         help="batch inference thật trong model.generate; 1 giữ behavior legacy",
     )
     parser.add_argument(
+        "--auto-batch",
+        action="store_true",
+        help="tự tăng generation batch theo peak VRAM và backoff khi OOM",
+    )
+    parser.add_argument(
+        "--auto-batch-target-vram-gb",
+        type=float,
+        default=None,
+        help="mục tiêu peak VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
+    )
+    parser.add_argument(
+        "--auto-batch-max-size",
+        type=int,
+        default=128,
+        help="batch tối đa cho auto-batch trên mỗi bucket",
+    )
+    parser.add_argument(
+        "--auto-batch-growth-factor",
+        type=float,
+        default=2.0,
+        help="hệ số tăng batch sau mỗi lần chạy thành công",
+    )
+    parser.add_argument(
         "--output-batch-size",
         type=int,
         default=1,
@@ -414,6 +463,12 @@ def main(argv=None) -> None:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
     if args.generation_batch_size < 1:
         raise ValueError("generation-batch-size phải >= 1")
+    if args.auto_batch_max_size < args.generation_batch_size:
+        raise ValueError("auto-batch-max-size phải >= generation-batch-size")
+    if args.auto_batch_growth_factor <= 1.0:
+        raise ValueError("auto-batch-growth-factor phải > 1")
+    if args.auto_batch_target_vram_gb is not None and args.auto_batch_target_vram_gb <= 0:
+        raise ValueError("auto-batch-target-vram-gb phải > 0")
     if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
         raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
     reporter = ProgressReporter(args.progress_path, interval_tokens=args.progress_interval_tokens)
@@ -521,6 +576,16 @@ def main(argv=None) -> None:
             stats["skipped_errors"] += 1
 
     generation_pending: List[Dict[str, Any]] = []
+    generation_controller = (
+        AdaptiveBatchController(
+            initial_batch_size=(1 if args.temperature > 0 else int(args.generation_batch_size)),
+            max_batch_size=(1 if args.temperature > 0 else int(args.auto_batch_max_size)),
+            growth_factor=float(args.auto_batch_growth_factor),
+            target_vram_gb=args.auto_batch_target_vram_gb,
+        )
+        if args.auto_batch
+        else None
+    )
 
     def emit_result(
         item: Dict[str, Any],
@@ -588,21 +653,49 @@ def main(argv=None) -> None:
 
     def flush_generation_pending(*, force: bool = False) -> None:
         """Generate các item đang chờ, cùng budget và có padding chung."""
-        effective_batch_size = (
-            1 if args.temperature > 0 else int(args.generation_batch_size)
-        )
-        while generation_pending and (force or len(generation_pending) >= effective_batch_size):
-            group = list(
-                select_generation_group(
-                    generation_pending,
-                    max_batch_size=effective_batch_size,
+        while generation_pending:
+            # Chọn bucket đầu tiên đủ một batch hiện tại. Nếu chưa đủ và đây
+            # không phải flush cuối, giữ lại để look-ahead có cơ hội gom thêm.
+            selected_key: Optional[str] = None
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for pending_item in generation_pending:
+                grouped.setdefault(_generation_batch_key(pending_item), []).append(pending_item)
+            for candidate_key, candidate_items in grouped.items():
+                candidate_limit = (
+                    1
+                    if args.temperature > 0
+                    else int(args.generation_batch_size)
                 )
+                if generation_controller is not None:
+                    candidate_limit = generation_controller.batch_size(
+                        candidate_key,
+                        default=int(args.generation_batch_size),
+                    )
+                if force or len(candidate_items) >= candidate_limit:
+                    selected_key = candidate_key
+                    break
+            if selected_key is None:
+                return
+            effective_batch_size = (
+                1
+                if args.temperature > 0
+                else int(args.generation_batch_size)
+            )
+            if generation_controller is not None:
+                effective_batch_size = generation_controller.batch_size(
+                    selected_key,
+                    default=int(args.generation_batch_size),
+                )
+            candidates = grouped[selected_key]
+            group = list(
+                select_generation_group(candidates, max_batch_size=effective_batch_size)
             )
             if not group:
                 raise RuntimeError("không chọn được generation batch từ pending items")
             # Chọn candidate theo độ dài để giảm padding, nhưng trả kết quả
             # theo thứ tự input để standalone regenerate vẫn giữ JSONL order.
             group.sort(key=lambda item: int(item["row_index"]))
+            attempted_batch_size = len(group)
             try:
                 responses_batch = _generate_prepared_batch(
                     model,
@@ -614,7 +707,22 @@ def main(argv=None) -> None:
                 )
             except Exception as exc:
                 if _is_cuda_oom(exc):
-                    raise
+                    if generation_controller is None or attempted_batch_size <= 1:
+                        raise
+                    next_batch_size = generation_controller.record_oom(
+                        selected_key,
+                        attempted_batch_size=attempted_batch_size,
+                    )
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    reporter.update(
+                        "auto_batch_oom",
+                        batch_size=attempted_batch_size,
+                        next_batch_size=next_batch_size,
+                        batch_key=selected_key,
+                    )
+                    # Không xóa group: vòng lặp sau retry chính các sample đó.
+                    continue
                 for item in group:
                     record_skip(
                         str(item["sample_id"]),
@@ -623,6 +731,11 @@ def main(argv=None) -> None:
                         prompt_tokens=int(item["prompt_tokens"]),
                     )
                 responses_batch = [""] * len(group)
+            if generation_controller is not None and attempted_batch_size >= effective_batch_size:
+                generation_controller.record_success(
+                    selected_key,
+                    peak_vram_gb=getattr(args, "_last_peak_vram_gb", None),
+                )
             group_ids = {id(item) for item in group}
             generation_pending[:] = [
                 item for item in generation_pending if id(item) not in group_ids
@@ -725,7 +838,14 @@ def main(argv=None) -> None:
                 # Look-ahead buffer amortizes model.generate while remaining
                 # bounded in CPU/GPU memory. The group itself is still capped
                 # by generation_batch_size.
-                pending_limit = max(1, int(args.generation_batch_size) * 4)
+                pending_limit = max(
+                    1,
+                    (
+                        int(args.auto_batch_max_size) * 4
+                        if generation_controller is not None
+                        else int(args.generation_batch_size) * 4
+                    ),
+                )
                 if len(generation_pending) >= pending_limit:
                     flush_generation_pending()
                 continue
@@ -778,6 +898,15 @@ def main(argv=None) -> None:
             "overflow_policy": args.overflow_policy,
             "sample_error_policy": args.sample_error_policy,
             "generation_batch_size": int(args.generation_batch_size),
+            "auto_batch": bool(args.auto_batch),
+            "auto_batch_target_vram_gb": args.auto_batch_target_vram_gb,
+            "auto_batch_max_size": int(args.auto_batch_max_size),
+            "auto_batch_growth_factor": float(args.auto_batch_growth_factor),
+            "auto_batch_profile": (
+                generation_controller.snapshot()
+                if generation_controller is not None
+                else {}
+            ),
             "output_batch_size": int(args.output_batch_size),
             "skipped_report": str(skipped_report),
             "shard_index": int(args.shard_index),

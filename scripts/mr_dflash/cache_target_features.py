@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from _common import append_jsonl_durable, read_jsonl
+from auto_batch import AdaptiveBatchController, cuda_memory_gb, target_memory_fraction
 from MR_DFlash.cache_batching import CacheBatchSchedule
 from MR_DFlash.cache_throughput import CacheThroughputBucket, CacheThroughputProfile
 from MR_DFlash.capture import HFTargetCapture
@@ -198,6 +199,9 @@ def _build_capturer(
     cache_max_total_tokens: Optional[int],
     cache_memory_fraction: float,
     throughput_profile: Optional[CacheThroughputProfile],
+    auto_batch: bool = False,
+    auto_batch_max_size: int = 128,
+    auto_batch_target_vram_gb: Optional[float] = None,
 ) -> Any:
     """Build HF fallback hoặc target SGLang capture độc lập trên một GPU."""
     backend = str(cache_backend).lower()
@@ -224,6 +228,8 @@ def _build_capturer(
         throughput_profile.max_batch_size if throughput_profile is not None else batch_size
     )
     concurrency = int(cache_concurrency or profile_batch)
+    if auto_batch:
+        concurrency = max(concurrency, int(auto_batch_max_size))
     if concurrency < 1:
         raise ValueError("cache_concurrency phải >= 1")
     profile_budget = (
@@ -232,15 +238,27 @@ def _build_capturer(
         else int(max_length) * concurrency
     )
     total_tokens = int(cache_max_total_tokens or profile_budget)
+    if auto_batch:
+        # The old 262K default could prevent a large 32K batch even when the
+        # B200 static pool still had headroom.
+        total_tokens = max(total_tokens, int(max_length) * int(auto_batch_max_size))
     if total_tokens < 1:
         raise ValueError("cache_max_total_tokens phải >= 1")
+    memory_fraction = float(cache_memory_fraction)
+    if auto_batch and auto_batch_target_vram_gb is not None and torch.cuda.is_available():
+        total_vram_gb, _reserved_vram_gb = cuda_memory_gb(device)
+        memory_fraction = target_memory_fraction(
+            auto_batch_target_vram_gb,
+            total_vram_gb,
+            requested_fraction=memory_fraction,
+        )
     return SpecForgeTargetCapture.from_pretrained(
         target_model_path,
         layer_ids,
         torch_dtype=torch_dtype,
         trust_remote_code=trust_remote_code,
         attention_backend=attention_backend,
-        mem_fraction_static=float(cache_memory_fraction),
+        mem_fraction_static=memory_fraction,
         context_length=int(max_length),
         max_running_requests=concurrency,
         max_total_tokens=total_tokens,
@@ -480,6 +498,10 @@ def cache_dataset(
     cache_concurrency: Optional[int] = None,
     cache_max_total_tokens: Optional[int] = None,
     cache_memory_fraction: float = 0.99,
+    auto_batch: bool = False,
+    auto_batch_target_vram_gb: Optional[float] = None,
+    auto_batch_max_size: int = 128,
+    auto_batch_growth_factor: float = 2.0,
 ) -> Dict[str, int]:
     """Chạy target capture theo batch và ghi cache sharded resumable."""
     if data_path is None and tokenized_path is None:
@@ -500,6 +522,12 @@ def cache_dataset(
         raise ValueError("cache_concurrency phải >= 1")
     if cache_max_total_tokens is not None and int(cache_max_total_tokens) < 1:
         raise ValueError("cache_max_total_tokens phải >= 1")
+    if int(auto_batch_max_size) < int(batch_size):
+        raise ValueError("auto_batch_max_size phải >= batch_size")
+    if float(auto_batch_growth_factor) <= 1.0:
+        raise ValueError("auto_batch_growth_factor phải > 1")
+    if auto_batch_target_vram_gb is not None and float(auto_batch_target_vram_gb) <= 0.0:
+        raise ValueError("auto_batch_target_vram_gb phải > 0")
     if batch_profile and throughput_profile:
         raise ValueError("chỉ được dùng một trong batch_profile hoặc throughput_profile")
     batch_schedule = CacheBatchSchedule.from_path(batch_profile) if batch_profile else None
@@ -519,6 +547,25 @@ def cache_dataset(
             max_length=max_length,
             batch_limit=throughput_schedule.max_batch_size,
         )
+    effective_cache_max_total_tokens = cache_max_total_tokens
+    effective_cache_memory_fraction = float(cache_memory_fraction)
+    if auto_batch and str(cache_backend).lower() == "specforge_sglang":
+        effective_cache_max_total_tokens = max(
+            int(cache_max_total_tokens or 0),
+            int(max_length) * int(auto_batch_max_size),
+        )
+        if auto_batch_target_vram_gb is not None and torch.cuda.is_available():
+            memory_device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if str(device) == "auto"
+                else device
+            )
+            total_vram_gb, _reserved_vram_gb = cuda_memory_gb(memory_device)
+            effective_cache_memory_fraction = target_memory_fraction(
+                auto_batch_target_vram_gb,
+                total_vram_gb,
+                requested_fraction=effective_cache_memory_fraction,
+            )
     profile_max_batch = max(
         batch_size,
         batch_schedule.max_batch_size if batch_schedule is not None else 0,
@@ -545,6 +592,10 @@ def cache_dataset(
         # Giữ đủ candidate trong buffer để scheduler token-budget có thể
         # chọn batch lớn nhất an toàn theo padded length thực tế.
         bucket_buffer_size = throughput_schedule.max_batch_size
+    if auto_batch and str(cache_backend).lower() == "specforge_sglang":
+        # The producer must be able to hold the next adaptive batch; this is
+        # CPU RAM, not a request to allocate that whole amount on the GPU.
+        bucket_buffer_size = max(int(bucket_buffer_size), int(auto_batch_max_size))
     if num_shards < 1 or shard_index < 0 or shard_index >= num_shards:
         raise ValueError("shard-index phải nằm trong [0, num-shards)")
 
@@ -584,9 +635,12 @@ def cache_dataset(
             max_length=max_length,
             batch_size=batch_size,
             cache_concurrency=cache_concurrency,
-            cache_max_total_tokens=cache_max_total_tokens,
-            cache_memory_fraction=cache_memory_fraction,
+            cache_max_total_tokens=effective_cache_max_total_tokens,
+            cache_memory_fraction=effective_cache_memory_fraction,
             throughput_profile=throughput_schedule,
+            auto_batch=bool(auto_batch and str(cache_backend).lower() == "specforge_sglang"),
+            auto_batch_max_size=int(auto_batch_max_size),
+            auto_batch_target_vram_gb=auto_batch_target_vram_gb,
         )
     except Exception as exc:
         # Static-pool allocation happens before the writer exists. Keep the
@@ -596,7 +650,7 @@ def cache_dataset(
                 output_path,
                 error=exc,
                 batch_size=max(batch_size, int(cache_concurrency or batch_size)),
-                max_total_tokens=cache_max_total_tokens,
+                max_total_tokens=effective_cache_max_total_tokens,
                 throughput_profile=throughput_schedule,
             )
             reporter.update(
@@ -621,9 +675,16 @@ def cache_dataset(
             else int(batch_size)
         ),
         cache_max_total_tokens=(
-            None if cache_max_total_tokens is None else int(cache_max_total_tokens)
+            None
+            if effective_cache_max_total_tokens is None
+            else int(effective_cache_max_total_tokens)
         ),
-        cache_memory_fraction=float(cache_memory_fraction),
+        cache_memory_fraction=float(effective_cache_memory_fraction),
+        requested_cache_memory_fraction=float(cache_memory_fraction),
+        auto_batch=bool(auto_batch),
+        auto_batch_target_vram_gb=auto_batch_target_vram_gb,
+        auto_batch_max_size=int(auto_batch_max_size),
+        auto_batch_growth_factor=float(auto_batch_growth_factor),
         io_threads=int(io_threads),
         io_queue_size=int(io_queue_size),
     )
@@ -800,7 +861,7 @@ def cache_dataset(
             output_path,
             error=error,
             batch_size=batch_size_for_retry,
-            max_total_tokens=cache_max_total_tokens,
+            max_total_tokens=effective_cache_max_total_tokens,
             throughput_profile=throughput_schedule,
         )
         try:
@@ -813,11 +874,33 @@ def cache_dataset(
             pass
 
     buffer: List[Dict[str, Any]] = []
+    adaptive_cache = bool(
+        auto_batch and str(cache_backend).lower() == "specforge_sglang"
+    )
+    cache_controller = (
+        AdaptiveBatchController(
+            initial_batch_size=int(batch_size),
+            max_batch_size=int(auto_batch_max_size),
+            growth_factor=float(auto_batch_growth_factor),
+            target_vram_gb=auto_batch_target_vram_gb,
+        )
+        if adaptive_cache
+        else None
+    )
 
-    def process(batch: List[Dict[str, Any]]) -> None:
+    def cache_batch_key(sample_length: int) -> str:
+        bucket = ((max(1, int(sample_length)) + 4095) // 4096) * 4096
+        return f"length_bucket={bucket}"
+
+    def process(
+        batch: List[Dict[str, Any]],
+        *,
+        batch_key: str,
+        allow_growth: bool,
+    ) -> bool:
         nonlocal capture_started_at, completed_tokens, captured_tokens
         if not batch:
-            return
+            return True
         if capture_started_at is None:
             capture_started_at = time.monotonic()
         reporter.update(
@@ -841,6 +924,23 @@ def cache_dataset(
             # Một sample lỗi không làm mất cả shard/batch. Fallback tuần tự
             # cũng giúp chẩn đoán rõ sample id trên model/driver bất ổn.
             if _is_cuda_oom(exc):
+                if cache_controller is not None and len(batch) > 1:
+                    next_batch = cache_controller.record_oom(
+                        batch_key,
+                        attempted_batch_size=len(batch),
+                    )
+                    if capturer.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    reporter.update(
+                        "auto_batch_oom",
+                        batch_key=batch_key,
+                        attempted_batch_size=len(batch),
+                        next_batch_size=next_batch,
+                        auto_batch_profile=cache_controller.snapshot(),
+                    )
+                    # Keep the CPU buffer intact; caller retries these exact
+                    # samples using the smaller batch selected next time.
+                    return False
                 handle_oom(exc, len(batch))
                 raise
             print(f"[cache] batch capture lỗi, fallback từng mẫu: {exc!r}")
@@ -876,7 +976,7 @@ def cache_dataset(
                 **estimate_progress(),
             )
             refresh_cache_bar(str(batch[-1]["id"]))
-            return
+            return True
         for sample, feature in zip(batch, captured):
             try:
                 added = writer.add({**sample, "hidden_states": feature})
@@ -893,6 +993,20 @@ def cache_dataset(
                 print(f"[cache] skip {sample['id']!r}: {exc!r}")
                 record_skip(sample["id"], kind="write_error", error=repr(exc))
                 stats["capture_errors"] += 1
+        if cache_controller is not None and allow_growth:
+            next_batch = cache_controller.record_success(
+                batch_key,
+                # SpecForge preallocates a static pool at startup, so request
+                # peak telemetry is not a useful stopping signal here.
+                peak_vram_gb=None,
+            )
+            reporter.update(
+                "auto_batch_grown",
+                batch_key=batch_key,
+                completed_batch_size=len(batch),
+                next_batch_size=next_batch,
+                auto_batch_profile=cache_controller.snapshot(),
+            )
         reporter.update(
             "batch_done",
             batch_size=len(batch),
@@ -902,6 +1016,7 @@ def cache_dataset(
             **estimate_progress(),
         )
         refresh_cache_bar(str(batch[-1]["id"]))
+        return True
 
     if tokenized_path is not None:
         from MR_DFlash.tokenized_data import TokenizedDFlashDataset
@@ -926,6 +1041,9 @@ def cache_dataset(
     rows = iter_cache_rows()
 
     def next_batch_size(sample_length: Optional[int] = None) -> int:
+        controller_key = (
+            None if sample_length is None else cache_batch_key(sample_length)
+        )
         if throughput_schedule is not None:
             if sample_length is None:
                 raise ValueError("throughput profile cần sample_length để chọn bucket")
@@ -936,12 +1054,12 @@ def cache_dataset(
                 padded_length=sample_length,
                 requested_batch_size=requested,
             )
-            if cache_max_total_tokens is not None:
-                token_cap = int(cache_max_total_tokens) // int(sample_length)
+            if effective_cache_max_total_tokens is not None:
+                token_cap = int(effective_cache_max_total_tokens) // int(sample_length)
                 if token_cap < 1:
                     raise ValueError(
                         "cache-max-total-tokens nhỏ hơn một sample: "
-                        f"{cache_max_total_tokens} < {sample_length}"
+                        f"{effective_cache_max_total_tokens} < {sample_length}"
                     )
                 selected = min(selected, token_cap)
         elif batch_schedule is not None:
@@ -950,6 +1068,20 @@ def cache_dataset(
             selected = batch_schedule.batch_size_for_length(sample_length)
         else:
             selected = batch_size
+        if cache_controller is not None and controller_key is not None:
+            selected = cache_controller.batch_size(
+                controller_key,
+                default=int(selected),
+            )
+            # Keep an explicitly supplied token cap as a hard safety limit.
+            if effective_cache_max_total_tokens is not None:
+                token_cap = int(effective_cache_max_total_tokens) // int(sample_length)
+                if token_cap < 1:
+                    raise ValueError(
+                        "cache-max-total-tokens nhỏ hơn một sample: "
+                        f"{effective_cache_max_total_tokens} < {sample_length}"
+                    )
+                selected = min(selected, token_cap)
         if num_samples is None:
             return selected
         remaining = int(num_samples) - writer.total_samples
@@ -1003,7 +1135,14 @@ def cache_dataset(
                 # debug hoặc số sample còn lại quá ít.
                 if len(buffer) < current_batch_size:
                     break
-                process(buffer[:current_batch_size])
+                batch_key = cache_batch_key(len(buffer[0]["input_ids"]))
+                processed = process(
+                    buffer[:current_batch_size],
+                    batch_key=batch_key,
+                    allow_growth=cache_controller is not None,
+                )
+                if not processed:
+                    continue
                 del buffer[:current_batch_size]
                 if num_samples is not None and writer.total_samples >= int(num_samples):
                     buffer.clear()
@@ -1016,7 +1155,19 @@ def cache_dataset(
         # Batch cuối có thể nhỏ hơn schedule khi shard kết thúc; đây là batch
         # an toàn vì nó chỉ giảm memory, không làm tăng padding length.
         current_batch_size = min(current_batch_size, len(buffer))
-        process(buffer[:current_batch_size])
+        batch_key = cache_batch_key(len(buffer[0]["input_ids"]))
+        processed = process(
+            buffer[:current_batch_size],
+            batch_key=batch_key,
+            # A short final batch must not make the controller grow based on
+            # an artificially small workload.
+            allow_growth=(
+                cache_controller is not None
+                and current_batch_size == next_batch_size(len(buffer[0]["input_ids"]))
+            ),
+        )
+        if not processed:
+            continue
         del buffer[:current_batch_size]
 
     stats["captured_total"] = writer.total_samples
@@ -1118,6 +1269,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="tỷ lệ VRAM static pool cho SpecForge SGLang (mặc định 0.99)",
     )
     parser.add_argument(
+        "--auto-batch",
+        action="store_true",
+        help="tự tăng batch SpecForge theo bucket length tới max batch",
+    )
+    parser.add_argument(
+        "--auto-batch-target-vram-gb",
+        type=float,
+        default=None,
+        help="mục tiêu static-pool VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
+    )
+    parser.add_argument(
+        "--auto-batch-max-size",
+        type=int,
+        default=128,
+        help="batch tối đa cho auto-batch trên mỗi bucket",
+    )
+    parser.add_argument(
+        "--auto-batch-growth-factor",
+        type=float,
+        default=2.0,
+        help="hệ số tăng batch sau mỗi batch thành công",
+    )
+    parser.add_argument(
         "--io-threads",
         type=int,
         default=2,
@@ -1194,6 +1368,10 @@ def main(argv=None) -> None:
         cache_concurrency=args.cache_concurrency,
         cache_max_total_tokens=args.cache_max_total_tokens,
         cache_memory_fraction=args.cache_memory_fraction,
+        auto_batch=args.auto_batch,
+        auto_batch_target_vram_gb=args.auto_batch_target_vram_gb,
+        auto_batch_max_size=args.auto_batch_max_size,
+        auto_batch_growth_factor=args.auto_batch_growth_factor,
     )
 
 

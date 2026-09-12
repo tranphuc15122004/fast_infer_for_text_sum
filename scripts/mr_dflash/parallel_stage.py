@@ -402,6 +402,15 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             "--progress-interval-tokens", str(args.progress_interval_tokens),
             "--output-batch-size", str(args.output_batch_size),
         ]
+        if args.auto_batch:
+            command.extend(
+                [
+                    "--auto-batch",
+                    "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-max-size", str(args.auto_batch_max_size),
+                    "--auto-batch-growth-factor", str(args.auto_batch_growth_factor),
+                ]
+            )
         if args.preserve_full_input:
             command.append("--preserve-full-input")
     else:
@@ -443,6 +452,15 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             command.extend(["--cache-concurrency", str(args.cache_concurrency)])
         if args.cache_max_total_tokens is not None:
             command.extend(["--cache-max-total-tokens", str(args.cache_max_total_tokens)])
+        if args.auto_batch:
+            command.extend(
+                [
+                    "--auto-batch",
+                    "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-max-size", str(args.auto_batch_max_size),
+                    "--auto-batch-growth-factor", str(args.auto_batch_growth_factor),
+                ]
+            )
     if args.target_revision:
         command.extend(["--target-revision", args.target_revision])
     if args.local_files_only:
@@ -773,6 +791,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=1,
         help="batch inference thật trong model.generate; khác output-batch-size",
     )
+    parser.add_argument(
+        "--auto-batch",
+        action="store_true",
+        help="bật adaptive batch cho regenerate hoặc SpecForge cache",
+    )
+    parser.add_argument(
+        "--auto-batch-target-vram-gb",
+        type=float,
+        default=170.0,
+        help="mục tiêu VRAM mỗi GPU; mặc định 170GB cho B200 180GB",
+    )
+    parser.add_argument(
+        "--auto-batch-max-size",
+        type=int,
+        default=128,
+        help="batch tối đa trên mỗi length/budget bucket",
+    )
+    parser.add_argument(
+        "--auto-batch-growth-factor",
+        type=float,
+        default=2.0,
+        help="hệ số tăng batch sau mỗi batch thành công",
+    )
     parser.add_argument("--overflow-policy", choices=["error", "skip"], default="error")
     parser.add_argument("--sample-error-policy", choices=["error", "skip"], default="error")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -883,6 +924,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("batch/bucket-buffer/shard-size không hợp lệ")
     if args.generation_batch_size < 1:
         raise ValueError("generation-batch-size phải >= 1")
+    if args.auto_batch_max_size < args.generation_batch_size:
+        raise ValueError("auto-batch-max-size phải >= generation-batch-size")
+    if args.auto_batch_growth_factor <= 1.0:
+        raise ValueError("auto-batch-growth-factor phải > 1")
+    if args.auto_batch_target_vram_gb <= 0.0:
+        raise ValueError("auto-batch-target-vram-gb phải > 0")
     if args.io_threads < 0 or args.io_queue_size < 0:
         raise ValueError("io-threads và io-queue-size không được âm")
     if args.cache_concurrency is not None and args.cache_concurrency < 1:
@@ -984,6 +1031,10 @@ def main(argv=None) -> int:
         "progress_interval_tokens": int(args.progress_interval_tokens),
         "output_batch_size": int(args.output_batch_size),
         "generation_batch_size": int(args.generation_batch_size),
+        "auto_batch": bool(args.auto_batch),
+        "auto_batch_target_vram_gb": float(args.auto_batch_target_vram_gb),
+        "auto_batch_max_size": int(args.auto_batch_max_size),
+        "auto_batch_growth_factor": float(args.auto_batch_growth_factor),
         "stall_timeout_seconds": float(args.stall_timeout_seconds),
         "stop_file": str(args.stop_file) if args.stop_file else None,
         "num_shards": len(args.gpu_ids),
