@@ -5,9 +5,11 @@ Profile B200 100 GB hiện hành được mô tả tại
 pilot dùng `batch_size=1`, accumulation 4 và `objective_chunk_blocks=64` để
 giữ effective batch/fairness đồng thời chừa headroom VRAM.
 
-Cơ chế chọn batch tự động cho target-feature cache được mô tả tại
+Backend cache tốc độ cao theo cơ chế offline SGLang của SpecForge và profile
+token-budget B200 được mô tả tại
 [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md). Bật
-`--cache-auto-batch` để pipeline profile trước rồi mới chạy cache.
+`--cache-backend specforge_sglang` để dùng đường này; `--cache-auto-batch` là
+đường tương thích cho HF backbone.
 
 Tài liệu này khóa thực nghiệm công bằng trên cùng target `Qwen/Qwen3-4B`:
 
@@ -36,7 +38,7 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 | `validate_{3k,8k}_{split}` | `manifests/validation_*.json` | Kiểm tra assistant cuối, target provenance, token length |
 | `tokenize_{3k,8k}_{split}` | `tokenized*/{split}/shard_*.pt`, `manifest.json` | Lưu `input_ids`, `loss_mask`, length; không lưu hidden |
 | `profile_cache_batch_{regime}` *(auto-batch)* | `manifests/cache_batch_profile_<regime>.json` | Đo batch an toàn theo bucket độ dài trên GPU profile; không ghi feature |
-| `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Đọc tokenized shard, chạy backbone target và lưu hidden `[1,9,17,25,33]` tại mọi offset |
+| `cache_{3k,8k}_{split}` | `target_features_qwen3_4b_*/{split}/shard_*.pt`, `manifest.json` | Đọc tokenized shard, chạy target bằng HF hoặc SpecForge offline SGLang và lưu hidden `[1,9,17,25,33]` tại mọi offset |
 
 ## Smoke phase 1 trên 20 sample
 
@@ -76,12 +78,26 @@ PYTHONPATH=src python3 scripts/mr_dflash/run_phase1_smoke.py \
   --dry-run
 ```
 
-Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` tại
-`pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
+Mỗi stage có log riêng tại `pipeline_logs/`, marker `success/failed` và
+heartbeat `*.progress.json` tại `pipeline_state/`, và toàn pipeline có `pipeline_plan.json` cùng
 `pipeline_summary.json`. Lỗi hệ thống hoặc CUDA OOM dừng tại stage để bảo toàn
 tính đúng đắn; lỗi sample trong chế độ `skip` được ghi vào `*.skipped.jsonl`
 và stage tiếp tục. Xem file `*.failed.json` để biết exit code/command và file
 `.log` để xem traceback.
+
+Khi chạy qua `run_preprocess_pipeline.py` hoặc `run_phase1_smoke.py`, terminal
+chỉ hiển thị một thanh `tqdm` cho stage hiện tại theo số sample
+`completed/total`; stdout/stderr chi tiết của child không append ra terminal mà
+được ghi vào `pipeline_logs/<stage>.log`. Heartbeat của stage nằm tại
+`pipeline_state/<stage>.progress.json`. Với `prepare`, tổng là số sample thực
+tế có thể lấy từ hai source; với `tokenize`/`validate`/`analyze`, tổng là số
+input sample của stage; với `regenerate`/`cache`, tổng lấy từ workload và
+counter durable tương ứng.
+
+Khi truyền `--parallel-gpu-ids 0 1 2 3`, bốn worker xử lý bốn shard không
+trùng nhau. Thanh `tqdm` của parent luôn giữ mẫu số bằng tổng sample toàn input;
+tử số là tổng `completed_samples` của cả bốn worker. Worker chưa ghi heartbeat
+được tính là chưa xử lý sample, không làm thay đổi mẫu số.
 
 Trên server B200, với model đã mount tại path local, chạy:
 
@@ -121,6 +137,10 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --full-context \
   --full-context-length 32768 \
   --max-new-tokens 2048 \
+  --cache-backend specforge_sglang \
+  --cache-concurrency 64 --cache-max-total-tokens 262144 \
+  --cache-memory-fraction 0.99 --cache-startup-stagger-seconds 3 \
+  --parallel-gpu-ids 0 1 2 3 \
   --allow-short \
   --regenerate-generation-batch-size 8 \
   --regenerate-output-batch-size 8 \
@@ -218,7 +238,7 @@ Từ phiên bản có `mr_dflash_worker_progress_v1`, mỗi worker còn ghi:
 tại (`loading_model`, `generating`, `generation_done`, `capturing`,
 `batch_done`, `done`/`failed`), sample ID, số token đã sinh/budget, số sample
 đã hoàn tất và VRAM. Parent tổng hợp các file này vào `status.json` mỗi giây.
-Đọc live bằng watcher:
+Đọc live bằng watcher (tqdm là mặc định):
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
@@ -226,16 +246,18 @@ python3 scripts/mr_dflash/watch_parallel_stage.py \
   --interval 5
 ```
 
-Nếu terminal hỗ trợ carriage-return, thêm `--tqdm` để mỗi GPU có một thanh
-tiến trình riêng. Với phase `cache`, thanh dùng **sample hợp lệ đã ghi** làm
-counter (`x/y sample`); với phase `regenerate`, thanh vẫn dùng token đang
-decode:
+Watcher hiển thị **một thanh tổng hợp của toàn stage** theo sample
+(`x/y sample`), thay vì in nhiều dòng heartbeat theo từng worker. Các chi tiết
+GPU, sample hiện tại và token vẫn nằm trong `status.json`/`worker.log`:
 
 ```bash
 python3 scripts/mr_dflash/watch_parallel_stage.py \
   --status /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/parallel_regenerate_train/status.json \
-  --interval 5 --tqdm
+  --interval 5
 ```
+
+Chỉ dùng `--no-tqdm` khi cần dump text một lần để chẩn đoán thủ công; pipeline
+chính không dùng chế độ này.
 
 Khi chạy cache trực tiếp bằng `cache_target_features.py`, script cũng hiển thị
 một thanh `Cache target features` theo tổng sample hợp lệ của worker. Thanh
@@ -560,24 +582,38 @@ done
 
 Chạy sau khi đã validate và regenerate đúng context regime. `--batch-size`
 chỉ ảnh hưởng throughput của phase cache, không thay đổi batch/optimizer của
-training. Với regime dài hơn 3K, tham số tương ứng trong pipeline là
-`--cache-batch-size-long-context`; giá trị của nó là số sample trên mỗi GPU,
-không phải độ dài context. Bắt đầu với 2 trên một B200 180 GB cho 8K và với
-1 cho 32K, sau đó tăng khi đã kiểm tra peak VRAM.
-`--bucket-buffer-size` giúp ghép các sample gần độ dài nhau.
+training. Đường khuyến nghị trên 4×B200 là `specforge_sglang`; nó tự chọn
+batch theo token-budget 64/32/16/4 và dùng static pool 0.99 VRAM. Các tham số
+`--cache-concurrency`, `--cache-max-total-tokens` và
+`--cache-memory-fraction` chỉ là performance knobs; có thể giảm sau OOM rồi
+resume mà không đổi hidden states đã ghi.
 
 Pipeline tự truyền `--tokenized-path` cho cache. Nếu chạy script cache
 riêng, nên truyền cả JSONL để provenance/audit và tokenized shard để tránh
 tokenize lần thứ hai:
 
 ```bash
-PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py --target-model-path /workspace/storage-shared/models/Qwen3-4B --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/tokenized_full/train --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train --target-layer-ids 1 9 17 25 33 --max-length 32768 --batch-size 1 --bucket-buffer-size 8 --shard-size 32 --attention-backend sdpa --io-threads 2 --io-queue-size 4 --supervision-mode last_assistant --device cuda --local-files-only --resume
+PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/regenerated_full/train.jsonl \
+  --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/tokenized_full/train \
+  --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train \
+  --target-layer-ids 1 9 17 25 33 --max-length 32768 \
+  --cache-backend specforge_sglang --cache-concurrency 64 \
+  --cache-max-total-tokens 262144 --cache-memory-fraction 0.99 \
+  --attention-backend flashinfer --io-threads 4 --io-queue-size 8 \
+  --shard-size 128 --supervision-mode last_assistant --device cuda \
+  --local-files-only --resume
 ```
 
-Ở đây `sdpa` là backend mặc định an toàn; PyTorch có thể chọn fused
-scaled-dot-product kernel phù hợp với build CUDA. Chỉ dùng
-`--attention-backend flash_attention_2` sau khi đã xác nhận package/kernels
-trên server. Manifest cache ghi lại backend capture, còn feature semantics
+Lệnh trên là worker đơn GPU; để dùng đủ bốn GPU, dùng lệnh pipeline ở phần
+full-context hoặc truyền `--parallel-gpu-ids 0 1 2 3`. Các vòng lặp cache HF
+bên dưới giữ lại để đối chiếu baseline cũ.
+
+Với SpecForge, `flashinfer` là lựa chọn throughput khuyến nghị nếu kernel đã
+được cài đúng với CUDA/server; `torch_native` là fallback tương thích nhưng
+chậm hơn. Với HF legacy, `sdpa` là backend mặc định an toàn và
+`flash_attention_2` chỉ nên dùng sau khi xác nhận package/kernel. Manifest cache ghi lại backend capture, còn feature semantics
 không đổi: hidden vẫn là teacher-forced hidden tại mọi offset hợp lệ.
 
 ## Benchmark target generation/cache trên B200

@@ -99,6 +99,52 @@ def test_sharded_writer_resume_does_not_duplicate_ids(tmp_path: Path) -> None:
     assert manifest["sample_ids"] == ["a", "b", "c"]
 
 
+def test_sharded_writer_resume_allows_performance_profile_change_and_keeps_history(
+    tmp_path: Path,
+) -> None:
+    from MR_DFlash.offline_features import ShardedFeatureWriter
+
+    root = tmp_path / "features"
+    common = {
+        "target_model_path": "tiny-target",
+        "feature_layer_ids": [1, 2],
+        "hidden_size": 3,
+        "feature_width": 6,
+        "max_length": 8,
+        "requested_torch_dtype": "bfloat16",
+    }
+    first = ShardedFeatureWriter(
+        root,
+        shard_size=2,
+        resume=False,
+        cache_batch_profile="aggressive-v1.json",
+        cache_batch_profile_sha256="old-profile",
+        **common,
+    )
+    first.add(_sample("a", 4, 6))
+    first.close()
+
+    resumed = ShardedFeatureWriter(
+        root,
+        shard_size=2,
+        resume=True,
+        cache_batch_profile="safe-v2.json",
+        cache_batch_profile_sha256="new-profile",
+        **common,
+    )
+    assert resumed.add(_sample("b", 4, 6))
+    manifest = resumed.close()
+
+    assert manifest["cache_batch_profile"] == "safe-v2.json"
+    assert manifest["cache_batch_profile_sha256"] == "new-profile"
+    assert manifest["cache_profile_history"] == [
+        {
+            "cache_batch_profile": "aggressive-v1.json",
+            "cache_batch_profile_sha256": "old-profile",
+        }
+    ]
+
+
 def test_hf_capture_batch_keeps_all_valid_offsets() -> None:
     from types import SimpleNamespace
 

@@ -199,6 +199,29 @@ def test_pipeline_auto_batch_adds_profile_for_cache_only_selection(tmp_path: Pat
     ]
 
 
+def test_pipeline_defaults_to_aggressive_specforge_cache_profile(tmp_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=8192,
+        cache_backend="specforge_sglang",
+        parallel_gpu_ids=(0, 1, 2, 3),
+    )
+    cache = next(stage for stage in build_stage_plan(options) if stage.name == "cache_full_train")
+    assert "--cache-backend" in cache.command
+    assert cache.command[cache.command.index("--cache-backend") + 1] == "specforge_sglang"
+    assert cache.command[cache.command.index("--cache-concurrency") + 1] == "64"
+    assert cache.command[cache.command.index("--cache-max-total-tokens") + 1] == "262144"
+    assert cache.command[cache.command.index("--cache-memory-fraction") + 1] == "0.99"
+
+
 def test_parallel_cache_worker_receives_batch_profile(tmp_path: Path) -> None:
     script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
     if str(script_dir) not in sys.path:
@@ -223,6 +246,42 @@ def test_parallel_cache_worker_receives_batch_profile(tmp_path: Path) -> None:
     )
     command = _build_worker_command(args, tmp_path / "rank_00", 0, 2)
     assert command[command.index("--batch-profile") + 1] == str(profile)
+
+
+def test_parallel_cache_worker_receives_specforge_throughput_controls(
+    tmp_path: Path,
+) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from parallel_stage import _build_worker_command, parse_args
+
+    profile = tmp_path / "throughput_profile.json"
+    profile.write_text("{}", encoding="utf-8")
+    args = parse_args(
+        [
+            "--mode", "cache",
+            "--gpu-ids", "0", "1", "2", "3",
+            "--input", str(tmp_path / "input.jsonl"),
+            "--tokenized-path", str(tmp_path / "tokenized"),
+            "--output", str(tmp_path / "cache"),
+            "--manifest", str(tmp_path / "manifest.json"),
+            "--target-model-path", "tiny-target",
+            "--max-length", "8192",
+            "--target-layer-ids", "0", "1",
+            "--cache-backend", "specforge_sglang",
+            "--throughput-profile", str(profile),
+            "--cache-concurrency", "64",
+            "--cache-max-total-tokens", "262144",
+            "--cache-memory-fraction", "0.99",
+        ]
+    )
+    command = _build_worker_command(args, tmp_path / "rank_00", 0, 4)
+    assert command[command.index("--cache-backend") + 1] == "specforge_sglang"
+    assert command[command.index("--throughput-profile") + 1] == str(profile)
+    assert command[command.index("--cache-concurrency") + 1] == "64"
+    assert command[command.index("--cache-max-total-tokens") + 1] == "262144"
+    assert command[command.index("--cache-memory-fraction") + 1] == "0.99"
 
 
 def test_pipeline_allow_short_is_explicitly_forwarded_to_prepare(tmp_path: Path) -> None:

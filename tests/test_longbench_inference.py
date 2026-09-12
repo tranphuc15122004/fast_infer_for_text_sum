@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -134,6 +135,112 @@ def test_child_log_is_streamed_before_baseline_exits(tmp_path):
     assert not thread.is_alive()
     assert result_holder["value"]["status"] == "success"
     assert "second runtime line" in log_path.read_text(encoding="utf-8")
+
+
+def test_timeout_kills_descendants_of_a_child_process(tmp_path):
+    from run_longbench_200 import _run_child
+
+    escaped = tmp_path / "escaped-after-timeout"
+    grandchild_code = (
+        "import pathlib,time; "
+        "time.sleep(1.5); "
+        f"pathlib.Path({str(escaped)!r}).write_text('escaped')"
+    )
+    parent_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild_code!r}]); "
+        "time.sleep(30)"
+    )
+
+    result = _run_child(
+        [sys.executable, "-c", parent_code],
+        output=tmp_path / "child-output.jsonl",
+        log_path=tmp_path / "child.log",
+        timeout_seconds=1,
+    )
+
+    assert result["status"] == "timeout"
+    time.sleep(1.0)
+    assert not escaped.exists(), "a descendant survived the parent timeout"
+
+
+def test_group_spawn_failure_cleans_up_children_already_started(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    real_spawn = runner._spawn_child
+
+    pid_path = tmp_path / "started-child.pid"
+    child_code = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    jobs = [
+        {
+            "command": [sys.executable, "-c", child_code],
+            "output": tmp_path / "first.jsonl",
+            "log_path": tmp_path / "first.log",
+            "cuda_visible_devices": "0",
+        },
+        {
+            "command": [str(tmp_path / "missing-executable")],
+            "output": tmp_path / "second.jsonl",
+            "log_path": tmp_path / "second.log",
+            "cuda_visible_devices": "1",
+        },
+    ]
+
+    spawn_count = 0
+
+    def spawn_after_first_is_running(*args, **kwargs):
+        nonlocal spawn_count
+        handle = real_spawn(*args, **kwargs)
+        spawn_count += 1
+        if spawn_count == 1:
+            deadline = time.monotonic() + 2
+            while not pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert pid_path.exists(), "the first child never started"
+        return handle
+
+    monkeypatch.setattr(runner, "_spawn_child", spawn_after_first_is_running)
+
+    with pytest.raises(FileNotFoundError):
+        runner._run_child_group(jobs, timeout_seconds=5)
+
+    pid = int(pid_path.read_text(encoding="utf-8"))
+    try:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_parallel_group_timeout_is_a_single_shared_deadline(tmp_path):
+    from run_longbench_200 import _run_child_group
+
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    jobs = [
+        {
+            "command": command,
+            "output": tmp_path / f"child-{index}.jsonl",
+            "log_path": tmp_path / f"child-{index}.log",
+            "cuda_visible_devices": str(index),
+        }
+        for index in range(3)
+    ]
+
+    started = time.monotonic()
+    results = _run_child_group(jobs, timeout_seconds=1)
+    elapsed = time.monotonic() - started
+
+    assert [result["status"] for result in results] == [
+        "timeout", "timeout", "timeout"
+    ]
+    assert elapsed < 1.8, f"parallel timeout overran by serial shard waits: {elapsed:.2f}s"
 
 
 def test_measure_call_returns_elapsed_and_output():
@@ -1006,3 +1113,724 @@ def test_code_completion_aggregate_excludes_rouge_keys():
 
     assert "rouge1_f" not in result["quality"]
     assert result["quality"]["code_exact_match"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Data-parallel execution (batch size 1 per GPU across several GPUs)
+# ---------------------------------------------------------------------------
+
+_DP_CHILD = r"""
+import json, os, sys, time
+src, out, gpu, fail = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rows = [json.loads(line) for line in open(src) if line.strip()]
+if fail == "1":
+    raise SystemExit(7)
+time.sleep(0.6)
+seen = os.environ.get("CUDA_VISIBLE_DEVICES")
+assert seen == gpu, (seen, gpu)
+with open(out, "w") as handle:
+    for row in rows:
+        handle.write(json.dumps({
+            "method": "vanilla_hf",
+            "sample_id": str(row["id"]),
+            "text": "generated",
+            "output_tokens": 8,
+            "decode_ms": 10.0,
+        }) + "\n")
+    handle.write(json.dumps({"type": "summary", "num_questions": len(rows)}) + "\n")
+"""
+
+
+def _dp_fixture(count, tokens):
+    from common.data_loader import normalize
+
+    source = [
+        {
+            "id": f"s{index}",
+            "dataset": "gov_report",
+            "context": "c",
+            "input": "q",
+            "answers": ["a"],
+            "reference_output": "a",
+            "input_tokens": tokens[index % len(tokens)],
+            "length_bin": "short",
+        }
+        for index in range(count)
+    ]
+    return source, [normalize(row, i) for i, row in enumerate(source)]
+
+
+def _install_fake_dp_adapter(monkeypatch, runner, gpu_groups, failing_shard=None):
+    state = {"call": 0}
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        index = state["call"]
+        state["call"] += 1
+        group = gpu_groups[index % len(gpu_groups)]
+        fail = "1" if index == failing_shard else "0"
+        return [
+            sys.executable, "-c", _DP_CHILD, str(data_file), str(output),
+            ",".join(str(gpu) for gpu in group), fail,
+        ]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+
+
+def test_data_parallel_cli_defaults_and_gpu_group_planning(monkeypatch):
+    import run_longbench_200 as runner
+
+    monkeypatch.delenv("LONG_BENCH_DATA_PARALLEL", raising=False)
+    monkeypatch.delenv("LONG_BENCH_DP_GPUS_PER_SHARD", raising=False)
+    defaults = runner._parser().parse_args([])
+    assert defaults.data_parallel is False
+    assert defaults.dp_gpus_per_shard is None
+
+    monkeypatch.setenv("LONG_BENCH_DATA_PARALLEL", "1")
+    assert runner._parser().parse_args([]).data_parallel is True
+    parsed = runner._parser().parse_args(["--data-parallel", "--gpu-ids", "0,1,2,3"])
+    assert parsed.gpu_ids == "0,1,2,3"
+
+    report = {"requested_ids": [0, 1, 2, 3]}
+    assert runner._resolve_dp_gpu_groups(
+        report, cuda_available=True, gpus_per_shard=1
+    ) == [[0], [1], [2], [3]]
+    assert runner._resolve_dp_gpu_groups(
+        report, cuda_available=True, gpus_per_shard=2
+    ) == [[0, 1], [2, 3]]
+    assert runner._resolve_dp_gpu_groups(
+        {"requested_ids": None, "visible_gpu_count": 2},
+        cuda_available=True,
+        gpus_per_shard=1,
+    ) == [[0], [1]]
+    assert runner._resolve_dp_gpu_groups(
+        {"requested_ids": [3]}, cuda_available=True, gpus_per_shard=1
+    ) == [[3]]
+    assert runner._resolve_dp_gpu_groups(
+        report, cuda_available=False, gpus_per_shard=1
+    ) == []
+    with pytest.raises(SystemExit):
+        runner._resolve_dp_gpu_groups(
+            {"requested_ids": [0, 1, 2]}, cuda_available=True, gpus_per_shard=2
+        )
+
+
+def test_safe_env_pins_shard_to_its_own_gpu_group(monkeypatch):
+    import run_longbench_200 as runner
+
+    monkeypatch.setenv("LONG_BENCH_GPU_IDS", "0,1,2,3")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+
+    assert runner._safe_env()["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert runner._safe_env("2")["CUDA_VISIBLE_DEVICES"] == "2"
+    assert runner._safe_env("2,3")["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert runner._safe_env("2")["PYTHONUNBUFFERED"] == "1"
+
+
+def test_shard_indices_balance_long_documents_deterministically():
+    import run_longbench_200 as runner
+
+    _, normalized = _dp_fixture(
+        8, [14000, 1000, 13000, 2000, 12000, 3000, 11000, 4000]
+    )
+    groups = runner.shard_indices(normalized, 4)
+
+    assert len(groups) == 4
+    assert all(groups), "every shard must own at least one sample"
+    assert sorted(index for group in groups for index in group) == list(range(8))
+    weights = [
+        sum(runner._record_weight(normalized[index]) for index in group)
+        for group in groups
+    ]
+    assert max(weights) - min(weights) <= 1000, weights
+    assert groups == runner.shard_indices(normalized, 4)
+    # Fewer samples than shards must not create empty children.
+    assert runner.shard_indices(normalized[:2], 4) == [[0], [1]]
+
+
+def test_data_parallel_cell_runs_batch1_shards_concurrently_and_merges(
+    tmp_path, monkeypatch
+):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(4, [14000, 1000, 13000, 2000])
+    gpu_groups = [[0], [1], [2], [3]]
+    _install_fake_dp_adapter(monkeypatch, runner, gpu_groups)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True, "device": "cuda"},
+        gpu_groups=gpu_groups,
+        timeout_seconds=60,
+        run_id="dp-run",
+        vram={"budget_gb": 0},  # planning off: keep this test deterministic
+    )
+
+    assert result["status"] == "success"
+    assert result["shard_count"] == 4
+    assert [shard["cuda_visible_devices"] for shard in result["shards"]] == [
+        "0", "1", "2", "3"
+    ]
+    assert [shard["sample_count"] for shard in result["shards"]] == [1, 1, 1, 1]
+    # Four 0.6s children overlapping must stay clearly under the serial 2.4s.
+    assert result["elapsed_ms"] < 1920, result["elapsed_ms"]
+
+    rows = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    samples = [row for row in rows if row.get("type") != "summary"]
+    summary = rows[-1]
+    assert [row["sample_id"] for row in samples] == [row["id"] for row in source_rows]
+    assert all(row["method"] == "vanilla_hf" and row["run_id"] == "dp-run" for row in samples)
+    assert summary["type"] == "summary"
+    assert summary["shard_count"] == 4
+    assert summary["shards_merged"] == 4
+    assert summary["num_samples"] == 4
+    assert len(summary["shard_summaries"]) == 4
+    assert summary["total_output_tokens"] == 32.0
+
+    # Per-shard raw outputs and inputs are kept for auditability.
+    for index in range(4):
+        assert (
+            run_dir / "vanilla_hf" / "shards" / f"gov_report.dp{index}.jsonl"
+        ).is_file()
+        assert (run_dir / "inputs" / "shards" / f"gov_report.dp{index}.jsonl").is_file()
+
+
+def test_data_parallel_cell_failure_keeps_healthy_shards(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(4, [1000] * 4)
+    gpu_groups = [[0], [1]]
+    _install_fake_dp_adapter(monkeypatch, runner, gpu_groups, failing_shard=1)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True, "device": "cuda"},
+        gpu_groups=gpu_groups,
+        timeout_seconds=60,
+        run_id="dp-fail",
+    )
+
+    assert result["status"] == "failed"
+    assert [shard["status"] for shard in result["shards"]] == ["success", "failed"]
+    assert result["shards"][1]["returncode"] == 7
+    assert result["log"].endswith("gov_report.dp1.log"), result["log"]
+
+    healthy = runner.shard_indices(normalized, 2)[0]
+    rows = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    samples = [row for row in rows if row.get("type") != "summary"]
+    summary = rows[-1]
+    assert {row["sample_id"] for row in samples} == {
+        source_rows[index]["id"] for index in healthy
+    }
+    assert summary["shard_count"] == 2
+    assert summary["shards_merged"] == 1
+    assert summary["shards_missing"] == 1
+    assert result["normalized_records"] == len(healthy)
+
+
+def test_data_parallel_cell_rejects_a_successful_shard_with_wrong_sample_ids(
+    tmp_path, monkeypatch
+):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(1, [1000])
+    bad_child = r"""
+import json, sys
+out = sys.argv[2]
+with open(out, "w") as handle:
+    handle.write(json.dumps({
+        "method": "vanilla_hf",
+        "sample_id": "not-the-input-sample",
+        "text": "generated",
+        "output_tokens": 8,
+        "decode_ms": 10.0,
+    }) + "\n")
+    handle.write(json.dumps({"type": "summary"}) + "\n")
+"""
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        return [sys.executable, "-c", bad_child, str(data_file), str(output)]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True},
+        gpu_groups=[[0]],
+        timeout_seconds=60,
+        run_id="wrong-sample",
+        vram={"budget_gb": 0},
+    )
+
+    assert result["status"] == "failed"
+    assert "sample coverage" in result["shards"][0]["reason"]
+    assert result["normalized_records"] == 0
+
+
+def test_vram_planner_packs_within_budget_and_backs_off_when_busy():
+    import run_longbench_200 as runner
+
+    idle = {0: {"total_gb": 180.0, "free_gb": 175.0, "used_gb": 5.0}}
+    slots, plan = runner.plan_shard_slots(
+        [[0]],
+        processes_per_gpu=8,
+        usable_gb=160.0,
+        child_gb=40.0,
+        sample_count=10,
+        usage=idle,
+    )
+    # 160 - 5 = 155 GiB usable for children, 155 // 40 = 3.
+    assert len(slots) == 3
+    assert plan["processes_per_gpu_planned"] == 3
+    assert 3 * 40.0 <= plan["usable_gb"], "planning must stay inside the budget"
+
+    busy = {0: {"total_gb": 180.0, "free_gb": 80.0, "used_gb": 100.0}}
+    _, busy_plan = runner.plan_shard_slots(
+        [[0]], processes_per_gpu=8, usable_gb=160.0, child_gb=40.0,
+        sample_count=10, usage=busy,
+    )
+    assert busy_plan["processes_per_gpu_planned"] == 1
+
+    crowded = {0: {"total_gb": 180.0, "free_gb": 15.0, "used_gb": 165.0}}
+    no_slots, crowded_plan = runner.plan_shard_slots(
+        [[0]], processes_per_gpu=1, usable_gb=160.0, child_gb=40.0,
+        sample_count=10, usage=crowded,
+    )
+    assert no_slots == []
+    assert crowded_plan["processes_per_gpu_planned"] == 0
+
+    # Without an inventory the planner honours the request instead of guessing.
+    _, unknown = runner.plan_shard_slots(
+        [[0], [1]], processes_per_gpu=2, usable_gb=160.0, child_gb=40.0,
+        sample_count=10, usage=None,
+    )
+    assert unknown["shard_slots"] == 4
+    assert unknown["nvidia_smi_available"] is False
+
+    # Never create empty shards.
+    few, _ = runner.plan_shard_slots(
+        [[0]], processes_per_gpu=8, usable_gb=None, child_gb=40.0,
+        sample_count=2, usage=None,
+    )
+    assert len(few) == 2
+
+
+def test_cell_blocks_without_launching_when_card_is_full(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(4, [1000] * 4)
+    launched: list[str] = []
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        launched.append(str(output))
+        return [sys.executable, "-c", _DP_CHILD, str(data_file), str(output), "0", "0"]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+    monkeypatch.setattr(
+        runner,
+        "_vram_usage_by_gpu",
+        lambda: {0: {"total_gb": 180.0, "free_gb": 10.0, "used_gb": 170.0}},
+    )
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True},
+        gpu_groups=[[0]],
+        timeout_seconds=60,
+        run_id="blocked",
+        vram={
+            "budget_gb": 170.0,
+            "headroom_gb": 10.0,
+            "child_reserve_gb": 40.0,
+            "wait_seconds": 0,
+            "oom_retries": 0,
+        },
+    )
+
+    assert result["status"] == "vram_blocked"
+    assert launched == [], "a blocked cell must not launch anything"
+    assert not output_path.exists()
+    assert not (run_dir / "inputs" / "shards").exists()
+    assert "no batch-1 child fits" in result["reason"]
+    assert "nothing was launched" in result["reason"]
+    assert result["vram_plan"]["groups"][0]["free_gb"] == 10.0
+
+
+_DP_OOM_CHILD = r"""
+import json, os, sys
+src, out = sys.argv[1], sys.argv[3]
+rows = [json.loads(line) for line in open(src) if line.strip()]
+if not out.endswith(".r1.jsonl"):
+    print("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB")
+    raise SystemExit(1)
+with open(out, "w") as handle:
+    for row in rows:
+        handle.write(json.dumps({
+            "method": "vanilla_hf",
+            "sample_id": str(row["id"]),
+            "text": "generated",
+            "output_tokens": 8,
+            "decode_ms": 10.0,
+        }) + "\n")
+    handle.write(json.dumps({"type": "summary", "num_questions": len(rows)}) + "\n")
+"""
+
+
+def test_cell_retries_oom_shards_and_marks_shared_gpu(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(4, [1000] * 4)
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        # Mirrors the real adapters, which always pass "--output <path>".
+        return [
+            sys.executable, "-c", _DP_OOM_CHILD, str(data_file),
+            "--output", str(output),
+        ]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True},
+        gpu_groups=[[0]],
+        timeout_seconds=60,
+        run_id="oom",
+        processes_per_gpu=2,
+        vram={"budget_gb": 0, "oom_retries": 1},
+    )
+
+    # Every shard OOMed on its first attempt, each was retried alone and the
+    # cell still completed instead of failing and needing a re-run.
+    assert result["status"] == "success", result["shards"]
+    assert result["processes_per_gpu"] == 2
+    assert result["oom_retry_rounds"] == 1
+    assert sorted(result["retried_shards"]) == [0, 1]
+    assert all(len(shard["retries"]) == 1 for shard in result["shards"])
+    assert all(shard["output"].endswith(".r1.jsonl") for shard in result["shards"])
+    assert all(shard["retries"][0]["status"] == "success" for shard in result["shards"])
+
+    rows = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    samples = [row for row in rows if row.get("type") != "summary"]
+    assert len(samples) == 4
+    # Packed runs are flagged so they can be excluded from a clean comparison.
+    assert {row["shared_gpu_concurrency"] for row in samples} == {2}
+    assert rows[-1]["processes_per_gpu"] == 2
+    assert "shared_gpu" in rows[-1]["measurement_note"]
+
+
+def test_oom_retry_does_not_launch_when_vram_has_no_retry_slot(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(1, [1000])
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        return [
+            sys.executable, "-c", _DP_OOM_CHILD, str(data_file),
+            "--output", str(output),
+        ]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+    wait_calls = []
+
+    def wait_for_slots(*args, **kwargs):
+        wait_calls.append(kwargs)
+        if len(wait_calls) == 1:
+            return [[0]], {"groups": [], "shard_slots": 1}, 0.0
+        return [], {"groups": [], "shard_slots": 0}, 0.0
+
+    monkeypatch.setattr(runner, "_wait_for_shard_slots", wait_for_slots)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True},
+        gpu_groups=[[0]],
+        timeout_seconds=60,
+        run_id="blocked-retry",
+        vram={"budget_gb": 170, "headroom_gb": 10, "child_reserve_gb": 40,
+              "wait_seconds": 0, "oom_retries": 1},
+    )
+
+    assert result["status"] == "failed"
+    assert len(wait_calls) == 2
+    assert result["oom_retry_rounds"] == 1
+    assert result["shards"][0]["retries"][0]["status"] == "vram_blocked"
+    assert not (run_dir / "vanilla_hf" / "shards" / "gov_report.dp0.r1.jsonl").exists()
+
+
+def test_oom_retry_uses_the_gpu_slot_returned_by_the_planner(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    source_rows, normalized = _dp_fixture(1, [1000])
+    seen_gpu = tmp_path / "retry-gpu.txt"
+    child_code = r"""
+import json, os, sys
+src, out, seen = sys.argv[1], sys.argv[3], sys.argv[4]
+with open(seen, "a") as handle:
+    handle.write(os.environ.get("CUDA_VISIBLE_DEVICES", "") + "\n")
+rows = [json.loads(line) for line in open(src) if line.strip()]
+if not out.endswith(".r1.jsonl"):
+    print("CUDA out of memory")
+    raise SystemExit(1)
+with open(out, "w") as handle:
+    for row in rows:
+        handle.write(json.dumps({
+            "method": "vanilla_hf",
+            "sample_id": str(row["id"]),
+            "text": "generated",
+            "output_tokens": 8,
+            "decode_ms": 10.0,
+        }) + "\n")
+    handle.write(json.dumps({"type": "summary"}) + "\n")
+"""
+
+    def build(baseline, config=None, data_file=None, output=None, mode=None,
+              *, max_samples=1, max_new_tokens=64, converted_input=None):
+        return [
+            sys.executable, "-c", child_code, str(data_file),
+            "--output", str(output), str(seen_gpu),
+        ]
+
+    monkeypatch.setattr(runner, "build_adapter_command", build)
+    wait_calls = []
+
+    def wait_for_slots(*args, **kwargs):
+        wait_calls.append(kwargs)
+        if len(wait_calls) == 1:
+            return [[0]], {"groups": [], "shard_slots": 1}, 0.0
+        return [[1]], {"groups": [], "shard_slots": 1}, 0.0
+
+    monkeypatch.setattr(runner, "_wait_for_shard_slots", wait_for_slots)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_path = run_dir / "vanilla_hf" / "gov_report.jsonl"
+    result = runner._run_data_parallel_cell(
+        baseline="vanilla_hf",
+        dataset="gov_report",
+        source_rows=source_rows,
+        normalized=normalized,
+        run_dir=run_dir,
+        output_path=output_path,
+        cfg={"max_new_tokens": 8, "smoke": True},
+        gpu_groups=[[0], [1]],
+        timeout_seconds=60,
+        run_id="retry-slot",
+        vram={"budget_gb": 170, "headroom_gb": 10, "child_reserve_gb": 40,
+              "wait_seconds": 0, "oom_retries": 1},
+    )
+
+    assert result["status"] == "success"
+    assert result["shards"][0]["retries"][0]["cuda_visible_devices"] == "1"
+    assert seen_gpu.read_text(encoding="utf-8").splitlines() == ["0", "1"]
+
+
+def test_replace_command_output_targets_the_output_flag():
+    import run_longbench_200 as runner
+
+    command = ["python", "infer.py", "--model", "m", "--output", "/tmp/old.jsonl"]
+    assert runner._replace_command_output(command, Path("/tmp/new.jsonl")) == [
+        "python", "infer.py", "--model", "m", "--output", "/tmp/new.jsonl"
+    ]
+    assert runner._replace_command_output(["python", "x.py"], Path("/tmp/n")) is None
+
+
+def test_oom_marker_detection_reads_child_logs(tmp_path):
+    import run_longbench_200 as runner
+
+    hit = tmp_path / "oom.log"
+    hit.write_text("step 3\nCUDA out of memory. Tried to allocate 2 GiB\n", encoding="utf-8")
+    clean = tmp_path / "clean.log"
+    clean.write_text("all shards finished normally\n", encoding="utf-8")
+    missing = tmp_path / "missing.log"
+
+    assert runner._log_shows_oom(hit) is True
+    assert runner._log_shows_oom(clean) is False
+    assert runner._log_shows_oom(missing) is False
+
+
+def test_main_data_parallel_wiring_records_shards_in_manifest(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    data_dir = ROOT / "data" / "longbench_100_14k"
+    if not (data_dir / "manifest.json").is_file():
+        pytest.skip("canonical LongBench profile is not available")
+
+    host_gpus = [
+        {
+            "index": index,
+            "name": "Fake B200",
+            "total_memory_gb": 180.0,
+            "free_memory_gb": 170.0,
+            "used_memory_gb": 10.0,
+            "utilization_percent": 0,
+            "compute_capability": "10.0",
+        }
+        for index in (0, 1)
+    ]
+    monkeypatch.setattr(
+        runner,
+        "describe_gpu_assignment",
+        lambda: {
+            "requested": "0,1",
+            "requested_ids": [0, 1],
+            "device_policy": "cuda",
+            "host_gpu_count": 2,
+            "host_gpus": host_gpus,
+            "torch_available": True,
+            "cuda_available": True,
+            "visible_gpu_count": 2,
+            "visible_gpus": [
+                {"visible_index": index, "name": "Fake B200",
+                 "compute_capability": "10.0", "total_memory_gb": 180.0}
+                for index in (0, 1)
+            ],
+        },
+    )
+    monkeypatch.setattr(runner, "_effective_cuda_available", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_vram_usage_by_gpu",
+        lambda: {
+            0: {"total_gb": 180.0, "free_gb": 175.0, "used_gb": 5.0},
+            1: {"total_gb": 180.0, "free_gb": 175.0, "used_gb": 5.0},
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "preflight_baseline",
+        lambda baseline, config=None, cuda_available=True: {
+            "status": "ready",
+            "reason": None,
+        },
+    )
+    _install_fake_dp_adapter(monkeypatch, runner, [[0], [1]])
+
+    # main() overwrites CUDA_VISIBLE_DEVICES / LONG_BENCH_GPU_IDS for the run;
+    # restore the process environment so other tests are unaffected.
+    saved_environ = dict(os.environ)
+    try:
+        exit_code = runner.main(
+            [
+                "--mode", "smoke",
+                "--baselines", "vanilla_hf",
+                "--datasets", "gov_report",
+                "--data-dir", str(data_dir),
+                "--output-dir", str(tmp_path / "outputs"),
+                "--gpu-ids", "0,1",
+                "--data-parallel",
+                "--max-samples", "5",
+                "--max-new-tokens", "8",
+                "--no-collect",
+                "--no-strict",
+            ]
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+    assert exit_code == 0
+    run_dir = next((tmp_path / "outputs").iterdir())
+    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["data_parallel"] is True
+    assert manifest["dp_requested"] is True
+    assert manifest["dp_world_size"] == 2
+    assert manifest["dp_gpu_groups"] == [[0], [1]]
+    assert manifest["dp_gpus_per_shard"] == 1
+    assert manifest["dp_processes_per_gpu"] == 1
+    assert manifest["vram"] == {
+        "budget_gb": 170.0,
+        "headroom_gb": 10.0,
+        "usable_gb": 160.0,
+        "child_reserve_gb": 40.0,
+        "wait_seconds": 600,
+        "oom_retries": 1,
+    }
+    assert manifest["failure_count"] == 0
+
+    cell = manifest["cells"][0]
+    assert cell["status"] == "success"
+    assert len(cell["shards"]) == 2
+    assert sum(shard["sample_count"] for shard in cell["shards"]) == 5
+    assert all(shard["command"] for shard in cell["shards"])
+    assert sorted(shard["cuda_visible_devices"] for shard in cell["shards"]) == ["0", "1"]
+    assert cell["vram_plan"]["processes_per_gpu_actual"] == 1
+    assert cell["vram_plan"]["nvidia_smi_available"] is True
+
+    merged = [
+        json.loads(line)
+        for line in (run_dir / "vanilla_hf" / "gov_report.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    samples = [row for row in merged if row.get("type") != "summary"]
+    assert len(samples) == 5
+    assert len({row["sample_id"] for row in samples}) == 5
+    assert merged[-1]["shard_count"] == 2

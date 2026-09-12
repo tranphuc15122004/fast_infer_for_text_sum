@@ -304,8 +304,18 @@ def materialize_subset(options: SmokeOptions) -> dict[str, Any]:
             raise RuntimeError(f"subset manifest không khớp số dòng: {subset_path}")
         return manifest
 
+    source_total = sum(1 for _ in read_jsonl(options.input_path))
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm có trong requirements server
+        tqdm = lambda iterator, **_kwargs: iterator
     selected = select_subset(
-        read_jsonl(options.input_path),
+        tqdm(
+            read_jsonl(options.input_path),
+            total=source_total,
+            desc="Phase1 subset",
+            unit="sample",
+        ),
         limit=int(options.num_samples),
         seed=int(options.seed),
     )

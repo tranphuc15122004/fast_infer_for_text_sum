@@ -209,7 +209,15 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 [`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md). Trên máy nhiều
 GPU (B200) dùng `--gpu-ids <index>` hoặc env `LONG_BENCH_GPU_IDS` để chọn GPU,
 `--list-gpus` để xem inventory host trước khi chạy; chi tiết trong mục
-"Chọn GPU trên máy nhiều GPU" của tài liệu đó. Trước mỗi job, kiểm tra VRAM
+"Chọn GPU trên máy nhiều GPU" của tài liệu đó. Muốn chạy batch size 1 trên nhiều
+card cùng lúc, thêm `--data-parallel` (`LONG_BENCH_DATA_PARALLEL=1`): mỗi cell
+được tách thành N shard, một shard cho mỗi nhóm GPU, rồi gộp lại thành
+`<baseline>/<dataset>.jsonl` — xem mục "Data-parallel: batch size 1 trên nhiều
+GPU". Trên card lớn (180 GiB) có thể dùng thêm VRAM trống bằng
+`--dp-processes-per-gpu K` với trần `--vram-budget-gb` (mặc định 170, giữ
+`--vram-headroom-gb` 10): runner lập kế hoạch theo VRAM trống thực tế, **chờ**
+khi card chật và retry shard OOM thay vì kill job — xem mục "Tận dụng VRAM".
+Trước mỗi job, kiểm tra VRAM
 trống bằng `bash scripts/run_gpu_check.sh --config <master> [--gpu-ids N]
 [--min-free-gb GB]` (xem cùng mục tài liệu).
 

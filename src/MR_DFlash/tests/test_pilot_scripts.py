@@ -554,6 +554,309 @@ def test_preprocess_pipeline_success_marker_allows_resume(tmp_path: Path) -> Non
     assert (data_root / "pipeline_logs" / "unit_success.log").exists()
 
 
+def test_stage_progress_spec_counts_input_samples_and_limit(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, Stage, stage_progress_spec
+
+    input_path = tmp_path / "input.jsonl"
+    _write_jsonl(input_path, [{"id": f"s{i}"} for i in range(7)])
+    stage = Stage(
+        name="analyze",
+        command=[
+            sys.executable,
+            "analyze_pilot_data.py",
+            "--input",
+            str(input_path),
+            "--limit",
+            "3",
+        ],
+        artifacts=(),
+    )
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+    )
+
+    spec = stage_progress_spec(stage, options)
+
+    assert spec["total_samples"] == 3
+    assert spec["progress_path"] == options.data_root / "pipeline_state" / "analyze.progress.json"
+
+
+def test_analyze_phase_publishes_completed_sample_count(tmp_path: Path, monkeypatch) -> None:
+    from analyze_pilot_data import main as analyze_main
+    from progress import read_progress
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {"id": "s0", "conversations": [{"role": "user", "content": "q"}]},
+            {"id": "s1", "conversations": [{"role": "user", "content": "q"}]},
+        ],
+    )
+    progress_path = tmp_path / "analyze.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_TOTAL_SAMPLES", "2")
+
+    analyze_main(["--input", str(source), "--output", str(tmp_path / "analysis.json")])
+
+    payload = read_progress(progress_path)
+    assert payload["phase"] == "done"
+    assert payload["total_samples"] == 2
+    assert payload["completed_samples"] == 2
+
+
+def test_validate_phase_publishes_completed_sample_count(tmp_path: Path, monkeypatch) -> None:
+    from progress import read_progress
+    from validate_pilot_dataset import main as validate_main
+
+    source = tmp_path / "regenerated.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "id": f"s{i}",
+                "source": "sharegpt",
+                "conversations": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "metadata": {"generation_model": "/models/Qwen3-4B"},
+            }
+            for i in range(2)
+        ],
+    )
+    progress_path = tmp_path / "validate.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_TOTAL_SAMPLES", "2")
+
+    validate_main(
+        [
+            "--input",
+            str(source),
+            "--expected-target-model",
+            "/models/Qwen3-4B",
+            "--require-generated",
+        ]
+    )
+
+    payload = read_progress(progress_path)
+    assert payload["phase"] == "done"
+    assert payload["completed_samples"] == 2
+
+
+def test_prepare_sources_keep_one_shared_sample_counter(tmp_path: Path, monkeypatch) -> None:
+    from prepare_arxiv import main as arxiv_main
+    from prepare_sharegpt import main as sharegpt_main
+    from progress import read_progress
+
+    share_source = tmp_path / "share.jsonl"
+    arxiv_source = tmp_path / "arxiv.jsonl"
+    _write_jsonl(
+        share_source,
+        [{"id": "s0", "conversations": [{"from": "human", "value": "Question"}]}],
+    )
+    _write_jsonl(arxiv_source, [{"id": "a0", "text": "Document"}])
+    progress_path = tmp_path / "prepare.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_TOTAL_SAMPLES", "2")
+
+    sharegpt_main(
+        ["--input", str(share_source), "--output", str(tmp_path / "share.out.jsonl")]
+    )
+    assert read_progress(progress_path)["completed_samples"] == 1
+    arxiv_main(
+        ["--input", str(arxiv_source), "--output", str(tmp_path / "arxiv.out.jsonl")]
+    )
+
+    payload = read_progress(progress_path)
+    assert payload["completed_samples"] == 2
+    assert payload["total_samples"] == 2
+
+
+def test_tokenize_phase_counts_input_samples_not_only_written_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import types
+
+    import MR_DFlash.data as data_module
+
+    from progress import read_progress
+    from tokenize_dataset import main as tokenize_main
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoTokenizer=FakeTokenizer),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "render_conversation",
+        lambda *_args, **_kwargs: ([1, 2, 3], [0, 1, 1]),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "has_consecutive_supervised_tokens",
+        lambda _mask: True,
+    )
+    source = tmp_path / "regenerated.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {"id": "s0", "conversations": [{"role": "user", "content": "q"}]},
+            {"id": "s1", "conversations": [{"role": "user", "content": "q"}]},
+        ],
+    )
+    progress_path = tmp_path / "tokenize.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+
+    tokenize_main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(tmp_path / "tokenized"),
+            "--provenance-manifest",
+            str(tmp_path / "tokenization.json"),
+            "--target-model-path",
+            "target",
+        ]
+    )
+
+    payload = read_progress(progress_path)
+    assert payload["phase"] == "done"
+    assert payload["total_samples"] == 2
+    assert payload["completed_samples"] == 2
+
+
+def test_tokenize_resume_limit_reports_existing_samples_as_processed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import types
+
+    import torch
+
+    import MR_DFlash.data as data_module
+
+    from progress import read_progress
+    from tokenize_dataset import main as tokenize_main
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoTokenizer=FakeTokenizer),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "render_conversation",
+        lambda *_args, **_kwargs: ([1, 2, 3], [0, 1, 1]),
+    )
+    monkeypatch.setattr(
+        data_module,
+        "has_consecutive_supervised_tokens",
+        lambda _mask: True,
+    )
+    source = tmp_path / "regenerated.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {"id": "s0", "conversations": [{"role": "user", "content": "q"}]},
+            {"id": "s1", "conversations": [{"role": "user", "content": "q"}]},
+            {"id": "s2", "conversations": [{"role": "user", "content": "q"}]},
+        ],
+    )
+    output = tmp_path / "tokenized"
+    output.mkdir()
+    torch.save(
+        {
+            "samples": [
+                {
+                    "id": "s0",
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.tensor([0, 1, 1]),
+                    "length": 3,
+                },
+                {
+                    "id": "s1",
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.tensor([0, 1, 1]),
+                    "length": 3,
+                },
+            ]
+        },
+        output / "shard_00000.pt",
+    )
+    progress_path = tmp_path / "tokenize.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+
+    tokenize_main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--target-model-path",
+            "target",
+            "--limit",
+            "2",
+            "--resume",
+        ]
+    )
+
+    payload = read_progress(progress_path)
+    assert payload["total_samples"] == 2
+    assert payload["completed_samples"] == 2
+
+
+def test_run_stage_redirects_child_output_to_log_and_uses_sample_progress(
+    tmp_path: Path, capsys
+) -> None:
+    from run_preprocess_pipeline import PipelineOptions, Stage, run_stage
+
+    input_path = tmp_path / "input.jsonl"
+    _write_jsonl(input_path, [{"id": f"s{i}"} for i in range(3)])
+    artifact = tmp_path / "pilot" / "artifact.txt"
+    child_code = (
+        "import json, os, time; "
+        "from pathlib import Path; "
+        "p=Path(os.environ['MR_DFLASH_PROGRESS_PATH']); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text(json.dumps({'total_samples': 3, 'completed_samples': 1}), encoding='utf-8'); "
+        "print('CHILD_LINE_MUST_STAY_IN_LOG', flush=True); time.sleep(0.05); "
+        "p.write_text(json.dumps({'total_samples': 3, 'completed_samples': 3}), encoding='utf-8'); "
+        f"Path({str(artifact)!r}).write_text('ok', encoding='utf-8')"
+    )
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+    )
+    stage = Stage(
+        name="unit_progress",
+        command=[sys.executable, "-c", child_code, "--input", str(input_path)],
+        artifacts=[artifact],
+    )
+
+    result = run_stage(stage, options, config_hash="test-hash")
+
+    captured = capsys.readouterr()
+    log_path = options.data_root / "pipeline_logs" / "unit_progress.log"
+    assert result["status"] == "success"
+    assert "\n[unit_progress] CHILD_LINE_MUST_STAY_IN_LOG" not in captured.out
+    assert "CHILD_LINE_MUST_STAY_IN_LOG" in log_path.read_text(encoding="utf-8")
+
+
 def test_preprocess_pipeline_lock_prevents_concurrent_writers(tmp_path: Path) -> None:
     from run_preprocess_pipeline import _PipelineLock
 

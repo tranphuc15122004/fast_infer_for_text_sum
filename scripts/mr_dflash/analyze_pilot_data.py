@@ -8,11 +8,14 @@ chạy toàn bộ dữ liệu server.
 from __future__ import annotations
 
 import argparse
+from itertools import islice
 import statistics
+import sys
 from collections import Counter
 from typing import Any, Dict, List
 
 from _common import read_jsonl, write_json
+from progress import ProgressReporter, install_exception_hook
 
 
 def _last_message(row: Dict[str, Any], role: str) -> str:
@@ -31,6 +34,18 @@ def main(argv=None) -> None:
     if args.limit < 1:
         raise ValueError("--limit phải >= 1")
 
+    input_total = sum(1 for _ in read_jsonl(args.input))
+    total = min(input_total, int(args.limit))
+    reporter = ProgressReporter(None)
+    reporter.set_context(total_samples=total)
+    previous_hook = install_exception_hook(reporter)
+    reporter.update(
+        "starting",
+        input=str(args.input),
+        output=str(args.output),
+        completed_samples=reporter.completed_samples(),
+    )
+
     rows: List[Dict[str, Any]] = []
     seen = set()
     duplicate_ids: List[str] = []
@@ -44,11 +59,10 @@ def main(argv=None) -> None:
     except ImportError:  # pragma: no cover - tqdm có trong requirements server
         tqdm = lambda iterator, **_kwargs: iterator
 
+    rows_to_process = islice(read_jsonl(args.input), int(args.limit))
     for index, row in enumerate(
-        tqdm(read_jsonl(args.input), desc="Analyze MR-DFlash", unit="row")
+        tqdm(rows_to_process, total=total, desc="Analyze MR-DFlash", unit="sample")
     ):
-        if index >= args.limit:
-            break
         sample_id = str(row.get("id", ""))
         if sample_id in seen:
             duplicate_ids.append(sample_id)
@@ -68,6 +82,12 @@ def main(argv=None) -> None:
         assistant_rows += int(has_assistant)
         prompt_only_rows += int(not has_assistant)
         reference_rows += int(bool(str(metadata.get("reference_summary", "")).strip()))
+        reporter.update(
+            "processing",
+            completed_samples=len(rows),
+            sample_id=sample_id,
+            row_index=int(index),
+        )
 
     report: Dict[str, Any] = {
         "schema_version": "mr_dflash_analysis_v1",
@@ -103,6 +123,12 @@ def main(argv=None) -> None:
         f"[analyze_pilot_data] rows={len(rows)} sources={dict(source_counts)} "
         f"output={args.output}"
     )
+    reporter.update(
+        "done",
+        completed_samples=len(rows),
+        rows=len(rows),
+    )
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

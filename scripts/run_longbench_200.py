@@ -14,6 +14,7 @@ import codecs
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -56,6 +57,14 @@ EXTERNAL_REFERENCE_BASELINES = {
     "magicdec",
     "fafo",
 }
+
+# Baselines whose child process emits ONE aggregate record for the whole input
+# instead of one record per sample (FAFO wraps the upstream pipeline, SSSD
+# reports vLLM server totals).  Data-parallel sharding is still useful for
+# wall-clock, but each shard then reports its own aggregate; the merged summary
+# records that explicitly so per-shard throughput is never mistaken for a
+# full-cell aggregate.
+AGGREGATE_ONLY_BASELINES = frozenset({"fafo", "sssd"})
 
 
 def _split(value: str | Sequence[str] | None) -> list[str]:
@@ -460,8 +469,13 @@ def _write_status_file(
     return len(records)
 
 
-def _safe_env() -> dict[str, str]:
-    """Child environment with the shared Python path and selected GPU IDs."""
+def _safe_env(cuda_visible_devices: str | None = None) -> dict[str, str]:
+    """Child environment with the shared Python path and selected GPU IDs.
+
+    ``cuda_visible_devices`` (a physical/comma-separated id list such as ``"3"``
+    or ``"0,1"``) overrides the process-wide selection and is how a
+    data-parallel shard is pinned to exactly the GPU group it owns.
+    """
     env = dict(os.environ)
     # Baseline output must reach the parent while inference is running.  This
     # applies to Python-based adapters and is harmless for other child tools.
@@ -471,49 +485,53 @@ def _safe_env() -> dict[str, str]:
     gpu_ids = env.get("LONG_BENCH_GPU_IDS") or env.get("FI_GPU_IDS")
     if gpu_ids is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return env
 
 
-def _run_child(
+def _spawn_child(
     command: Sequence[str],
     *,
     output: Path,
     log_path: Path,
-    timeout_seconds: int,
+    cuda_visible_devices: str | None = None,
 ) -> dict[str, Any]:
-    """Run one baseline while teeing its combined output to log and console.
+    """Start one child process while teeing its combined output to log/console.
 
-    ``subprocess.run(capture_output=True)`` delayed the log file until the
-    baseline exited, which made long inference runs impossible to monitor.
-    A reader thread drains the pipe continuously while the parent keeps the
-    existing bounded timeout around ``wait``.  The raw child output is kept in
-    the per-cell log; the console copy is prefixed with the log stem so output
-    from sequential cells remains attributable to a baseline/dataset.
+    The log file and the reader thread are created before the child is waited
+    on, so long inference runs stay observable.  Spawning and awaiting are
+    split so the data-parallel path can start N batch-1 children (one per GPU
+    group) and only then join them.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    start = time.perf_counter()
-    timed_out = False
-    returncode: int | None = None
-    log_tail = ""
-
     # Create the file before spawning the child so operators can tail it as
     # soon as the cell is launched, even before its first output line.
     log_handle = log_path.open("w", encoding="utf-8", buffering=1)
     try:
+        popen_kwargs: dict[str, Any] = {
+            "cwd": ROOT,
+            "env": _safe_env(cuda_visible_devices),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "bufsize": 0,
+        }
+        if os.name != "nt":
+            # Baseline adapters may launch wrappers, vLLM workers or other
+            # subprocesses.  Put the whole child tree in its own process group
+            # so a timeout cannot leave GPU work running after the cell ends.
+            popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             list(command),
-            cwd=ROOT,
-            env=_safe_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
+            **popen_kwargs,
         )
     except BaseException:
         log_handle.close()
         raise
 
+    state: dict[str, str] = {"tail": ""}
+
     def _stream_output() -> None:
-        nonlocal log_tail
         assert proc.stdout is not None
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
@@ -527,13 +545,13 @@ def _run_child(
                 text = decoder.decode(chunk)
                 if not text:
                     continue
-                log_tail = (log_tail + text)[-2000:]
+                state["tail"] = (state["tail"] + text)[-2000:]
                 log_handle.write(text)
                 log_handle.flush()
                 print(f"[{log_path.stem}] {text}", end="", flush=True)
             remainder = decoder.decode(b"", final=True)
             if remainder:
-                log_tail = (log_tail + remainder)[-2000:]
+                state["tail"] = (state["tail"] + remainder)[-2000:]
                 log_handle.write(remainder)
                 log_handle.flush()
                 print(f"[{log_path.stem}] {remainder}", end="", flush=True)
@@ -546,12 +564,71 @@ def _run_child(
         daemon=True,
     )
     reader.start()
+    return {
+        "proc": proc,
+        "reader": reader,
+        "log_handle": log_handle,
+        "log_path": log_path,
+        "output": Path(output),
+        "command": [str(part) for part in command],
+        "start": time.perf_counter(),
+        "state": state,
+    }
+
+
+def _kill_child_group(proc: subprocess.Popen[Any]) -> None:
+    """Kill a child and every descendant started in its process group."""
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            # The leader may have exited between wait() and cleanup.  Fall
+            # back to the direct child so this remains safe if group setup was
+            # unavailable for an unusual platform/runtime.
+            pass
+    proc.kill()
+
+
+def _cleanup_spawned_children(handles: Sequence[Mapping[str, Any]]) -> None:
+    """Stop and reap children when launching a group fails part-way through."""
+    for handle in handles:
+        proc = handle["proc"]
+        if proc.poll() is None:
+            _kill_child_group(proc)
+    for handle in handles:
+        proc = handle["proc"]
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_child_group(proc)
+            proc.wait()
+        reader = handle["reader"]
+        reader.join(timeout=1)
+        if reader.is_alive() and proc.stdout is not None:
+            proc.stdout.close()
+            reader.join(timeout=1)
+        log_handle = handle["log_handle"]
+        log_handle.flush()
+        log_handle.close()
+
+
+def _await_child(
+    handle: Mapping[str, Any], *, timeout_seconds: float
+) -> dict[str, Any]:
+    """Wait (bounded) for a spawned child and return its result record."""
+    proc = handle["proc"]
+    log_path = handle["log_path"]
+    log_handle = handle["log_handle"]
+    reader = handle["reader"]
+    timed_out = False
+    returncode: int | None = None
     try:
         try:
             returncode = proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            proc.kill()
+            _kill_child_group(proc)
             proc.wait()
             returncode = None
     finally:
@@ -565,16 +642,856 @@ def _run_child(
         log_handle.flush()
         log_handle.close()
 
-    elapsed_ms = round((time.perf_counter() - start) * 1000.0, 3)
+    elapsed_ms = round((time.perf_counter() - handle["start"]) * 1000.0, 3)
+    output = handle["output"]
     return {
         "status": "timeout" if timed_out else ("success" if returncode == 0 else "failed"),
         "returncode": returncode,
         "elapsed_ms": elapsed_ms,
         "output_exists": output.is_file(),
         "log": str(log_path),
-        "log_tail": log_tail,
-        "command": [str(part) for part in command],
+        "log_tail": handle["state"]["tail"],
+        "command": list(handle["command"]),
     }
+
+
+def _run_child(
+    command: Sequence[str],
+    *,
+    output: Path,
+    log_path: Path,
+    timeout_seconds: int,
+    cuda_visible_devices: str | None = None,
+) -> dict[str, Any]:
+    """Run one child to completion (sequential cells and the collector)."""
+    handle = _spawn_child(
+        command,
+        output=output,
+        log_path=log_path,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+    return _await_child(handle, timeout_seconds=timeout_seconds)
+
+
+def _run_child_group(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    """Run independent batch-1 children concurrently on separate GPUs.
+
+    Every job is spawned first so the GPU groups overlap, then joined against
+    one shared deadline: ``timeout_seconds`` bounds the whole cell, exactly as
+    it bounds a single sequential cell.  Each entry in ``jobs`` provides
+    ``command``, ``output``, ``log_path`` and ``cuda_visible_devices``; the
+    extra bookkeeping keys are copied onto the corresponding result.
+    """
+    handles: list[dict[str, Any]] = []
+    try:
+        for job in jobs:
+            handles.append(
+                _spawn_child(
+                    job["command"],
+                    output=job["output"],
+                    log_path=job["log_path"],
+                    cuda_visible_devices=job.get("cuda_visible_devices"),
+                )
+            )
+    except BaseException:
+        _cleanup_spawned_children(handles)
+        raise
+    deadline = time.perf_counter() + max(0.0, float(timeout_seconds))
+    results: list[dict[str, Any]] = []
+    for job, handle in zip(jobs, handles):
+        remaining = max(0.0, deadline - time.perf_counter())
+        result = _await_child(handle, timeout_seconds=remaining)
+        for key in ("shard_index", "cuda_visible_devices", "sample_count", "output_path"):
+            if key in job:
+                result[key] = job[key]
+        results.append(result)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# VRAM budget planner: use the card fully without ever risking an OOM
+# ---------------------------------------------------------------------------
+
+def _vram_usage_by_gpu() -> dict[int, dict[str, float]] | None:
+    """Live ``{gpu_index: {total_gb, free_gb, used_gb}}`` from nvidia-smi.
+
+    Returns ``None`` when the inventory is unavailable.  The planner then keeps
+    the requested concurrency instead of guessing memory it cannot observe, and
+    the OOM retry stays as the only protection.
+    """
+    gpus = _nvidia_smi_gpus()
+    if not gpus:
+        return None
+    usage: dict[int, dict[str, float]] = {}
+    for gpu in gpus:
+        total = gpu.get("total_memory_gb")
+        free = gpu.get("free_memory_gb")
+        if total is None or free is None:
+            continue
+        used = gpu.get("used_memory_gb")
+        usage[int(gpu["index"])] = {
+            "total_gb": float(total),
+            "free_gb": float(free),
+            "used_gb": float(used) if used is not None else float(total) - float(free),
+        }
+    return usage or None
+
+
+def _group_capacity(
+    group: Sequence[int],
+    usage: Mapping[int, Mapping[str, float]] | None,
+    *,
+    usable_gb: float | None,
+    child_gb: float,
+) -> dict[str, Any]:
+    """How many batch-1 children still fit in one GPU group.
+
+    ``usable_gb`` is the schedulable ceiling (``--vram-budget-gb`` minus
+    ``--vram-headroom-gb``), always capped by the card's *total* memory so a
+    budget meant for a 180 GiB card cannot be spent on a small one.  A group
+    spanning several cards is judged conservatively: the child must fit on the
+    least empty card, and the budget is charged against the most occupied one.
+    """
+    if not usage or usable_gb is None:
+        return {
+            "free_gb": None,
+            "other_used_gb": None,
+            "usable_gb": None,
+            "total_gb": None,
+            "free_slots": None,
+        }
+    observed = [usage[index] for index in group if index in usage]
+    if not observed:
+        return {
+            "free_gb": None,
+            "other_used_gb": None,
+            "usable_gb": None,
+            "total_gb": None,
+            "free_slots": None,
+        }
+    free_gb = min(entry["free_gb"] for entry in observed)
+    other_used_gb = max(entry["used_gb"] for entry in observed)
+    total_gb = min(entry["total_gb"] for entry in observed)
+    effective_usable = min(float(usable_gb), total_gb)
+    remaining = effective_usable - other_used_gb
+    free_slots = int(remaining // child_gb) if child_gb > 0 else 0
+    return {
+        "free_gb": round(free_gb, 1),
+        "other_used_gb": round(other_used_gb, 1),
+        "usable_gb": round(effective_usable, 1),
+        "total_gb": round(total_gb, 1),
+        "free_slots": max(0, free_slots),
+    }
+
+
+def plan_shard_slots(
+    gpu_groups: Sequence[Sequence[int]],
+    *,
+    processes_per_gpu: int,
+    usable_gb: float | None,
+    child_gb: float,
+    sample_count: int,
+    usage: Mapping[int, Mapping[str, float]] | None,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    """Return one device group per concurrent batch-1 child, plus the plan.
+
+    The returned slot list is what the cell actually launches: one entry per
+    child, each entry being the GPU group that child owns.  ``processes_per_gpu``
+    is the operator's upper bound and the observed free VRAM is the real one, so
+    the effective concurrency is ``min(requested, what fits in the budget)``.
+    """
+    slots: list[list[int]] = []
+    per_group: list[dict[str, Any]] = []
+    for group in gpu_groups:
+        capacity = _group_capacity(
+            group, usage, usable_gb=usable_gb, child_gb=child_gb
+        )
+        if capacity["free_slots"] is None:
+            allowed = int(processes_per_gpu)
+        else:
+            allowed = min(int(processes_per_gpu), int(capacity["free_slots"]))
+        allowed = max(0, allowed)
+        per_group.append(
+            {
+                "gpu_ids": [int(gpu) for gpu in group],
+                **capacity,
+                "planned_processes": allowed,
+            }
+        )
+        slots.extend([[int(gpu) for gpu in group] for _ in range(allowed)])
+    if len(slots) > sample_count:
+        # Never create empty shards; drop the extra slots from the tail.
+        slots = slots[:sample_count]
+        for entry in per_group:
+            entry["planned_processes"] = sum(
+                1 for slot in slots if slot == entry["gpu_ids"]
+            )
+    plan = {
+        "processes_per_gpu_requested": int(processes_per_gpu),
+        "processes_per_gpu_planned": max(
+            (entry["planned_processes"] for entry in per_group), default=0
+        ),
+        "usable_gb": None if usable_gb is None else round(float(usable_gb), 1),
+        "child_reserve_gb": round(float(child_gb), 1),
+        "nvidia_smi_available": bool(usage),
+        "groups": per_group,
+        "shard_slots": len(slots),
+    }
+    return slots, plan
+
+
+def _wait_for_shard_slots(
+    gpu_groups: Sequence[Sequence[int]],
+    *,
+    processes_per_gpu: int,
+    usable_gb: float | None,
+    child_gb: float,
+    sample_count: int,
+    wait_seconds: float,
+    poll_seconds: float = 15.0,
+) -> tuple[list[list[int]], dict[str, Any], float]:
+    """Block until at least one shard slot fits, or the wait budget expires.
+
+    Waiting (rather than launching into a known OOM) is what makes a long
+    unattended sweep safe: a crowded card delays this cell instead of killing a
+    child, and no process that someone else owns is ever touched.
+    """
+    if usable_gb is None:
+        # Planning is disabled (budget 0): honour the requested concurrency and
+        # do not shell out to nvidia-smi or wait for anything.  The OOM retry
+        # remains the safety net.
+        slots, plan = plan_shard_slots(
+            gpu_groups,
+            processes_per_gpu=processes_per_gpu,
+            usable_gb=None,
+            child_gb=child_gb,
+            sample_count=sample_count,
+            usage=None,
+        )
+        plan["waited_seconds"] = 0.0
+        return slots, plan, 0.0
+
+    started = time.perf_counter()
+    deadline = started + max(0.0, float(wait_seconds))
+    while True:
+        usage = _vram_usage_by_gpu()
+        slots, plan = plan_shard_slots(
+            gpu_groups,
+            processes_per_gpu=processes_per_gpu,
+            usable_gb=usable_gb,
+            child_gb=child_gb,
+            sample_count=sample_count,
+            usage=usage,
+        )
+        plan["waited_seconds"] = round(time.perf_counter() - started, 1)
+        if slots or wait_seconds <= 0 or time.perf_counter() >= deadline:
+            return slots, plan, plan["waited_seconds"]
+        now = time.perf_counter()
+        if now < deadline:
+            print(
+                "[vram] no slot free within budget "
+                f"({plan['groups']}); retrying in "
+                f"{min(poll_seconds, max(0.5, deadline - now)):.0f}s",
+                flush=True,
+            )
+        time.sleep(min(poll_seconds, max(0.5, deadline - time.perf_counter())))
+
+
+_OOM_MARKERS = (
+    "out of memory",
+    "outofmemoryerror",
+    "cuda_error_out_of_memory",
+)
+
+
+def _log_shows_oom(path: Path, *, tail_bytes: int = 262144) -> bool:
+    """Detect a CUDA/allocation OOM in a child log without reading all of it."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > tail_bytes:
+                handle.seek(size - tail_bytes)
+            blob = handle.read().decode("utf-8", errors="replace").lower()
+    except OSError:
+        return False
+    return any(marker in blob for marker in _OOM_MARKERS)
+
+
+def _replace_command_output(command: Sequence[str], new_output: Path) -> list[str] | None:
+    """Point a built command's ``--output`` at ``new_output``.
+
+    Every adapter appends ``--output <path>``; if a future adapter stops doing
+    that the retry is skipped instead of silently appending to the previous,
+    partial file.
+    """
+    parts = [str(part) for part in command]
+    for position in range(len(parts) - 1, 0, -1):
+        if parts[position] == "--output":
+            parts[position + 1] = str(new_output)
+            return parts
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Data-parallel execution: batch size 1 per GPU across many GPUs
+# ---------------------------------------------------------------------------
+
+def _record_weight(record: Mapping[str, Any]) -> int:
+    """Rough per-sample cost used to balance shards across GPU groups."""
+    raw = record.get("raw")
+    if isinstance(raw, Mapping):
+        try:
+            tokens = int(raw.get("input_tokens") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+        if tokens > 0:
+            return tokens
+    return len(str(record.get("prompt") or ""))
+
+
+def shard_indices(
+    records: Sequence[Mapping[str, Any]], shards: int
+) -> list[list[int]]:
+    """Split record indices into deterministic, length-balanced shards.
+
+    LongBench rows span roughly 1k-14k tokens, so a contiguous split can pile
+    every long document onto one GPU and leave the others idle.  A
+    longest-first greedy assignment (ties broken by source index) balances the
+    estimated work while staying fully reproducible; the canonical order is
+    restored inside each shard so logs stay readable.
+    """
+    if shards <= 1 or len(records) <= 1:
+        return [list(range(len(records)))]
+    count = min(int(shards), len(records))
+    groups: list[list[int]] = [[] for _ in range(count)]
+    weights = [0] * count
+    order = sorted(
+        range(len(records)),
+        key=lambda index: (-_record_weight(records[index]), index),
+    )
+    for index in order:
+        # Empty groups are filled first, then the currently lightest group;
+        # the final key keeps the assignment fully deterministic.
+        target = min(
+            range(count),
+            key=lambda bucket: (0 if not groups[bucket] else 1, weights[bucket], bucket),
+        )
+        groups[target].append(index)
+        weights[target] += _record_weight(records[index])
+    return [sorted(group) for group in groups]
+
+
+def _resolve_dp_gpu_groups(
+    report: Mapping[str, Any],
+    *,
+    cuda_available: bool,
+    gpus_per_shard: int,
+) -> list[list[int]]:
+    """Partition the selected GPUs into one device group per shard.
+
+    ``--gpu-ids`` (physical indices) defines the pool; when it is unset every
+    CUDA-visible device is used.  A group of size 1 means "one card per batch-1
+    child", while larger groups support methods that need intra-process
+    parallelism (for example tensor parallel).
+    """
+    if not cuda_available:
+        return []
+    ids = [int(value) for value in (report.get("requested_ids") or [])]
+    if not ids:
+        ids = list(range(int(report.get("visible_gpu_count") or 0)))
+    if len(ids) < 2:
+        return [ids] if ids else []
+    if len(ids) % gpus_per_shard != 0:
+        raise SystemExit(
+            f"--dp-gpus-per-shard {gpus_per_shard} does not divide the "
+            f"{len(ids)} selected GPU(s) {ids}; adjust --gpu-ids or the group "
+            "size so every shard owns the same number of devices"
+        )
+    return [ids[start : start + gpus_per_shard] for start in range(0, len(ids), gpus_per_shard)]
+
+
+def _merge_shard_outputs(
+    outputs: Sequence[Path],
+    *,
+    output_path: Path,
+    baseline: str,
+    dataset: str,
+    run_id: str,
+    sample_order: Mapping[str, int],
+    aggregate_only: bool,
+    world_size: int,
+    processes_per_gpu: int = 1,
+) -> int:
+    """Concatenate shard JSONL files into the canonical per-cell output file.
+
+    Upstream per-shard summaries are preserved verbatim under
+    ``shard_summaries`` instead of being arithmetically merged: their keys are
+    baseline-specific and mixing them blindly could fabricate a metric.
+    Canonical metrics are recomputed by ``collect_metrics.py`` from the merged
+    sample rows.
+    """
+    rows: list[dict[str, Any]] = []
+    shard_summaries: list[dict[str, Any]] = []
+    for path in outputs:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("type") == "summary":
+                shard_summaries.append(row)
+            else:
+                rows.append(row)
+
+    def _sort_key(row: Mapping[str, Any]) -> tuple[int, int]:
+        sample_id = row.get("sample_id")
+        if sample_id is None:
+            # Aggregate rows stay last; the sort is stable, so shard order and
+            # within-shard order are preserved.
+            return (1, 0)
+        return (0, int(sample_order.get(str(sample_id), len(sample_order))))
+
+    rows.sort(key=_sort_key)
+
+    totals: dict[str, float] = {}
+    for field in ("output_tokens", "prefill_ms", "ttft_ms", "decode_ms", "e2e_ms"):
+        values = [
+            float(row[field])
+            for row in rows
+            if isinstance(row.get(field), (int, float)) and not isinstance(row.get(field), bool)
+        ]
+        if values:
+            totals[f"total_{field}"] = round(sum(values), 3)
+    sample_rows = [
+        row
+        for row in rows
+        if row.get("scope") != "aggregate" and row.get("sample_id") is not None
+    ]
+
+    summary: dict[str, Any] = {
+        "type": "summary",
+        "method": baseline,
+        "dataset": dataset,
+        "run_id": run_id,
+        "data_parallel": True,
+        "shard_count": int(world_size),
+        "shards_merged": len(outputs),
+        "num_records": len(rows),
+        "num_samples": len(sample_rows),
+        "num_aggregate_records": len(rows) - len(sample_rows),
+        **totals,
+        "aggregation_note": (
+            "rows merged from data-parallel shards (batch size 1 per GPU group); "
+            "canonical metrics are aggregated by collect_metrics.py from the "
+            "sample rows, upstream per-shard summaries are preserved as-is "
+            "under shard_summaries"
+        ),
+        "shard_summaries": shard_summaries,
+    }
+    if len(outputs) != int(world_size):
+        summary["shards_missing"] = int(world_size) - len(outputs)
+    if aggregate_only:
+        summary["shard_aggregate_semantics"] = "per_shard"
+    if int(processes_per_gpu) > 1:
+        # Several batch-1 children shared each card, so latency/throughput were
+        # measured under SM contention and must not be compared with a run that
+        # had one process per card.
+        summary["processes_per_gpu"] = int(processes_per_gpu)
+        summary["measurement_note"] = (
+            "shared_gpu: multiple batch-1 processes ran on the same card; "
+            "per-sample latency/throughput are not comparable with "
+            "one-process-per-card runs"
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    return len(rows)
+
+
+def _run_data_parallel_cell(
+    *,
+    baseline: str,
+    dataset: str,
+    source_rows: Sequence[Mapping[str, Any]],
+    normalized: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+    output_path: Path,
+    cfg: Mapping[str, Any],
+    gpu_groups: Sequence[Sequence[int]],
+    timeout_seconds: int,
+    run_id: str,
+    processes_per_gpu: int = 1,
+    vram: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one matrix cell as concurrent batch-1 shards over the GPU pool.
+
+    Each shard is an independent child pinned to its own device group, so
+    ``processes_per_gpu > 1`` means several batch-1 children share a card.  The
+    VRAM planner only launches what fits inside ``budget - headroom`` and waits
+    when nothing fits: a child is never started into a known OOM, a running
+    child is never killed, and a shard that still OOMs is retried alone.  The
+    returned record mirrors ``_run_child``'s shape so the caller treats both
+    paths identically.
+    """
+    vram_cfg = dict(vram or {})
+    budget_gb = float(vram_cfg.get("budget_gb") or 0.0)
+    headroom_gb = float(vram_cfg.get("headroom_gb") or 0.0)
+    child_gb = float(vram_cfg.get("child_reserve_gb") or 0.0) or 1.0
+    wait_seconds = float(vram_cfg.get("wait_seconds") or 0.0)
+    oom_retries = int(vram_cfg.get("oom_retries") or 0)
+    usable_gb = max(0.0, budget_gb - headroom_gb) if budget_gb > 0 else None
+
+    start = time.perf_counter()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Shard inputs live under inputs/shards (pristine, reproducible) while shard
+    # outputs live next to the merged file under <baseline>/shards, so a child
+    # never reads and writes the same path.
+    input_shard_dir = run_dir / "inputs" / "shards"
+    output_shard_dir = output_path.parent / "shards"
+    output_shard_dir.mkdir(parents=True, exist_ok=True)
+
+    def _result(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "status": "failed",
+            "returncode": None,
+            "elapsed_ms": round((time.perf_counter() - start) * 1000.0, 3),
+            "output_exists": output_path.is_file(),
+            "log": "",
+            "log_tail": "",
+            "command": [],
+            "data_parallel": True,
+            "shard_count": 0,
+            "shards": [],
+            "normalized_records": 0,
+            "processes_per_gpu": 1,
+            "vram_plan": None,
+            "oom_retry_rounds": 0,
+            "retried_shards": [],
+        }
+        base.update(overrides)
+        return base
+
+    slots, plan, waited = _wait_for_shard_slots(
+        gpu_groups,
+        processes_per_gpu=processes_per_gpu,
+        usable_gb=usable_gb,
+        child_gb=child_gb,
+        sample_count=len(normalized),
+        wait_seconds=wait_seconds,
+    )
+    plan["dataset"] = dataset
+    if not slots:
+        reason = (
+            f"no batch-1 child fits in the {budget_gb:.0f} GiB VRAM budget "
+            f"(usable {plan['usable_gb']} GiB, reserve {child_gb:.0f} GiB/child) "
+            f"after waiting {waited:.0f}s; nothing was launched so no job was killed"
+        )
+        print(f"[{baseline}/{dataset}] vram_blocked: {reason}", file=sys.stderr, flush=True)
+        return _result(status="vram_blocked", reason=reason, vram_plan=plan)
+
+    sample_groups = shard_indices(normalized, len(slots))
+    slots = slots[: len(sample_groups)]
+    processes_per_card = max(
+        (sum(1 for other in slots if other == slot) for slot in slots), default=1
+    )
+    plan["shard_slots"] = len(slots)
+    plan["processes_per_gpu_actual"] = processes_per_card
+    if processes_per_card > 1:
+        print(
+            f"[{baseline}/{dataset}] WARNING {processes_per_card} batch-1 "
+            "processes share each card: throughput of the sweep improves but "
+            "per-sample latency/throughput are no longer comparable with "
+            "one-process-per-card runs (marked in the output and manifest)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    jobs: list[dict[str, Any]] = []
+    for index, group in enumerate(sample_groups):
+        device_group = slots[index]
+        shard_source = [source_rows[position] for position in group]
+        shard_normalized = [normalized[position] for position in group]
+        source_path = input_shard_dir / f"{dataset}.dp{index}.jsonl"
+        converted_path = input_shard_dir / f"{baseline}_{dataset}.dp{index}.jsonl"
+        _write_jsonl(source_path, shard_source)
+        converted_input = convert_records_for_baseline(
+            baseline, shard_normalized, converted_path
+        )
+        shard_output = output_shard_dir / f"{dataset}.dp{index}.jsonl"
+        command = build_adapter_command(
+            baseline,
+            data_file=source_path,
+            converted_input=converted_input,
+            output=shard_output,
+            max_samples=len(shard_normalized),
+            max_new_tokens=int(cfg.get("max_new_tokens") or 0),
+            config=cfg,
+        )
+        if command is None:
+            return _result(
+                status="unsupported_dataset",
+                reason="adapter did not produce a command for this dataset",
+                vram_plan=plan,
+            )
+        jobs.append(
+            {
+                "command": command,
+                "output": shard_output,
+                "log_path": run_dir / "logs" / f"{baseline}_{dataset}.dp{index}.log",
+                "cuda_visible_devices": ",".join(str(gpu) for gpu in device_group),
+                "shard_index": index,
+                "sample_count": len(shard_normalized),
+                "output_path": shard_output,
+                "input_path": source_path,
+                "gpu_ids": [int(gpu) for gpu in device_group],
+                "source_records": shard_normalized,
+                "concurrency": sum(1 for other in slots if other == device_group),
+                "_final_status": "failed",
+                "_last_result": {},
+                "_retries": [],
+            }
+        )
+
+    print(
+        f"[{baseline}/{dataset}] launching {len(jobs)} batch-1 shard(s) "
+        f"({processes_per_card}/card): "
+        + ", ".join(
+            f"shard {job['shard_index']} -> GPU {job['cuda_visible_devices']} "
+            f"({job['sample_count']} sample(s))"
+            for job in jobs
+        ),
+        flush=True,
+    )
+
+    def _finalize(job: dict[str, Any], result: dict[str, Any], path: Path) -> str:
+        """Normalize a finished shard written to ``path`` and return its status."""
+        status = str(result["status"])
+        if status != "success":
+            return status
+        extra = (
+            {"shared_gpu_concurrency": job["concurrency"]}
+            if job["concurrency"] > 1
+            else None
+        )
+        count = _normalize_child_output(
+            path,
+            baseline=baseline,
+            dataset=dataset,
+            source_records=job["source_records"],
+            config=cfg,
+            run_id=run_id,
+            extra_fields=extra,
+        )
+        if count == 0:
+            result["reason"] = "shard exited successfully but wrote no result records"
+            return "failed"
+        coverage_error = _sample_coverage_error(
+            path, source_records=job["source_records"]
+        )
+        if coverage_error is not None:
+            result["reason"] = coverage_error
+            return "failed"
+        result["normalized_records"] = count
+        return "success"
+
+    results = _run_child_group(jobs, timeout_seconds=timeout_seconds)
+    for job, result in zip(jobs, results):
+        job["_last_result"] = result
+        job["_final_status"] = _finalize(job, result, job["output_path"])
+
+    # Safety net for the long unattended runs: a shard that OOMed even inside
+    # the budget is retried alone, after its siblings have exited, before the
+    # cell is allowed to fail.  Nothing is killed and no cell is silently
+    # dropped; every attempt is recorded.
+    retry_rounds = 0
+    retry_plans: list[dict[str, Any]] = []
+    for attempt in range(1, oom_retries + 1):
+        pending = [
+            job
+            for job in jobs
+            if job["_final_status"] != "success" and _log_shows_oom(job["log_path"])
+        ]
+        if not pending:
+            break
+        retry_rounds = attempt
+        retry_slots, retry_plan, retry_waited = _wait_for_shard_slots(
+            gpu_groups,
+            processes_per_gpu=1,
+            usable_gb=usable_gb,
+            child_gb=child_gb,
+            sample_count=1,
+            wait_seconds=wait_seconds,
+        )
+        print(
+            f"[{baseline}/{dataset}] OOM retry {attempt}/{oom_retries}: "
+            f"{len(pending)} shard(s), one at a time, "
+            f"waited {retry_waited:.0f}s for VRAM",
+            file=sys.stderr,
+            flush=True,
+        )
+        retry_plans.append(retry_plan)
+        if not retry_slots:
+            reason = (
+                "OOM retry blocked: no GPU slot satisfied the configured VRAM "
+                f"budget after waiting {retry_waited:.0f}s"
+            )
+            print(
+                f"[{baseline}/{dataset}] {reason}; leaving OOM shards failed",
+                file=sys.stderr,
+                flush=True,
+            )
+            for job in pending:
+                job["_retries"].append(
+                    {
+                        "attempt": attempt,
+                        "status": "vram_blocked",
+                        "returncode": None,
+                        "reason": reason,
+                        "vram_plan": retry_plan,
+                    }
+                )
+            break
+
+        # The planner returns a concrete physical GPU group.  Use that group
+        # for the retry instead of silently reusing the possibly-full shard
+        # assignment from the failed concurrent round.
+        retry_cuda_visible_devices = ",".join(
+            str(gpu) for gpu in retry_slots[0]
+        )
+        for job in pending:
+            retry_output = job["output_path"].with_name(
+                f"{job['output_path'].stem}.r{attempt}.jsonl"
+            )
+            retry_log = job["log_path"].with_name(
+                f"{job['log_path'].stem}.r{attempt}.log"
+            )
+            command = _replace_command_output(job["command"], retry_output)
+            if command is None:
+                print(
+                    f"[{baseline}/{dataset}] shard {job['shard_index']}: cannot "
+                    "retry (command has no --output), leaving it failed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+            result = _run_child(
+                command,
+                output=retry_output,
+                log_path=retry_log,
+                timeout_seconds=timeout_seconds,
+                cuda_visible_devices=retry_cuda_visible_devices,
+            )
+            result["retry_attempt"] = attempt
+            status = _finalize(job, result, retry_output)
+            job["_retries"].append(
+                {
+                    "attempt": attempt,
+                    "status": status,
+                    "returncode": result.get("returncode"),
+                    "log": str(retry_log),
+                    "output": str(retry_output),
+                    "cuda_visible_devices": retry_cuda_visible_devices,
+                }
+            )
+            job["_last_result"] = result
+            job["_final_status"] = status
+            if status == "success":
+                # Merge from the retry file; the partial first attempt stays on
+                # disk for inspection but is never merged.
+                job["output_path"] = retry_output
+                job["log_path"] = retry_log
+                job["output"] = retry_output
+
+    entries: list[dict[str, Any]] = []
+    for job in jobs:
+        result = job["_last_result"]
+        entry: dict[str, Any] = {
+            "shard_index": job["shard_index"],
+            "gpu_ids": job["gpu_ids"],
+            "cuda_visible_devices": job["cuda_visible_devices"],
+            "concurrency": job["concurrency"],
+            "sample_count": job["sample_count"],
+            "status": job["_final_status"],
+            "returncode": result.get("returncode"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "log": result.get("log"),
+            "input": str(job["input_path"]),
+            "output": str(job["output_path"]),
+            "output_exists": bool(result.get("output_exists")),
+            "command": list(result.get("command") or job["command"]),
+        }
+        if result.get("reason"):
+            entry["reason"] = result["reason"]
+        if result.get("normalized_records") is not None:
+            entry["normalized_records"] = result["normalized_records"]
+        if job["_retries"]:
+            entry["retries"] = job["_retries"]
+        entries.append(entry)
+
+    successful = [job for job in jobs if job["_final_status"] == "success"]
+    merged_count = 0
+    if successful:
+        # Partial shard failures still contribute their records, matching the
+        # existing behaviour where a failed child may have written partial
+        # output; strict collection then flags the incomplete cell.
+        merged_count = _merge_shard_outputs(
+            [job["output_path"] for job in successful],
+            output_path=output_path,
+            baseline=baseline,
+            dataset=dataset,
+            run_id=run_id,
+            sample_order={str(row["id"]): position for position, row in enumerate(normalized)},
+            aggregate_only=baseline in AGGREGATE_ONLY_BASELINES,
+            world_size=len(jobs),
+            processes_per_gpu=processes_per_card,
+        )
+        if merged_count:
+            _normalize_child_output(
+                output_path,
+                baseline=baseline,
+                dataset=dataset,
+                source_records=normalized,
+                config=cfg,
+                run_id=run_id,
+                extra_fields=(
+                    {"shared_gpu_concurrency": processes_per_card}
+                    if processes_per_card > 1
+                    else None
+                ),
+            )
+
+    statuses = [job["_final_status"] for job in jobs]
+    if statuses and all(value == "success" for value in statuses):
+        status = "success"
+    elif any(value == "timeout" for value in statuses):
+        status = "timeout"
+    else:
+        status = "failed"
+    first_failed = next((entry for entry in entries if entry["status"] != "success"), None)
+    return _result(
+        status=status,
+        returncode=0 if status == "success" else 1,
+        log=(first_failed or entries[0])["log"] if entries else "",
+        log_tail="",
+        shard_count=len(jobs),
+        shards=entries,
+        normalized_records=merged_count,
+        processes_per_gpu=processes_per_card,
+        vram_plan=plan,
+        oom_retry_rounds=retry_rounds,
+        oom_retry_plans=retry_plans,
+        retried_shards=[
+            entry["shard_index"] for entry in entries if entry.get("retries")
+        ],
+    )
 
 
 def _run_collector(
@@ -652,6 +1569,42 @@ _TIMING_FIELDS = (
 )
 
 
+def _sample_coverage_error(
+    path: Path, *, source_records: Sequence[Mapping[str, Any]]
+) -> str | None:
+    """Return a validation error when a successful shard has wrong sample ids."""
+    expected = {
+        str(record["id"])
+        for record in source_records
+        if record.get("id") is not None
+    }
+    observed: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("type") == "summary":
+            continue
+        sample_id = row.get("sample_id")
+        if sample_id is not None and row.get("scope") != "aggregate":
+            observed.add(str(sample_id))
+            continue
+        sample_ids = row.get("sample_ids")
+        if isinstance(sample_ids, (list, tuple, set)):
+            observed.update(str(value) for value in sample_ids)
+
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    if not missing and not unexpected:
+        return None
+    details: list[str] = []
+    if missing:
+        details.append(f"missing={missing[:5]}")
+    if unexpected:
+        details.append(f"unexpected={unexpected[:5]}")
+    return "shard sample coverage mismatch: " + "; ".join(details)
+
+
 def _normalize_child_output(
     path: Path,
     *,
@@ -660,8 +1613,14 @@ def _normalize_child_output(
     source_records: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
     run_id: str,
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> int:
-    """Normalize upstream JSONL fields in-place after a successful child run."""
+    """Normalize upstream JSONL fields in-place after a successful child run.
+
+    ``extra_fields`` are stamped onto every non-summary row (for example the
+    shared-GPU concurrency, so a packed run can be filtered out of a
+    batch-1-only comparison later).
+    """
     if not path.is_file():
         return 0
     rows = [
@@ -696,6 +1655,8 @@ def _normalize_child_output(
         row.setdefault("temperature", config.get("temperature"))
         row.setdefault("max_new_tokens", config.get("max_new_tokens"))
         row.setdefault("warmup_runs", config.get("warmup_runs"))
+        for key, value in (extra_fields or {}).items():
+            row.setdefault(key, value)
 
         if row.get("sample_id") is None and row.get("question_id") is not None:
             row["sample_id"] = row["question_id"]
@@ -1042,7 +2003,78 @@ def _parser() -> argparse.ArgumentParser:
         dest="gpu_ids",
         default=None,
         help="physical GPU id(s) to run on, e.g. '0', '2' or '0,1'; "
-        "overrides LONG_BENCH_GPU_IDS / FI_GPU_IDS / CUDA_VISIBLE_DEVICES",
+        "overrides LONG_BENCH_GPU_IDS / FI_GPU_IDS / CUDA_VISIBLE_DEVICES. "
+        "With --data-parallel the list is the pool that gets partitioned into "
+        "one device group per shard",
+    )
+    parser.add_argument(
+        "--data-parallel",
+        dest="data_parallel",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LONG_BENCH_DATA_PARALLEL", "0") == "1",
+        help="run every (baseline, dataset) cell as N concurrent batch-1 child "
+        "processes, one per GPU group, then merge the shards; default off "
+        "(env: LONG_BENCH_DATA_PARALLEL=1)",
+    )
+    parser.add_argument(
+        "--dp-gpus-per-shard",
+        dest="dp_gpus_per_shard",
+        type=int,
+        default=None,
+        help="GPUs owned by each data-parallel shard; 1 (the default) means one "
+        "card per batch-1 child, 2+ is for methods that need intra-process "
+        "parallelism (env: LONG_BENCH_DP_GPUS_PER_SHARD)",
+    )
+    parser.add_argument(
+        "--dp-processes-per-gpu",
+        dest="dp_processes_per_gpu",
+        type=int,
+        default=None,
+        help="how many batch-1 processes may share one card; >1 uses spare "
+        "VRAM to shorten a sweep but makes per-sample latency/throughput "
+        "non-comparable (default: LONG_BENCH_DP_PROCESSES_PER_GPU or 1)",
+    )
+    parser.add_argument(
+        "--vram-budget-gb",
+        dest="vram_budget_gb",
+        type=float,
+        default=None,
+        help="hard ceiling for VRAM usage per card; the planner never plans "
+        "above it (default: LONG_BENCH_VRAM_BUDGET_GB or 170)",
+    )
+    parser.add_argument(
+        "--vram-headroom-gb",
+        dest="vram_headroom_gb",
+        type=float,
+        default=None,
+        help="safety margin subtracted from the budget before packing children "
+        "(default: LONG_BENCH_VRAM_HEADROOM_GB or 10)",
+    )
+    parser.add_argument(
+        "--child-vram-gb",
+        dest="child_vram_gb",
+        type=float,
+        default=None,
+        help="conservative VRAM reserve per batch-1 child, used to size "
+        "concurrency (default: LONG_BENCH_CHILD_VRAM_GB or 40; lower it only "
+        "after checking measured peak_memory_gb)",
+    )
+    parser.add_argument(
+        "--vram-wait-seconds",
+        dest="vram_wait_seconds",
+        type=int,
+        default=None,
+        help="how long a cell waits for free VRAM before it is recorded as "
+        "vram_blocked instead of launching into an OOM (default: "
+        "LONG_BENCH_VRAM_WAIT_SECONDS or 600)",
+    )
+    parser.add_argument(
+        "--oom-retries",
+        dest="oom_retries",
+        type=int,
+        default=None,
+        help="how many times a shard that hit an OOM is retried alone, after "
+        "its siblings exited (default: LONG_BENCH_OOM_RETRIES or 1; 0 disables)",
     )
     parser.add_argument(
         "--list-gpus",
@@ -1080,12 +2112,195 @@ def main(argv: Sequence[str] | None = None) -> int:
             os.environ["CUDA_VISIBLE_DEVICES"] = selection
 
     gpu_report = describe_gpu_assignment()
+    cuda_available = _effective_cuda_available()
+
+    # Data-parallel plan: partition the selected GPUs into one device group per
+    # batch-1 shard.  Resolved before the early exit so --list-gpus can show the
+    # exact groups a real run would use.
+    dp_gpus_per_shard = (
+        args.dp_gpus_per_shard
+        if args.dp_gpus_per_shard is not None
+        else _env_int("LONG_BENCH_DP_GPUS_PER_SHARD", 1)
+    )
+    if dp_gpus_per_shard < 1:
+        raise SystemExit("--dp-gpus-per-shard must be >= 1")
+
+    # VRAM budget: the planner packs batch-1 children up to
+    # ``budget - headroom`` per card, and refuses to launch (waiting instead)
+    # when nothing fits.  0 disables budget planning entirely.
+    vram_budget_gb = (
+        args.vram_budget_gb
+        if args.vram_budget_gb is not None
+        else _env_float("LONG_BENCH_VRAM_BUDGET_GB", 170.0)
+    )
+    vram_headroom_gb = (
+        args.vram_headroom_gb
+        if args.vram_headroom_gb is not None
+        else _env_float("LONG_BENCH_VRAM_HEADROOM_GB", 10.0)
+    )
+    child_vram_gb = (
+        args.child_vram_gb
+        if args.child_vram_gb is not None
+        else _env_float("LONG_BENCH_CHILD_VRAM_GB", 40.0)
+    )
+    vram_wait_seconds = (
+        args.vram_wait_seconds
+        if args.vram_wait_seconds is not None
+        else _env_int("LONG_BENCH_VRAM_WAIT_SECONDS", 600)
+    )
+    oom_retries = (
+        args.oom_retries
+        if args.oom_retries is not None
+        else _env_int("LONG_BENCH_OOM_RETRIES", 1)
+    )
+    processes_per_gpu = (
+        args.dp_processes_per_gpu
+        if args.dp_processes_per_gpu is not None
+        else _env_int("LONG_BENCH_DP_PROCESSES_PER_GPU", 1)
+    )
+    if vram_budget_gb < 0:
+        raise SystemExit("--vram-budget-gb must be >= 0 (0 disables planning)")
+    if vram_headroom_gb < 0:
+        raise SystemExit("--vram-headroom-gb must be >= 0")
+    if child_vram_gb <= 0:
+        raise SystemExit("--child-vram-gb must be > 0")
+    if vram_wait_seconds < 0:
+        raise SystemExit("--vram-wait-seconds must be >= 0")
+    if oom_retries < 0:
+        raise SystemExit("--oom-retries must be >= 0")
+    if processes_per_gpu < 1:
+        raise SystemExit("--dp-processes-per-gpu must be >= 1")
+    if vram_budget_gb > 0 and vram_headroom_gb >= vram_budget_gb:
+        raise SystemExit(
+            f"--vram-headroom-gb {vram_headroom_gb} must be smaller than "
+            f"--vram-budget-gb {vram_budget_gb}, otherwise no child can be planned"
+        )
+    vram_cfg = {
+        "budget_gb": vram_budget_gb,
+        "headroom_gb": vram_headroom_gb,
+        "usable_gb": (
+            None if vram_budget_gb <= 0
+            else round(vram_budget_gb - vram_headroom_gb, 1)
+        ),
+        "child_reserve_gb": child_vram_gb,
+        "wait_seconds": vram_wait_seconds,
+        "oom_retries": oom_retries,
+    }
+
+    # Parallel execution needs either several GPU groups or several processes
+    # sharing a card; both go through the same shard/merge machinery.
+    parallel_requested = bool(args.data_parallel) or processes_per_gpu > 1
+    dp_groups = (
+        _resolve_dp_gpu_groups(
+            gpu_report,
+            cuda_available=cuda_available,
+            gpus_per_shard=dp_gpus_per_shard,
+        )
+        if parallel_requested
+        else []
+    )
+
     if args.list_gpus:
         print_gpu_inventory(gpu_report)
+        if parallel_requested:
+            # Preview straight from the physical inventory so the plan is
+            # visible even when torch itself cannot see CUDA (CPU dev boxes).
+            preview_pool = dp_groups or _resolve_dp_gpu_groups(
+                gpu_report, cuda_available=True, gpus_per_shard=dp_gpus_per_shard
+            )
+            preview_slots, preview_plan = plan_shard_slots(
+                preview_pool,
+                processes_per_gpu=processes_per_gpu,
+                usable_gb=vram_cfg["usable_gb"],
+                child_gb=child_vram_gb,
+                sample_count=1_000_000,
+                usage=_vram_usage_by_gpu(),
+            )
+            print(
+                "\nParallel plan "
+                f"(--dp-gpus-per-shard {dp_gpus_per_shard}, "
+                f"--dp-processes-per-gpu {processes_per_gpu}, budget "
+                f"{vram_budget_gb:.0f} GiB, usable {vram_cfg['usable_gb']} GiB, "
+                f"reserve {child_vram_gb:.0f} GiB/child):"
+            )
+            for entry in preview_plan["groups"]:
+                free = entry["free_gb"]
+                print(
+                    f"  GPU {', '.join(map(str, entry['gpu_ids']))}: "
+                    f"{entry['planned_processes']} process(es)"
+                    + (f", free {free} GiB" if free is not None else "")
+                    + (
+                        f", card total {entry['total_gb']} GiB"
+                        if entry["total_gb"] is not None
+                        else ""
+                    )
+                )
+            print(
+                f"  -> {len(preview_slots)} concurrent batch-1 child(ren) per cell"
+            )
+            if not cuda_available:
+                print(
+                    "\nNote: torch cannot see CUDA on this host, so a real run "
+                    "would fall back to one CPU process per cell; the plan above "
+                    "is what the GPUs would allow."
+                )
         return 0
 
-    cuda_available = _effective_cuda_available()
     print_gpu_summary(gpu_report, effective_cuda=cuda_available)
+    dp_enabled = (
+        bool(dp_groups)
+        and (len(dp_groups) > 1 or processes_per_gpu > 1)
+        and not args.preflight_only
+    )
+    if parallel_requested and not dp_enabled:
+        if args.preflight_only:
+            reason = "--preflight-only never launches inference children"
+        elif not cuda_available:
+            reason = "CUDA is not available to this process"
+        elif not dp_groups:
+            reason = "no GPU was selected"
+        else:
+            reason = "only one GPU group and --dp-processes-per-gpu 1"
+        print(
+            f"[parallel] requested but inactive ({reason}); falling back to one "
+            "batch-1 process per cell",
+            file=sys.stderr,
+            flush=True,
+        )
+    if dp_enabled:
+        _, startup_plan = plan_shard_slots(
+            dp_groups,
+            processes_per_gpu=processes_per_gpu,
+            usable_gb=vram_cfg["usable_gb"],
+            child_gb=child_vram_gb,
+            sample_count=1_000_000,
+            usage=_vram_usage_by_gpu(),
+        )
+        print(
+            "[parallel] enabled: "
+            + ", ".join(
+                f"GPU {','.join(map(str, entry['gpu_ids']))} -> "
+                f"{entry['planned_processes']}x batch-1"
+                + (
+                    f" (free {entry['free_gb']} GiB)"
+                    if entry["free_gb"] is not None
+                    else ""
+                )
+                for entry in startup_plan["groups"]
+            )
+            + f" | VRAM budget {vram_budget_gb:.0f} GiB (usable "
+            f"{vram_cfg['usable_gb']} GiB, reserve {child_vram_gb:.0f} GiB/child, "
+            f"wait {vram_wait_seconds}s, oom-retries {oom_retries})",
+            flush=True,
+        )
+        if processes_per_gpu > 1:
+            print(
+                "[parallel] WARNING multiple batch-1 processes per card: the "
+                "sweep finishes sooner but per-sample latency/throughput are no "
+                "longer comparable with one-process-per-card runs",
+                file=sys.stderr,
+                flush=True,
+            )
     profile = resolve_profile(
         mode=args.mode,
         cuda_available=cuda_available,
@@ -1190,6 +2405,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "allow_unsupported": bool(args.allow_unsupported),
         "gpu_ids": gpu_report.get("requested"),
         "gpu": gpu_report,
+        "data_parallel": dp_enabled,
+        "dp_requested": bool(parallel_requested),
+        "dp_gpus_per_shard": dp_gpus_per_shard if dp_enabled else 1,
+        "dp_processes_per_gpu": processes_per_gpu if dp_enabled else 1,
+        "dp_world_size": len(dp_groups) if dp_enabled else 1,
+        "dp_gpu_groups": [list(group) for group in dp_groups] if dp_enabled else [],
+        "dp_aggregate_only_baselines": sorted(AGGREGATE_ONLY_BASELINES & set(baselines)),
+        "vram": {
+            "budget_gb": vram_budget_gb,
+            "headroom_gb": vram_headroom_gb,
+            "usable_gb": vram_cfg["usable_gb"],
+            "child_reserve_gb": child_vram_gb,
+            "wait_seconds": vram_wait_seconds,
+            "oom_retries": oom_retries,
+        },
         "runtime": runtime_metadata(),
         "cells": [],
     }
@@ -1287,55 +2517,98 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
 
             converted = run_dir / "inputs" / f"{baseline}_{dataset}.jsonl"
-            converted_input = convert_records_for_baseline(baseline, normalized, converted)
-            command = build_adapter_command(
-                baseline,
-                data_file=subset_path,
-                converted_input=converted_input,
-                output=output_path,
-                max_samples=len(normalized),
-                max_new_tokens=max_new_tokens,
-                config=cfg,
-            )
-            if command is None:
-                reason = "adapter did not produce a command for this dataset"
-                _write_status_file(
-                    output_path,
+            if dp_enabled:
+                # Each shard builds its own command over its own input file, so
+                # the full-cell converted input is not written in this mode.
+                child = _run_data_parallel_cell(
                     baseline=baseline,
                     dataset=dataset,
-                    records=normalized,
-                    status="unsupported_dataset",
-                    reason=reason,
-                    model=cfg.get("model"),
-                    config=cfg,
+                    source_rows=source_rows,
+                    normalized=normalized,
+                    run_dir=run_dir,
+                    output_path=output_path,
+                    cfg=cfg,
+                    gpu_groups=dp_groups,
+                    timeout_seconds=timeout_seconds,
                     run_id=run_id,
+                    processes_per_gpu=processes_per_gpu,
+                    vram=vram_cfg,
                 )
-                cell.update(status="unsupported_dataset", reason=reason)
-                manifest["cells"].append(cell)
-                continue
+                if child["status"] == "unsupported_dataset":
+                    reason = child.get("reason") or (
+                        "adapter did not produce a command for this dataset"
+                    )
+                    _write_status_file(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        records=normalized,
+                        status="unsupported_dataset",
+                        reason=reason,
+                        model=cfg.get("model"),
+                        config=cfg,
+                        run_id=run_id,
+                    )
+                    cell.update(status="unsupported_dataset", reason=reason)
+                    manifest["cells"].append(cell)
+                    continue
+            else:
+                converted_input = convert_records_for_baseline(
+                    baseline, normalized, converted
+                )
+                command = build_adapter_command(
+                    baseline,
+                    data_file=subset_path,
+                    converted_input=converted_input,
+                    output=output_path,
+                    max_samples=len(normalized),
+                    max_new_tokens=max_new_tokens,
+                    config=cfg,
+                )
+                if command is None:
+                    reason = "adapter did not produce a command for this dataset"
+                    _write_status_file(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        records=normalized,
+                        status="unsupported_dataset",
+                        reason=reason,
+                        model=cfg.get("model"),
+                        config=cfg,
+                        run_id=run_id,
+                    )
+                    cell.update(status="unsupported_dataset", reason=reason)
+                    manifest["cells"].append(cell)
+                    continue
 
-            live_log = run_dir / "logs" / f"{baseline}_{dataset}.log"
-            print(
-                f"[{baseline}/{dataset}] launching {len(normalized)} sample(s)\n"
-                f"[{baseline}/{dataset}] live log: {live_log}",
-                flush=True,
-            )
-            child = _run_child(
-                command,
-                output=output_path,
-                log_path=live_log,
-                timeout_seconds=timeout_seconds,
-            )
-            if child["status"] == "success":
-                normalized_count = _normalize_child_output(
-                    output_path,
-                    baseline=baseline,
-                    dataset=dataset,
-                    source_records=normalized,
-                    config=cfg,
-                    run_id=run_id,
+                live_log = run_dir / "logs" / f"{baseline}_{dataset}.log"
+                print(
+                    f"[{baseline}/{dataset}] launching {len(normalized)} sample(s)\n"
+                    f"[{baseline}/{dataset}] live log: {live_log}",
+                    flush=True,
                 )
-                child["normalized_records"] = normalized_count
+                child = _run_child(
+                    command,
+                    output=output_path,
+                    log_path=live_log,
+                    timeout_seconds=timeout_seconds,
+                )
+            if child["status"] == "success":
+                if dp_enabled:
+                    # Shards were already normalized before the merge; the
+                    # merged file has been normalized too.
+                    normalized_count = int(child.get("normalized_records") or 0)
+                else:
+                    normalized_count = _normalize_child_output(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        source_records=normalized,
+                        config=cfg,
+                        run_id=run_id,
+                    )
+                    child["normalized_records"] = normalized_count
                 if normalized_count == 0:
                     child["status"] = "failed"
                     child["reason"] = "child exited successfully but wrote no result records"
@@ -1360,7 +2633,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         records=normalized,
                         status=child["status"],
-                        reason=f"child process failed; see {child['log']}",
+                        reason=child.get("reason")
+                        or f"child process failed; see {child['log']}",
                         model=cfg.get("model"),
                         config=cfg,
                         run_id=run_id,

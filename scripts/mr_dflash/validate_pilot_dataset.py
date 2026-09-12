@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
 from _common import read_jsonl, write_json
+from progress import ProgressReporter, install_exception_hook
 
 
 def main(argv=None) -> None:
@@ -29,6 +31,16 @@ def main(argv=None) -> None:
         help="ghi báo cáo JSON để pipeline/CI đọc lại sau khi validate",
     )
     args = parser.parse_args(argv)
+    total = sum(1 for _ in read_jsonl(args.input))
+    reporter = ProgressReporter(None)
+    reporter.set_context(total_samples=total)
+    previous_hook = install_exception_hook(reporter)
+    reporter.update(
+        "starting",
+        input=str(args.input),
+        report=str(args.report) if args.report else None,
+        completed_samples=reporter.completed_samples(),
+    )
     tokenizer = None
     if args.tokenizer:
         from transformers import AutoTokenizer
@@ -71,6 +83,12 @@ def main(argv=None) -> None:
             if len(ids) > args.max_length or sum(mask) < 2:
                 raise ValueError(f"row {index}: tokenized length/mask không hợp lệ (len={len(ids)})")
         valid += 1
+        reporter.update(
+            "processing",
+            completed_samples=valid,
+            sample_id=sample_id,
+            row_index=int(index - 1),
+        )
     report = {
         "schema_version": "mr_dflash_validation_v1",
         "input": str(args.input),
@@ -88,6 +106,8 @@ def main(argv=None) -> None:
         f"[validate_pilot_dataset] valid={valid} sources={dict(counts)} "
         f"strata={dict(strata)}"
     )
+    reporter.update("done", completed_samples=total, valid=valid)
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

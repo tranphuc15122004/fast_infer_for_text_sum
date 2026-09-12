@@ -120,6 +120,7 @@ def write_sharded_feature_manifest(
     attention_backend: Optional[str] = None,
     cache_batch_profile: Optional[str] = None,
     cache_batch_profile_sha256: Optional[str] = None,
+    cache_profile_history: Optional[Sequence[Dict[str, Any]]] = None,
     stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Ghi manifest schema ``mr_dflash_feature_sharded_v1``."""
@@ -145,6 +146,7 @@ def write_sharded_feature_manifest(
         "attention_backend": attention_backend,
         "cache_batch_profile": cache_batch_profile,
         "cache_batch_profile_sha256": cache_batch_profile_sha256,
+        "cache_profile_history": [dict(item) for item in (cache_profile_history or [])],
         "stats": dict(stats or {}),
     }
     _atomic_json_write(root / SHARDED_FEATURE_MANIFEST_FILENAME, payload)
@@ -234,6 +236,10 @@ class ShardedFeatureWriter:
             "cache_batch_profile": cache_batch_profile,
             "cache_batch_profile_sha256": cache_batch_profile_sha256,
         }
+        # Batch/token profiles chỉ ảnh hưởng hiệu năng, không thay đổi hidden
+        # states đã ghi. Giữ provenance của profile cũ để resume với profile
+        # an toàn hơn sau OOM vẫn audit được toàn bộ lịch sử chạy.
+        self.cache_profile_history: List[Dict[str, Any]] = []
         manifest_path = self.root / SHARDED_FEATURE_MANIFEST_FILENAME
         existing_pt = sorted(self.root.glob("shard_*.pt"))
         if not resume and (manifest_path.exists() or existing_pt):
@@ -259,28 +265,38 @@ class ShardedFeatureWriter:
                         f"metadata cache không khớp ở {key}: "
                         f"{manifest.get(key)!r} != {self.metadata[key]!r}"
                     )
-            for key in (
-                "source_tokenized_path",
-                "capture_backend",
-                "attention_backend",
-                "cache_batch_profile",
-                "cache_batch_profile_sha256",
-            ):
-                # Profile là một phần correctness/provenance của cache. Nếu
-                # run mới có profile nhưng manifest cũ chưa có key, cũng phải
-                # dừng thay vì resume silently với schedule khác.
-                if (
-                    (key in {"cache_batch_profile", "cache_batch_profile_sha256"} and manifest.get(key) != self.metadata[key])
-                    or (
-                        key not in {"cache_batch_profile", "cache_batch_profile_sha256"}
-                        and key in manifest
-                        and manifest.get(key) != self.metadata[key]
-                    )
-                ):
+            for key in ("requested_torch_dtype", "target_revision"):
+                if key in manifest and manifest.get(key) != self.metadata[key]:
                     raise ValueError(
                         f"metadata cache không khớp ở {key}: "
                         f"{manifest.get(key)!r} != {self.metadata[key]!r}"
                     )
+            for key in (
+                "source_tokenized_path",
+                "capture_backend",
+                "attention_backend",
+            ):
+                if key in manifest and manifest.get(key) != self.metadata[key]:
+                    raise ValueError(
+                        f"metadata cache không khớp ở {key}: "
+                        f"{manifest.get(key)!r} != {self.metadata[key]!r}"
+                    )
+            raw_history = manifest.get("cache_profile_history", [])
+            if isinstance(raw_history, list):
+                self.cache_profile_history = [
+                    dict(item) for item in raw_history if isinstance(item, dict)
+                ]
+            old_profile = {
+                "cache_batch_profile": manifest.get("cache_batch_profile"),
+                "cache_batch_profile_sha256": manifest.get("cache_batch_profile_sha256"),
+            }
+            new_profile = {
+                "cache_batch_profile": self.metadata["cache_batch_profile"],
+                "cache_batch_profile_sha256": self.metadata["cache_batch_profile_sha256"],
+            }
+            if old_profile != new_profile and any(value is not None for value in old_profile.values()):
+                if old_profile not in self.cache_profile_history:
+                    self.cache_profile_history.append(old_profile)
             self.shards = [dict(item) for item in manifest.get("shards", [])]
             self.sample_ids = [str(x) for x in manifest.get("sample_ids", [])]
             missing_shards = [
@@ -446,6 +462,7 @@ class ShardedFeatureWriter:
             stored_feature_dtype=self._stored_dtype,
             shards=self.shards,
             sample_ids=self.sample_ids,
+            cache_profile_history=self.cache_profile_history,
             stats=self.stats,
         )
 

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import random
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from _common import read_jsonl, stable_id, write_json, write_jsonl
+from progress import ProgressReporter, install_exception_hook
 
 
 DEFAULT_SHAREGPT_COUNT = 50000
@@ -101,6 +104,15 @@ def main(argv=None) -> None:
     parser.add_argument("--allow-short", action="store_true")
     args = parser.parse_args(argv)
 
+    reporter = ProgressReporter(None)
+    previous_hook = install_exception_hook(reporter)
+    reporter.update(
+        "starting",
+        input_sharegpt=str(args.sharegpt),
+        input_arxiv=str(args.arxiv),
+        completed_samples=reporter.completed_samples(),
+    )
+
     sharegpt = list(read_jsonl(args.sharegpt))
     arxiv = list(read_jsonl(args.arxiv))
     if not args.allow_short and (len(sharegpt) < args.sharegpt_count or len(arxiv) < args.arxiv_count):
@@ -113,6 +125,10 @@ def main(argv=None) -> None:
     rng.shuffle(arxiv)
     sharegpt = sharegpt[: args.sharegpt_count]
     arxiv = arxiv[: args.arxiv_count]
+    total = len(sharegpt) + len(arxiv)
+    if "MR_DFLASH_PROGRESS_TOTAL_SAMPLES" not in os.environ:
+        reporter.set_context(total_samples=total)
+    reporter.update("writing", completed_samples=reporter.completed_samples(), total_rows=total)
     splits = {"train": [], "val": [], "test": []}
     for source_rows, source_seed in ((sharegpt, args.seed + 11), (arxiv, args.seed + 29)):
         assigned = _assign(source_rows, source_seed)
@@ -171,7 +187,10 @@ def main(argv=None) -> None:
             "arxiv_input": str(args.source_arxiv_input or args.arxiv),
         },
     )
+    reporter.update("writing", completed_samples=total, total_rows=total)
     print(f"[build_pilot_dataset] total={sum(counts.values())} splits={counts}")
+    reporter.update("done", completed_samples=total, total_rows=total)
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

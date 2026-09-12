@@ -299,6 +299,118 @@ host sẽ có cảnh báo trên stderr. Lựa chọn và snapshot đầy đủ (
 đồ visible) được ghi vào `run_manifest.json` ở các field `gpu_ids`/`gpu`. Khi
 `LONG_BENCH_DEVICE=cpu` (dev CPU) GPU vẫn được ghi lại nhưng compute chạy CPU.
 
+### Data-parallel: batch size 1 trên nhiều GPU
+
+Mặc định runner chạy tuần tự từng cell `(baseline, dataset)` trong **một**
+process batch size 1. Muốn dùng nhiều card cho cùng một cell (vẫn batch size 1
+trên mỗi card), bật `--data-parallel`:
+
+```bash
+# 4 card, mỗi card 1 shard batch size 1
+bash scripts/run_longbench_200.sh --config <master> --mode full \
+  --gpu-ids 0,1,2,3 --data-parallel
+
+# hoặc qua env trong master: LONG_BENCH_DATA_PARALLEL=1 + LONG_BENCH_GPU_IDS=0,1,2,3
+```
+
+Cơ chế:
+
+- Pool GPU lấy từ `--gpu-ids` / `LONG_BENCH_GPU_IDS` / `FI_GPU_IDS` /
+  `CUDA_VISIBLE_DEVICES`; nếu không khai báo thì dùng toàn bộ device torch
+  nhìn thấy. Pool được chia thành các **nhóm device**, mỗi nhóm 1 shard
+  (`--dp-gpus-per-shard N`, mặc định 1 = 1 card/shard; `N>1` dành cho baseline
+  cần song song trong cùng process). Số card phải chia hết cho `N`.
+- Mỗi cell được chia thành N shard, cân bằng theo **độ dài input token**
+  (greedy longest-first, deterministic) chứ không chia đều số mẫu, vì mỗi row
+  LongBench dài ngắn rất khác nhau.
+- Mỗi shard là một child process riêng, `CUDA_VISIBLE_DEVICES` chỉ chứa đúng
+  nhóm GPU của nó, đọc file input riêng
+  (`<run>/inputs/shards/<dataset>.dp<k>.jsonl`) và ghi output riêng
+  (`<run>/<baseline>/shards/<dataset>.dp<k>.jsonl`, log
+  `<run>/logs/<baseline>_<dataset>.dp<k>.log`, stdout prefix
+  `[<baseline>_<dataset>.dp<k>]`). Các shard chạy **đồng thời**; timeout của
+  cell áp cho cả cell như trước.
+- Sau khi tất cả shard xong, runner gộp thành file canonical
+  `<run>/<baseline>/<dataset>.jsonl` (đúng thứ tự mẫu gốc) và ghi một summary
+  duy nhất, trong đó `shard_count` là số shard của cell còn `shards_merged` là
+  số file shard thực sự gộp (khác nhau khi có shard lỗi, kèm `shards_missing`).
+  Summary của từng shard được giữ nguyên trong field `shard_summaries` (không
+  cộng/trung bình các key đặc thù của từng baseline để tránh tạo ra metric
+  giả); metric canonical vẫn do `collect_metrics.py` tính từ các sample row.
+- Manifest ghi `data_parallel`, `dp_world_size`, `dp_gpu_groups`,
+  `dp_gpus_per_shard` và danh sách `shards` (GPU, số mẫu, status, log, elapsed)
+  trong từng cell.
+
+Điểm cần lưu ý:
+
+- DP chỉ giảm **wall-clock**; mỗi sample vẫn chạy batch size 1 trên một card nên
+  latency/throughput mỗi sample giữ nguyên ý nghĩa. Model được load một lần cho
+  mỗi shard → cần N× VRAM; guard `--min-free-gb` được kiểm tra trên **từng** GPU
+  được chọn.
+- FAFO và SSSD chỉ trả `scope=aggregate` cho cả process: khi bật DP, mỗi shard
+  báo aggregate cho riêng batch của nó. Summary gộp đánh dấu
+  `shard_aggregate_semantics: "per_shard"` — **không** so sánh throughput của
+  shard nhỏ với aggregate của cả cell chạy tuần tự.
+- Cell chỉ `success` khi **mọi** shard thành công. Shard lỗi/timeout làm cell
+  `failed` (record của các shard còn lại vẫn được gộp và giữ để điều tra), và
+  chế độ `--strict` sẽ báo cell thiếu mẫu.
+- Trên máy không có CUDA (dev CPU) hoặc khi chỉ có 1 nhóm GPU, runner in cảnh
+  báo `[parallel] ... inactive` rồi tự fallback về 1 process batch size 1 như cũ.
+
+#### Tận dụng VRAM: nhiều process trên mỗi card + ngân sách an toàn
+
+Một cell chỉ dùng ~20-25 GiB/card (batch 1, context ≤14k), nên card 180 GiB còn
+rất nhiều chỗ trống. Muốn dùng phần đó để rút ngắn sweep, cho nhiều process
+batch-1 **chia sẻ** một card:
+
+```bash
+# 4 card × 4 process/card = 16 shard song song, trần sử dụng 170 GiB/card
+bash scripts/run_longbench_200.sh --config <master> --mode full \
+  --gpu-ids 0,1,2,3 --data-parallel --dp-processes-per-gpu 4
+
+# xem trước kế hoạch trên host mà không chạy gì
+bash scripts/run_longbench_200.sh --config <master> --list-gpus \
+  --data-parallel --dp-processes-per-gpu 4
+```
+
+Cách tính concurrency (mỗi lần cell bắt đầu, dựa trên `nvidia-smi` sống):
+
+```text
+usable    = min(--vram-budget-gb, tổng VRAM thật của card) - --vram-headroom-gb
+K         = min(--dp-processes-per-gpu, floor((usable - VRAM đang bị chiếm) / --child-vram-gb))
+```
+
+Với mặc định `budget=170`, `headroom=10`, `child-vram-gb=40` trên card 180 GiB
+đang trống → `K = 3..4` process/card; trần sử dụng luôn ≤170 GiB vì planner
+không bao giờ xếp quá `usable`. Nếu muốn pack dày hơn, giảm `--child-vram-gb`
+(ví dụ 25 với Llama-3.1-8B + DFlash ở 14k) — nhưng chỉ nên làm **sau khi** xem
+`peak_memory_gb` đo được của cell đầu tiên.
+
+**Cơ chế bảo đảm không OOM và không job nào bị kill giữa chừng:**
+
+1. Planner chỉ launch khi phần bộ nhớ đó thực sự trống; `--vram-budget-gb` bị
+   cap bởi tổng VRAM của card nên không thể "tiêu" ngân sách của card lớn trên
+   card nhỏ.
+2. Nếu không đủ chỗ cho dù chỉ 1 child, runner **chờ** (`--vram-wait-seconds`,
+   mặc định 600s) và poll lại, thay vì launch liều rồi OOM.
+3. Hết thời gian chờ, runner ghi cell đó là `vram_blocked` (chỉ cell đó; sweep
+   vẫn chạy tiếp) và **không kill** bất kỳ process nào — kể cả process của
+   người khác đang chiếm card.
+4. Nếu shard vẫn OOM (reserve thấp hơn thực tế), runner **retry riêng shard đó**
+   sau khi các shard anh em đã thoát (`--oom-retries`, mặc định 1, chạy lần lượt
+   từng shard) và dùng output của lần retry để gộp. Mọi lần thử được ghi ở
+   `shards[].retries`, `oom_retry_rounds`, `retried_shards` trong manifest; file
+   partial của lần OOM được giữ lại nhưng **không** được gộp.
+5. `--vram-budget-gb 0` tắt hẳn planner (không đọc `nvidia-smi`, không chờ) và
+   dùng đúng `--dp-processes-per-gpu`; khi đó retry OOM là lưới an toàn duy nhất.
+
+**Hệ quả đo lường:** `K>1` làm nhiều process tranh chấp SM/băng thông bộ nhớ
+trên cùng card, nên latency/throughput từng sample **không còn so sánh được**
+với run 1 process/card. Runner in warning khi bắt đầu, gắn
+`shared_gpu_concurrency` vào từng record và `measurement_note` vào summary. Chỉ
+dùng `K>1` khi ưu tiên wall-clock (ví dụ chạy full matrix), không dùng cho số
+liệu head-line.
+
 Mỗi run lưu `run_manifest.json`, input subset bất biến, log child process và
 `<baseline>/<dataset>.jsonl`. Record thành công có input/output tokens,
 model-load/prefill/TTFT/decode/E2E, TPOT, throughput, QPS, peak GPU memory,

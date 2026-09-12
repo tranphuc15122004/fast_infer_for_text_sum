@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 from _common import append_jsonl_durable, canonical_prompt, join_text, read_jsonl, stable_id
+from progress import ProgressReporter, install_exception_hook
 
 
 def _document(row: Dict[str, Any]) -> str:
@@ -35,6 +37,15 @@ def main(argv=None) -> None:
         default="Summarize the following scientific document:\n\n",
     )
     args = parser.parse_args(argv)
+    reporter = ProgressReporter(None)
+    if "MR_DFLASH_PROGRESS_TOTAL_SAMPLES" not in os.environ:
+        source_total = (
+            int(args.limit)
+            if args.limit is not None
+            else sum(1 for _ in read_jsonl(args.input))
+        )
+        reporter.set_context(total_samples=source_total)
+    previous_hook = install_exception_hook(reporter)
     tokenizer = None
     if args.tokenizer:
         from transformers import AutoTokenizer
@@ -64,6 +75,13 @@ def main(argv=None) -> None:
                 break
             valid_lines.append(line)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_base = reporter.completed_samples() + len(existing)
+    reporter.update(
+        "starting",
+        input=str(args.input),
+        output=str(args.output),
+        completed_samples=progress_base,
+    )
 
     def rows():
         emitted = len(existing)
@@ -111,9 +129,14 @@ def main(argv=None) -> None:
         output_path.unlink(missing_ok=True)
     count = 0
     pending = []
-    for row in tqdm(rows(), desc="Normalize ArXiv", unit="row"):
+    for row in tqdm(rows(), total=args.limit, desc="Normalize ArXiv", unit="sample"):
         pending.append(row)
         count += 1
+        reporter.update(
+            "processing",
+            completed_samples=progress_base + count,
+            sample_id=str(row.get("id", "")),
+        )
         if len(pending) >= 256:
             append_jsonl_durable(output_path, pending)
             pending.clear()
@@ -122,6 +145,12 @@ def main(argv=None) -> None:
     if not output_path.exists():
         output_path.touch()
     print(f"[prepare_arxiv] wrote={count} output={args.output}")
+    reporter.update(
+        "done",
+        completed_samples=progress_base + count,
+        written=count,
+    )
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

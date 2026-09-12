@@ -144,6 +144,38 @@ def test_profile_caps_batch_by_actual_padded_token_count() -> None:
     assert profile.batch_for_lengths([100, 200, 4096], requested_batch_size=64) == 64
 
 
+def test_builtin_specforge_profile_uses_aggressive_b200_buckets() -> None:
+    import cache_target_features
+
+    profile = cache_target_features._default_specforge_profile(32768)
+    assert [(bucket.max_length, bucket.batch_size, bucket.token_budget) for bucket in profile.buckets] == [
+        (4096, 64, 262144),
+        (8192, 32, 262144),
+        (16384, 16, 262144),
+        (32768, 4, 131072),
+    ]
+
+
+def test_oom_retry_hint_preserves_reduced_profile(tmp_path: Path) -> None:
+    import cache_target_features
+    from MR_DFlash.cache_throughput import CacheThroughputProfile
+
+    profile = CacheThroughputProfile.from_payload(_candidate_payload())
+    cache_target_features._write_retry_hint(
+        tmp_path / "cache",
+        error=torch.cuda.OutOfMemoryError("CUDA out of memory"),
+        batch_size=64,
+        max_total_tokens=262144,
+        throughput_profile=profile,
+    )
+    payload = json.loads((tmp_path / "cache" / "retry_hint.json").read_text())
+    assert payload["resume"] is True
+    assert payload["suggested_batch_size"] == 32
+    assert payload["suggested_max_total_tokens"] == 131072
+    assert payload["suggested_throughput_profile"]["buckets"][0]["batch_size"] == 32
+    assert (tmp_path / "cache" / "retry_throughput_profile.json").is_file()
+
+
 def test_cache_worker_consumes_throughput_profile(tmp_path: Path, monkeypatch) -> None:
     import cache_target_features
     from MR_DFlash.tokenized_data import write_tokenized_manifest

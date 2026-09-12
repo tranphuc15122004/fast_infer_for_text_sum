@@ -21,6 +21,7 @@ import signal
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ from prepare_server_data import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_SHAREGPT_SOURCE,
 )
+from progress import read_progress
 
 
 DEFAULT_TARGET_MODEL = "/workspace/storage-shared/models/Qwen3-4B"
@@ -99,6 +101,14 @@ class PipelineOptions:
     cache_profile_vram_limit_gb: Optional[float] = None
     cache_profile_headroom_fraction: float = 0.10
     cache_profile_bucket_step: int = 8192
+    # Backend SpecForge là opt-in ở pipeline để giữ tương thích với các
+    # cache HF cũ; khi bật, worker tự dùng profile aggressive theo bucket.
+    cache_backend: str = "hf"
+    cache_throughput_profile: Optional[str] = None
+    cache_concurrency: int = 64
+    cache_max_total_tokens: int = 262_144
+    cache_memory_fraction: float = 0.99
+    cache_startup_stagger_seconds: float = 3.0
     parallel_gpu_ids: tuple[int, ...] = ()
     progress_interval_tokens: int = 256
     # Batch inference thật trong ``model.generate``; khác với
@@ -464,7 +474,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
             if options.cache_batch_profile
             else manifests / f"cache_batch_profile_{regime}.json"
         )
-        if options.cache_auto_batch and not options.cache_batch_profile:
+        if (
+            options.cache_backend != "specforge_sglang"
+            and options.cache_auto_batch
+            and not options.cache_batch_profile
+        ):
             profile_device = options.device
             if profile_device in {"cuda", "auto"}:
                 profile_device = f"cuda:{options.cache_profile_gpu_id}"
@@ -514,7 +528,10 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
             )
 
         batch_size, bucket_buffer, shard_size = _cache_sizes(options, regime)
-        use_batch_profile = bool(options.cache_auto_batch or options.cache_batch_profile)
+        use_batch_profile = bool(
+            options.cache_backend != "specforge_sglang"
+            and (options.cache_auto_batch or options.cache_batch_profile)
+        )
         for split in options.cache_splits:
             output_dir = feature_root / split
             manifest = output_dir / "manifest.json"
@@ -541,6 +558,14 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(shard_size),
                         "--attention-backend",
                         options.cache_attention_backend,
+                        "--cache-backend",
+                        options.cache_backend,
+                        "--cache-concurrency",
+                        str(options.cache_concurrency),
+                        "--cache-max-total-tokens",
+                        str(options.cache_max_total_tokens),
+                        "--cache-memory-fraction",
+                        str(options.cache_memory_fraction),
                         "--io-threads",
                         str(options.cache_io_threads),
                         "--io-queue-size",
@@ -548,6 +573,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         *(
                             ["--batch-profile", str(profile_path)]
                             if use_batch_profile
+                            else []
+                        ),
+                        *(
+                            ["--throughput-profile", str(options.cache_throughput_profile)]
+                            if options.cache_throughput_profile
                             else []
                         ),
                         "--device",
@@ -592,6 +622,16 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(shard_size),
                     "--attention-backend",
                     options.cache_attention_backend,
+                    "--cache-backend",
+                    options.cache_backend,
+                    "--cache-concurrency",
+                    str(options.cache_concurrency),
+                    "--cache-max-total-tokens",
+                    str(options.cache_max_total_tokens),
+                    "--cache-memory-fraction",
+                    str(options.cache_memory_fraction),
+                    "--cache-startup-stagger-seconds",
+                    str(options.cache_startup_stagger_seconds),
                     "--io-threads",
                     str(options.cache_io_threads),
                     "--io-queue-size",
@@ -599,6 +639,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     *(
                         ["--batch-profile", str(profile_path)]
                         if use_batch_profile
+                        else []
+                    ),
+                    *(
+                        ["--throughput-profile", str(options.cache_throughput_profile)]
+                        if options.cache_throughput_profile
                         else []
                     ),
                     "--torch-dtype",
@@ -643,6 +688,14 @@ def pipeline_config_hash(options: PipelineOptions) -> str:
         "regenerate_output_batch_size",
         "worker_stall_timeout_seconds",
         "worker_stop_file",
+        # Cache performance knobs may be lowered after OOM and must not make
+        # already completed prepare/regenerate stages non-reusable.
+        "cache_batch_profile",
+        "cache_throughput_profile",
+        "cache_concurrency",
+        "cache_max_total_tokens",
+        "cache_memory_fraction",
+        "cache_startup_stagger_seconds",
     ):
         payload_options.pop(key, None)
     payload = json.dumps(
@@ -752,8 +805,208 @@ def _reusable_success(stage: Stage, options: PipelineOptions, config_hash: str) 
     return True
 
 
+def _count_jsonl_samples(path: Path) -> int:
+    """Đếm sample JSONL mà không load toàn bộ dataset vào RAM."""
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _command_value(command: Sequence[str], *flags: str) -> Optional[str]:
+    for flag in flags:
+        try:
+            index = command.index(flag)
+        except ValueError:
+            continue
+        if index + 1 < len(command):
+            return str(command[index + 1])
+    return None
+
+
+def _count_input_samples(path: Path) -> int:
+    """Đếm input JSON/JSONL hoặc tokenized manifest cho progress stage."""
+    if path.is_dir():
+        manifest_path = path / "manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if isinstance(payload, dict):
+            for key in ("num_samples", "total_samples", "valid_samples"):
+                try:
+                    value = int(payload.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    return value
+        return 0
+    if path.suffix.lower() == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if isinstance(payload, list):
+            return sum(1 for value in payload if isinstance(value, dict))
+        return 1 if isinstance(payload, dict) else 0
+    try:
+        return _count_jsonl_samples(path)
+    except OSError:
+        return 0
+
+
+def parallel_progress_spec(stage: Stage) -> Optional[dict[str, Any]]:
+    """Lấy metadata để parent hiển thị một progress bar tổng hợp.
+
+    ``parallel_stage.py`` vẫn ghi heartbeat/diagnostic vào worker directory,
+    nhưng stdout của nó không còn được stream thành các dòng ``completed=...``
+    lặp lại. Parent pipeline dùng tổng số dòng input làm total cố định, nhờ đó
+    ngay từ đầu đã hiện đúng ``0/100000`` thay vì phụ thuộc heartbeat đầu tiên.
+    """
+    command = stage.command
+    if not any(Path(str(value)).name == "parallel_stage.py" for value in command):
+        return None
+
+    mode = _command_value(command, "--mode")
+    input_path = _command_value(command, "--input")
+    work_root = _command_value(command, "--work-root")
+    if not mode or not input_path or not work_root:
+        return None
+    count_path = (
+        _command_value(command, "--tokenized-path")
+        if mode == "cache"
+        else input_path
+    )
+    input_file = Path(count_path or input_path)
+    try:
+        total_samples = _count_input_samples(input_file)
+    except OSError:
+        # Let the child command produce the canonical error and log it. The
+        # caller can still run without a bar total in this unusual case.
+        total_samples = 0
+    return {
+        "mode": mode,
+        "total_samples": total_samples,
+        "status_path": Path(work_root) / "status.json",
+    }
+
+
+def parallel_progress_description(mode: str, stage_name: str) -> str:
+    """Tên ngắn cho progress bar, không lặp prefix/log implementation."""
+    split = stage_name.rsplit("_", 1)[-1]
+    return f"{mode} {split}"
+
+
+def _parallel_completed_samples(status_path: Path, total_samples: int) -> int:
+    """Đọc completed sample từ aggregate heartbeat hiện tại."""
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    aggregate = payload.get("aggregate")
+    if not isinstance(aggregate, dict):
+        return 0
+    try:
+        completed = int(aggregate.get("completed_samples", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return min(max(0, completed), max(0, int(total_samples)))
+
+
+def stage_progress_spec(stage: Stage, options: PipelineOptions) -> dict[str, Any]:
+    """Tạo contract progress cho mọi stage, không chỉ parallel worker."""
+    parallel = parallel_progress_spec(stage)
+    if parallel is not None:
+        return {
+            **parallel,
+            "kind": "parallel",
+            "progress_path": parallel["status_path"],
+            "unit": "sample",
+        }
+
+    progress_value = _command_value(stage.command, "--progress-path")
+    progress_path = (
+        Path(progress_value)
+        if progress_value
+        else options.data_root / "pipeline_state" / f"{stage.name}.progress.json"
+    )
+    if stage.name == "prepare":
+        total = 0
+        for source_flag, count_flag in (
+            ("--sharegpt-source", "--sharegpt-count"),
+            ("--arxiv-source", "--arxiv-count"),
+        ):
+            requested = int(_command_value(stage.command, count_flag) or 0)
+            source_value = _command_value(stage.command, source_flag)
+            available = _count_input_samples(Path(source_value)) if source_value else 0
+            total += min(requested, available) if available else requested
+    elif stage.name.startswith("profile_cache_batch_"):
+        try:
+            max_length = int(_command_value(stage.command, "--max-length") or 0)
+            bucket_step = int(_command_value(stage.command, "--bucket-step") or 8192)
+            total = max(0, (max_length + bucket_step - 1) // bucket_step)
+        except ValueError:
+            total = 0
+    else:
+        input_value = _command_value(stage.command, "--input", "--data-path")
+        total = _count_input_samples(Path(input_value)) if input_value else 0
+        limit_value = _command_value(stage.command, "--limit")
+        if limit_value:
+            try:
+                total = min(total, max(0, int(limit_value)))
+            except ValueError:
+                pass
+    return {
+        "kind": "stage",
+        "total_samples": max(0, int(total)),
+        "progress_path": progress_path,
+        "unit": "sample",
+    }
+
+
+def _stage_progress_snapshot(
+    path: Path,
+    fallback_total: int,
+    *,
+    fixed_total: bool = False,
+) -> tuple[int, int, dict[str, Any]]:
+    """Đọc completed từ heartbeat với mẫu số cố định cho parallel stage."""
+    payload = read_progress(path)
+    counters = payload.get("aggregate")
+    if not isinstance(counters, dict):
+        counters = payload
+    try:
+        reported_total = int(counters.get("total_samples", 0) or 0)
+    except (TypeError, ValueError):
+        reported_total = 0
+    total = (
+        max(0, int(fallback_total))
+        if fixed_total
+        else max(0, reported_total or int(fallback_total))
+    )
+    try:
+        completed = int(counters.get("completed_samples", 0) or 0)
+    except (TypeError, ValueError):
+        completed = 0
+    return total, min(max(0, completed), total), payload
+
+
+def _write_initial_stage_progress(path: Path, *, total: int, unit: str) -> None:
+    write_json(
+        path,
+        {
+            "schema_version": "mr_dflash_worker_progress_v1",
+            "phase": "starting",
+            "total_samples": max(0, int(total)),
+            "completed_samples": 0,
+            "progress_unit": str(unit),
+            "updated_at_unix": time.time(),
+        },
+    )
+
+
 def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[str, Any]:
-    """Chạy một stage, stream log và ghi marker thành công/thất bại."""
+    """Chạy stage với một tqdm theo sample; raw output chỉ ghi vào log file."""
 
     if options.dry_run:
         print(f"[pipeline][dry-run] {stage.name}: {shlex.join(stage.command)}")
@@ -793,6 +1046,18 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
     environment.setdefault("PYTHONUNBUFFERED", "1")
     return_code: Optional[int] = None
     process: Optional[subprocess.Popen[str]] = None
+    progress_spec = stage_progress_spec(stage, options)
+    progress_path = Path(progress_spec["progress_path"])
+    total_samples = max(0, int(progress_spec["total_samples"]))
+    progress_unit = str(progress_spec.get("unit", "sample"))
+    if progress_spec["kind"] != "parallel":
+        _write_initial_stage_progress(
+            progress_path,
+            total=total_samples,
+            unit=progress_unit,
+        )
+    environment["MR_DFLASH_PROGRESS_PATH"] = str(progress_path)
+    environment["MR_DFLASH_PROGRESS_TOTAL_SAMPLES"] = str(total_samples)
 
     previous_handlers: dict[int, Any] = {}
 
@@ -822,20 +1087,67 @@ def run_stage(stage: Stage, options: PipelineOptions, config_hash: str) -> dict[
                 stage.command,
                 cwd=str(options.repo_root),
                 env=environment,
-                stdout=subprocess.PIPE,
+                stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                bufsize=1,
                 start_new_session=True,
             )
-            assert process.stdout is not None
-            for line in process.stdout:
-                log_handle.write(line)
-                log_handle.flush()
-                print(f"[{stage.name}] {line.rstrip()}", flush=True)
-            return_code = process.wait()
+            try:
+                from tqdm import tqdm
+            except ImportError:  # pragma: no cover
+                tqdm = None
+            fixed_total = progress_spec["kind"] == "parallel"
+            current_total, current_n, payload = _stage_progress_snapshot(
+                progress_path, total_samples, fixed_total=fixed_total
+            )
+            bar = None
+            if tqdm is not None:
+                description = (
+                    parallel_progress_description(str(progress_spec["mode"]), stage.name)
+                    if progress_spec["kind"] == "parallel"
+                    else stage.name.replace("_", " ")
+                )
+                bar = tqdm(
+                    total=current_total,
+                    initial=current_n,
+                    desc=description,
+                    unit=progress_unit,
+                    dynamic_ncols=True,
+                    mininterval=1.0,
+                    file=sys.stderr,
+                    leave=True,
+                )
+            try:
+                while True:
+                    return_code = process.poll()
+                    if bar is not None:
+                        current_total, current_n, payload = _stage_progress_snapshot(
+                            progress_path, total_samples, fixed_total=fixed_total
+                        )
+                        if bar.total != current_total:
+                            bar.total = current_total
+                        if current_n < bar.n:
+                            bar.n = current_n
+                            bar.refresh()
+                        elif current_n > bar.n:
+                            bar.update(current_n - bar.n)
+                        phase = payload.get("phase", "starting")
+                        eta = payload.get("eta_human")
+                        postfix = f"phase={phase}"
+                        if eta:
+                            postfix += f" eta={eta}"
+                        bar.set_postfix_str(postfix)
+                    if return_code is not None:
+                        if bar is not None and return_code == 0:
+                            bar.n = bar.total
+                            bar.refresh()
+                        break
+                    time.sleep(0.5)
+            finally:
+                if bar is not None:
+                    bar.close()
         restore_signal_handlers()
         if return_code != 0:
             raise RuntimeError(f"command trả về exit code {return_code}")
@@ -1050,9 +1362,54 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-attention-backend",
-        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        choices=[
+            "auto",
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flashinfer",
+            "triton",
+            "torch_native",
+        ],
         default="sdpa",
         help="backend attention của backbone khi cache target; sdpa là mặc định an toàn",
+    )
+    parser.add_argument(
+        "--cache-backend",
+        choices=["hf", "specforge_sglang"],
+        default="hf",
+        help="backend capture target; specforge_sglang dùng offline SGLang của SpecForge",
+    )
+    parser.add_argument(
+        "--cache-throughput-profile",
+        "--throughput-profile",
+        dest="cache_throughput_profile",
+        default=None,
+        help="profile token-budget đã benchmark; bỏ trống để dùng profile aggressive built-in",
+    )
+    parser.add_argument(
+        "--cache-concurrency",
+        type=int,
+        default=64,
+        help="max running requests trên mỗi GPU SpecForge (mặc định 64)",
+    )
+    parser.add_argument(
+        "--cache-max-total-tokens",
+        type=int,
+        default=262_144,
+        help="max total tokens static pool trên mỗi GPU (mặc định 262144)",
+    )
+    parser.add_argument(
+        "--cache-memory-fraction",
+        type=float,
+        default=0.99,
+        help="VRAM static pool fraction trên mỗi GPU (mặc định 0.99)",
+    )
+    parser.add_argument(
+        "--cache-startup-stagger-seconds",
+        type=float,
+        default=3.0,
+        help="độ trễ khởi động giữa các GPU cache (mặc định 3 giây)",
     )
     parser.add_argument(
         "--cache-io-threads",
@@ -1196,6 +1553,21 @@ def main(argv=None) -> int:
         raise ValueError("cache-profile-headroom-fraction phải thuộc [0, 1)")
     if args.cache_profile_vram_limit_gb is not None and args.cache_profile_vram_limit_gb <= 0:
         raise ValueError("cache-profile-vram-limit-gb phải > 0")
+    if args.cache_concurrency < 1 or args.cache_max_total_tokens < 1:
+        raise ValueError("cache-concurrency và cache-max-total-tokens phải >= 1")
+    if not 0.0 < float(args.cache_memory_fraction) <= 1.0:
+        raise ValueError("cache-memory-fraction phải thuộc (0, 1]")
+    if args.cache_startup_stagger_seconds < 0:
+        raise ValueError("cache-startup-stagger-seconds không được âm")
+    if args.cache_backend == "specforge_sglang" and args.cache_auto_batch:
+        raise ValueError(
+            "SpecForge cache đã dùng throughput profile token-budget; "
+            "không kết hợp --cache-auto-batch legacy"
+        )
+    if args.cache_throughput_profile and not Path(args.cache_throughput_profile).is_file():
+        raise FileNotFoundError(
+            f"không tìm thấy cache throughput profile: {args.cache_throughput_profile}"
+        )
     if args.worker_stall_timeout_seconds < 0:
         raise ValueError("worker-stall-timeout-seconds không được âm")
     options = PipelineOptions(
@@ -1242,6 +1614,16 @@ def main(argv=None) -> int:
         ),
         cache_profile_headroom_fraction=float(args.cache_profile_headroom_fraction),
         cache_profile_bucket_step=int(args.cache_profile_bucket_step),
+        cache_backend=str(args.cache_backend),
+        cache_throughput_profile=(
+            str(args.cache_throughput_profile)
+            if args.cache_throughput_profile
+            else None
+        ),
+        cache_concurrency=int(args.cache_concurrency),
+        cache_max_total_tokens=int(args.cache_max_total_tokens),
+        cache_memory_fraction=float(args.cache_memory_fraction),
+        cache_startup_stagger_seconds=float(args.cache_startup_stagger_seconds),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         progress_interval_tokens=int(args.progress_interval_tokens),
         regenerate_generation_batch_size=int(args.regenerate_generation_batch_size),
@@ -1262,7 +1644,7 @@ def main(argv=None) -> int:
     selected = _add_auto_batch_dependencies(
         plan,
         selected,
-        enabled=bool(args.cache_auto_batch),
+        enabled=bool(args.cache_auto_batch and args.cache_backend != "specforge_sglang"),
         has_explicit_profile=bool(args.cache_batch_profile),
     )
     config_hash = pipeline_config_hash(options)

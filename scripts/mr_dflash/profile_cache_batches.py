@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from typing import Any, Sequence
 import torch
 
 from _common import write_json
+from progress import ProgressReporter, install_exception_hook
 from MR_DFlash.cache_batching import (
     CACHE_BATCH_PROFILE_SCHEMA_VERSION,
     CacheBatchSchedule,
@@ -189,6 +191,8 @@ def profile_cache_batches(
     warmup_runs: int = 1,
 ) -> dict[str, Any]:
     """Profile và ghi schedule; không tạo feature cache."""
+    reporter = ProgressReporter(None)
+    previous_hook = install_exception_hook(reporter)
     if not torch.cuda.is_available():
         raise RuntimeError("auto-batch profile cần CUDA khả dụng trên GPU profile")
     if max_length < 1 or bucket_step < 1:
@@ -225,6 +229,14 @@ def profile_cache_batches(
     if len(dataset) < 1:
         raise RuntimeError(f"tokenized dataset rỗng: {tokenized_path}")
     candidates = candidate_batch_sizes(max_batch_size, requested_batch_sizes)
+    bucket_specs = make_bucket_specs(max_length, bucket_step)
+    reporter.set_context(total_samples=len(bucket_specs))
+    reporter.update(
+        "starting",
+        input=str(tokenized_path),
+        output=str(output),
+        completed_samples=reporter.completed_samples(),
+    )
     print(
         f"[profile] gpu={device_obj.index} name={torch.cuda.get_device_name(device_obj)} "
         f"total_vram={total_vram_bytes / 1024**3:.2f}GiB "
@@ -252,7 +264,7 @@ def profile_cache_batches(
                 f"{capturer.layer_ids} != {list(target_layer_ids)}"
             )
         bucket_payloads: list[dict[str, Any]] = []
-        for bucket in make_bucket_specs(max_length, bucket_step):
+        for bucket_index, bucket in enumerate(bucket_specs, 1):
             lower = int(bucket["min_length"])
             upper = int(bucket["max_length"])
             sample_index = _representative_index(dataset, lower, upper)
@@ -309,6 +321,12 @@ def profile_cache_batches(
                     "results": results,
                 }
             )
+            reporter.update(
+                "sample_done",
+                completed_samples=int(bucket_index),
+                sample_id=str(sample["id"]),
+                bucket=f"{lower}-{upper}",
+            )
             print(
                 f"[profile] selected bucket={lower}-{upper}: batch_size={selected}",
                 flush=True,
@@ -340,6 +358,8 @@ def profile_cache_batches(
         CacheBatchSchedule.from_payload(payload, profile_path=str(output))
         write_json(output, payload)
         print(f"[profile] DONE output={output}", flush=True)
+        reporter.update("done", completed_samples=len(bucket_specs), buckets=len(bucket_specs))
+        sys.excepthook = previous_hook
         return payload
     finally:
         capturer.close()

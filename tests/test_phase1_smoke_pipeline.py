@@ -80,7 +80,9 @@ def test_build_stage_plan_keeps_cache_provenance_paths_aligned(tmp_path: Path) -
     assert cache in plan[3].command
 
 
-def test_materialize_subset_writes_audit_manifest_without_touching_source(tmp_path: Path) -> None:
+def test_materialize_subset_writes_audit_manifest_without_touching_source(
+    tmp_path: Path, capsys
+) -> None:
     import json
 
     from run_phase1_smoke import SmokeOptions, materialize_subset
@@ -104,3 +106,4 @@ def test_materialize_subset_writes_audit_manifest_without_touching_source(tmp_pa
     assert sum(manifest["source_counts"].values()) == 4
     assert set(manifest["source_counts"]) == {"arxiv", "sharegpt"}
     assert source.read_text(encoding="utf-8") == source_text
+    assert "Phase1 subset" in capsys.readouterr().err

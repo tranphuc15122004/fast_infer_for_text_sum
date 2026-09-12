@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ import torch
 
 from _common import append_jsonl_durable, read_jsonl
 from MR_DFlash.cache_batching import CacheBatchSchedule
-from MR_DFlash.cache_throughput import CacheThroughputProfile
+from MR_DFlash.cache_throughput import CacheThroughputBucket, CacheThroughputProfile
 from MR_DFlash.capture import HFTargetCapture
 from progress import ProgressReporter, estimate_fields, install_exception_hook
 
@@ -39,6 +40,214 @@ from progress import ProgressReporter, estimate_fields, install_exception_hook
 def _is_cuda_oom(exc: BaseException) -> bool:
     """OOM không thể coi là lỗi của một sample rồi tiếp tục cache."""
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _effective_attention_backend(cache_backend: str, attention_backend: str) -> str:
+    """Map the legacy HF default to a backend registered by SpecForge SGLang."""
+    backend = str(cache_backend).lower()
+    attention = str(attention_backend).lower()
+    if backend != "specforge_sglang":
+        return attention
+    if attention in {"auto", "sdpa"}:
+        # sdpa is a Transformers name. The vendored SGLang registry uses
+        # flashinfer for the B200 path and does not register sdpa.
+        return "flashinfer"
+    if attention not in {"flashinfer", "triton", "torch_native"}:
+        raise ValueError(
+            "SpecForge SGLang chỉ hỗ trợ attention backend "
+            "flashinfer, triton hoặc torch_native; "
+            f"got {attention_backend!r}"
+        )
+    return attention
+
+
+def _default_specforge_profile(max_length: int) -> CacheThroughputProfile:
+    """Aggressive B200 profile cho dữ liệu chủ yếu <=8K.
+
+    Token budget giữ đủ headroom để batch 64×4K, 32×8K và 16×16K chạy
+    chung một static pool; bucket 32K giảm còn 4 sample vì KV/activation tăng
+    nhanh. Profile chỉ là performance hint, hidden-state contract không đổi.
+    """
+    requested = int(max_length)
+    if requested < 1:
+        raise ValueError("max_length phải >= 1")
+    candidates = (
+        (1, 4096, 64, 262144),
+        (4097, 8192, 32, 262144),
+        (8193, 16384, 16, 262144),
+        (16385, 32768, 4, 131072),
+    )
+    buckets: list[CacheThroughputBucket] = []
+    for minimum, maximum, batch, budget in candidates:
+        if minimum > requested:
+            break
+        buckets.append(
+            CacheThroughputBucket(
+                min_length=minimum,
+                max_length=min(maximum, requested),
+                batch_size=batch,
+                token_budget=budget,
+            )
+        )
+    return CacheThroughputProfile(buckets=tuple(buckets))
+
+
+def _write_retry_hint(
+    output_path: str | Path,
+    *,
+    error: BaseException,
+    batch_size: int,
+    max_total_tokens: Optional[int],
+    throughput_profile: Optional[CacheThroughputProfile],
+) -> None:
+    """Ghi hướng dẫn retry sau OOM mà không đụng các shard đã durable."""
+    root = Path(output_path)
+    root.mkdir(parents=True, exist_ok=True)
+    reduced_profile = None
+    reduced_profile_path = None
+    if throughput_profile is not None:
+        reduced_profile = throughput_profile.to_payload()
+        reduced_profile["buckets"] = [
+            {
+                **bucket,
+                "batch_size": max(1, int(bucket["batch_size"]) // 2),
+                "token_budget": max(1, int(bucket["token_budget"]) // 2),
+            }
+            for bucket in reduced_profile["buckets"]
+        ]
+        reduced_profile_path = root / "retry_throughput_profile.json"
+        temporary_profile = reduced_profile_path.with_name(
+            f".{reduced_profile_path.name}.tmp"
+        )
+        temporary_profile.write_text(
+            json.dumps(reduced_profile, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary_profile.replace(reduced_profile_path)
+    payload = {
+        "schema_version": "mr_dflash_cache_retry_hint_v1",
+        "reason": "cuda_oom_or_worker_killed",
+        "error": repr(error),
+        "suggested_batch_size": max(1, int(batch_size) // 2),
+        "suggested_max_total_tokens": (
+            None if max_total_tokens is None else max(1, int(max_total_tokens) // 2)
+        ),
+        "suggested_throughput_profile": reduced_profile,
+        "suggested_throughput_profile_path": (
+            None if reduced_profile_path is None else str(reduced_profile_path)
+        ),
+        "resume": True,
+        "note": "Giữ shard đã ghi; chạy lại với budget thấp hơn và --resume.",
+    }
+    temporary = root / ".retry_hint.json.tmp"
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(root / "retry_hint.json")
+
+
+def _preflight_storage(
+    output_path: str | Path,
+    *,
+    remaining_tokens: int,
+    feature_width: int,
+    torch_dtype: str,
+) -> dict[str, int]:
+    """Ước lượng hidden-state footprint trước khi chạy forward dài."""
+    bytes_per_value = {
+        "float32": 4,
+        "bfloat16": 2,
+        "float16": 2,
+    }.get(str(torch_dtype), 2)
+    estimated = int(max(0, remaining_tokens)) * int(feature_width) * bytes_per_value
+    # Input/loss/shard metadata và serialization tạm thời cần thêm headroom.
+    required = int(estimated * 1.15) + 256 * 1024 * 1024
+    usage = shutil.disk_usage(Path(output_path))
+    available = int(usage.free)
+    if required > available:
+        raise RuntimeError(
+            "storage không đủ cho feature cache: "
+            f"cần khoảng {required / 1024**4:.2f} TiB, "
+            f"còn {available / 1024**4:.2f} TiB tại {output_path}; "
+            "chọn staging/local NVMe hoặc giảm dataset"
+        )
+    return {
+        "estimated_feature_bytes": int(estimated),
+        "estimated_required_bytes": int(required),
+        "available_bytes": available,
+    }
+
+
+def _build_capturer(
+    *,
+    target_model_path: str,
+    layer_ids: List[int],
+    cache_backend: str,
+    cache_dir: str,
+    trust_remote_code: bool,
+    torch_dtype: str,
+    device: str,
+    local_files_only: Optional[bool],
+    target_revision: Optional[str],
+    attention_backend: str,
+    max_length: int,
+    batch_size: int,
+    cache_concurrency: Optional[int],
+    cache_max_total_tokens: Optional[int],
+    cache_memory_fraction: float,
+    throughput_profile: Optional[CacheThroughputProfile],
+) -> Any:
+    """Build HF fallback hoặc target SGLang capture độc lập trên một GPU."""
+    backend = str(cache_backend).lower()
+    if backend in {"hf", "hf_backbone", "legacy"}:
+        return HFTargetCapture(
+            target_model_path,
+            layer_ids,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
+            device=device,
+            local_files_only=local_files_only,
+            target_revision=target_revision,
+            attention_backend=attention_backend,
+        )
+    if backend != "specforge_sglang":
+        raise ValueError(
+            "cache_backend phải là 'hf' hoặc 'specforge_sglang', "
+            f"got {cache_backend!r}"
+        )
+    from specforge_capture import SpecForgeTargetCapture
+
+    profile_batch = (
+        throughput_profile.max_batch_size if throughput_profile is not None else batch_size
+    )
+    concurrency = int(cache_concurrency or profile_batch)
+    if concurrency < 1:
+        raise ValueError("cache_concurrency phải >= 1")
+    profile_budget = (
+        max(int(bucket.token_budget) for bucket in throughput_profile.buckets)
+        if throughput_profile is not None
+        else int(max_length) * concurrency
+    )
+    total_tokens = int(cache_max_total_tokens or profile_budget)
+    if total_tokens < 1:
+        raise ValueError("cache_max_total_tokens phải >= 1")
+    return SpecForgeTargetCapture.from_pretrained(
+        target_model_path,
+        layer_ids,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        attention_backend=attention_backend,
+        mem_fraction_static=float(cache_memory_fraction),
+        context_length=int(max_length),
+        max_running_requests=concurrency,
+        max_total_tokens=total_tokens,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+        target_revision=target_revision,
+    )
 
 
 def _cache_progress_kwargs(workload: Dict[str, Any]) -> dict[str, Any]:
@@ -267,14 +476,30 @@ def cache_dataset(
     progress_path: Optional[str] = None,
     batch_profile: Optional[str] = None,
     throughput_profile: Optional[str] = None,
+    cache_backend: str = "hf_backbone",
+    cache_concurrency: Optional[int] = None,
+    cache_max_total_tokens: Optional[int] = None,
+    cache_memory_fraction: float = 0.99,
 ) -> Dict[str, int]:
     """Chạy target capture theo batch và ghi cache sharded resumable."""
     if data_path is None and tokenized_path is None:
         raise ValueError("cache cần data_path hoặc tokenized_path")
+    if str(cache_backend).lower() == "specforge_sglang" and tokenized_path is None:
+        raise ValueError(
+            "cache backend specforge_sglang cần --tokenized-path để giữ đúng "
+            "tokenization và tránh tokenize lại trong worker"
+        )
+    attention_backend = _effective_attention_backend(cache_backend, attention_backend)
     if batch_size < 1:
         raise ValueError("batch_size phải >= 1")
     if io_threads < 0 or io_queue_size < 0:
         raise ValueError("io_threads và io_queue_size không được âm")
+    if not 0.0 < float(cache_memory_fraction) <= 1.0:
+        raise ValueError("cache_memory_fraction phải thuộc (0, 1]")
+    if cache_concurrency is not None and int(cache_concurrency) < 1:
+        raise ValueError("cache_concurrency phải >= 1")
+    if cache_max_total_tokens is not None and int(cache_max_total_tokens) < 1:
+        raise ValueError("cache_max_total_tokens phải >= 1")
     if batch_profile and throughput_profile:
         raise ValueError("chỉ được dùng một trong batch_profile hoặc throughput_profile")
     batch_schedule = CacheBatchSchedule.from_path(batch_profile) if batch_profile else None
@@ -283,6 +508,10 @@ def cache_dataset(
         if throughput_profile
         else None
     )
+    throughput_profile_label = throughput_profile
+    if str(cache_backend).lower() == "specforge_sglang" and throughput_schedule is None:
+        throughput_schedule = _default_specforge_profile(max_length)
+        throughput_profile_label = "builtin:specforge-aggressive-v1"
     if throughput_schedule is not None:
         # Trong throughput mode, profile là giới hạn batch chính thức. Giá trị
         # ``batch_size`` cũ chỉ điều khiển HF mode khi không có profile.
@@ -334,18 +563,48 @@ def cache_dataset(
         completed_samples=0,
     )
 
-    reporter.update("loading_model", target_model_path=str(target_model_path))
-    capturer = HFTargetCapture(
-        target_model_path,
-        layer_ids or [],
-        cache_dir=cache_dir,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=torch_dtype,
-        device=device,
-        local_files_only=local_files_only,
-        target_revision=target_revision,
-        attention_backend=attention_backend,
+    reporter.update(
+        "loading_model",
+        target_model_path=str(target_model_path),
+        cache_backend=str(cache_backend),
+        attention_backend=str(attention_backend),
     )
+    try:
+        capturer = _build_capturer(
+            target_model_path=target_model_path,
+            layer_ids=layer_ids or [],
+            cache_backend=cache_backend,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
+            device=device,
+            local_files_only=local_files_only,
+            target_revision=target_revision,
+            attention_backend=attention_backend,
+            max_length=max_length,
+            batch_size=batch_size,
+            cache_concurrency=cache_concurrency,
+            cache_max_total_tokens=cache_max_total_tokens,
+            cache_memory_fraction=cache_memory_fraction,
+            throughput_profile=throughput_schedule,
+        )
+    except Exception as exc:
+        # Static-pool allocation happens before the writer exists. Keep the
+        # same retry contract as capture-time OOM for this failure point.
+        if _is_cuda_oom(exc):
+            _write_retry_hint(
+                output_path,
+                error=exc,
+                batch_size=max(batch_size, int(cache_concurrency or batch_size)),
+                max_total_tokens=cache_max_total_tokens,
+                throughput_profile=throughput_schedule,
+            )
+            reporter.update(
+                "oom",
+                error=repr(exc),
+                retry_hint=str(Path(output_path) / "retry_hint.json"),
+            )
+        raise
     reporter.update(
         "model_ready",
         target_model_path=str(target_model_path),
@@ -353,6 +612,18 @@ def cache_dataset(
         dtype=torch_dtype,
         feature_layer_ids=[int(value) for value in capturer.layer_ids],
         attention_backend=str(attention_backend),
+        cache_backend=str(cache_backend),
+        cache_concurrency=(
+            int(cache_concurrency)
+            if cache_concurrency is not None
+            else int(throughput_schedule.max_batch_size)
+            if throughput_schedule is not None
+            else int(batch_size)
+        ),
+        cache_max_total_tokens=(
+            None if cache_max_total_tokens is None else int(cache_max_total_tokens)
+        ),
+        cache_memory_fraction=float(cache_memory_fraction),
         io_threads=int(io_threads),
         io_queue_size=int(io_queue_size),
     )
@@ -380,7 +651,7 @@ def cache_dataset(
     if throughput_schedule is not None:
         reporter.update(
             "throughput_profile_ready",
-            throughput_profile=str(throughput_profile),
+            throughput_profile=str(throughput_profile_label),
             throughput_profile_sha256=throughput_schedule.profile_sha256,
             throughput_buckets=[
                 {
@@ -410,9 +681,12 @@ def cache_dataset(
         resume=resume,
         io_threads=io_threads,
         io_queue_size=io_queue_size,
-        capture_backend="hf_backbone",
+        capture_backend=(
+            "specforge_sglang" if str(cache_backend).lower() == "specforge_sglang"
+            else "hf_backbone"
+        ),
         attention_backend=attention_backend,
-        cache_batch_profile=throughput_profile or batch_profile,
+        cache_batch_profile=throughput_profile_label or batch_profile,
         cache_batch_profile_sha256=(
             throughput_schedule.profile_sha256
             if throughput_schedule is not None
@@ -468,6 +742,13 @@ def cache_dataset(
         valid_tokens=total_tokens,
         **estimate_progress(),
     )
+    storage_estimate = _preflight_storage(
+        output_path,
+        remaining_tokens=max(0, total_tokens - completed_tokens),
+        feature_width=int(capturer.context_feature_dim),
+        torch_dtype=torch_dtype,
+    )
+    reporter.update("storage_ready", **storage_estimate)
 
     try:
         from tqdm import tqdm
@@ -512,6 +793,25 @@ def cache_dataset(
             error=str(error),
             completed_samples=int(writer.total_samples),
         )
+
+    def handle_oom(error: BaseException, batch_size_for_retry: int) -> None:
+        """Flush durable CPU shards before propagating OOM to the launcher."""
+        _write_retry_hint(
+            output_path,
+            error=error,
+            batch_size=batch_size_for_retry,
+            max_total_tokens=cache_max_total_tokens,
+            throughput_profile=throughput_schedule,
+        )
+        try:
+            writer.close(stats={**stats, "status": "oom", "error": repr(error)})
+        except Exception:
+            writer.abort()
+        try:
+            capturer.close()
+        except Exception:
+            pass
+
     buffer: List[Dict[str, Any]] = []
 
     def process(batch: List[Dict[str, Any]]) -> None:
@@ -526,12 +826,12 @@ def cache_dataset(
             batch_sample_ids=[str(sample["id"]) for sample in batch],
             **estimate_progress(),
         )
-        input_ids, attention_mask = _pad_samples(
-            batch,
-            pad_token_id=int(pad_token_id),
-            device=capturer.device,
-        )
         try:
+            input_ids, attention_mask = _pad_samples(
+                batch,
+                pad_token_id=int(pad_token_id),
+                device=capturer.device,
+            )
             captured = capturer.capture_batch(input_ids, attention_mask)
             if len(captured) != len(batch):
                 raise RuntimeError(
@@ -541,11 +841,17 @@ def cache_dataset(
             # Một sample lỗi không làm mất cả shard/batch. Fallback tuần tự
             # cũng giúp chẩn đoán rõ sample id trên model/driver bất ổn.
             if _is_cuda_oom(exc):
+                handle_oom(exc, len(batch))
                 raise
             print(f"[cache] batch capture lỗi, fallback từng mẫu: {exc!r}")
             for sample in batch:
                 try:
-                    feature = capturer.capture_one(sample["input_ids"])[0]
+                    single_ids, single_mask = _pad_samples(
+                        [sample],
+                        pad_token_id=int(pad_token_id),
+                        device=capturer.device,
+                    )
+                    feature = capturer.capture_batch(single_ids, single_mask)[0]
                     added = writer.add({**sample, "hidden_states": feature})
                     if added:
                         stats["captured"] += 1
@@ -556,6 +862,7 @@ def cache_dataset(
                         stats["skipped_existing"] += 1
                 except Exception as sample_exc:
                     if _is_cuda_oom(sample_exc):
+                        handle_oom(sample_exc, 1)
                         raise
                     print(f"[cache] skip {sample['id']!r}: {sample_exc!r}")
                     record_skip(sample["id"], kind="capture_error", error=repr(sample_exc))
@@ -629,6 +936,14 @@ def cache_dataset(
                 padded_length=sample_length,
                 requested_batch_size=requested,
             )
+            if cache_max_total_tokens is not None:
+                token_cap = int(cache_max_total_tokens) // int(sample_length)
+                if token_cap < 1:
+                    raise ValueError(
+                        "cache-max-total-tokens nhỏ hơn một sample: "
+                        f"{cache_max_total_tokens} < {sample_length}"
+                    )
+                selected = min(selected, token_cap)
         elif batch_schedule is not None:
             if sample_length is None:
                 raise ValueError("auto-batch cần sample_length để chọn bucket")
@@ -710,6 +1025,7 @@ def cache_dataset(
     stats["workload_valid_tokens"] = total_tokens
     stats["workload_existing_samples"] = int(workload["existing_samples"])
     stats["workload_existing_tokens"] = int(workload["existing_tokens"])
+    stats.update({f"storage_{key}": int(value) for key, value in storage_estimate.items()})
     final_estimate = estimate_progress()
     stats["cache_elapsed_seconds"] = int(round(final_estimate["active_elapsed_seconds"]))
     stats["throughput_tokens_per_second"] = int(round(final_estimate["throughput_tokens_per_second"] or 0))
@@ -762,12 +1078,44 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--target-revision", default=None)
     parser.add_argument(
         "--attention-backend",
-        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        choices=[
+            "auto",
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flashinfer",
+            "triton",
+            "torch_native",
+        ],
         default="sdpa",
         help=(
             "attention implementation cho backbone capture; sdpa dùng kernel "
             "PyTorch tối ưu và không bắt buộc flash-attn"
         ),
+    )
+    parser.add_argument(
+        "--cache-backend",
+        choices=["hf", "specforge_sglang"],
+        default="hf",
+        help="backend capture; specforge_sglang dùng offline SGLang của SpecForge",
+    )
+    parser.add_argument(
+        "--cache-concurrency",
+        type=int,
+        default=None,
+        help="max running requests của offline SGLang; mặc định lấy batch lớn nhất profile",
+    )
+    parser.add_argument(
+        "--cache-max-total-tokens",
+        type=int,
+        default=None,
+        help="trần token KV/static của offline SGLang; ưu tiên dùng gần đầy VRAM",
+    )
+    parser.add_argument(
+        "--cache-memory-fraction",
+        type=float,
+        default=0.99,
+        help="tỷ lệ VRAM static pool cho SpecForge SGLang (mặc định 0.99)",
     )
     parser.add_argument(
         "--io-threads",
@@ -842,6 +1190,10 @@ def main(argv=None) -> None:
         progress_path=args.progress_path,
         batch_profile=args.batch_profile,
         throughput_profile=args.throughput_profile,
+        cache_backend=args.cache_backend,
+        cache_concurrency=args.cache_concurrency,
+        cache_max_total_tokens=args.cache_max_total_tokens,
+        cache_memory_fraction=args.cache_memory_fraction,
     )
 
 

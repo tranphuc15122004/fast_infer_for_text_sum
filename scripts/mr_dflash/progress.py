@@ -169,10 +169,18 @@ class ProgressReporter:
     """Reporter no-op khi không có path, heartbeat khi chạy parallel."""
 
     def __init__(self, path: str | Path | None, *, interval_tokens: int = 256) -> None:
-        self.path = Path(path) if path else None
+        environment_path = os.environ.get("MR_DFLASH_PROGRESS_PATH")
+        self.path = Path(path or environment_path) if (path or environment_path) else None
         self.interval_tokens = max(1, int(interval_tokens))
         self._last_token_write: Optional[int] = None
         self._context: dict[str, Any] = {}
+        self._last_fields: dict[str, Any] = {}
+        environment_total = os.environ.get("MR_DFLASH_PROGRESS_TOTAL_SAMPLES")
+        if environment_total is not None:
+            try:
+                self._context["total_samples"] = max(0, int(environment_total))
+            except ValueError:
+                pass
 
     def set_context(self, **fields: Any) -> None:
         """Giữ các field bất biến qua mọi heartbeat của cùng worker.
@@ -183,11 +191,25 @@ class ProgressReporter:
         """
         self._context.update(fields)
 
+    def completed_samples(self) -> int:
+        """Lấy counter hiện tại để các subprocess tuần tự không reset bar."""
+        if self.path is None:
+            return 0
+        value = read_progress(self.path).get("completed_samples", 0)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def update(self, phase: str, **fields: Any) -> dict[str, Any] | None:
         if self.path is None:
             return None
         payload = dict(self._context)
+        payload.update(self._last_fields)
         payload.update(fields)
+        self._last_fields = {
+            key: value for key, value in payload.items() if key not in self._context
+        }
         return write_progress(self.path, phase=phase, **payload)
 
     def maybe_tokens(self, generated_tokens: int, **fields: Any) -> dict[str, Any] | None:

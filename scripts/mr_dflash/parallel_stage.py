@@ -57,7 +57,11 @@ def build_worker_status(
     }
 
 
-def aggregate_progress(worker_statuses: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def aggregate_progress(
+    worker_statuses: Sequence[Dict[str, Any]],
+    *,
+    total_samples: int | None = None,
+) -> Dict[str, Any]:
     """Gom workload/ETA của toàn bộ worker để ghi ở ``status.json``.
 
     Các worker có thể có sample dài ngắn khác nhau; ETA của stage là ETA lớn
@@ -72,6 +76,21 @@ def aggregate_progress(worker_statuses: Sequence[Dict[str, Any]]) -> Dict[str, A
     def total(name: str) -> int:
         return sum(int(value.get(name, 0) or 0) for value in progress_values)
 
+    def completed_total() -> int:
+        completed = 0
+        for value in progress_values:
+            worker_total = max(0, int(value.get("total_samples", 0) or 0))
+            worker_completed = max(0, int(value.get("completed_samples", 0) or 0))
+            completed += min(worker_completed, worker_total) if worker_total else worker_completed
+        return completed
+
+    global_total = (
+        max(0, int(total_samples))
+        if total_samples is not None
+        else total("total_samples")
+    )
+    global_completed = min(completed_total(), global_total)
+
     etas = [
         float(value["eta_seconds"])
         for value in progress_values
@@ -85,9 +104,9 @@ def aggregate_progress(worker_statuses: Sequence[Dict[str, Any]]) -> Dict[str, A
     eta = max(etas) if etas else None
     throughput = sum(rates) if rates else None
     result: Dict[str, Any] = {
-        "total_samples": total("total_samples"),
-        "completed_samples": total("completed_samples"),
-        "remaining_samples": total("remaining_samples"),
+        "total_samples": global_total,
+        "completed_samples": global_completed,
+        "remaining_samples": max(0, global_total - global_completed),
         "total_tokens": total("total_tokens"),
         "completed_tokens": total("completed_tokens"),
         "remaining_tokens": total("remaining_tokens"),
@@ -276,6 +295,7 @@ def merge_feature_caches(
         "cache_batch_profile_sha256",
     )
     base: Dict[str, Any] | None = None
+    profile_history: list[Dict[str, Any]] = []
     all_ids: list[str] = []
     final_shards: list[Dict[str, Any]] = []
     for rank, root in enumerate(worker_roots):
@@ -296,6 +316,9 @@ def merge_feature_caches(
             if sample_id in all_ids:
                 raise ValueError(f"worker cache trùng sample id: {sample_id!r}")
             all_ids.append(sample_id)
+        for history_item in payload.get("cache_profile_history", []):
+            if isinstance(history_item, dict) and history_item not in profile_history:
+                profile_history.append(dict(history_item))
         for local_index, descriptor in enumerate(payload.get("shards", [])):
             if not isinstance(descriptor, dict) or "path" not in descriptor:
                 raise ValueError(f"worker cache shard descriptor lỗi: {manifest_path_worker}")
@@ -341,6 +364,7 @@ def merge_feature_caches(
         attention_backend=base.get("attention_backend"),
         cache_batch_profile=base.get("cache_batch_profile"),
         cache_batch_profile_sha256=base.get("cache_batch_profile_sha256"),
+        cache_profile_history=profile_history,
         stats={
             "worker_count": len(worker_roots),
             "gpu_ids": [int(value) for value in gpu_ids],
@@ -397,6 +421,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             "--bucket-buffer-size", str(args.bucket_buffer_size),
             "--shard-size", str(args.shard_size),
             "--attention-backend", args.attention_backend,
+            "--cache-backend", args.cache_backend,
+            "--cache-memory-fraction", str(args.cache_memory_fraction),
             "--io-threads", str(args.io_threads),
             "--io-queue-size", str(args.io_queue_size),
             "--device", worker_device,
@@ -411,6 +437,12 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             command.extend(["--tokenized-path", args.tokenized_path])
         if args.batch_profile:
             command.extend(["--batch-profile", args.batch_profile])
+        if args.throughput_profile:
+            command.extend(["--throughput-profile", args.throughput_profile])
+        if args.cache_concurrency is not None:
+            command.extend(["--cache-concurrency", str(args.cache_concurrency)])
+        if args.cache_max_total_tokens is not None:
+            command.extend(["--cache-max-total-tokens", str(args.cache_max_total_tokens)])
     if args.target_revision:
         command.extend(["--target-revision", args.target_revision])
     if args.local_files_only:
@@ -443,14 +475,113 @@ def _terminate_workers(processes: Sequence[subprocess.Popen[Any]]) -> None:
             process.wait()
 
 
-def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[int]) -> list[Path]:
+def _write_parallel_retry_hint(
+    work_root: Path,
+    *,
+    args: argparse.Namespace,
+    failed: Sequence[tuple[int, int]],
+) -> None:
+    """Persist retry guidance when the OS kills a GPU worker (usually OOM)."""
+    killed = [int(rank) for rank, code in failed if int(code) == -9]
+    oom_ranks: list[int] = []
+    if args.mode == "cache":
+        for rank, _code in failed:
+            log_path = _worker_root(work_root, int(rank)) / "worker.log"
+            try:
+                tail = log_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )[-32_000:]
+            except OSError:
+                tail = ""
+            lowered = tail.lower()
+            if "out of memory" in lowered or "cuda oom" in lowered:
+                oom_ranks.append(int(rank))
+    retry_ranks = sorted(set(killed) | set(oom_ranks))
+    if not retry_ranks:
+        return
+    reduced_profile_path = None
+    if args.throughput_profile:
+        try:
+            profile_payload = json.loads(
+                Path(args.throughput_profile).read_text(encoding="utf-8")
+            )
+            if isinstance(profile_payload, dict) and isinstance(
+                profile_payload.get("buckets"), list
+            ):
+                reduced_profile = dict(profile_payload)
+                reduced_profile["buckets"] = [
+                    {
+                        **bucket,
+                        "batch_size": max(1, int(bucket["batch_size"]) // 2),
+                        "token_budget": max(1, int(bucket["token_budget"]) // 2),
+                    }
+                    for bucket in profile_payload["buckets"]
+                    if isinstance(bucket, dict)
+                ]
+                reduced_profile_path = work_root / "retry_throughput_profile.json"
+                write_json(reduced_profile_path, reduced_profile)
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            reduced_profile_path = None
+    payload = {
+        "schema_version": "mr_dflash_parallel_retry_hint_v1",
+        "reason": "worker_sigkill_or_oom",
+        "killed_ranks": killed,
+        "oom_ranks": oom_ranks,
+        "failed_ranks": [int(rank) for rank, _code in failed],
+        "resume": True,
+        "suggested_batch_size": max(1, int(args.batch_size) // 2),
+        "suggested_cache_concurrency": (
+            None
+            if args.cache_concurrency is None
+            else max(1, int(args.cache_concurrency) // 2)
+        ),
+        "suggested_cache_max_total_tokens": (
+            None
+            if args.cache_max_total_tokens is None
+            else max(1, int(args.cache_max_total_tokens) // 2)
+        ),
+        "suggested_cache_memory_fraction": min(
+            0.98, max(0.80, float(args.cache_memory_fraction) - 0.02)
+        ),
+        "suggested_throughput_profile_path": (
+            None if reduced_profile_path is None else str(reduced_profile_path)
+        ),
+        "note": (
+            "Các shard đã durable được giữ nguyên. Chạy lại cùng command với "
+            "--resume và các giá trị suggested; profile là performance-only."
+        ),
+    }
+    write_json(work_root / "retry_hint.json", payload)
+
+
+def _run_workers(
+    args: argparse.Namespace,
+    work_root: Path,
+    gpu_ids: Sequence[int],
+    *,
+    total_samples: int,
+) -> list[Path]:
     worker_roots = [_worker_root(work_root, rank) for rank in range(len(gpu_ids))]
     work_root.mkdir(parents=True, exist_ok=True)
     processes: list[subprocess.Popen[Any]] = []
     logs = []
     started_at: dict[int, float] = {}
     previous_handlers: dict[int, Any] = {}
-    last_progress_log_at = 0.0
+    dist_port_base = 29600 + (os.getpid() % 1000) * 4
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm có trong runtime server
+        aggregate_bar = None
+    else:
+        aggregate_bar = tqdm(
+            total=max(0, int(total_samples)),
+            desc=f"MR-DFlash parallel {args.mode}",
+            unit="sample",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        )
+    last_aggregate_completed = 0
 
     def handle_parent_signal(signum: int, _frame: Any) -> None:
         # SIGTERM/SIGINT của parent phải truyền xuống process group. Nếu chỉ
@@ -475,6 +606,12 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             environment["MR_DFLASH_GPU_ID"] = str(gpu_id)
+            # Mỗi worker là một process-group SGLang độc lập trên một GPU;
+            # dùng port riêng để bốn worker không join nhầm cùng rendezvous.
+            environment["MR_DFLASH_WORKER_RANK"] = str(rank)
+            # Adapter cộng ``rank`` vào base này để mỗi child có rendezvous
+            # riêng; giữ cùng base giúp trực tiếp chạy một worker cũng ổn.
+            environment["MR_DFLASH_DIST_PORT"] = str(dist_port_base)
             environment.setdefault("PYTHONUNBUFFERED", "1")
             source_path = str(REPO_ROOT / "src")
             environment["PYTHONPATH"] = source_path + (
@@ -492,6 +629,8 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
             started_at[rank] = time.time()
             logs.append((log_handle, log_path))
             print(f"[parallel] rank={rank} gpu={gpu_id} pid={process.pid} log={log_path}", flush=True)
+            if args.mode == "cache" and args.cache_startup_stagger_seconds > 0 and rank + 1 < len(gpu_ids):
+                time.sleep(args.cache_startup_stagger_seconds)
         while True:
             statuses = [process.poll() for process in processes]
             worker_statuses = [
@@ -505,7 +644,26 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
                 for rank in range(len(processes))
             ]
             now = time.time()
-            aggregate = aggregate_progress(worker_statuses)
+            aggregate = aggregate_progress(worker_statuses, total_samples=total_samples)
+            if aggregate_bar is not None:
+                completed = int(aggregate.get("completed_samples", 0) or 0)
+                delta = completed - last_aggregate_completed
+                if delta > 0:
+                    aggregate_bar.update(delta)
+                    last_aggregate_completed = completed
+                aggregate_bar.set_postfix(
+                    tokens=(
+                        f"{int(aggregate.get('completed_tokens', 0) or 0)}"
+                        f"/{int(aggregate.get('total_tokens', 0) or 0)}"
+                    ),
+                    rate=(
+                        "-"
+                        if aggregate.get("throughput_tokens_per_second") is None
+                        else f"{float(aggregate['throughput_tokens_per_second']):.1f} tok/s"
+                    ),
+                    eta=aggregate.get("eta_human", "unknown"),
+                )
+                aggregate_bar.refresh()
             write_json(
                 work_root / "status.json",
                 {
@@ -517,23 +675,6 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
                     "aggregate": aggregate,
                 },
             )
-            if now - last_progress_log_at >= 30.0:
-                total_tokens = int(aggregate["total_tokens"])
-                token_progress = (
-                    f"{aggregate['completed_tokens']}/{total_tokens}"
-                    if total_tokens > 0
-                    else "unknown"
-                )
-                print(
-                    "[parallel] progress "
-                    f"mode={args.mode} "
-                    f"completed={aggregate['completed_samples']}/{aggregate['total_samples']} "
-                    f"tokens={token_progress} "
-                    f"rate={aggregate['throughput_tokens_per_second'] or 0:.1f} tok/s "
-                    f"eta={aggregate['eta_human']}",
-                    flush=True,
-                )
-                last_progress_log_at = now
             if args.stop_file and Path(args.stop_file).exists():
                 _terminate_workers(processes)
                 raise RuntimeError(f"stop file yêu cầu dừng: {args.stop_file}")
@@ -560,6 +701,7 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
             failed = [(rank, status) for rank, status in enumerate(statuses) if status not in (None, 0)]
             if failed:
                 _terminate_workers(processes)
+                _write_parallel_retry_hint(work_root, args=args, failed=failed)
                 details = ", ".join(
                     f"rank={rank} code={status} log={worker_roots[rank] / 'worker.log'}"
                     for rank, status in failed
@@ -573,10 +715,28 @@ def _run_workers(args: argparse.Namespace, work_root: Path, gpu_ids: Sequence[in
         _terminate_workers(processes)
         raise
     finally:
+        if aggregate_bar is not None:
+            aggregate_bar.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         for log_handle, _log_path in logs:
             log_handle.close()
+
+
+def _count_parallel_samples(args: argparse.Namespace) -> int:
+    """Đếm một lần nguồn sample mà các worker thực sự phân shard.
+
+    Cache có thể lặp trên tokenized manifest thay vì JSONL ``--input``; khi
+    đó manifest là nguồn chuẩn để mẫu số không lệch với workload của worker.
+    """
+    if args.mode == "cache" and args.tokenized_path:
+        manifest_path = Path(args.tokenized_path) / "manifest.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        shards = payload.get("shards", [])
+        if not isinstance(shards, list):
+            raise ValueError(f"tokenized manifest không có shards hợp lệ: {manifest_path}")
+        return sum(max(0, int(shard.get("count", 0) or 0)) for shard in shards)
+    return sum(1 for _ in read_jsonl(Path(args.input)))
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -624,8 +784,48 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="profile JSON dùng chung cho mọi worker cache; chọn batch theo length bucket",
     )
     parser.add_argument(
+        "--throughput-profile",
+        "--cache-throughput-profile",
+        "--cache-profile",
+        dest="throughput_profile",
+        default=None,
+        help="profile token-budget SpecForge dùng chung cho mọi worker cache",
+    )
+    parser.add_argument(
+        "--cache-backend",
+        choices=["hf", "specforge_sglang"],
+        default="hf",
+        help="backend cache target; specforge_sglang dùng offline SGLang",
+    )
+    parser.add_argument(
+        "--cache-concurrency",
+        type=int,
+        default=None,
+        help="max running requests trên mỗi GPU cho SGLang cache",
+    )
+    parser.add_argument(
+        "--cache-max-total-tokens",
+        type=int,
+        default=None,
+        help="max total tokens static pool trên mỗi GPU cho SGLang cache",
+    )
+    parser.add_argument(
+        "--cache-memory-fraction",
+        type=float,
+        default=0.99,
+        help="VRAM static pool fraction trên mỗi GPU (mặc định 0.99)",
+    )
+    parser.add_argument(
         "--attention-backend",
-        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        choices=[
+            "auto",
+            "eager",
+            "sdpa",
+            "flash_attention_2",
+            "flashinfer",
+            "triton",
+            "torch_native",
+        ],
         default="sdpa",
         help="attention implementation cho HF backbone khi cache target",
     )
@@ -667,6 +867,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help="khi file tồn tại, parent dừng sạch toàn bộ worker ở vòng poll kế tiếp",
     )
+    parser.add_argument(
+        "--cache-startup-stagger-seconds",
+        type=float,
+        default=3.0,
+        help="khoảng cách khởi động worker cache để tránh peak host/PCIe (giây)",
+    )
     args = parser.parse_args(argv)
     args.gpu_ids = _validate_gpu_ids(args.gpu_ids)
     if args.mode == "cache" and not args.target_layer_ids:
@@ -679,12 +885,26 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("generation-batch-size phải >= 1")
     if args.io_threads < 0 or args.io_queue_size < 0:
         raise ValueError("io-threads và io-queue-size không được âm")
+    if args.cache_concurrency is not None and args.cache_concurrency < 1:
+        raise ValueError("cache-concurrency phải >= 1")
+    if args.cache_max_total_tokens is not None and args.cache_max_total_tokens < 1:
+        raise ValueError("cache-max-total-tokens phải >= 1")
+    if not 0.0 < args.cache_memory_fraction <= 1.0:
+        raise ValueError("cache-memory-fraction phải thuộc (0, 1]")
+    if args.cache_startup_stagger_seconds < 0:
+        raise ValueError("cache-startup-stagger-seconds không được âm")
     if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
         raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
     if args.stall_timeout_seconds < 0:
         raise ValueError("stall-timeout-seconds không được âm")
     if args.batch_profile and not Path(args.batch_profile).is_file():
         raise FileNotFoundError(f"không tìm thấy cache batch profile: {args.batch_profile}")
+    if args.throughput_profile and not Path(args.throughput_profile).is_file():
+        raise FileNotFoundError(
+            f"không tìm thấy cache throughput profile: {args.throughput_profile}"
+        )
+    if args.batch_profile and args.throughput_profile:
+        raise ValueError("chỉ được dùng một trong batch-profile hoặc throughput-profile")
     if args.work_root is None:
         output = Path(args.output)
         args.work_root = str(resolve_parallel_work_root(output, args.mode))
@@ -696,6 +916,7 @@ def main(argv=None) -> int:
     output_path = Path(args.output)
     manifest_path = Path(args.manifest)
     work_root = Path(args.work_root)
+    total_samples = _count_parallel_samples(args)
     if args.stop_file and Path(args.stop_file).exists():
         raise RuntimeError(f"stop file đã tồn tại trước khi khởi động: {args.stop_file}")
     active_pids = _active_worker_pids(work_root)
@@ -745,6 +966,17 @@ def main(argv=None) -> int:
             if args.batch_profile
             else None
         ),
+        "throughput_profile": str(args.throughput_profile) if args.throughput_profile else None,
+        "throughput_profile_sha256": (
+            hashlib.sha256(Path(args.throughput_profile).read_bytes()).hexdigest()
+            if args.throughput_profile
+            else None
+        ),
+        "cache_backend": args.cache_backend,
+        "cache_concurrency": args.cache_concurrency,
+        "cache_max_total_tokens": args.cache_max_total_tokens,
+        "cache_memory_fraction": float(args.cache_memory_fraction),
+        "cache_startup_stagger_seconds": float(args.cache_startup_stagger_seconds),
         "attention_backend": args.attention_backend,
         "io_threads": int(args.io_threads),
         "io_queue_size": int(args.io_queue_size),
@@ -755,6 +987,7 @@ def main(argv=None) -> int:
         "stall_timeout_seconds": float(args.stall_timeout_seconds),
         "stop_file": str(args.stop_file) if args.stop_file else None,
         "num_shards": len(args.gpu_ids),
+        "total_samples": total_samples,
     }
     if args.resume and plan_path.exists():
         old = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -771,11 +1004,11 @@ def main(argv=None) -> int:
             "generation_batch_size",
             "target_layer_ids",
             "attention_backend",
-            "batch_profile",
-            "batch_profile_sha256",
             "io_threads",
             "io_queue_size",
             "num_shards",
+            "total_samples",
+            "cache_backend",
         )
         # New optimization fields were added after older work-roots may have
         # been created. Missing legacy keys are compatible; an explicitly
@@ -792,7 +1025,12 @@ def main(argv=None) -> int:
         raise FileExistsError(f"parallel work-root đã tồn tại: {work_root}; dùng --resume hoặc work-root mới")
     write_json(plan_path, plan)
     try:
-        worker_roots = _run_workers(args, work_root, args.gpu_ids)
+        worker_roots = _run_workers(
+            args,
+            work_root,
+            args.gpu_ids,
+            total_samples=total_samples,
+        )
         if args.mode == "regenerate":
             payload = merge_regenerated_outputs(
                 input_path=Path(args.input),
@@ -828,7 +1066,9 @@ def main(argv=None) -> int:
                 "payload": payload,
                 "gpu_ids": [int(value) for value in args.gpu_ids],
                 "workers": last_status.get("workers", []),
-                "aggregate": aggregate_progress(last_status.get("workers", [])),
+                "aggregate": aggregate_progress(
+                    last_status.get("workers", []), total_samples=total_samples
+                ),
                 "updated_at_unix": time.time(),
             },
         )
@@ -852,7 +1092,9 @@ def main(argv=None) -> int:
                 "error": repr(exc),
                 "gpu_ids": [int(value) for value in args.gpu_ids],
                 "workers": last_status.get("workers", []),
-                "aggregate": aggregate_progress(last_status.get("workers", [])),
+                "aggregate": aggregate_progress(
+                    last_status.get("workers", []), total_samples=total_samples
+                ),
                 "updated_at_unix": time.time(),
             },
         )

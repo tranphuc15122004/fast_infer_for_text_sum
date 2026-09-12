@@ -5,12 +5,19 @@ from __future__ import annotations
 import argparse
 import os
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
 
 from _common import read_jsonl
+from progress import ProgressReporter, install_exception_hook
+
+
+def _count_input_samples(path: str | Path) -> int:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 def main(argv=None) -> None:
@@ -36,6 +43,18 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     if args.shard_size < 1:
         raise ValueError("--shard-size phải >= 1")
+    input_total = _count_input_samples(args.input)
+    if args.limit is not None:
+        input_total = min(input_total, max(0, int(args.limit)))
+    reporter = ProgressReporter(None)
+    reporter.set_context(total_samples=input_total)
+    previous_hook = install_exception_hook(reporter)
+    reporter.update(
+        "starting",
+        input=str(args.input),
+        output=str(args.output),
+        completed_samples=reporter.completed_samples(),
+    )
     from transformers import AutoTokenizer
     load_kwargs = {"cache_dir": args.cache_dir, "local_files_only": args.local_files_only}
     if args.target_revision:
@@ -50,6 +69,7 @@ def main(argv=None) -> None:
     shards: List[Dict[str, Any]] = []
     existing_ids = set()
     total = 0
+    processed_samples = 0
     existing_shards = sorted(root.glob("shard_*.pt"))
     manifest_path = root / "manifest.json"
     if not args.resume and (existing_shards or manifest_path.exists()):
@@ -106,12 +126,24 @@ def main(argv=None) -> None:
         from tqdm import tqdm
     except ImportError:  # pragma: no cover - tqdm có trong requirements server
         tqdm = lambda iterator, **_kwargs: iterator
-    rows = tqdm(read_jsonl(args.input), desc="Tokenize MR-DFlash", unit="row")
+    rows = tqdm(
+        read_jsonl(args.input),
+        total=input_total,
+        desc="Tokenize MR-DFlash",
+        unit="sample",
+    )
     for row_index, row in enumerate(rows):
-        if args.limit is not None and total >= args.limit:
+        if args.limit is not None and row_index >= args.limit:
             break
         sample_id = str(row.get("id", row_index))
         if sample_id in existing_ids:
+            processed_samples += 1
+            reporter.update(
+                "sample_done",
+                completed_samples=processed_samples,
+                sample_id=sample_id,
+                status="existing",
+            )
             continue
         conversations = row.get("conversations") or []
         input_ids, loss_mask = render_conversation(
@@ -126,6 +158,13 @@ def main(argv=None) -> None:
                 f"max_length={args.max_length}; regenerate với prompt budget nhỏ hơn"
             )
         if len(input_ids) < 3 or not has_consecutive_supervised_tokens(loss_mask):
+            processed_samples += 1
+            reporter.update(
+                "sample_done",
+                completed_samples=processed_samples,
+                sample_id=sample_id,
+                status="skipped",
+            )
             continue
         ids = torch.tensor(input_ids, dtype=torch.long)
         mask = torch.tensor(loss_mask, dtype=torch.float32)
@@ -137,6 +176,13 @@ def main(argv=None) -> None:
         })
         existing_ids.add(sample_id)
         total += 1
+        processed_samples += 1
+        reporter.update(
+            "sample_done",
+            completed_samples=processed_samples,
+            sample_id=sample_id,
+            written_samples=total,
+        )
         if len(samples) >= args.shard_size:
             flush()
     flush()
@@ -162,6 +208,13 @@ def main(argv=None) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, target)
     print(f"[tokenize_dataset] samples={total} shards={len(shards)} output={root}")
+    reporter.update(
+        "done",
+        completed_samples=processed_samples,
+        written_samples=total,
+        shards=len(shards),
+    )
+    sys.excepthook = previous_hook
 
 
 if __name__ == "__main__":

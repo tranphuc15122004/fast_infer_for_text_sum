@@ -66,6 +66,14 @@ FAST_INFER_VENV="$PWD/.venv" "$PWD/.venv/bin/python" scripts/check_shared_env.py
 
 # Chạy 1 baseline
 bash scripts/run.sh <baseline>
+
+# LongBench matrix: batch size 1 trên nhiều GPU (data-parallel), gộp shard tự động
+bash scripts/run_longbench_200.sh --config <master> --mode full \
+  --gpu-ids 0,1,2,3 --data-parallel
+
+# Tận dụng VRAM: 4 process batch-1/card, trần 170 GiB/card, chờ thay vì OOM
+bash scripts/run_longbench_200.sh --config <master> --mode full \
+  --gpu-ids 0,1,2,3 --data-parallel --dp-processes-per-gpu 4
 ```
 
 Baseline khả dụng: `eagle3 dflash llmlingua fastkv rocketkv gemfilter

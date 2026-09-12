@@ -1,8 +1,46 @@
-# Auto-batch cho phase cache MR-DFlash
+# Throughput profile cho phase cache MR-DFlash
+
+## Khuyến nghị cho 4×B200 180GB
+
+Cache nhanh dùng backend offline SGLang theo cơ chế SpecForge. Với dữ liệu
+thực tế chủ yếu dưới 8K, worker mặc định dùng profile aggressive:
+
+| Độ dài padded | Batch/GPU | Token budget |
+|---:|---:|---:|
+| 1–4096 | 64 | 262144 |
+| 4097–8192 | 32 | 262144 |
+| 8193–16384 | 16 | 262144 |
+| 16385–32768 | 4 | 131072 |
+
+Chạy cache trên bốn GPU độc lập:
+
+```bash
+PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
+  --target-model-path /workspace/storage-shared/models/Qwen3-4B \
+  --data-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full \
+  --full-context --full-context-length 32768 --max-new-tokens 2048 \
+  --cache-backend specforge_sglang \
+  --cache-attention-backend flashinfer \
+  --cache-concurrency 64 --cache-max-total-tokens 262144 \
+  --cache-memory-fraction 0.99 --cache-startup-stagger-seconds 3 \
+  --parallel-gpu-ids 0 1 2 3 --cache-splits train val --resume
+```
+
+`0.99` cố ý tận dụng gần toàn bộ 180GB. Nếu worker bị CUDA OOM hoặc bị hệ
+điều hành kill với exit code `-9`, launcher ghi `retry_hint.json` trong
+`parallel_cache_<split>/`; các shard đã durable vẫn giữ nguyên. Chạy lại cùng
+lệnh với `--resume`, giảm `--cache-concurrency`/`--cache-max-total-tokens`
+theo hint. Profile là performance-only nên đổi profile không làm mất cache
+đã hoàn tất.
+
+Parent hiển thị một tqdm tổng hợp trên cả bốn GPU; `completed/total` tính theo
+sample của toàn input, còn heartbeat chi tiết từng worker nằm trong
+`parallel_cache_<split>/rank_*/progress.json`.
 
 ## Mục đích
 
-`--cache-auto-batch` chạy một stage profile trước `cache_*`. Profiler dùng
+`--cache-auto-batch` là đường tương thích cho HF backbone cũ và chạy một stage
+profile trước `cache_*`. Profiler dùng
 tokenized train shard và target model thật trên một GPU, đo lần lượt các batch
 candidate (mặc định `1,2,4,8`) tại cận trên của từng bucket độ dài. Bucket chỉ
 được chọn batch nếu `peak_memory_reserved` không vượt hard limit VRAM.
@@ -18,7 +56,7 @@ thử lại bằng batch khác sau khi đã bắt đầu ghi feature shard; nế
 an toàn, profile dừng trước cache. Cache manifest cũng ghi
 `cache_batch_profile` để audit/resume không dùng nhầm schedule.
 
-## Lệnh cho 4 B200 180 GB
+## Lệnh HF legacy cho 4 B200 180 GB
 
 Với dữ liệu đã có `tokenized_full/train`, chạy từ stage profile. `170` là hard
 limit mỗi GPU, chừa khoảng 10 GB cho driver/process khác:

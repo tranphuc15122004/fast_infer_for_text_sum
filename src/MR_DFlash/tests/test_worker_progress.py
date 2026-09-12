@@ -69,6 +69,35 @@ def test_progress_reporter_preserves_worker_context(tmp_path: Path) -> None:
     assert payload["completed_samples"] == 3
 
 
+def test_progress_reporter_uses_pipeline_environment_path(tmp_path: Path, monkeypatch) -> None:
+    from progress import ProgressReporter, read_progress
+
+    progress_path = tmp_path / "pipeline.progress.json"
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_PATH", str(progress_path))
+    monkeypatch.setenv("MR_DFLASH_PROGRESS_TOTAL_SAMPLES", "9")
+
+    reporter = ProgressReporter(None)
+    reporter.update("processing", completed_samples=4)
+
+    payload = read_progress(progress_path)
+    assert payload["phase"] == "processing"
+    assert payload["total_samples"] == 9
+    assert payload["completed_samples"] == 4
+
+
+def test_token_heartbeat_preserves_completed_sample_count(tmp_path: Path) -> None:
+    from progress import ProgressReporter, read_progress
+
+    reporter = ProgressReporter(tmp_path / "progress.json", interval_tokens=1)
+    reporter.update("sample_done", completed_samples=7, sample_id="s7")
+    reporter.maybe_tokens(16, generation_budget=32)
+
+    payload = read_progress(tmp_path / "progress.json")
+    assert payload["phase"] == "generating"
+    assert payload["generated_tokens"] == 16
+    assert payload["completed_samples"] == 7
+
+
 def test_regenerate_progress_counts_rows_assigned_to_worker(tmp_path: Path) -> None:
     from regenerate_pilot import _count_shard_rows
 
@@ -99,6 +128,24 @@ def test_parallel_aggregate_uses_slowest_worker_eta() -> None:
     assert aggregate["throughput_tokens_per_second"] == 45.0
     assert aggregate["eta_seconds"] == 20.0
     assert aggregate["eta_human"] == "20.0s"
+
+
+def test_parallel_aggregate_keeps_global_total_before_all_gpu_heartbeats() -> None:
+    from parallel_stage import aggregate_progress
+
+    aggregate = aggregate_progress(
+        [
+            {"rank": 0, "progress": {"total_samples": 25, "completed_samples": 7}},
+            {"rank": 1, "progress": {}},
+            {"rank": 2, "progress": {"total_samples": 25, "completed_samples": 3}},
+            {"rank": 3, "progress": {}},
+        ],
+        total_samples=100,
+    )
+
+    assert aggregate["total_samples"] == 100
+    assert aggregate["completed_samples"] == 10
+    assert aggregate["remaining_samples"] == 90
 
 
 def test_watch_formatter_reports_aggregate_eta() -> None:
@@ -248,3 +295,125 @@ def test_observability_controls_do_not_change_pipeline_data_hash(tmp_path: Path)
         worker_stop_file="/tmp/stop",
     )
     assert pipeline_config_hash(base) == pipeline_config_hash(changed)
+
+
+def test_pipeline_parallel_progress_uses_global_input_sample_count(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import Stage, parallel_progress_spec
+
+    input_path = tmp_path / "train_prompts.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps({"id": f"s{i}"}) for i in range(5)) + "\n\n",
+        encoding="utf-8",
+    )
+    work_root = tmp_path / "parallel_regenerate_train"
+    stage = Stage(
+        name="regenerate_full_train",
+        command=[
+            "python3",
+            "scripts/mr_dflash/parallel_stage.py",
+            "--mode",
+            "regenerate",
+            "--input",
+            str(input_path),
+            "--work-root",
+            str(work_root),
+        ],
+        artifacts=(),
+    )
+
+    spec = parallel_progress_spec(stage)
+
+    assert spec is not None
+    assert spec["mode"] == "regenerate"
+    assert spec["total_samples"] == 5
+    assert spec["status_path"] == work_root / "status.json"
+
+
+def test_pipeline_parallel_cache_progress_uses_tokenized_sample_count(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import Stage, parallel_progress_spec
+
+    input_path = tmp_path / "regenerated_train.jsonl"
+    input_path.write_text(
+        "\n".join(json.dumps({"id": f"s{i}"}) for i in range(4)) + "\n",
+        encoding="utf-8",
+    )
+    tokenized_path = tmp_path / "tokenized" / "train"
+    tokenized_path.mkdir(parents=True)
+    (tokenized_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "mr_dflash_tokenized_v1",
+                "num_samples": 5,
+                "shards": [{"path": "shard_00000.pt", "count": 5}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage = Stage(
+        name="cache_8k_train",
+        command=[
+            "python3",
+            "scripts/mr_dflash/parallel_stage.py",
+            "--mode",
+            "cache",
+            "--input",
+            str(input_path),
+            "--tokenized-path",
+            str(tokenized_path),
+            "--work-root",
+            str(tmp_path / "parallel_cache_train"),
+        ],
+        artifacts=(),
+    )
+
+    spec = parallel_progress_spec(stage)
+
+    assert spec is not None
+    assert spec["total_samples"] == 5
+
+
+def test_pipeline_parallel_progress_description_is_concise() -> None:
+    from run_preprocess_pipeline import parallel_progress_description
+
+    assert parallel_progress_description("regenerate", "regenerate_full_train") == "regenerate train"
+    assert "parallel" not in parallel_progress_description("regenerate", "regenerate_full_train")
+
+
+def test_pipeline_progress_snapshot_reads_parallel_aggregate(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import _stage_progress_snapshot
+
+    path = tmp_path / "status.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "aggregate": {"total_samples": 10, "completed_samples": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    total, completed, _payload = _stage_progress_snapshot(path, 99)
+
+    assert (total, completed) == (10, 4)
+
+
+def test_pipeline_progress_snapshot_keeps_parallel_total_fixed(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import _stage_progress_snapshot
+
+    path = tmp_path / "status.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "aggregate": {"total_samples": 25, "completed_samples": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    total, completed, _payload = _stage_progress_snapshot(
+        path, 100, fixed_total=True
+    )
+
+    assert (total, completed) == (100, 4)
