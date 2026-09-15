@@ -110,8 +110,10 @@ bash scripts/setup_b200_venv.sh
 source "$FAST_INFER_B200_VENV/bin/activate"
 ```
 
-Script tạo Python 3.12 venv mới rồi chạy `pip install -r requirements.txt`.
-Khi server không có internet, chuẩn bị wheelhouse đầy đủ và chạy:
+Script tạo Python 3.12 venv mới, cài manifest từ index/mirror do pip trên
+server cấu hình, rồi tùy chọn build riêng sdist FlashAttention bằng helper
+C++20. Khi server không có internet hoặc route public bị giới hạn, chuẩn bị
+wheelhouse đầy đủ và chạy:
 
 ```bash
 export B200_OFFLINE=1

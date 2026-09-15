@@ -98,7 +98,7 @@ def test_sssd_native_kernel_is_declared_for_the_server_runtime():
         for line in requirements.splitlines()
         if line.strip().startswith("sglang-kernel")
     ]
-    assert any("0.4.2" in line for line in sglang_kernel_lines)
+    assert any("0.4.7" in line for line in sglang_kernel_lines)
     assert "\ngguf" in f"\n{requirements}"
 
 

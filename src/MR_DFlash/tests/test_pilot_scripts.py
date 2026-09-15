@@ -487,6 +487,55 @@ def test_generation_budget_clips_only_response_not_full_prompt() -> None:
         resolve_generation_budget(32_768, 32_768, 2_048)
 
 
+def test_fit_assistant_response_respects_rendered_chat_length() -> None:
+    import torch
+
+    from regenerate_pilot import _fit_assistant_response
+
+    class FakeTokenizer:
+        def __call__(self, text, *, add_special_tokens=False):
+            del add_special_tokens
+            return {"input_ids": list(range(len(text)))}
+
+        def decode(self, ids, *, skip_special_tokens=True):
+            del skip_special_tokens
+            return "x" * len(ids)
+
+        def apply_chat_template(self, messages, **kwargs):
+            del kwargs
+            user_tokens = len(messages[0]["content"])
+            assistant_tokens = (
+                len(messages[1]["content"])
+                if len(messages) > 1
+                else 0
+            )
+            # The assistant turn contributes two template tokens in addition
+            # to the prompt and response content.
+            length = 4 + user_tokens + assistant_tokens
+            if len(messages) > 1:
+                length += 2
+            return torch.arange(length).unsqueeze(0)
+
+    tokenizer = FakeTokenizer()
+    fitted, clipped = _fit_assistant_response(
+        tokenizer,
+        [{"role": "user", "content": "abc"}],
+        "123456",
+        max_length=12,
+    )
+
+    assert clipped is True
+    assert len(fitted) < len("123456")
+    rendered = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": fitted},
+        ],
+        tokenize=True,
+    )
+    assert int(rendered.shape[-1]) <= 12
+
+
 def test_preprocess_pipeline_plan_options_are_json_serializable(tmp_path: Path) -> None:
     import json
 

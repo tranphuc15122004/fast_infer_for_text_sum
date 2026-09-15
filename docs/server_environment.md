@@ -49,14 +49,23 @@ bash scripts/setup_b200_venv.sh
 source "$FAST_INFER_B200_VENV/bin/activate"
 ```
 
-`requirements.txt` đã khai báo index cu130 cho Torch và FlashInfer. Với server
-offline, chỉ dùng wheelhouse đã mirror đủ artifact:
+`requirements.txt` không nhúng public index; pip sẽ dùng mirror/index đã được
+operator cấu hình trên server. Với server offline hoặc các route public bị giới
+hạn, chỉ dùng wheelhouse đã mirror đủ artifact:
 
 ```bash
 export B200_OFFLINE=1
 export B200_WHEELHOUSE=/workspace/storage-shared/nlp/dungdx4/phuc_projects/offline_wheelhouse
 bash scripts/setup_b200_venv.sh
 ```
+
+`flash-attn==2.8.3.post1` hiện là source distribution trong mirror nên được
+để ngoài manifest. Vì vậy `pip install -r requirements.txt` có thể chạy trực
+tiếp trên server. Khi cần các baseline vanilla_fa, DFlash hoặc SpecExtend full,
+chạy thêm helper; helper patch bản source tạm sang C++20 để khớp header Torch
+2.14 và build với `MAX_JOBS=8`. Có thể đổi số job bằng
+`FLASH_ATTENTION_MAX_JOBS`. `flashinfer-jit-cache` không có trong mirror nên
+không nằm trong manifest; FlashInfer sẽ JIT vào `FLASHINFER_WORKSPACE_BASE`.
 
 Script không xoá target đã tồn tại. Cài system packages `libnuma1` và
 `libnuma-dev` bằng image/OS package manager trước khi chạy SGLang; chúng không

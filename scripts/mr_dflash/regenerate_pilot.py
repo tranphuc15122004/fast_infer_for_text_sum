@@ -217,6 +217,56 @@ def _as_ids(value: Any) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.long)
 
 
+def _fit_assistant_response(
+    tokenizer: Any,
+    prompt_messages: List[Dict[str, str]],
+    assistant: str,
+    max_length: int,
+) -> tuple[str, bool]:
+    """Trim a generated response so the rendered conversation fits exactly.
+
+    The generation prompt and the final conversation do not necessarily have
+    the same chat-template overhead.  Checking only the generation prompt
+    length can therefore produce a regenerated row that is a few tokens over
+    ``max_length`` (notably with Qwen chat templates).
+    """
+    response = str(assistant)
+    conversation = [
+        *prompt_messages,
+        {"role": "assistant", "content": response},
+    ]
+    rendered = _as_ids(
+        _apply_chat(tokenizer, conversation, generation=False)
+    ).flatten()
+    if int(rendered.numel()) <= int(max_length):
+        return response, False
+
+    response_ids = _as_ids(
+        tokenizer(response, add_special_tokens=False)
+    ).flatten().tolist()
+    lo, hi = 0, len(response_ids)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = tokenizer.decode(
+            response_ids[:mid],
+            skip_special_tokens=True,
+        )
+        candidate_conversation = [
+            *prompt_messages,
+            {"role": "assistant", "content": candidate},
+        ]
+        candidate_ids = _as_ids(
+            _apply_chat(tokenizer, candidate_conversation, generation=False)
+        ).flatten()
+        if int(candidate_ids.numel()) <= int(max_length):
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best, True
+
+
 def _truncate_prompt(tokenizer: Any, messages: List[Dict[str, str]], budget: int) -> List[Dict[str, str]]:
     """Giữ phần đầu document khi prompt vượt budget dành cho target response."""
     if int(_as_ids(_apply_chat(tokenizer, messages, generation=True)).shape[-1]) <= budget:
@@ -611,6 +661,14 @@ def main(argv=None) -> None:
         prompt_ids_len = item.get("prompt_tokens")
         budget_clipped = bool(item.get("budget_clipped", False))
         row = item["row"]
+        response_clipped = False
+        if tokenizer is not None:
+            assistant, response_clipped = _fit_assistant_response(
+                tokenizer,
+                prompt_messages,
+                assistant,
+                args.max_length,
+            )
         if not assistant:
             record_skip(
                 sample_id,
@@ -636,8 +694,12 @@ def main(argv=None) -> None:
         generated.append(final_row)
         existing.add(sample_id)
         stats["written"] += 1
-        if budget_clipped:
+        if budget_clipped or response_clipped:
             stats["clipped_outputs"] += 1
+        final_row["metadata"]["generation_budget_clipped"] = bool(
+            budget_clipped or response_clipped
+        )
+        final_row["metadata"]["response_template_clipped"] = bool(response_clipped)
         reporter.update(
             "writing_output",
             row_index=int(item["row_index"]),

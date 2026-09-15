@@ -187,6 +187,12 @@ def test_preflight_checks_local_dflash_and_cuda():
     assert "cuda.is_available" in text
 
 
+def test_preflight_treats_flash_attn_as_optional_shared_artifact():
+    text = (ROOT / "scripts/check_shared_env.py").read_text()
+    assert 'OPTIONAL_MODULES = {"flash_attn"}' in text
+    assert '"WARN OPTIONAL"' in text
+
+
 def test_preflight_covers_mr_dflash_train_cache_and_infer_runtime():
     text = (ROOT / "scripts/check_shared_env.py").read_text()
     required_modules = (

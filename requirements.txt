@@ -3,11 +3,9 @@
 # Keep this file index/wheelhouse-installable: do not add local file URIs,
 # editable paths, direct host URLs, or Ubuntu system-package snapshots.
 # CUDA/cu130 packages must be mirrored in the server's offline wheelhouse.
-# These public indexes are only used when the operator allows online pip
-# resolution; B200 offline setup overrides them with --no-index/--find-links.
---extra-index-url https://download.pytorch.org/whl/cu130
---extra-index-url https://flashinfer.ai/whl
---extra-index-url https://flashinfer.ai/whl/cu130
+# Package indexes are operator-owned and must be supplied through pip config,
+# environment variables, or --find-links. Keep network endpoints out of this
+# manifest so restricted servers do not retry unreachable public hosts.
 absl-py==2.4.0
 accelerate==1.14.0
 aiofile==3.11.1
@@ -85,11 +83,15 @@ fastar==0.11.0
 fastjsonschema==2.21.2
 fastsafetensors==0.3.2
 filelock==3.29.4
-flash-attn==2.8.3.post1
-flashinfer-cubin==0.6.12
-# cu130 wheel must be present in the offline wheelhouse; no direct URL here.
-flashinfer-jit-cache==0.6.12+cu130
-flashinfer-python==0.6.12
+# Optional B200 artifact: the configured mirror exposes only an sdist whose
+# setup.py needs the Torch 2.14/C++20 build in scripts/install_flash_attn_b200.sh.
+# Keeping it out of the manifest makes `pip install -r requirements.txt`
+# installable on the restricted server. Install it separately for vanilla_fa,
+# DFlash and SpecExtend full runs.
+flashinfer-cubin==0.6.13
+# flashinfer-jit-cache is not published in the configured package mirror.
+# The runtime falls back to JIT compilation under FLASHINFER_WORKSPACE_BASE.
+flashinfer-python==0.6.13
 fqdn==1.5.1
 frozenlist==1.8.0
 fsspec==2026.4.0
@@ -341,8 +343,8 @@ sentry-sdk==2.63.0
 setproctitle==1.3.7
 setuptools==80.10.2
 setuptools-scm==10.2.0
-sglang==0.5.14
-sglang-kernel==0.4.2
+sglang==0.5.19
+sglang-kernel==0.4.7
 shellingham==1.5.4
 six==1.17.0
 sniffio==1.3.1
@@ -370,15 +372,14 @@ tinycss2==1.5.1
 tokenizers==0.22.2
 tokenspeed-mla==0.1.2
 tokenspeed-triton==3.7.10.post20260531
-torch==2.11.0+cu130
+torch==2.14.0+cu130
 torch_c_dlpack_ext==0.1.5
-torchaudio==2.11.0+cu130
-torchvision==0.26.0+cu130
+torchvision==0.29.0+cu130
 tornado==6.5.7
 tqdm==4.68.3
 traitlets==5.15.1
 transformers==5.12.1
-triton==3.6.0
+triton==3.8.0
 trl==1.9.2
 truststore==0.10.4
 typepy==1.3.5
@@ -393,7 +394,7 @@ uv==0.11.25
 uvicorn==0.49.0
 uvloop==0.22.1
 vcs-versioning==2.2.1
-vllm==0.24.0
+vllm==0.29.0
 wadllib==1.3.6
 watchfiles==1.2.0
 wcwidth==0.8.2

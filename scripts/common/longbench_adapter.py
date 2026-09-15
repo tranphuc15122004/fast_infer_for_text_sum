@@ -374,7 +374,7 @@ def preflight_baseline(
             result.update(
                 status="missing_dependency",
                 reason=(
-                    "sglang-kernel==0.4.2 cannot be imported in the shared "
+                    "sglang-kernel==0.4.7 cannot be imported in the shared "
                     f"runtime ({kernel_reason})"
                 ),
             )

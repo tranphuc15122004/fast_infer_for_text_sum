@@ -67,6 +67,7 @@ DIST_NAMES = {
     "llmlingua": "llmlingua",
     "sentence_transformers": "sentence-transformers",
 }
+OPTIONAL_MODULES = {"flash_attn"}
 
 
 def _version(module_name: str, module: object) -> str:
@@ -120,8 +121,10 @@ def main() -> int:
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:  # binary imports can fail with varied errors
-            failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
-            print(f"FAIL {module_name}: {type(exc).__name__}: {exc}")
+            level = "WARN OPTIONAL" if module_name in OPTIONAL_MODULES else "FAIL"
+            print(f"{level} {module_name}: {type(exc).__name__}: {exc}")
+            if module_name not in OPTIONAL_MODULES:
+                failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
         else:
             print(f"PASS {module_name} {_version(module_name, module)}")
             if module_name == "torch":
