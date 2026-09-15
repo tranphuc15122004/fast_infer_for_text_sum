@@ -1,20 +1,18 @@
-"""Phân tích một mẫu nhỏ của artifact MR-DFlash trước khi scale.
+"""Phân tích artifact MR-DFlash và tạo manifest điều phối theo độ dài.
 
-Script không sửa input. Mặc định chỉ đọc tối đa 1.000 dòng đầu để người dùng
-spot-check schema, source ratio, độ dài và reference ArXiv trước khi cho phép
-chạy toàn bộ dữ liệu server.
+Script không sửa input. Khi ``--limit`` không được truyền, toàn bộ input được
+quét để có thống kê đủ cho batch controller; có thể dùng limit cho smoke.
 """
 
 from __future__ import annotations
 
 import argparse
-from itertools import islice
 import statistics
 import sys
 from collections import Counter
 from typing import Any, Dict, List
 
-from _common import read_jsonl, write_json
+from _common import read_jsonl, write_json, write_jsonl
 from progress import ProgressReporter, install_exception_hook
 
 
@@ -26,16 +24,21 @@ def _last_message(row: Dict[str, Any], role: str) -> str:
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description="Analyze a small MR-DFlash data sample")
+    parser = argparse.ArgumentParser(description="Analyze MR-DFlash data and build length manifest")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--length-manifest",
+        default=None,
+        help="JSONL manifest sorted tăng dần theo token length; mặc định không ghi",
+    )
     args = parser.parse_args(argv)
-    if args.limit < 1:
+    if args.limit is not None and args.limit < 1:
         raise ValueError("--limit phải >= 1")
 
     input_total = sum(1 for _ in read_jsonl(args.input))
-    total = min(input_total, int(args.limit))
+    total = input_total if args.limit is None else min(input_total, int(args.limit))
     reporter = ProgressReporter(None)
     reporter.set_context(total_samples=total)
     previous_hook = install_exception_hook(reporter)
@@ -59,7 +62,12 @@ def main(argv=None) -> None:
     except ImportError:  # pragma: no cover - tqdm có trong requirements server
         tqdm = lambda iterator, **_kwargs: iterator
 
-    rows_to_process = islice(read_jsonl(args.input), int(args.limit))
+    rows_to_process = read_jsonl(args.input)
+    if args.limit is not None:
+        from itertools import islice
+
+        rows_to_process = islice(rows_to_process, int(args.limit))
+    length_rows: List[Dict[str, Any]] = []
     for index, row in enumerate(
         tqdm(rows_to_process, total=total, desc="Analyze MR-DFlash", unit="sample")
     ):
@@ -71,8 +79,22 @@ def main(argv=None) -> None:
         source_counts[str(row.get("source", "unknown"))] += 1
         metadata = row.get("metadata") or {}
         length = metadata.get("source_token_length", metadata.get("source_length"))
-        if length is not None:
-            lengths.append(int(length))
+        if length is None:
+            # This fallback is intentionally only a deterministic ordering
+            # hint. Exact token lengths are supplied by prepare/tokenize when
+            # available; the scheduler must never treat character count as a
+            # VRAM measurement.
+            length = len(_last_message(row, "user"))
+        length = max(0, int(length))
+        lengths.append(length)
+        length_rows.append(
+            {
+                "sample_id": sample_id,
+                "index": int(index),
+                "length": length,
+                "source": str(row.get("source", "unknown")),
+            }
+        )
         conversations = row.get("conversations") or []
         has_assistant = any(
             isinstance(message, dict)
@@ -89,6 +111,15 @@ def main(argv=None) -> None:
             row_index=int(index),
         )
 
+    quantiles: Dict[str, int | None] = {}
+    if lengths:
+        ordered_lengths = sorted(lengths)
+        for name, fraction in (("p50", 0.50), ("p90", 0.90), ("p95", 0.95), ("p99", 0.99)):
+            position = min(len(ordered_lengths) - 1, int(round((len(ordered_lengths) - 1) * fraction)))
+            quantiles[name] = int(ordered_lengths[position])
+    else:
+        quantiles = {name: None for name in ("p50", "p90", "p95", "p99")}
+
     report: Dict[str, Any] = {
         "schema_version": "mr_dflash_analysis_v1",
         "input": str(args.input),
@@ -104,6 +135,7 @@ def main(argv=None) -> None:
             "min": min(lengths) if lengths else None,
             "max": max(lengths) if lengths else None,
             "mean": round(statistics.fmean(lengths), 2) if lengths else None,
+            "quantiles": quantiles,
         },
         "sample_preview": [
             {
@@ -119,6 +151,11 @@ def main(argv=None) -> None:
         ],
     }
     write_json(args.output, report)
+    if args.length_manifest:
+        write_jsonl(
+            args.length_manifest,
+            sorted(length_rows, key=lambda value: (int(value["length"]), int(value["index"]))),
+        )
     print(
         f"[analyze_pilot_data] rows={len(rows)} sources={dict(source_counts)} "
         f"output={args.output}"

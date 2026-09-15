@@ -75,7 +75,9 @@ class PipelineOptions:
     overflow_policy: str = "error"
     sample_error_policy: str = "error"
     temperature: float = 0.0
-    analysis_limit: int = 1000
+    # ``None`` means scan the complete normalized input.  A finite limit is
+    # reserved for smoke/debug runs and must be explicit.
+    analysis_limit: Optional[int] = None
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     target_revision: Optional[str] = None
@@ -95,7 +97,8 @@ class PipelineOptions:
     # theo từng bucket; profile throughput chỉ còn là token-budget hint.
     # ``cache_batch_profile`` vẫn dành cho HF legacy/fixed schedule.
     cache_auto_batch: bool = False
-    cache_auto_batch_target_vram_gb: float = 170.0
+    cache_auto_batch_target_vram_gb: float = 160.0
+    cache_auto_batch_hard_vram_gb: float = 163.0
     cache_auto_batch_start_size: int = 1
     cache_auto_batch_safety_fraction: float = 0.95
     cache_auto_batch_max_size: int = 128
@@ -115,12 +118,14 @@ class PipelineOptions:
     cache_memory_fraction: float = 0.99
     cache_startup_stagger_seconds: float = 3.0
     parallel_gpu_ids: tuple[int, ...] = ()
+    parallel_scheduler: str = "shared_lease"
     progress_interval_tokens: int = 256
     # Batch inference thật trong ``model.generate``; khác với
     # regenerate_output_batch_size là batch chỉ dùng khi flush JSONL.
     regenerate_generation_batch_size: int = 1
     regenerate_auto_batch: bool = False
-    regenerate_auto_batch_target_vram_gb: float = 170.0
+    regenerate_auto_batch_target_vram_gb: float = 160.0
+    regenerate_auto_batch_hard_vram_gb: float = 163.0
     regenerate_auto_batch_max_size: int = 128
     regenerate_auto_batch_growth_factor: float = 2.0
     regenerate_output_batch_size: int = 1
@@ -303,10 +308,15 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 str(normalized / "pilot_prompts.jsonl"),
                 "--output",
                 str(manifests / "analysis.json"),
-                "--limit",
-                str(options.analysis_limit),
+                "--length-manifest",
+                str(manifests / "length_manifest.jsonl"),
+                *(
+                    ["--limit", str(options.analysis_limit)]
+                    if options.analysis_limit is not None
+                    else []
+                ),
             ],
-            artifacts=(manifests / "analysis.json",),
+            artifacts=(manifests / "analysis.json", manifests / "length_manifest.jsonl"),
         )
     )
 
@@ -356,6 +366,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         "--auto-batch",
                         "--auto-batch-target-vram-gb",
                         str(options.regenerate_auto_batch_target_vram_gb),
+                        "--auto-batch-hard-vram-gb",
+                        str(options.regenerate_auto_batch_hard_vram_gb),
                         "--auto-batch-max-size",
                         str(options.regenerate_auto_batch_max_size),
                         "--auto-batch-growth-factor",
@@ -383,6 +395,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     _stage_script(options, "parallel_stage.py"),
                     "--mode",
                     "regenerate",
+                    "--scheduler",
+                    options.parallel_scheduler,
                     "--gpu-ids",
                     *(str(value) for value in options.parallel_gpu_ids),
                     "--input",
@@ -410,6 +424,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                             "--auto-batch",
                             "--auto-batch-target-vram-gb",
                             str(options.regenerate_auto_batch_target_vram_gb),
+                            "--auto-batch-hard-vram-gb",
+                            str(options.regenerate_auto_batch_hard_vram_gb),
                             "--auto-batch-max-size",
                             str(options.regenerate_auto_batch_max_size),
                             "--auto-batch-growth-factor",
@@ -606,6 +622,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                                 "--auto-batch",
                                 "--auto-batch-target-vram-gb",
                                 str(options.cache_auto_batch_target_vram_gb),
+                                "--auto-batch-hard-vram-gb",
+                                str(options.cache_auto_batch_hard_vram_gb),
                                 "--auto-batch-start-size",
                                 str(options.cache_auto_batch_start_size),
                                 "--auto-batch-safety-fraction",
@@ -649,6 +667,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     _stage_script(options, "parallel_stage.py"),
                     "--mode",
                     "cache",
+                    "--scheduler",
+                    options.parallel_scheduler,
                     "--gpu-ids",
                     *(str(value) for value in options.parallel_gpu_ids),
                     "--input",
@@ -688,6 +708,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                             "--auto-batch",
                             "--auto-batch-target-vram-gb",
                             str(options.cache_auto_batch_target_vram_gb),
+                            "--auto-batch-hard-vram-gb",
+                            str(options.cache_auto_batch_hard_vram_gb),
                             "--auto-batch-start-size",
                             str(options.cache_auto_batch_start_size),
                             "--cache-auto-batch-safety-fraction",
@@ -769,14 +791,17 @@ def pipeline_config_hash(options: PipelineOptions) -> str:
         "cache_startup_stagger_seconds",
         "cache_auto_batch",
         "cache_auto_batch_target_vram_gb",
+        "cache_auto_batch_hard_vram_gb",
         "cache_auto_batch_start_size",
         "cache_auto_batch_safety_fraction",
         "cache_auto_batch_max_size",
         "cache_auto_batch_growth_factor",
         "regenerate_auto_batch",
         "regenerate_auto_batch_target_vram_gb",
+        "regenerate_auto_batch_hard_vram_gb",
         "regenerate_auto_batch_max_size",
         "regenerate_auto_batch_growth_factor",
+        "parallel_gpu_ids",
     ):
         payload_options.pop(key, None)
     payload = json.dumps(
@@ -1407,7 +1432,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="lỗi từng sample: dừng hoặc ghi skipped report rồi tiếp tục",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--analysis-limit", type=int, default=1000)
+    parser.add_argument(
+        "--analysis-limit",
+        type=int,
+        default=None,
+        help="giới hạn analyzer cho smoke; mặc định quét toàn bộ dữ liệu",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--target-revision", default=None)
@@ -1515,8 +1545,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--cache-auto-batch-target-vram-gb",
         type=float,
-        default=170.0,
-        help="mục tiêu VRAM cache mỗi GPU; mặc định 170GB trên B200 180GB",
+        default=160.0,
+        help="soft target VRAM cache mỗi GPU; mặc định 160 GiB",
+    )
+    parser.add_argument(
+        "--cache-auto-batch-hard-vram-gb",
+        type=float,
+        default=163.0,
+        help="hard cap VRAM cache mỗi GPU; mặc định 163 GiB",
     )
     parser.add_argument(
         "--cache-auto-batch-start-size",
@@ -1585,6 +1621,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="data-parallel GPU vật lý; ví dụ 1 2 3 (không dùng GPU 0 nếu không truyền)",
     )
     parser.add_argument(
+        "--parallel-scheduler",
+        choices=["static", "shared_lease"],
+        default="shared_lease",
+        help="scheduler cho worker multi-GPU; shared_lease hỗ trợ đổi host/GPU khi resume",
+    )
+    parser.add_argument(
         "--progress-interval-tokens",
         type=int,
         default=256,
@@ -1607,8 +1649,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--regenerate-auto-batch-target-vram-gb",
         type=float,
-        default=170.0,
-        help="mục tiêu peak VRAM regenerate mỗi GPU; mặc định 170GB",
+        default=160.0,
+        help="soft target VRAM regenerate mỗi GPU; mặc định 160 GiB",
+    )
+    parser.add_argument(
+        "--regenerate-auto-batch-hard-vram-gb",
+        type=float,
+        default=163.0,
+        help="hard cap VRAM regenerate mỗi GPU; mặc định 163 GiB",
     )
     parser.add_argument(
         "--regenerate-auto-batch-max-size",
@@ -1685,6 +1733,8 @@ def main(argv=None) -> int:
         raise ValueError("regenerate-auto-batch-growth-factor phải > 1")
     if args.regenerate_auto_batch_target_vram_gb <= 0.0:
         raise ValueError("regenerate-auto-batch-target-vram-gb phải > 0")
+    if args.regenerate_auto_batch_hard_vram_gb < args.regenerate_auto_batch_target_vram_gb:
+        raise ValueError("hard VRAM regenerate phải >= soft target")
     if args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
         raise ValueError("cache-io-threads và cache-io-queue-size không được âm")
     if args.cache_profile_gpu_id < 0:
@@ -1713,6 +1763,10 @@ def main(argv=None) -> int:
         raise ValueError("cache-auto-batch-growth-factor phải > 1")
     if args.cache_auto_batch_target_vram_gb <= 0.0:
         raise ValueError("cache-auto-batch-target-vram-gb phải > 0")
+    if args.cache_auto_batch_hard_vram_gb < args.cache_auto_batch_target_vram_gb:
+        raise ValueError("hard VRAM cache phải >= soft target")
+    if args.analysis_limit is not None and args.analysis_limit < 1:
+        raise ValueError("analysis-limit phải >= 1 khi được truyền")
     if args.cache_throughput_profile and not Path(args.cache_throughput_profile).is_file():
         raise FileNotFoundError(
             f"không tìm thấy cache throughput profile: {args.cache_throughput_profile}"
@@ -1739,7 +1793,7 @@ def main(argv=None) -> int:
         overflow_policy=str(args.overflow_policy),
         sample_error_policy=str(args.sample_error_policy),
         temperature=float(args.temperature),
-        analysis_limit=int(args.analysis_limit),
+        analysis_limit=(int(args.analysis_limit) if args.analysis_limit is not None else None),
         device=str(args.device),
         torch_dtype=str(args.torch_dtype),
         target_revision=args.target_revision,
@@ -1754,6 +1808,7 @@ def main(argv=None) -> int:
         cache_io_queue_size=int(args.cache_io_queue_size),
         cache_auto_batch=bool(args.cache_auto_batch),
         cache_auto_batch_target_vram_gb=float(args.cache_auto_batch_target_vram_gb),
+        cache_auto_batch_hard_vram_gb=float(args.cache_auto_batch_hard_vram_gb),
         cache_auto_batch_start_size=int(args.cache_auto_batch_start_size),
         cache_auto_batch_safety_fraction=float(args.cache_auto_batch_safety_fraction),
         cache_auto_batch_max_size=int(args.cache_auto_batch_max_size),
@@ -1779,10 +1834,12 @@ def main(argv=None) -> int:
         cache_memory_fraction=float(args.cache_memory_fraction),
         cache_startup_stagger_seconds=float(args.cache_startup_stagger_seconds),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
+        parallel_scheduler=str(args.parallel_scheduler),
         progress_interval_tokens=int(args.progress_interval_tokens),
         regenerate_generation_batch_size=int(args.regenerate_generation_batch_size),
         regenerate_auto_batch=bool(args.regenerate_auto_batch),
         regenerate_auto_batch_target_vram_gb=float(args.regenerate_auto_batch_target_vram_gb),
+        regenerate_auto_batch_hard_vram_gb=float(args.regenerate_auto_batch_hard_vram_gb),
         regenerate_auto_batch_max_size=int(args.regenerate_auto_batch_max_size),
         regenerate_auto_batch_growth_factor=float(args.regenerate_auto_batch_growth_factor),
         regenerate_output_batch_size=int(args.regenerate_output_batch_size),

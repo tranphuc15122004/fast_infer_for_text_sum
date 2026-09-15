@@ -14,9 +14,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -25,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from _common import REPO_ROOT, read_jsonl, resolve_parallel_work_root, write_json, write_jsonl
 from progress import format_duration, read_progress
+from shared_scheduler import SharedLeaseQueue, WorkItem
 
 
 def _worker_root(work_root: Path, rank: int) -> Path:
@@ -47,6 +50,7 @@ def build_worker_status(
         age = max(0.0, time.time() - float(updated_at))
     return {
         "rank": int(rank),
+        "host": socket.gethostname(),
         "gpu_id": int(gpu_id),
         "pid": int(pid),
         "return_code": return_code,
@@ -118,7 +122,13 @@ def aggregate_progress(
 
 
 def _active_worker_pids(work_root: Path) -> list[int]:
-    """Tìm worker cũ còn sống để không launch trùng target trên cùng GPU."""
+    """Tìm worker local còn sống để không launch trùng target.
+
+    ``status.json`` nằm trên shared filesystem và có thể được resume từ host
+    khác.  PID chỉ có ý nghĩa trong namespace của host đã tạo nó; không được
+    gọi ``kill(pid, 0)`` trên host mới vì có thể trùng với một process không
+    liên quan.
+    """
     status_path = work_root / "status.json"
     if not status_path.is_file():
         return []
@@ -129,8 +139,12 @@ def _active_worker_pids(work_root: Path) -> list[int]:
     if not isinstance(payload, dict) or payload.get("status") not in {"running", "joining"}:
         return []
     active: list[int] = []
+    local_host = socket.gethostname()
     for worker in payload.get("workers", []):
         if not isinstance(worker, dict) or not worker.get("alive"):
+            continue
+        recorded_host = worker.get("host")
+        if recorded_host and str(recorded_host) != local_host:
             continue
         try:
             pid = int(worker["pid"])
@@ -150,6 +164,155 @@ def _validate_gpu_ids(gpu_ids: Sequence[int]) -> list[int]:
     if len(values) != len(set(values)):
         raise ValueError("--gpu-ids không được trùng")
     return values
+
+
+def build_shared_queue_items(
+    mode: str,
+    input_path: str | Path,
+    *,
+    tokenized_path: str | Path | None = None,
+) -> list[WorkItem]:
+    """Build queue metadata without loading model weights.
+
+    Regeneration uses the prepared source token length when available. Cache
+    uses exact tokenized length, which is the quantity that controls padding
+    and static-pool pressure.
+    """
+    if mode == "cache" and tokenized_path is not None:
+        from MR_DFlash.tokenized_data import TokenizedDFlashDataset
+
+        dataset = TokenizedDFlashDataset(str(tokenized_path))
+        return [
+            WorkItem(
+                sample_id=str(item["id"]),
+                index=index,
+                length=len(item["input_ids"]),
+            )
+            for index in range(len(dataset))
+            for item in (dataset[index],)
+        ]
+    rows = list(read_jsonl(input_path))
+    items: list[WorkItem] = []
+    for index, row in enumerate(rows):
+        metadata = row.get("metadata") or {}
+        length = metadata.get("source_token_length", metadata.get("source_length"))
+        if length is None and isinstance(row.get("input_ids"), list):
+            length = len(row["input_ids"])
+        if length is None:
+            user_text = "\n".join(
+                str(message.get("content", ""))
+                for message in row.get("conversations", [])
+                if isinstance(message, dict) and str(message.get("role", "")).lower() == "user"
+            )
+            length = len(user_text)
+        items.append(WorkItem(sample_id=str(row.get("id", f"row_{index}")), index=index, length=max(0, int(length))))
+    return items
+
+
+def _shared_queue_config_hash(args: argparse.Namespace) -> str:
+    payload = {
+        "mode": args.mode,
+        "input": str(Path(args.input).resolve()),
+        "tokenized_path": str(Path(args.tokenized_path).resolve()) if args.tokenized_path else None,
+        "target_model_path": str(args.target_model_path),
+        "max_length": int(args.max_length),
+        "max_new_tokens": int(args.max_new_tokens),
+        "target_layer_ids": [int(value) for value in (args.target_layer_ids or [])],
+        "cache_backend": str(args.cache_backend),
+        "attention_backend": str(args.attention_backend),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def prepare_shared_queue(args: argparse.Namespace, work_root: Path) -> SharedLeaseQueue:
+    queue_root = Path(args.queue_root) if args.queue_root else work_root / "shared_queue"
+    queue = SharedLeaseQueue(
+        queue_root,
+        stage=f"{args.mode}:{Path(args.output).name}",
+        config_hash=_shared_queue_config_hash(args),
+        lease_ttl_seconds=float(args.queue_lease_ttl_seconds),
+        lock_ttl_seconds=float(args.queue_lock_ttl_seconds),
+        max_attempts=int(args.queue_max_attempts),
+    )
+    queue.initialize(
+        build_shared_queue_items(
+            args.mode,
+            args.input,
+            tokenized_path=args.tokenized_path,
+        ),
+        resume=bool(args.resume),
+    )
+    # Migrate durable outputs produced by the old modulo-shard launcher. This
+    # makes the first shared-lease resume safe even when the previous host was
+    # killed before it wrote a queue event.
+    for worker_root in sorted(work_root.glob("rank_*")):
+        if args.mode == "regenerate":
+            for artifact_path in (worker_root / "output.jsonl", worker_root / "skipped.jsonl"):
+                if not artifact_path.is_file():
+                    continue
+                ids = [str(row.get("id", "")) for row in read_jsonl(artifact_path) if row.get("id")]
+                queue.seed_completed(ids, artifact=str(artifact_path))
+        else:
+            artifact_path = worker_root / "manifest.json"
+            if artifact_path.is_file():
+                try:
+                    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                ids = payload.get("sample_ids", []) if isinstance(payload, dict) else []
+                queue.seed_completed(ids, artifact=str(artifact_path))
+    return queue
+
+
+def assign_shared_leases(
+    queue: SharedLeaseQueue,
+    args: argparse.Namespace,
+    work_root: Path,
+) -> dict[int, Any]:
+    """Claim one sorted work slice per available GPU and publish ID files."""
+    snapshot = queue.snapshot()
+    if snapshot["pending"] == 0 and snapshot["leased"] > 0:
+        raise RuntimeError(
+            "shared queue đang có lease chưa hết hạn; dừng host cũ hoặc chờ lease TTL "
+            "trước khi chuyển host"
+        )
+    pending = int(snapshot["pending"])
+    chunk_size = max(1, math.ceil(pending / max(1, len(args.gpu_ids)))) if pending else 1
+    sample_ids_files: dict[int, Path] = {}
+    leases: dict[int, Any] = {}
+    for rank, _gpu_id in enumerate(args.gpu_ids):
+        lease = queue.claim(
+            worker_id=f"{socket.gethostname()}/rank-{rank}/pid-{os.getpid()}",
+            max_items=chunk_size,
+        )
+        ids_file = _worker_root(work_root, rank) / "leased_sample_ids.jsonl"
+        ids_file.parent.mkdir(parents=True, exist_ok=True)
+        rows = [] if lease is None else [{"sample_id": item.sample_id} for item in lease.items]
+        write_jsonl(ids_file, rows)
+        sample_ids_files[rank] = ids_file
+        if lease is not None:
+            leases[rank] = lease
+    args._shared_sample_ids_files = sample_ids_files
+    return leases
+
+
+def durable_worker_ids(args: argparse.Namespace, work_root: Path, rank: int) -> set[str]:
+    """Read IDs already durable in a worker root after a partial failure."""
+    root = _worker_root(work_root, rank)
+    if args.mode == "regenerate":
+        ids: set[str] = set()
+        for path in (root / "output.jsonl", root / "skipped.jsonl"):
+            if path.is_file():
+                ids.update(str(row.get("id", "")) for row in read_jsonl(path) if row.get("id"))
+        return ids
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        return set()
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(value) for value in payload.get("sample_ids", [])} if isinstance(payload, dict) else set()
 
 
 def _read_object_rows(path: Path) -> list[Dict[str, Any]]:
@@ -189,17 +352,23 @@ def merge_regenerated_outputs(
 
     generated: Dict[str, Dict[str, Any]] = {}
     skipped: Dict[str, Dict[str, Any]] = {}
+    duplicates = 0
     worker_stats: list[Dict[str, Any]] = []
     for rank, root in enumerate(worker_roots):
         output_rows = _read_object_rows(root / "output.jsonl")
         skipped_rows = _read_object_rows(root / "skipped.jsonl")
         for sample_id, row in _index_rows(output_rows, path=root / "output.jsonl").items():
-            if sample_id in generated or sample_id in skipped:
-                raise ValueError(f"worker outputs trùng sample id: {sample_id!r}")
+            if sample_id in generated:
+                duplicates += 1
+                continue
+            # A replay can leave a stale skipped record beside a later
+            # successful output. Prefer the successful trajectory.
+            skipped.pop(sample_id, None)
             generated[sample_id] = row
         for sample_id, row in _index_rows(skipped_rows, path=root / "skipped.jsonl").items():
             if sample_id in generated or sample_id in skipped:
-                raise ValueError(f"worker reports trùng sample id: {sample_id!r}")
+                duplicates += 1
+                continue
             skipped[sample_id] = row
         worker_manifest = root / "manifest.json"
         worker_payload = {}
@@ -234,6 +403,7 @@ def merge_regenerated_outputs(
             "written": len(merged_output),
             "skipped": len(merged_skipped),
             "missing": len(missing),
+            "duplicates": int(duplicates),
         },
         "workers": worker_stats,
     }
@@ -264,6 +434,7 @@ def merge_feature_caches(
     output_path: Path,
     manifest_path: Path,
     gpu_ids: Sequence[int],
+    quarantined_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Merge worker feature stores mà không reserialize hidden tensor lớn."""
     if tokenized_path is not None:
@@ -301,6 +472,19 @@ def merge_feature_caches(
     for rank, root in enumerate(worker_roots):
         manifest_path_worker = root / "manifest.json"
         if not manifest_path_worker.is_file():
+            assigned_path = root / "leased_sample_ids.jsonl"
+            assigned_ids = {
+                str(row.get("sample_id", row.get("id", "")))
+                for row in read_jsonl(assigned_path)
+                if row.get("sample_id", row.get("id", ""))
+            } if assigned_path.is_file() else set()
+            if not assigned_ids or assigned_ids.issubset(set(str(value) for value in quarantined_ids)):
+                # A worker may be killed before ShardedFeatureWriter emits a
+                # manifest. It is safe to omit the root only when it has no
+                # live assignment left (or every assigned sample is already
+                # quarantined); any other missing manifest means coverage is
+                # ambiguous and must fail loudly.
+                continue
             raise FileNotFoundError(f"worker cache thiếu manifest: {manifest_path_worker}")
         payload = json.loads(manifest_path_worker.read_text(encoding="utf-8"))
         if payload.get("schema_version") != "mr_dflash_feature_sharded_v1":
@@ -336,10 +520,13 @@ def merge_feature_caches(
     actual = set(all_ids)
     missing = sorted(expected - actual)
     extra = sorted(actual - expected)
-    if missing or extra:
+    quarantined = set(str(value) for value in quarantined_ids)
+    unresolved_missing = sorted(set(missing) - quarantined)
+    if unresolved_missing or extra:
         raise RuntimeError(
             "parallel cache coverage không đầy đủ: "
-            f"missing={missing[:5]} ({len(missing)}), extra={extra[:5]} ({len(extra)})"
+            f"missing={unresolved_missing[:5]} ({len(unresolved_missing)}), "
+            f"extra={extra[:5]} ({len(extra)})"
         )
     if base is None:
         raise ValueError("không có worker cache")
@@ -369,15 +556,26 @@ def merge_feature_caches(
             "worker_count": len(worker_roots),
             "gpu_ids": [int(value) for value in gpu_ids],
             "num_samples": len(all_ids),
+            "quarantined": len(quarantined & set(missing)),
+            "missing_sample_ids": sorted(quarantined & set(missing)),
         },
     )
     write_json(manifest_path, {**output_manifest, "parallel_gpu_ids": [int(value) for value in gpu_ids]})
     return output_manifest
 
 
-def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_shards: int) -> list[str]:
+def _build_worker_command(
+    args: argparse.Namespace,
+    root: Path,
+    rank: int,
+    num_shards: int,
+    *,
+    sample_ids_file: Path | None = None,
+) -> list[str]:
     python = sys.executable
     worker_device = "cuda:0"
+    worker_shard_index = 0 if sample_ids_file is not None else rank
+    worker_num_shards = 1 if sample_ids_file is not None else num_shards
     if args.mode == "regenerate":
         command = [
             python,
@@ -393,8 +591,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             "--device", worker_device,
             "--generation-batch-size", str(args.generation_batch_size),
             "--torch-dtype", args.torch_dtype,
-            "--shard-index", str(rank),
-            "--num-shards", str(num_shards),
+            "--shard-index", str(worker_shard_index),
+            "--num-shards", str(worker_num_shards),
             "--overflow-policy", args.overflow_policy,
             "--sample-error-policy", args.sample_error_policy,
             "--skipped-report", str(root / "skipped.jsonl"),
@@ -407,6 +605,7 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
                 [
                     "--auto-batch",
                     "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-hard-vram-gb", str(args.auto_batch_hard_vram_gb),
                     "--auto-batch-start-size", str(args.auto_batch_start_size),
                     "--auto-batch-max-size", str(args.auto_batch_max_size),
                     "--auto-batch-growth-factor", str(args.auto_batch_growth_factor),
@@ -438,8 +637,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
             "--device", worker_device,
             "--torch-dtype", args.torch_dtype,
             "--supervision-mode", args.supervision_mode,
-            "--shard-index", str(rank),
-            "--num-shards", str(num_shards),
+            "--shard-index", str(worker_shard_index),
+            "--num-shards", str(worker_num_shards),
             "--skipped-report", str(root / "skipped.jsonl"),
             "--progress-path", str(root / "progress.json"),
         ]
@@ -458,6 +657,7 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
                 [
                     "--auto-batch",
                     "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-hard-vram-gb", str(args.auto_batch_hard_vram_gb),
                     "--auto-batch-start-size", str(args.auto_batch_start_size),
                     "--auto-batch-safety-fraction", str(args.cache_auto_batch_safety_fraction),
                     "--auto-batch-max-size", str(args.auto_batch_max_size),
@@ -470,6 +670,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
         command.append("--local-files-only")
     if args.resume:
         command.append("--resume")
+    if sample_ids_file is not None:
+        command.extend(["--sample-ids-file", str(sample_ids_file)])
     return command
 
 
@@ -619,7 +821,14 @@ def _run_workers(
         for rank, gpu_id in enumerate(gpu_ids):
             root = worker_roots[rank]
             root.mkdir(parents=True, exist_ok=True)
-            command = _build_worker_command(args, root, rank, len(gpu_ids))
+            sample_ids_file = getattr(args, "_shared_sample_ids_files", {}).get(rank)
+            command = _build_worker_command(
+                args,
+                root,
+                rank,
+                len(gpu_ids),
+                sample_ids_file=sample_ids_file,
+            )
             log_path = root / "worker.log"
             log_handle = log_path.open("a", encoding="utf-8")
             log_handle.write(f"\n=== command gpu={gpu_id} rank={rank} ===\n")
@@ -665,6 +874,9 @@ def _run_workers(
                 for rank in range(len(processes))
             ]
             now = time.time()
+            heartbeat = getattr(args, "_shared_queue_heartbeat", None)
+            if callable(heartbeat):
+                heartbeat()
             aggregate = aggregate_progress(worker_statuses, total_samples=total_samples)
             if aggregate_bar is not None:
                 completed = int(aggregate.get("completed_samples", 0) or 0)
@@ -763,6 +975,20 @@ def _count_parallel_samples(args: argparse.Namespace) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MR-DFlash data-parallel generate/cache")
     parser.add_argument("--mode", choices=["regenerate", "cache"], required=True)
+    parser.add_argument(
+        "--scheduler",
+        choices=["static", "shared_lease"],
+        default="static",
+        help="static modulo shards hoặc queue lease resumable trên shared filesystem",
+    )
+    parser.add_argument(
+        "--queue-root",
+        default=None,
+        help="thư mục queue chung; mặc định là work-root/shared_queue",
+    )
+    parser.add_argument("--queue-lease-ttl-seconds", type=float, default=300.0)
+    parser.add_argument("--queue-lock-ttl-seconds", type=float, default=600.0)
+    parser.add_argument("--queue-max-attempts", type=int, default=3)
     parser.add_argument("--gpu-ids", type=int, nargs="+", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument(
@@ -802,8 +1028,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--auto-batch-target-vram-gb",
         type=float,
-        default=170.0,
-        help="mục tiêu VRAM mỗi GPU; mặc định 170GB cho B200 180GB",
+        default=160.0,
+        help="soft target VRAM mỗi GPU; mặc định 160 GiB",
+    )
+    parser.add_argument(
+        "--auto-batch-hard-vram-gb",
+        type=float,
+        default=None,
+        help="hard cap VRAM mỗi GPU; mặc định bằng soft target nếu không truyền",
     )
     parser.add_argument(
         "--auto-batch-start-size",
@@ -930,6 +1162,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="khoảng cách khởi động worker cache để tránh peak host/PCIe (giây)",
     )
     args = parser.parse_args(argv)
+    if args.auto_batch_hard_vram_gb is None:
+        args.auto_batch_hard_vram_gb = float(args.auto_batch_target_vram_gb)
+    if args.queue_lease_ttl_seconds <= 0 or args.queue_lock_ttl_seconds <= 0:
+        raise ValueError("queue TTL phải > 0")
+    if args.queue_max_attempts < 1:
+        raise ValueError("queue-max-attempts phải >= 1")
     args.gpu_ids = _validate_gpu_ids(args.gpu_ids)
     if args.mode == "cache" and not args.target_layer_ids:
         raise ValueError("parallel cache phải truyền rõ --target-layer-ids")
@@ -951,6 +1189,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("auto-batch-growth-factor phải > 1")
     if args.auto_batch_target_vram_gb <= 0.0:
         raise ValueError("auto-batch-target-vram-gb phải > 0")
+    if args.auto_batch_hard_vram_gb < args.auto_batch_target_vram_gb:
+        raise ValueError("hard VRAM phải >= soft target")
     if args.io_threads < 0 or args.io_queue_size < 0:
         raise ValueError("io-threads và io-queue-size không được âm")
     if args.cache_concurrency is not None and args.cache_concurrency < 1:
@@ -1006,7 +1246,9 @@ def main(argv=None) -> int:
     plan = {
         "schema_version": "mr_dflash_parallel_plan_v1",
         "mode": args.mode,
+        "scheduler": args.scheduler,
         "gpu_ids": args.gpu_ids,
+        "queue_root": str(Path(args.queue_root)) if args.queue_root else str(work_root / "shared_queue"),
         "input": str(Path(args.input)),
         "tokenized_path": str(Path(args.tokenized_path)) if args.tokenized_path else None,
         "output": str(output_path),
@@ -1054,6 +1296,7 @@ def main(argv=None) -> int:
         "generation_batch_size": int(args.generation_batch_size),
         "auto_batch": bool(args.auto_batch),
         "auto_batch_target_vram_gb": float(args.auto_batch_target_vram_gb),
+        "auto_batch_hard_vram_gb": float(args.auto_batch_hard_vram_gb),
         "auto_batch_start_size": int(args.auto_batch_start_size),
         "cache_auto_batch_safety_fraction": float(args.cache_auto_batch_safety_fraction),
         "auto_batch_max_size": int(args.auto_batch_max_size),
@@ -1067,7 +1310,6 @@ def main(argv=None) -> int:
         old = json.loads(plan_path.read_text(encoding="utf-8"))
         immutable = (
             "mode",
-            "gpu_ids",
             "input",
             "tokenized_path",
             "output",
@@ -1080,7 +1322,6 @@ def main(argv=None) -> int:
             "attention_backend",
             "io_threads",
             "io_queue_size",
-            "num_shards",
             "total_samples",
             "cache_backend",
         )
@@ -1098,30 +1339,164 @@ def main(argv=None) -> int:
     elif work_root.exists() and any(work_root.iterdir()) and not args.resume:
         raise FileExistsError(f"parallel work-root đã tồn tại: {work_root}; dùng --resume hoặc work-root mới")
     write_json(plan_path, plan)
+    queue: SharedLeaseQueue | None = None
+    queue_leases: dict[int, Any] = {}
+    if args.scheduler == "shared_lease":
+        queue = prepare_shared_queue(args, work_root)
+        queue_leases = assign_shared_leases(queue, args, work_root)
+
+        def heartbeat_shared_queue() -> None:
+            for lease in list(queue_leases.values()):
+                queue.heartbeat(lease.lease_id)
+
+        args._shared_queue_heartbeat = heartbeat_shared_queue
     try:
-        worker_roots = _run_workers(
-            args,
-            work_root,
-            args.gpu_ids,
-            total_samples=total_samples,
-        )
+        if queue is None:
+            worker_roots = _run_workers(
+                args,
+                work_root,
+                args.gpu_ids,
+                total_samples=total_samples,
+            )
+        else:
+            worker_roots = []
+            round_index = 0
+            while True:
+                try:
+                    worker_roots = _run_workers(
+                        args,
+                        work_root,
+                        args.gpu_ids,
+                        total_samples=total_samples,
+                    )
+                    incomplete = False
+                    for rank, lease in list(queue_leases.items()):
+                        assigned_ids = {item.sample_id for item in lease.items}
+                        done_ids = durable_worker_ids(args, work_root, rank) & assigned_ids
+                        unresolved_ids = assigned_ids - done_ids
+                        if not unresolved_ids:
+                            continue
+                        if done_ids:
+                            queue.complete(
+                                lease.lease_id,
+                                sample_ids=done_ids,
+                                artifacts={sample_id: str(_worker_root(work_root, rank)) for sample_id in done_ids},
+                            )
+                        retry_result = queue.retry(
+                            lease.lease_id,
+                            error=(
+                                "worker completed without durable artifact for "
+                                f"{len(unresolved_ids)} sample(s)"
+                            ),
+                        )
+                        if retry_result == "quarantined":
+                            queue_leases.pop(rank, None)
+                        incomplete = True
+                    if incomplete:
+                        round_index += 1
+                        if queue.snapshot()["pending"] == 0:
+                            worker_roots = sorted(work_root.glob("rank_*"))
+                            break
+                        if round_index >= int(args.queue_max_attempts):
+                            raise RuntimeError(
+                                "shared queue còn sample không có artifact sau "
+                                f"{args.queue_max_attempts} lần thử"
+                            )
+                        queue_leases = assign_shared_leases(queue, args, work_root)
+                        continue
+                    break
+                except BaseException as worker_error:
+                    # Commit completed rows from a worker that died after a
+                    # durable flush, then retry only the unresolved IDs.
+                    for rank, lease in list(queue_leases.items()):
+                        done_ids = durable_worker_ids(args, work_root, rank)
+                        done_ids &= {item.sample_id for item in lease.items}
+                        if done_ids:
+                            queue.complete(
+                                lease.lease_id,
+                                sample_ids=done_ids,
+                                artifacts={sample_id: str(_worker_root(work_root, rank)) for sample_id in done_ids},
+                            )
+                        try:
+                            retry_result = queue.retry(lease.lease_id, error=repr(worker_error))
+                            if retry_result == "quarantined":
+                                # The lease no longer exists after the final
+                                # retry; do not call complete() on it in the
+                                # post-loop artifact publication step.
+                                queue_leases.pop(rank, None)
+                        except RuntimeError:
+                            pass
+                    round_index += 1
+                    if queue.snapshot()["pending"] == 0:
+                        worker_roots = sorted(work_root.glob("rank_*"))
+                        break
+                    if round_index >= int(args.queue_max_attempts):
+                        raise
+                    queue_leases = assign_shared_leases(queue, args, work_root)
+        merge_worker_roots = sorted(work_root.glob("rank_*")) if queue is not None else worker_roots
+        if not merge_worker_roots:
+            merge_worker_roots = worker_roots
+        if queue is not None:
+            for rank, lease in queue_leases.items():
+                root = _worker_root(work_root, rank)
+                artifact = root / ("output.jsonl" if args.mode == "regenerate" else "manifest.json")
+                queue.complete(
+                    lease.lease_id,
+                    artifacts={item.sample_id: str(artifact) for item in lease.items},
+                )
+        quarantine_records = queue.quarantine_records() if queue is not None else []
+        quarantined_ids = {str(record["sample_id"]) for record in quarantine_records}
+        if quarantine_records:
+            write_jsonl(work_root / "quarantine.jsonl", quarantine_records)
+        if quarantine_records and args.mode == "regenerate":
+            quarantine_root = _worker_root(work_root, 0)
+            quarantine_path = quarantine_root / "skipped.jsonl"
+            existing_quarantine = list(read_jsonl(quarantine_path)) if quarantine_path.is_file() else []
+            existing_ids = {str(row.get("id", "")) for row in existing_quarantine}
+            quarantine_rows = [
+                {
+                    "id": str(record["sample_id"]),
+                    "kind": "quarantine",
+                    "error": str(record.get("error", "")),
+                    "retry_attempts": int(record.get("attempts", 0)),
+                }
+                for record in quarantine_records
+                if str(record["sample_id"]) not in existing_ids
+            ]
+            if quarantine_rows:
+                write_jsonl(quarantine_path, [*existing_quarantine, *quarantine_rows])
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            if quarantine_root not in merge_worker_roots:
+                merge_worker_roots = [*merge_worker_roots, quarantine_root]
+        if args.mode == "regenerate":
+            # A worker can be killed by CUDA OOM before its first flush. Keep
+            # empty artifacts for that rank so the canonical merge can still
+            # represent samples that were quarantined after the final retry.
+            for root in merge_worker_roots:
+                (root / "output.jsonl").parent.mkdir(parents=True, exist_ok=True)
+                for artifact_path in (root / "output.jsonl", root / "skipped.jsonl"):
+                    artifact_path.touch(exist_ok=True)
+        merge_gpu_ids = list(args.gpu_ids)
+        if len(merge_worker_roots) > len(merge_gpu_ids):
+            merge_gpu_ids.extend([-1] * (len(merge_worker_roots) - len(merge_gpu_ids)))
         if args.mode == "regenerate":
             payload = merge_regenerated_outputs(
                 input_path=Path(args.input),
-                worker_roots=worker_roots,
+                worker_roots=merge_worker_roots,
                 output_path=output_path,
                 skipped_path=output_path.with_name(output_path.stem + ".skipped.jsonl"),
                 manifest_path=manifest_path,
-                gpu_ids=args.gpu_ids,
+                gpu_ids=merge_gpu_ids,
             )
         else:
             payload = merge_feature_caches(
                 input_path=Path(args.input),
                 tokenized_path=Path(args.tokenized_path) if args.tokenized_path else None,
-                worker_roots=worker_roots,
+                worker_roots=merge_worker_roots,
                 output_path=output_path,
                 manifest_path=manifest_path,
-                gpu_ids=args.gpu_ids,
+                gpu_ids=merge_gpu_ids,
+                quarantined_ids=sorted(quarantined_ids),
             )
         last_status: Dict[str, Any] = {}
         status_path = work_root / "status.json"
@@ -1136,7 +1511,7 @@ def main(argv=None) -> int:
             status_path,
             {
                 "schema_version": "mr_dflash_parallel_status_v2",
-                "status": "success",
+                "status": "success_with_quarantine" if quarantine_records else "success",
                 "payload": payload,
                 "gpu_ids": [int(value) for value in args.gpu_ids],
                 "workers": last_status.get("workers", []),
@@ -1149,6 +1524,12 @@ def main(argv=None) -> int:
         print(f"[parallel] DONE mode={args.mode} gpu_ids={args.gpu_ids}", flush=True)
         return 0
     except BaseException as exc:
+        if queue is not None:
+            for lease in queue_leases.values():
+                try:
+                    queue.retry(lease.lease_id, error=repr(exc))
+                except RuntimeError:
+                    pass
         status_path = work_root / "status.json"
         last_status: Dict[str, Any] = {}
         if status_path.is_file():

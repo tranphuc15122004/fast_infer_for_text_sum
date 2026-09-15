@@ -303,6 +303,18 @@ def _load_responses(path: str) -> Dict[str, str]:
     return responses
 
 
+def _load_sample_ids(path: Optional[str]) -> Optional[set[str]]:
+    """Load the IDs assigned by a shared lease without loading prompt text."""
+    if not path:
+        return None
+    selected: set[str] = set()
+    for row in read_jsonl(path):
+        sample_id = str(row.get("sample_id", row.get("id", "")))
+        if sample_id:
+            selected.add(sample_id)
+    return selected
+
+
 def _generate_prepared_batch(
     model: Any,
     tokenizer: Any,
@@ -457,6 +469,11 @@ def main(argv=None) -> None:
         help="giữ output hiện có và bỏ qua sample id đã regenerate",
     )
     parser.add_argument(
+        "--sample-ids-file",
+        default=None,
+        help="JSONL sample_id được shared scheduler giao cho worker hiện tại",
+    )
+    parser.add_argument(
         "--progress-path",
         default=None,
         help="JSON heartbeat per-worker; bỏ trống nếu chạy standalone",
@@ -483,6 +500,12 @@ def main(argv=None) -> None:
         type=float,
         default=None,
         help="mục tiêu peak VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
+    )
+    parser.add_argument(
+        "--auto-batch-hard-vram-gb",
+        type=float,
+        default=None,
+        help="hard cap VRAM mỗi GPU; không được thấp hơn soft target",
     )
     parser.add_argument(
         "--auto-batch-start-size",
@@ -529,6 +552,14 @@ def main(argv=None) -> None:
         raise ValueError("auto-batch-growth-factor phải > 1")
     if args.auto_batch_target_vram_gb is not None and args.auto_batch_target_vram_gb <= 0:
         raise ValueError("auto-batch-target-vram-gb phải > 0")
+    if args.auto_batch_hard_vram_gb is not None and args.auto_batch_hard_vram_gb <= 0:
+        raise ValueError("auto-batch-hard-vram-gb phải > 0")
+    if (
+        args.auto_batch_target_vram_gb is not None
+        and args.auto_batch_hard_vram_gb is not None
+        and args.auto_batch_hard_vram_gb < args.auto_batch_target_vram_gb
+    ):
+        raise ValueError("auto-batch-hard-vram-gb phải >= auto-batch-target-vram-gb")
     if args.progress_interval_tokens < 1 or args.output_batch_size < 1:
         raise ValueError("progress-interval-tokens và output-batch-size phải >= 1")
     reporter = ProgressReporter(args.progress_path, interval_tokens=args.progress_interval_tokens)
@@ -550,6 +581,7 @@ def main(argv=None) -> None:
     )
     torch.manual_seed(args.seed)
     responses = _load_responses(args.responses_jsonl) if args.responses_jsonl else {}
+    selected_sample_ids = _load_sample_ids(args.sample_ids_file)
     tokenizer = model = None
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.target_model_path:
@@ -644,6 +676,7 @@ def main(argv=None) -> None:
             max_batch_size=(1 if args.temperature > 0 else int(args.auto_batch_max_size)),
             growth_factor=float(args.auto_batch_growth_factor),
             target_vram_gb=args.auto_batch_target_vram_gb,
+            hard_vram_gb=args.auto_batch_hard_vram_gb,
         )
         if args.auto_batch
         else None
@@ -826,6 +859,8 @@ def main(argv=None) -> None:
         if args.limit is not None and stats["written"] >= args.limit:
             break
         sample_id = str(row.get("id", ""))
+        if selected_sample_ids is not None and sample_id not in selected_sample_ids:
+            continue
         reporter.update(
             "reading_sample",
             row_index=int(index),
@@ -974,6 +1009,7 @@ def main(argv=None) -> None:
             "generation_batch_size": int(args.generation_batch_size),
             "auto_batch": bool(args.auto_batch),
             "auto_batch_target_vram_gb": args.auto_batch_target_vram_gb,
+            "auto_batch_hard_vram_gb": args.auto_batch_hard_vram_gb,
             "auto_batch_start_size": int(args.auto_batch_start_size),
             "auto_batch_max_size": int(args.auto_batch_max_size),
             "auto_batch_growth_factor": float(args.auto_batch_growth_factor),
@@ -986,6 +1022,7 @@ def main(argv=None) -> None:
             "skipped_report": str(skipped_report),
             "shard_index": int(args.shard_index),
             "num_shards": int(args.num_shards),
+            "sample_ids_file": args.sample_ids_file,
             "stats": stats,
         },
     )

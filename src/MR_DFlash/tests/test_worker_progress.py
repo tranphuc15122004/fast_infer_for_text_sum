@@ -193,6 +193,32 @@ def test_parallel_status_includes_worker_progress(tmp_path: Path) -> None:
     assert status["progress"]["generated_tokens"] == 8
 
 
+def test_parallel_resume_ignores_alive_pid_recorded_on_another_host(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from _common import write_json
+    from parallel_stage import _active_worker_pids
+
+    write_json(
+        tmp_path / "status.json",
+        {
+            "status": "running",
+            "workers": [
+                {
+                    "host": "old-b200-host",
+                    "pid": 12345,
+                    "alive": True,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("parallel_stage.socket.gethostname", lambda: "new-b200-host")
+    monkeypatch.setattr("parallel_stage.os.kill", lambda pid, sig: None)
+
+    assert _active_worker_pids(tmp_path) == []
+
+
 def test_watch_formatter_reports_each_gpu_and_staleness() -> None:
     from watch_parallel_stage import format_status
 

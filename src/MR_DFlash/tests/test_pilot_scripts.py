@@ -113,6 +113,33 @@ def test_regeneration_skips_invalid_sample_and_records_reason(tmp_path: Path) ->
     ]
 
 
+def test_regeneration_can_process_a_shared_queue_sample_subset(tmp_path: Path) -> None:
+    from regenerate_pilot import main as regenerate_main
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {"id": "s0", "conversations": [{"role": "user", "content": "q0"}]},
+            {"id": "s1", "conversations": [{"role": "user", "content": "q1"}]},
+        ],
+    )
+    responses = tmp_path / "responses.jsonl"
+    _write_jsonl(responses, [{"id": "s0", "assistant": "a0"}, {"id": "s1", "assistant": "a1"}])
+    sample_ids = tmp_path / "lease_ids.jsonl"
+    _write_jsonl(sample_ids, [{"sample_id": "s1"}])
+    output = tmp_path / "subset.jsonl"
+    regenerate_main(
+        [
+            "--input", str(source),
+            "--output", str(output),
+            "--responses-jsonl", str(responses),
+            "--sample-ids-file", str(sample_ids),
+        ]
+    )
+    assert [json.loads(line)["id"] for line in output.read_text().splitlines()] == ["s1"]
+
+
 def test_regeneration_repairs_truncated_last_jsonl_line(tmp_path: Path) -> None:
     from regenerate_pilot import _load_status_ids
 
@@ -329,6 +356,38 @@ def test_analyze_pilot_data_reports_small_sample(tmp_path: Path) -> None:
     assert report["source_counts"] == {"arxiv": 1, "sharegpt": 1}
     assert report["duplicate_ids"] == []
     assert report["reference_rows"] == 1
+
+
+def test_analyze_pilot_data_writes_full_length_manifest_sorted_by_length(tmp_path: Path) -> None:
+    from analyze_pilot_data import main as analyze_main
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {"id": "long", "metadata": {"source_token_length": 30}, "conversations": []},
+            {"id": "short", "metadata": {"source_token_length": 5}, "conversations": []},
+            {"id": "mid", "metadata": {"source_token_length": 15}, "conversations": []},
+        ],
+    )
+    report_path = tmp_path / "analysis.json"
+    length_manifest = tmp_path / "length_manifest.jsonl"
+    analyze_main(
+        [
+            "--input", str(source),
+            "--output", str(report_path),
+            "--length-manifest", str(length_manifest),
+        ]
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["rows"] == 3
+    assert report["length_stats"]["min"] == 5
+    assert report["length_stats"]["max"] == 30
+    assert report["length_stats"]["quantiles"]["p95"] == 30
+    ordered = [json.loads(line) for line in length_manifest.read_text().splitlines()]
+    assert [row["sample_id"] for row in ordered] == ["short", "mid", "long"]
+    assert [row["index"] for row in ordered] == [1, 2, 0]
 
 
 def test_server_data_defaults_balance_sharegpt_and_arxiv() -> None:
@@ -974,6 +1033,99 @@ def test_parallel_pipeline_plan_targets_explicit_gpu_ids(tmp_path: Path) -> None
     assert stage.command[stage.command.index("--gpu-ids") + 1 : stage.command.index("--input")] == ["1", "2", "3"]
     cache_stage = next(stage for stage in build_stage_plan(options) if stage.name == "cache_full_train")
     assert cache_stage.command[1].endswith("parallel_stage.py")
+
+
+def test_parallel_merge_deduplicates_replayed_worker_output(tmp_path: Path) -> None:
+    from parallel_stage import merge_regenerated_outputs
+
+    source = tmp_path / "input.jsonl"
+    _write_jsonl(source, [{"id": "s0"}, {"id": "s1"}])
+    roots = [tmp_path / "rank_00", tmp_path / "rank_01"]
+    for root in roots:
+        root.mkdir()
+        _write_jsonl(root / "skipped.jsonl", [])
+    _write_jsonl(roots[0] / "output.jsonl", [{"id": "s0", "value": "first"}])
+    _write_jsonl(roots[1] / "output.jsonl", [{"id": "s0", "value": "replayed"}, {"id": "s1", "value": "ok"}])
+
+    manifest = merge_regenerated_outputs(
+        input_path=source,
+        worker_roots=roots,
+        output_path=tmp_path / "merged.jsonl",
+        skipped_path=tmp_path / "merged.skipped.jsonl",
+        manifest_path=tmp_path / "merged.manifest.json",
+        gpu_ids=[0, 1],
+    )
+    rows = [json.loads(line) for line in (tmp_path / "merged.jsonl").read_text().splitlines()]
+    assert [row["id"] for row in rows] == ["s0", "s1"]
+    assert manifest["stats"]["duplicates"] == 1
+
+
+def test_pipeline_analyze_scans_all_rows_and_publishes_length_manifest(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+        analysis_limit=None,
+    )
+    stage = next(stage for stage in build_stage_plan(options) if stage.name == "analyze")
+    assert "--limit" not in stage.command
+    assert stage.command[stage.command.index("--length-manifest") + 1] == str(
+        tmp_path / "pilot" / "manifests" / "length_manifest.jsonl"
+    )
+
+
+def test_pipeline_defaults_keep_sixteen_gib_vram_reserve() -> None:
+    from run_preprocess_pipeline import PipelineOptions
+
+    options = PipelineOptions(repo_root=Path("."), data_root=Path("data"), target_model_path="target")
+    assert options.cache_auto_batch_target_vram_gb == 160.0
+    assert options.regenerate_auto_batch_target_vram_gb == 160.0
+
+
+def test_pipeline_forwards_hard_vram_cap_to_regeneration_and_cache(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+        full_context=True,
+        full_context_length=32768,
+        regenerate_auto_batch=True,
+        cache_auto_batch=True,
+        cache_backend="specforge_sglang",
+    )
+    plan = build_stage_plan(options)
+    regen = next(stage for stage in plan if stage.name == "regenerate_full_train")
+    cache = next(stage for stage in plan if stage.name == "cache_full_train")
+    assert regen.command[regen.command.index("--auto-batch-hard-vram-gb") + 1] == "163.0"
+    assert cache.command[cache.command.index("--auto-batch-hard-vram-gb") + 1] == "163.0"
+
+
+def test_pipeline_uses_shared_lease_scheduler_without_gpu_identity_in_config_hash(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan, pipeline_config_hash
+
+    first = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="target",
+        full_context=True,
+        full_context_length=32768,
+        parallel_gpu_ids=(0, 1, 2, 3),
+    )
+    second = PipelineOptions(
+        **{
+            **first.__dict__,
+            "parallel_gpu_ids": (0, 1),
+            "cache_auto_batch_hard_vram_gb": 161.0,
+            "regenerate_auto_batch_hard_vram_gb": 161.0,
+        }
+    )
+    assert pipeline_config_hash(first) == pipeline_config_hash(second)
+    stage = next(stage for stage in build_stage_plan(first) if stage.name == "regenerate_full_train")
+    assert stage.command[stage.command.index("--scheduler") + 1] == "shared_lease"
 
 
 def test_parallel_cache_merge_validates_all_samples(tmp_path: Path) -> None:

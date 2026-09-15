@@ -1,5 +1,9 @@
 # Pipeline thực nghiệm MR-DFlash pilot
 
+Runbook đầy đủ cho Phase 1 source-to-cache hiện hành, bao gồm adaptive batch,
+shared lease, retry/quarantine và resume khi đổi host/GPU, nằm tại
+[`mr_dflash_phase1_pipeline_v2.md`](mr_dflash_phase1_pipeline_v2.md).
+
 Profile B200 100 GB hiện hành được mô tả tại
 [`docs/mr_dflash_b200_profile.md`](mr_dflash_b200_profile.md). Các config
 pilot dùng `batch_size=1`, accumulation 4 và `objective_chunk_blocks=64` để
@@ -12,7 +16,8 @@ SpecForge là tùy chọn tăng tốc; profile token-budget của nó được m
 [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md). Bật
 `--cache-backend specforge_sglang` để dùng đường này; Phase 1 smoke cũng nhận
 flag này; với B200 nên thêm
-`--cache-auto-batch --cache-auto-batch-target-vram-gb 170`. Với HF backbone,
+`--cache-auto-batch --cache-auto-batch-target-vram-gb 160
+--cache-auto-batch-hard-vram-gb 163`. Với HF backbone,
 `--cache-auto-batch` vẫn giữ đường profiler tương thích cũ.
 
 Tài liệu này khóa thực nghiệm công bằng trên cùng target `Qwen/Qwen3-4B`:

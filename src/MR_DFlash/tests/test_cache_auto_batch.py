@@ -538,6 +538,31 @@ def test_parallel_cache_worker_receives_specforge_throughput_controls(
     assert command[command.index("--cache-memory-fraction") + 1] == "0.99"
 
 
+def test_shared_scheduler_worker_receives_lease_sample_ids_file(tmp_path: Path) -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from parallel_stage import _build_worker_command, parse_args
+
+    args = parse_args(
+        [
+            "--mode", "regenerate",
+            "--scheduler", "shared_lease",
+            "--gpu-ids", "0",
+            "--input", str(tmp_path / "input.jsonl"),
+            "--output", str(tmp_path / "out.jsonl"),
+            "--manifest", str(tmp_path / "manifest.json"),
+            "--target-model-path", "tiny-target",
+            "--max-length", "64",
+        ]
+    )
+    ids_file = tmp_path / "lease_ids.jsonl"
+    ids_file.write_text('{"sample_id":"s0"}\n', encoding="utf-8")
+    command = _build_worker_command(args, tmp_path / "rank_00", 0, 1, sample_ids_file=ids_file)
+    assert command[command.index("--sample-ids-file") + 1] == str(ids_file)
+    assert command[command.index("--num-shards") + 1] == "1"
+
+
 def test_pipeline_allow_short_is_explicitly_forwarded_to_prepare(tmp_path: Path) -> None:
     script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
     if str(script_dir) not in sys.path:
@@ -555,3 +580,27 @@ def test_pipeline_allow_short_is_explicitly_forwarded_to_prepare(tmp_path: Path)
     )
     prepare = next(stage for stage in build_stage_plan(options) if stage.name == "prepare")
     assert "--allow-short" in prepare.command
+
+
+def test_cache_work_buffer_is_sorted_from_short_to_long() -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from cache_target_features import sort_cache_buffer
+
+    rows = [
+        {"id": "long", "input_ids": [0] * 30},
+        {"id": "short", "input_ids": [0] * 5},
+        {"id": "mid", "input_ids": [0] * 15},
+    ]
+    assert [row["id"] for row in sort_cache_buffer(rows)] == ["short", "mid", "long"]
+
+
+def test_cache_rows_can_be_filtered_by_shared_lease_ids() -> None:
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from cache_target_features import filter_cache_rows
+
+    rows = [{"id": "s0"}, {"id": "s1"}, {"id": "s2"}]
+    assert [row["id"] for row in filter_cache_rows(rows, {"s2", "s0"})] == ["s0", "s2"]

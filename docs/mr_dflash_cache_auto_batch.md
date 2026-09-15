@@ -10,7 +10,7 @@ PyTorch + Transformers. Phase 1 smoke có thể chạy đúng backend tăng tố
 sang `flashinfer`. Không cần cài `flash-attn`, `sglang-kernel` hay `specforge`
 cho đường HF.
 
-## Khuyến nghị cho 2×B200 180GB
+## Khuyến nghị cho B200 180 GiB
 
 Cache nhanh dùng backend offline SGLang theo cơ chế SpecForge. Với dữ liệu
 thực tế chủ yếu dưới 8K, worker dùng token-budget profile làm giới hạn padding
@@ -31,11 +31,13 @@ PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --cache-attention-backend flashinfer \
   --cache-auto-batch --cache-auto-batch-start-size 1 \
   --cache-auto-batch-safety-fraction 0.95 \
-  --cache-auto-batch-target-vram-gb 170 \
+  --cache-auto-batch-target-vram-gb 160 \
+  --cache-auto-batch-hard-vram-gb 163 \
   --cache-auto-batch-max-size 128 \
   --cache-concurrency 64 --cache-max-total-tokens 262144 \
   --cache-memory-fraction 0.99 --cache-startup-stagger-seconds 3 \
-  --parallel-gpu-ids 0 1 --cache-splits train val --resume
+  --parallel-gpu-ids 0 1 --parallel-scheduler shared_lease \
+  --cache-splits train val --resume
 ```
 
 Khi bật `--cache-auto-batch`, worker bắt đầu từ
@@ -46,14 +48,21 @@ worker lấy token capacity thực tế của SGLang static-pool, chừa 5% theo
 `--cache-auto-batch-safety-fraction`, rồi kiểm tra cả batch hiện tại cộng thêm
 một sample; nếu vượt giới hạn dự đoán thì giữ batch hiện tại. Nếu vẫn gặp OOM,
 worker giữ shard CPU, giải phóng request/KV pool, backoff và tìm lại batch an
-toàn giữa batch thành công và batch lỗi. Static-pool được giới hạn gần
-`170/180` GB mỗi GPU.
+toàn giữa batch thành công và batch lỗi. Static-pool được giới hạn theo soft
+target `160 GiB`, hard cap `163 GiB`; phần còn lại giữ làm headroom cho driver,
+allocator và sample bất thường.
 Nếu worker bị CUDA OOM hoặc bị hệ
 điều hành kill với exit code `-9`, launcher ghi `retry_hint.json` trong
 `parallel_cache_<split>/`; các shard đã durable vẫn giữ nguyên. Chạy lại cùng
 lệnh với `--resume`, giảm `--cache-concurrency`/`--cache-max-total-tokens`
 theo hint. Profile là performance-only nên đổi profile không làm mất cache
 đã hoàn tất.
+
+`shared_lease` lưu queue, lease và event log trong `work-root/shared_queue`.
+Worker nhận sample theo length tăng dần; khi process hoặc host bị dừng, lease
+hết hạn sẽ được host mới reclaim. Mỗi sample được retry tối đa 3 lần; sample
+vẫn lỗi ở batch 1 được ghi vào `quarantine.jsonl`. Merge cuối vẫn giữ thứ tự
+canonical của input và không ghi trùng sample.
 
 Parent hiển thị một tqdm tổng hợp trên cả hai GPU; `completed/total` tính theo
 sample của toàn input, còn heartbeat chi tiết từng worker nằm trong

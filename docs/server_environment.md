@@ -136,7 +136,8 @@ python3 scripts/mr_dflash/run_phase1_smoke.py \
   --cache-backend specforge_sglang --cache-attention-backend sdpa \
   --cache-auto-batch --cache-auto-batch-start-size 1 \
   --cache-auto-batch-safety-fraction 0.95 \
-  --cache-auto-batch-target-vram-gb 170 \
+  --cache-auto-batch-target-vram-gb 160 \
+  --cache-auto-batch-hard-vram-gb 163 \
   --cache-auto-batch-max-size 128
 ```
 

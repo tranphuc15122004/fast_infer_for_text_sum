@@ -21,6 +21,7 @@ Ví dụ trên server B200:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -43,6 +44,18 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
 
 
+def load_sample_ids(path: Optional[str]) -> Optional[set[str]]:
+    """Load sample IDs assigned by the shared filesystem scheduler."""
+    if not path:
+        return None
+    selected: set[str] = set()
+    for row in read_jsonl(path):
+        sample_id = str(row.get("sample_id", row.get("id", "")))
+        if sample_id:
+            selected.add(sample_id)
+    return selected
+
+
 def _effective_attention_backend(cache_backend: str, attention_backend: str) -> str:
     """Map the legacy HF default to a backend registered by SpecForge SGLang."""
     backend = str(cache_backend).lower()
@@ -60,6 +73,24 @@ def _effective_attention_backend(cache_backend: str, attention_backend: str) -> 
             f"got {attention_backend!r}"
         )
     return attention
+
+
+def sort_cache_buffer(buffer: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sắp xếp work buffer từ sample ngắn đến sample dài một cách ổn định."""
+    return sorted(
+        buffer,
+        key=lambda item: (len(item.get("input_ids", [])), str(item.get("id", ""))),
+    )
+
+
+def filter_cache_rows(
+    rows: Any,
+    selected_ids: Optional[set[str]],
+) -> list[Dict[str, Any]]:
+    """Keep only rows assigned by a shared lease, preserving input order."""
+    if selected_ids is None:
+        return list(rows)
+    return [row for row in rows if str(row.get("id", "")) in selected_ids]
 
 
 def _default_specforge_profile(max_length: int) -> CacheThroughputProfile:
@@ -202,6 +233,7 @@ def _build_capturer(
     auto_batch: bool = False,
     auto_batch_max_size: int = 128,
     auto_batch_target_vram_gb: Optional[float] = None,
+    auto_batch_hard_vram_gb: Optional[float] = None,
 ) -> Any:
     """Build HF fallback hoặc target SGLang capture độc lập trên một GPU."""
     backend = str(cache_backend).lower()
@@ -313,6 +345,7 @@ def _workload_signature(
     shard_index: int,
     num_shards: int,
     num_samples: Optional[int],
+    selected_ids: Optional[set[str]],
 ) -> dict[str, Any]:
     """Signature của preflight token-count để resume không dùng nhầm estimate."""
     sources: dict[str, Any] = {}
@@ -334,6 +367,13 @@ def _workload_signature(
         "shard_index": int(shard_index),
         "num_shards": int(num_shards),
         "num_samples": None if num_samples is None else int(num_samples),
+        "selected_ids_hash": (
+            None
+            if selected_ids is None
+            else hashlib.sha256(
+                "\n".join(sorted(str(value) for value in selected_ids)).encode("utf-8")
+            ).hexdigest()
+        ),
     }
 
 
@@ -348,6 +388,7 @@ def _estimate_workload(
     num_shards: int,
     num_samples: Optional[int],
     existing_ids: set[str],
+    selected_ids: Optional[set[str]],
     report_path: Path,
     reporter: ProgressReporter,
 ) -> dict[str, int]:
@@ -365,6 +406,7 @@ def _estimate_workload(
         shard_index=shard_index,
         num_shards=num_shards,
         num_samples=num_samples,
+        selected_ids=selected_ids,
     )
     if report_path.is_file():
         try:
@@ -420,6 +462,8 @@ def _estimate_workload(
     valid_sample_lengths: dict[str, int] = {}
     reporter.update("estimating_workload", **result)
     for row_index, row in enumerate(iter_rows()):
+        if selected_ids is not None and str(row.get("id", "")) not in selected_ids:
+            continue
         if row_index % num_shards != shard_index:
             continue
         result["input_rows"] += 1
@@ -491,6 +535,7 @@ def cache_dataset(
     shard_index: int = 0,
     num_shards: int = 1,
     skipped_report: Optional[str] = None,
+    sample_ids_file: Optional[str] = None,
     progress_path: Optional[str] = None,
     batch_profile: Optional[str] = None,
     throughput_profile: Optional[str] = None,
@@ -500,6 +545,7 @@ def cache_dataset(
     cache_memory_fraction: float = 0.99,
     auto_batch: bool = False,
     auto_batch_target_vram_gb: Optional[float] = None,
+    auto_batch_hard_vram_gb: Optional[float] = None,
     auto_batch_start_size: int = 1,
     auto_batch_safety_fraction: float = 0.95,
     auto_batch_max_size: int = 128,
@@ -517,6 +563,7 @@ def cache_dataset(
     adaptive_cache = bool(
         auto_batch and str(cache_backend).lower() == "specforge_sglang"
     )
+    selected_ids = load_sample_ids(sample_ids_file)
     if batch_size < 1:
         raise ValueError("batch_size phải >= 1")
     if io_threads < 0 or io_queue_size < 0:
@@ -539,6 +586,14 @@ def cache_dataset(
         raise ValueError("auto_batch_growth_factor phải > 1")
     if auto_batch_target_vram_gb is not None and float(auto_batch_target_vram_gb) <= 0.0:
         raise ValueError("auto_batch_target_vram_gb phải > 0")
+    if auto_batch_hard_vram_gb is not None and float(auto_batch_hard_vram_gb) <= 0.0:
+        raise ValueError("auto_batch_hard_vram_gb phải > 0")
+    if (
+        auto_batch_target_vram_gb is not None
+        and auto_batch_hard_vram_gb is not None
+        and float(auto_batch_hard_vram_gb) < float(auto_batch_target_vram_gb)
+    ):
+        raise ValueError("auto_batch_hard_vram_gb phải >= auto_batch_target_vram_gb")
     if batch_profile and throughput_profile:
         raise ValueError("chỉ được dùng một trong batch_profile hoặc throughput_profile")
     batch_schedule = CacheBatchSchedule.from_path(batch_profile) if batch_profile else None
@@ -652,6 +707,7 @@ def cache_dataset(
             auto_batch=adaptive_cache,
             auto_batch_max_size=int(auto_batch_max_size),
             auto_batch_target_vram_gb=auto_batch_target_vram_gb,
+            auto_batch_hard_vram_gb=auto_batch_hard_vram_gb,
         )
     except Exception as exc:
         # Static-pool allocation happens before the writer exists. Keep the
@@ -704,6 +760,7 @@ def cache_dataset(
         requested_cache_memory_fraction=float(cache_memory_fraction),
         auto_batch=bool(auto_batch),
         auto_batch_target_vram_gb=auto_batch_target_vram_gb,
+        auto_batch_hard_vram_gb=auto_batch_hard_vram_gb,
         auto_batch_start_size=int(auto_batch_start_size),
         auto_batch_safety_fraction=float(auto_batch_safety_fraction),
         runtime_token_capacity=(
@@ -821,6 +878,7 @@ def cache_dataset(
         num_shards=num_shards,
         num_samples=num_samples,
         existing_ids=writer.existing_ids,
+        selected_ids=selected_ids,
         report_path=Path(output_path) / "workload.json",
         reporter=reporter,
     )
@@ -928,6 +986,7 @@ def cache_dataset(
             max_batch_size=int(auto_batch_max_size),
             growth_factor=float(auto_batch_growth_factor),
             target_vram_gb=auto_batch_target_vram_gb,
+            hard_vram_gb=auto_batch_hard_vram_gb,
             safety_margin_gb=(
                 float(auto_batch_target_vram_gb) * (1.0 - float(auto_batch_safety_fraction))
                 if auto_batch_target_vram_gb is not None
@@ -1094,17 +1153,21 @@ def cache_dataset(
         def iter_cache_rows():
             for index in range(len(tokenized_dataset)):
                 item = tokenized_dataset[index]
-                yield {
+                row = {
                     "id": str(item["id"]),
                     "input_ids": item["input_ids"],
                     "loss_mask": item["loss_mask"],
                 }
+                if selected_ids is None or row["id"] in selected_ids:
+                    yield row
     else:
         if data_path is None:  # guarded above; keep the error local and clear
             raise ValueError("cache cần --data-path hoặc --tokenized-path")
 
         def iter_cache_rows():
-            yield from read_jsonl(data_path)
+            for row in read_jsonl(data_path):
+                if selected_ids is None or str(row.get("id", "")) in selected_ids:
+                    yield row
 
     rows = iter_cache_rows()
 
@@ -1138,8 +1201,8 @@ def cache_dataset(
             if sample_length is None:
                 raise ValueError("throughput profile cần sample_length để chọn bucket")
             requested = throughput_schedule.batch_for_length(sample_length)
-            # Buffer đã được sort giảm dần theo length trước khi gọi helper,
-            # vì vậy length của sample đầu là padded length thật của batch.
+            # Buffer is sorted by length before this helper, so the selected
+            # bucket is based on the current padded length.
             selected = throughput_schedule.cap_batch_size(
                 padded_length=sample_length,
                 requested_batch_size=requested,
@@ -1222,9 +1285,9 @@ def cache_dataset(
         stats["valid"] += 1
         buffer.append(sample)
         if len(buffer) >= bucket_buffer_size:
-            # Stable sort giữ kết quả deterministic trong cùng độ dài; batch
-            # gần độ dài nhau để giảm padding trên target forward.
-            buffer.sort(key=lambda item: -len(item["input_ids"]))
+            # Stable short-to-long order keeps the next padded length
+            # predictable; token-budget logic still controls each batch.
+            buffer[:] = sort_cache_buffer(buffer)
             while buffer:
                 current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
                 if current_batch_size == 0:
@@ -1247,7 +1310,7 @@ def cache_dataset(
                 if num_samples is not None and writer.total_samples >= int(num_samples):
                     buffer.clear()
                     break
-    buffer.sort(key=lambda item: -len(item["input_ids"]))
+    buffer[:] = sort_cache_buffer(buffer)
     while buffer and (num_samples is None or writer.total_samples < int(num_samples)):
         current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
         if current_batch_size == 0:
@@ -1377,7 +1440,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--auto-batch-target-vram-gb",
         type=float,
         default=None,
-        help="mục tiêu static-pool VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
+        help="soft target static-pool VRAM mỗi GPU; ví dụ 160 trên B200",
+    )
+    parser.add_argument(
+        "--auto-batch-hard-vram-gb",
+        type=float,
+        default=None,
+        help="hard cap static-pool VRAM mỗi GPU; không thấp hơn soft target",
     )
     parser.add_argument(
         "--auto-batch-start-size",
@@ -1424,6 +1493,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--skipped-report", default=None)
+    parser.add_argument(
+        "--sample-ids-file",
+        default=None,
+        help="JSONL sample_id được shared scheduler giao cho worker hiện tại",
+    )
     parser.add_argument("--progress-path", default=None)
     parser.add_argument(
         "--batch-profile",
@@ -1473,6 +1547,7 @@ def main(argv=None) -> None:
         shard_index=args.shard_index,
         num_shards=args.num_shards,
         skipped_report=args.skipped_report,
+        sample_ids_file=args.sample_ids_file,
         progress_path=args.progress_path,
         batch_profile=args.batch_profile,
         throughput_profile=args.throughput_profile,
@@ -1482,6 +1557,7 @@ def main(argv=None) -> None:
         cache_memory_fraction=args.cache_memory_fraction,
         auto_batch=args.auto_batch,
         auto_batch_target_vram_gb=args.auto_batch_target_vram_gb,
+        auto_batch_hard_vram_gb=args.auto_batch_hard_vram_gb,
         auto_batch_start_size=args.auto_batch_start_size,
         auto_batch_safety_fraction=args.auto_batch_safety_fraction,
         auto_batch_max_size=args.auto_batch_max_size,

@@ -112,3 +112,19 @@ def test_auto_batch_respects_runtime_token_safety_ceiling() -> None:
 
     assert controller.record_success("32k", peak_vram_gb=None, max_next_batch_size=2) == 2
     assert controller.record_success("32k", peak_vram_gb=None, max_next_batch_size=2) == 2
+
+
+def test_auto_batch_exposes_hard_vram_cap_separately_from_soft_target() -> None:
+    from auto_batch import AdaptiveBatchController
+
+    controller = AdaptiveBatchController(
+        initial_batch_size=1,
+        max_batch_size=32,
+        target_vram_gb=160.0,
+        hard_vram_gb=163.0,
+    )
+    assert controller.hard_vram_gb == 163.0
+    assert controller.record_success("32k", peak_vram_gb=159.0) == 2
+    # Soft target stops ordinary growth; hard cap remains available for
+    # telemetry/validation when allocator granularity overshoots the target.
+    assert controller.record_success("32k", peak_vram_gb=162.5) == 2

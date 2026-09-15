@@ -32,7 +32,10 @@ def test_llama31_rope_theta_is_recovered_from_modern_config():
     config = LlamaConfig(rope_theta=500000.0)
     # Transformers 5 stores this value only in rope_parameters, while older
     # releases may expose a top-level attribute.  Exercise the nested path on
-    # both versions.
+    # both versions by constructing the modern field when running against an
+    # older Transformers release.
+    if not hasattr(config, "rope_parameters"):
+        config.rope_parameters = {"rope_theta": 500000.0}
     if hasattr(config, "rope_theta"):
         delattr(config, "rope_theta")
 

@@ -39,6 +39,7 @@ class AdaptiveBatchController:
         max_batch_size: int,
         growth_factor: float = 2.0,
         target_vram_gb: Optional[float] = None,
+        hard_vram_gb: Optional[float] = None,
         safety_margin_gb: float = 0.0,
     ) -> None:
         if int(initial_batch_size) < 1:
@@ -49,6 +50,14 @@ class AdaptiveBatchController:
             raise ValueError("growth_factor phải > 1")
         if target_vram_gb is not None and float(target_vram_gb) <= 0.0:
             raise ValueError("target_vram_gb phải > 0")
+        if hard_vram_gb is not None and float(hard_vram_gb) <= 0.0:
+            raise ValueError("hard_vram_gb phải > 0")
+        if (
+            target_vram_gb is not None
+            and hard_vram_gb is not None
+            and float(hard_vram_gb) < float(target_vram_gb)
+        ):
+            raise ValueError("hard_vram_gb phải >= target_vram_gb")
         if float(safety_margin_gb) < 0.0:
             raise ValueError("safety_margin_gb không được âm")
         if (
@@ -61,6 +70,9 @@ class AdaptiveBatchController:
         self.growth_factor = float(growth_factor)
         self.target_vram_gb = (
             None if target_vram_gb is None else float(target_vram_gb)
+        )
+        self.hard_vram_gb = (
+            None if hard_vram_gb is None else float(hard_vram_gb)
         )
         self.safety_margin_gb = float(safety_margin_gb)
         self._states: dict[str, _BatchState] = {}
@@ -178,6 +190,7 @@ class AdaptiveBatchController:
                 "batch_size": int(state.current),
                 "target_reached": bool(state.target_reached),
                 "last_peak_vram_gb": state.last_peak_vram_gb,
+                "hard_vram_gb": self.hard_vram_gb,
                 "last_success_batch_size": state.last_success_batch_size,
                 "oom_count": int(state.oom_count),
                 "upper_bound": state.upper_bound,
