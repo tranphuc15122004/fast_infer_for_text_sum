@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import os
+import time
 
 import torch
 import torch.nn as nn
@@ -8,7 +11,11 @@ from classic.utils_classic import *
 from shared.kv_cache import initialize_past_key_values
 from transformers import AutoTokenizer
 from shared.opt_tree import Tree
-from termcolor import colored
+try:
+    from termcolor import colored
+except ImportError:  # cosmetic dependency; keep the algorithm dependency-free
+    def colored(text, *_args, **_kwargs):
+        return str(text)
 from datetime import datetime
 from typing import List, Tuple
 
@@ -33,9 +40,67 @@ class SPModel(nn.Module):
 
         self.full_draft_kv=None
         self.evicted = 0
+        self._horizon_trace_path = None
+        self._horizon_trace_sample_id = None
+        self._last_retrieve_attn_scores = False
+        self._last_target_attention_shape = None
+        self._last_target_attention_error = None
 
     def get_tokenizer(self):
         return self.tokenizer
+
+    def _horizon_trace_event(self, event):
+        """Append optional aggregate-only Horizon-CMR telemetry."""
+        path = self._horizon_trace_path
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                handle.flush()
+        except (OSError, TypeError, ValueError):
+            # Telemetry must never alter baseline inference semantics.
+            self._horizon_trace_path = None
+
+    def _source_chunk_attention(self, input_len):
+        """Return chunk-level source attention for offline horizon analysis."""
+        attention = getattr(self, "attn_scores", None)
+        chunks = getattr(self, "chunks", None) or getattr(self, "selected_chunks", None)
+        if attention is None:
+            self._last_target_attention_error = "attention_none"
+            return None
+        if not chunks:
+            self._last_target_attention_error = "chunks_empty"
+            return None
+        try:
+            attention = attention.detach().float()
+            if attention.ndim == 4:
+                attention = attention.mean(dim=(0, 1))
+            elif attention.ndim == 3:
+                attention = attention.mean(dim=0)
+            if attention.ndim != 2:
+                return None
+            source_limit = min(int(input_len), int(attention.shape[-1]))
+            scores = {}
+            for chunk_id, start, end in chunks:
+                start = max(0, int(start))
+                end = min(source_limit, int(end))
+                if end <= start:
+                    continue
+                scores[str(chunk_id)] = float(attention[:, start:end].mean().item())
+            return scores or None
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            self._last_target_attention_error = (
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            return None
+
+    @staticmethod
+    def _trace_chunks(chunks):
+        return [
+            {"id": int(chunk_id), "start": int(start), "end": int(end)}
+            for chunk_id, start, end in (chunks or [])
+        ]
 
     @classmethod
     def from_pretrained(
@@ -184,6 +249,9 @@ class SPModel(nn.Module):
             logits_processor=None,
             retrieve_attn_scores=False
     ):
+        self._last_retrieve_attn_scores = bool(retrieve_attn_scores)
+        self._last_target_attention_shape = None
+        self._last_target_attention_error = None
         with torch.inference_mode():
             outputs = self.base_model.model(
                 input_ids=input_ids,
@@ -204,7 +272,16 @@ class SPModel(nn.Module):
             
             if self.use_retrieval_cache:
                 if retrieve_attn_scores:
-                    self.attn_scores = outputs.attentions[-1] # already returns last layer attention only
+                    attentions = getattr(outputs, "attentions", None)
+                    if attentions:
+                        self.attn_scores = attentions[-1]
+                        if self.attn_scores is not None:
+                            self._last_target_attention_shape = list(
+                                self.attn_scores.shape
+                            )
+                    else:
+                        self.attn_scores = None
+                        self._last_target_attention_error = "attention_output_empty"
             
         if init:
             if logits_processor is not None:
@@ -340,6 +417,25 @@ class SPModel(nn.Module):
     ):   
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         input_len = input_ids.shape[1]
+
+        self._horizon_trace_sample_id = os.environ.get("SPECEXTEND_TRACE_SAMPLE_ID")
+        # Warmup calls do not set a sample id and must not contaminate the
+        # pilot trace with unmeasured cycles.
+        self._horizon_trace_path = (
+            os.environ.get("SPECEXTEND_TRACE_FILE")
+            if self._horizon_trace_sample_id is not None else None
+        )
+        self._horizon_trace_event({
+            "type": "manifest",
+            "method": "specextend_classic",
+            "sample_id": self._horizon_trace_sample_id,
+            "input_tokens": int(input_len),
+            "retrieval_chunk_size": int(retrieval_chunk_size),
+            "retrieve_top_k": int(retrieve_top_k),
+            "retrieve_every_n_steps": int(retrieve_every_n_steps),
+            "max_new_tokens": int(max_new_tokens),
+            "use_specextend": bool(use_specextend),
+        })
         
         self.use_retrieval_cache = use_specextend
         # FlashAttention-2 is optional and unavailable on the repo's T4
@@ -360,6 +456,7 @@ class SPModel(nn.Module):
         self.retrieve_every_n_steps = retrieve_every_n_steps
         self.num_chunks_old = 0
         self.retrieval_condition = False
+        self.last_chunk_scores = None
         
         self.attn_scores = None # attention scores returned from the forward pass
         self.attn_scores_final = None # final attention scores used for retrieval (includes newly accepted tokens)
@@ -409,6 +506,9 @@ class SPModel(nn.Module):
         accept_length_list = []
         while True:
             assert past_key_values[0][0].shape[2]==draft_position_ids[0]
+            cycle_start = time.perf_counter()
+            current_chunks = self._trace_chunks(getattr(self, "selected_chunks", None))
+            current_chunk_scores = getattr(self, "last_chunk_scores", None)
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_input_ids,
@@ -416,6 +516,23 @@ class SPModel(nn.Module):
                 draft_position_ids,
                 tree_attention_mask
             )
+
+            # ``verify`` immediately drafts the next block and the retrieval
+            # update clears ``self.attn_scores``.  Capture the target-attention
+            # horizon signal before that reset; this is telemetry only and
+            # does not affect the current CMR selection.
+            horizon_chunk_scores = None
+            horizon_chunk_ids = []
+            if self.retrieval_condition:
+                horizon_chunk_scores = self._source_chunk_attention(input_len)
+                if horizon_chunk_scores:
+                    horizon_chunk_ids = [
+                        int(chunk_id) if str(chunk_id).lstrip("-").isdigit() else chunk_id
+                        for chunk_id in sorted(
+                            horizon_chunk_scores,
+                            key=lambda key: (-horizon_chunk_scores[key], str(key)),
+                        )[: int(retrieve_top_k)]
+                    ]
 
             old_len = input_ids.shape[1]
 
@@ -434,6 +551,43 @@ class SPModel(nn.Module):
                                                                       logits_processor)
             
             accept_length_list.append(accept_length.item() if isinstance(accept_length, torch.Tensor) else int(accept_length))
+
+            accepted_length_int = int(accept_length.item() if isinstance(accept_length, torch.Tensor) else accept_length)
+            current_context_tokens = sum(
+                max(0, int(chunk["end"]) - int(chunk["start"]))
+                for chunk in current_chunks
+            )
+            horizon_spans = {
+                int(chunk["id"]): chunk
+                for chunk in self._trace_chunks(getattr(self, "chunks", None))
+            }
+            horizon_context_tokens = sum(
+                max(0, int(horizon_spans[chunk_id]["end"]) - int(horizon_spans[chunk_id]["start"]))
+                for chunk_id in horizon_chunk_ids
+                if isinstance(chunk_id, int) and chunk_id in horizon_spans
+            )
+            self._horizon_trace_event({
+                "type": "cycle",
+                "method": "specextend_classic",
+                "sample_id": self._horizon_trace_sample_id,
+                "dataset": os.environ.get("SPECEXTEND_TRACE_DATASET", "govreport"),
+                "cycle": len(accept_length_list),
+                "accepted_before": int(new_token),
+                "accept_length": accepted_length_int,
+                "accepted_tokens": accepted_length_int + 1,
+                "current_chunk_ids": [chunk["id"] for chunk in current_chunks],
+                "current_chunks": current_chunks,
+                "current_chunk_scores": current_chunk_scores,
+                "horizon_chunk_ids": horizon_chunk_ids,
+                "horizon_chunk_scores": horizon_chunk_scores,
+                "horizon_context_tokens": horizon_context_tokens or None,
+                "current_context_tokens": current_context_tokens or None,
+                "target_attention_available": horizon_chunk_scores is not None,
+                "retrieve_attn_scores": bool(self._last_retrieve_attn_scores),
+                "target_attention_shape": self._last_target_attention_shape,
+                "target_attention_error": self._last_target_attention_error,
+                "cycle_time_s": time.perf_counter() - cycle_start,
+            })
 
             generated_tokens_list = print_newly_accepted_tokens(old_len, input_ids,
                                                         self.tokenizer, verbose=verbose)
@@ -661,6 +815,12 @@ class SPModel(nn.Module):
             topk = torch.topk(chunk_means, k=k)
             selected_indices = topk.indices  # indices into the list of chunks
             selected_chunks = [self.chunks[i] for i in selected_indices.tolist()]
+            self.last_chunk_scores = {
+                str(chunk_id): float(score)
+                for (chunk_id, _, _), score in zip(
+                    self.chunks, chunk_means.detach().float().tolist()
+                )
+            }
 
             selected_chunks.sort(key=lambda x: x[0])
             self.selected_chunks = selected_chunks

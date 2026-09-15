@@ -55,6 +55,7 @@ for split in train val; do
     --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot/target_features_qwen3_4b_8k/${split} \
     --target-layer-ids 1 9 17 25 33 --max-length 8192 \
     --batch-size 1 --bucket-buffer-size 8 --shard-size 32 \
+    --cache-backend hf --attention-backend sdpa \
     --device cuda --local-files-only --resume
 done
 ```

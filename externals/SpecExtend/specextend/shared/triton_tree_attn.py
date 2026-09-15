@@ -1,10 +1,10 @@
 import math
 import torch
 
-__all__ = ["attention"]
+__all__ = ["tree_part_fwd_target"]
 
-@torch.compile
-def tree_part_fwd_target(query_states, key_states, value_states, tree_mask, 
+
+def _tree_part_fwd_target(query_states, key_states, value_states, tree_mask,
                   cache_lens, prefix_lse, bsz, q_len, num_heads, hidden_dim):
     tree_mask = tree_mask[:, :, -q_len:, -q_len:]
     tree_mask = (tree_mask == 0).to(torch.int8) # convert to 1 and 0
@@ -28,3 +28,25 @@ def tree_part_fwd_target(query_states, key_states, value_states, tree_mask,
 
     weight = torch.nn.functional.sigmoid(prefix_lse - current_lse).to(query_states.dtype)
     return current_out, weight
+
+
+def _supports_compiled_tree_attention() -> bool:
+    """Torch.compile/Triton path is only valid on Ampere+ GPUs.
+
+    The upstream decorator compiles unconditionally.  On a Tesla T4 this
+    either selects an unsupported Triton kernel or fails while compiling the
+    Python 3.11 extension.  Keep the exact eager implementation available for
+    sm75 and CPU; use compilation only where the upstream kernel is supported.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability()[0] >= 8
+    except (RuntimeError, AssertionError, IndexError):
+        return False
+
+
+if _supports_compiled_tree_attention():
+    tree_part_fwd_target = torch.compile(_tree_part_fwd_target)
+else:
+    tree_part_fwd_target = _tree_part_fwd_target

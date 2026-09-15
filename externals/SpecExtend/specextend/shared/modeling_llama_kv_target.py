@@ -770,7 +770,24 @@ class LlamaAttention(nn.Module):
                     q_flash = query_states.transpose(1,2)
                     full_k = key_states.transpose(1,2)
                     full_v = value_states.transpose(1,2)
-                    if flash_attn_with_kvcache is not None:
+                    # FlashAttention's KV-cache kernel is importable in some
+                    # environments even when the GPU is a T4 (sm75).  The
+                    # kernel itself only supports Ampere+; check capability
+                    # at the call site so a T4 uses the correctness-preserving
+                    # PyTorch prefix fallback below instead of failing inside
+                    # the extension.
+                    flash_kvcache_ok = flash_attn_with_kvcache is not None
+                    if flash_kvcache_ok and q_flash.device.type == "cuda":
+                        try:
+                            flash_kvcache_ok = (
+                                torch.cuda.get_device_capability(q_flash.device)[0]
+                                >= 8
+                            )
+                        except (RuntimeError, AssertionError, IndexError):
+                            flash_kvcache_ok = False
+                    else:
+                        flash_kvcache_ok = False
+                    if flash_kvcache_ok:
                         prefix_o, prefix_lse = flash_attn_with_kvcache(
                             q_flash,
                             full_k,

@@ -19,6 +19,7 @@ class _BatchState:
     current: int
     target_reached: bool = False
     last_peak_vram_gb: Optional[float] = None
+    last_success_batch_size: Optional[int] = None
     oom_count: int = 0
     upper_bound: Optional[int] = None
 
@@ -26,10 +27,9 @@ class _BatchState:
 class AdaptiveBatchController:
     """Grow a batch per length/budget bucket and back off after OOM.
 
-    ``default`` in :meth:`batch_size` lets a caller provide a profiled starting
-    point for a new bucket.  This is useful for cache workloads: the built-in
-    SpecForge profile is a good warm start, then this controller can continue
-    growing it to use the available VRAM.
+    ``default`` in :meth:`batch_size` lets a caller provide a starting point
+    for a new bucket.  SGLang cache mode intentionally uses a small safe start,
+    then applies a token-capacity guard and OOM backoff while growing.
     """
 
     def __init__(
@@ -39,6 +39,7 @@ class AdaptiveBatchController:
         max_batch_size: int,
         growth_factor: float = 2.0,
         target_vram_gb: Optional[float] = None,
+        safety_margin_gb: float = 0.0,
     ) -> None:
         if int(initial_batch_size) < 1:
             raise ValueError("initial_batch_size phải >= 1")
@@ -48,12 +49,20 @@ class AdaptiveBatchController:
             raise ValueError("growth_factor phải > 1")
         if target_vram_gb is not None and float(target_vram_gb) <= 0.0:
             raise ValueError("target_vram_gb phải > 0")
+        if float(safety_margin_gb) < 0.0:
+            raise ValueError("safety_margin_gb không được âm")
+        if (
+            target_vram_gb is not None
+            and float(safety_margin_gb) >= float(target_vram_gb)
+        ):
+            raise ValueError("safety_margin_gb phải nhỏ hơn target_vram_gb")
         self.initial_batch_size = int(initial_batch_size)
         self.max_batch_size = int(max_batch_size)
         self.growth_factor = float(growth_factor)
         self.target_vram_gb = (
             None if target_vram_gb is None else float(target_vram_gb)
         )
+        self.safety_margin_gb = float(safety_margin_gb)
         self._states: dict[str, _BatchState] = {}
 
     def _state(self, key: str, default: Optional[int] = None) -> _BatchState:
@@ -74,17 +83,29 @@ class AdaptiveBatchController:
         key: str,
         *,
         peak_vram_gb: Optional[float],
+        max_next_batch_size: Optional[int] = None,
     ) -> int:
         state = self._state(key)
+        if max_next_batch_size is not None and int(max_next_batch_size) < 1:
+            raise ValueError("max_next_batch_size phải >= 1")
+        ceiling = self.max_batch_size
+        if max_next_batch_size is not None:
+            ceiling = min(ceiling, int(max_next_batch_size))
+
+        previous_peak = state.last_peak_vram_gb
+        previous_batch = state.last_success_batch_size
         if peak_vram_gb is not None:
             peak = float(peak_vram_gb)
             if peak < 0.0:
                 raise ValueError("peak_vram_gb không được âm")
             state.last_peak_vram_gb = peak
-            if self.target_vram_gb is not None and peak >= self.target_vram_gb:
+            state.last_success_batch_size = int(state.current)
+            if self.target_vram_gb is not None and peak >= self._safe_vram_limit:
                 state.target_reached = True
-        if state.target_reached or state.current >= self.max_batch_size:
+        if state.target_reached or state.current >= ceiling:
             return int(state.current)
+
+        grown = None
         if state.upper_bound is not None:
             # After an OOM, binary-search the interval between the last safe
             # batch and the failed candidate. This reaches the VRAM target
@@ -95,7 +116,39 @@ class AdaptiveBatchController:
             grown = (state.current + int(state.upper_bound) + 1) // 2
         else:
             grown = max(state.current + 1, math.ceil(state.current * self.growth_factor))
-        state.current = min(self.max_batch_size, grown)
+
+        grown = min(ceiling, grown)
+
+        # Predict the next request before launching it.  The first successful
+        # observation establishes a baseline; the next one gives an online
+        # per-sample slope.  Near the safety limit, switch from exponential
+        # growth to the largest integer that is still predicted safe.  In
+        # particular, if adding one sample is already unsafe, hold the current
+        # batch and never issue that forward.
+        if (
+            self.target_vram_gb is not None
+            and peak_vram_gb is not None
+            and previous_peak is not None
+            and previous_batch is not None
+            and int(state.current) > int(previous_batch)
+        ):
+            slope = max(
+                0.0,
+                (float(peak_vram_gb) - float(previous_peak))
+                / (int(state.current) - int(previous_batch)),
+            )
+            if slope > 0.0:
+                safe_limit = self._safe_vram_limit
+                one_more_prediction = float(peak_vram_gb) + slope
+                if one_more_prediction >= safe_limit:
+                    state.target_reached = True
+                    return int(state.current)
+                safe_delta = int(
+                    math.floor((safe_limit - float(peak_vram_gb)) / slope)
+                )
+                grown = min(grown, int(state.current) + max(1, safe_delta))
+
+        state.current = min(ceiling, grown)
         return int(state.current)
 
     def record_oom(self, key: str, attempted_batch_size: Optional[int] = None) -> int:
@@ -107,7 +160,7 @@ class AdaptiveBatchController:
         state.target_reached = bool(
             self.target_vram_gb is not None
             and state.last_peak_vram_gb is not None
-            and state.last_peak_vram_gb >= self.target_vram_gb
+            and state.last_peak_vram_gb >= self._safe_vram_limit
         )
         failed_upper = max(1, attempted - 1)
         state.upper_bound = (
@@ -125,11 +178,18 @@ class AdaptiveBatchController:
                 "batch_size": int(state.current),
                 "target_reached": bool(state.target_reached),
                 "last_peak_vram_gb": state.last_peak_vram_gb,
+                "last_success_batch_size": state.last_success_batch_size,
                 "oom_count": int(state.oom_count),
                 "upper_bound": state.upper_bound,
             }
             for key, state in sorted(self._states.items())
         }
+
+    @property
+    def _safe_vram_limit(self) -> float:
+        if self.target_vram_gb is None:
+            return float("inf")
+        return float(self.target_vram_gb) - float(self.safety_margin_gb)
 
 
 def target_memory_fraction(

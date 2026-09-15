@@ -5,10 +5,13 @@ Profile B200 100 GB hiện hành được mô tả tại
 pilot dùng `batch_size=1`, accumulation 4 và `objective_chunk_blocks=64` để
 giữ effective batch/fairness đồng thời chừa headroom VRAM.
 
-Backend cache tốc độ cao theo cơ chế offline SGLang của SpecForge và profile
-token-budget B200 được mô tả tại
+Phase cache có hai backend. Đường mặc định và đường smoke B200 là
+`transformers` + PyTorch `sdpa` (`--cache-backend hf`), không cần cài SGLang,
+SpecForge, `flash-attn` hoặc `sglang-kernel`. Backend offline SGLang của
+SpecForge là tùy chọn tăng tốc; profile token-budget của nó được mô tả tại
 [`docs/mr_dflash_cache_auto_batch.md`](mr_dflash_cache_auto_batch.md). Bật
-`--cache-backend specforge_sglang` để dùng đường này; với B200 nên thêm
+`--cache-backend specforge_sglang` để dùng đường này; Phase 1 smoke cũng nhận
+flag này; với B200 nên thêm
 `--cache-auto-batch --cache-auto-batch-target-vram-gb 170`. Với HF backbone,
 `--cache-auto-batch` vẫn giữ đường profiler tương thích cũ.
 
@@ -138,9 +141,8 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --full-context \
   --full-context-length 32768 \
   --max-new-tokens 2048 \
-  --cache-backend specforge_sglang \
-  --cache-concurrency 64 --cache-max-total-tokens 262144 \
-  --cache-memory-fraction 0.99 --cache-startup-stagger-seconds 3 \
+  --cache-backend hf --cache-attention-backend sdpa \
+  --cache-batch-size-long-context 1 \
   --parallel-gpu-ids 0 1 2 3 \
   --allow-short \
   --regenerate-generation-batch-size 8 \
@@ -584,10 +586,11 @@ done
 
 Chạy sau khi đã validate và regenerate đúng context regime. `--batch-size`
 chỉ ảnh hưởng throughput của phase cache, không thay đổi batch/optimizer của
-training. Đường khuyến nghị trên 4×B200 là `specforge_sglang`; thêm
+training. Để smoke hoặc chạy khi chưa có stack SGLang, dùng `hf` + `sdpa`;
+đây là backend mặc định và chỉ cần PyTorch/Transformers. Với run throughput
+đã cài đủ SpecForge, có thể dùng `specforge_sglang` cùng
 `--cache-auto-batch --cache-auto-batch-target-vram-gb 170` để profile
-token-budget 64/32/16/4 chỉ làm điểm khởi đầu, batch tiếp tục tăng và static
-pool dùng khoảng 170GB/GPU. Các tham số
+token-budget 64/32/16/4. Các tham số
 `--cache-concurrency`, `--cache-max-total-tokens` và
 `--cache-memory-fraction` chỉ là performance knobs; có thể giảm sau OOM rồi
 resume mà không đổi hidden states đã ghi.
@@ -603,11 +606,9 @@ PYTHONPATH=src python3 scripts/mr_dflash/cache_target_features.py \
   --tokenized-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/tokenized_full/train \
   --output-path /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_pilot_full/target_features_qwen3_4b_full/train \
   --target-layer-ids 1 9 17 25 33 --max-length 32768 \
-  --cache-backend specforge_sglang --cache-auto-batch \
-  --cache-auto-batch-target-vram-gb 170 --cache-auto-batch-max-size 128 \
-  --cache-concurrency 64 \
-  --cache-max-total-tokens 262144 --cache-memory-fraction 0.99 \
-  --attention-backend flashinfer --io-threads 4 --io-queue-size 8 \
+  --cache-backend hf --attention-backend sdpa \
+  --batch-size 1 --bucket-buffer-size 8 \
+  --io-threads 2 --io-queue-size 4 \
   --shard-size 128 --supervision-mode last_assistant --device cuda \
   --local-files-only --resume
 ```

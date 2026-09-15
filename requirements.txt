@@ -1,3 +1,13 @@
+# Canonical Python 3.12 server manifest.
+#
+# Keep this file index/wheelhouse-installable: do not add local file URIs,
+# editable paths, direct host URLs, or Ubuntu system-package snapshots.
+# CUDA/cu130 packages must be mirrored in the server's offline wheelhouse.
+# These public indexes are only used when the operator allows online pip
+# resolution; B200 offline setup overrides them with --no-index/--find-links.
+--extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://flashinfer.ai/whl
+--extra-index-url https://flashinfer.ai/whl/cu130
 absl-py==2.4.0
 accelerate==1.14.0
 aiofile==3.11.1
@@ -54,10 +64,8 @@ cufile-python==0.2.0
 cupy-cuda13x==14.0.1
 DataProperty==1.1.1
 datasets==5.0.0
-dbus-python==1.2.18
 debugpy==1.8.21
 decorator==5.3.1
-deep_ep @ file:///vllm-workspace/ep_kernels/dist/deep_ep-1.2.1+73b6ea4-cp312-cp312-linux_x86_64.whl
 defusedxml==0.7.1
 depyf==0.20.0
 detect-installer==0.1.0
@@ -77,8 +85,9 @@ fastar==0.11.0
 fastjsonschema==2.21.2
 fastsafetensors==0.3.2
 filelock==3.29.4
-flash_attn==2.8.3.post1
+flash-attn==2.8.3.post1
 flashinfer-cubin==0.6.12
+# cu130 wheel must be present in the offline wheelhouse; no direct URL here.
 flashinfer-jit-cache==0.6.12+cu130
 flashinfer-python==0.6.12
 fqdn==1.5.1
@@ -167,6 +176,7 @@ lazr.uri==1.0.6
 leidenalg==0.12.0
 llguidance==1.7.6
 llvmlite==0.47.0
+llmlingua==0.2.2
 lm-format-enforcer==0.11.3
 lm_eval==0.4.12
 lmcache==0.5.0
@@ -184,7 +194,6 @@ mistune==3.3.2
 ml_dtypes==0.5.4
 model-hosting-container-standards==0.1.16
 modelscope==1.37.1
-mooncake-transfer-engine @ https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_35_x86_64.whl
 more-itertools==8.10.0
 mpmath==1.3.0
 msal==1.37.0
@@ -201,7 +210,7 @@ networkx==3.6.1
 ninja==1.13.0
 nixl==1.2.0
 nixl-cu12==1.2.0
-nixl-cu13==1.3.0
+nixl-cu13==1.2.0
 nltk==3.9.4
 notebook==7.6.0
 notebook_shim==0.2.4
@@ -286,13 +295,10 @@ pydantic-settings==2.14.2
 pydantic_core==2.46.4
 pyelftools==0.33
 Pygments==2.20.0
-PyGObject==3.42.1
 PyJWT==2.13.0
 pyparsing==2.4.7
-pyrouge==0.1.3
 pytablewriter==1.2.1
 pytest==9.1.1
-python-apt==2.4.0+ubuntu4.1
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
 python-dotenv==1.2.2
@@ -329,13 +335,14 @@ scikit-learn==1.9.0
 scipy==1.18.0
 SecretStorage==3.3.1
 Send2Trash==2.1.0
-sentence-transformers @ file:///workspace/storage-shared/nlp/dungdx4/phuc_projects/offline_wheelhouse/sentence_transformers-5.7.0-py3-none-any.whl#sha256=b78141da3d8137e70d965866e2ca43190b9266f3d4d8752e250ded75e7136730
+sentence-transformers==5.7.0
 sentencepiece==0.2.1
 sentry-sdk==2.63.0
 setproctitle==1.3.7
 setuptools==80.10.2
 setuptools-scm==10.2.0
-sglang-kernel @ file:///workspace/storage-shared/nlp/dungdx4/phuc_projects/offline_wheelhouse/sglang_kernel-0.4.2%2Bcu130-cp310-abi3-manylinux2014_x86_64.whl#sha256=cc66600a07874d44fd91211e5a768ad41aa9960a8ed94fc1dec3fb14be019849
+sglang==0.5.14
+sglang-kernel==0.4.2
 shellingham==1.5.4
 six==1.17.0
 sniffio==1.3.1
@@ -386,7 +393,7 @@ uv==0.11.25
 uvicorn==0.49.0
 uvloop==0.22.1
 vcs-versioning==2.2.1
-vllm @ file:///vllm-workspace/dist/vllm-0.24.0-cp38-abi3-linux_x86_64.whl
+vllm==0.24.0
 wadllib==1.3.6
 watchfiles==1.2.0
 wcwidth==0.8.2
@@ -401,6 +408,7 @@ word2number==1.1
 xgrammar==0.2.3
 xxhash==3.8.0
 yarl==1.24.2
+yunchang==0.6.4
 z3-solver==4.15.4.0
 zipp==4.1.0
 zstandard==0.25.0

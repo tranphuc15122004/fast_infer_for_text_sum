@@ -17,7 +17,21 @@ import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
+try:
+    # SGLang >=0.5.14 exposes the helper from scheduler_components. The
+    # vendored SSSD tree used by this repository predates that package split
+    # and keeps the same function in scheduler_dp_attn_mixin.
+    from sglang.srt.managers.scheduler_components.dp_attn import (
+        prepare_mlp_sync_batch_raw,
+    )
+except ModuleNotFoundError as exc:
+    if not str(exc.name or "").startswith(
+        "sglang.srt.managers.scheduler_components"
+    ):
+        raise
+    from sglang.srt.managers.scheduler_dp_attn_mixin import (
+        prepare_mlp_sync_batch_raw,
+    )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch

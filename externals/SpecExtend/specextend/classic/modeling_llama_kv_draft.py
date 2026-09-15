@@ -515,13 +515,24 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        # Transformers >=5 normalizes a legacy ``rope_scaling=None`` config
+        # into ``{"rope_type": "default", ...}``.  SpecExtend's classic
+        # loader predates that schema and used the old ``type`` key.  Treat
+        # both representations identically so the cached Vicuna-68M draft
+        # can run with the CUDA/cu124 T4 environment.
+        rope_scaling = self.config.rope_scaling
+        normalized_type = (
+            rope_scaling.get("rope_type")
+            if isinstance(rope_scaling, dict)
+            else None
+        )
+        if rope_scaling is None or normalized_type == "default":
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim, max_position_embeddings=self.max_position_embeddings
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_type = rope_scaling.get("type", normalized_type)
+            scaling_factor = rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,

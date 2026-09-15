@@ -83,9 +83,16 @@ class SmokeOptions:
     cache_bucket_buffer: int = 8
     cache_shard_size: int = 32
     cache_attention_backend: str = "sdpa"
+    cache_backend: str = "hf"
     cache_io_threads: int = 2
     cache_io_queue_size: int = 4
     cache_batch_profile: str | None = None
+    cache_auto_batch: bool = False
+    cache_auto_batch_target_vram_gb: float | None = None
+    cache_auto_batch_start_size: int = 1
+    cache_auto_batch_safety_fraction: float = 0.95
+    cache_auto_batch_max_size: int = 128
+    cache_auto_batch_growth_factor: float = 2.0
     progress_interval_tokens: int = 256
     local_files_only: bool = True
     resume: bool = True
@@ -230,6 +237,8 @@ def build_stage_plan(options: SmokeOptions) -> list[Stage]:
         str(options.cache_shard_size),
         "--attention-backend",
         options.cache_attention_backend,
+        "--cache-backend",
+        options.cache_backend,
         "--io-threads",
         str(options.cache_io_threads),
         "--io-queue-size",
@@ -245,6 +254,32 @@ def build_stage_plan(options: SmokeOptions) -> list[Stage]:
         "--progress-path",
         str(options.output_root / "pipeline_state" / "cache_progress.json"),
         *(["--batch-profile", options.cache_batch_profile] if options.cache_batch_profile else []),
+        *(["--auto-batch"] if options.cache_auto_batch else []),
+        *(
+            ["--auto-batch-target-vram-gb", str(options.cache_auto_batch_target_vram_gb)]
+            if options.cache_auto_batch_target_vram_gb is not None
+            else []
+        ),
+        *(
+            ["--auto-batch-start-size", str(options.cache_auto_batch_start_size)]
+            if options.cache_auto_batch
+            else []
+        ),
+        *(
+            ["--auto-batch-safety-fraction", str(options.cache_auto_batch_safety_fraction)]
+            if options.cache_auto_batch
+            else []
+        ),
+        *(
+            ["--auto-batch-max-size", str(options.cache_auto_batch_max_size)]
+            if options.cache_auto_batch
+            else []
+        ),
+        *(
+            ["--auto-batch-growth-factor", str(options.cache_auto_batch_growth_factor)]
+            if options.cache_auto_batch
+            else []
+        ),
         *(["--target-revision", options.target_revision] if options.target_revision else []),
         *_local_files_args(options),
         *_resume_args(options),
@@ -438,9 +473,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cache-bucket-buffer", type=int, default=8)
     parser.add_argument("--cache-shard-size", type=int, default=32)
     parser.add_argument("--cache-attention-backend", choices=["auto", "eager", "sdpa", "flash_attention_2"], default="sdpa")
+    parser.add_argument(
+        "--cache-backend",
+        choices=["hf", "specforge_sglang"],
+        default="hf",
+        help="backend capture; specforge_sglang cần SGLang/SpecForge runtime tương thích",
+    )
     parser.add_argument("--cache-io-threads", type=int, default=2)
     parser.add_argument("--cache-io-queue-size", type=int, default=4)
     parser.add_argument("--cache-batch-profile", default=None)
+    parser.add_argument(
+        "--cache-auto-batch",
+        action="store_true",
+        help="bật adaptive batching cho cache backend specforge_sglang",
+    )
+    parser.add_argument("--cache-auto-batch-target-vram-gb", type=float, default=None)
+    parser.add_argument("--cache-auto-batch-start-size", type=int, default=1)
+    parser.add_argument("--cache-auto-batch-safety-fraction", type=float, default=0.95)
+    parser.add_argument("--cache-auto-batch-max-size", type=int, default=128)
+    parser.add_argument("--cache-auto-batch-growth-factor", type=float, default=2.0)
     parser.add_argument("--progress-interval-tokens", type=int, default=256)
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -459,6 +510,16 @@ def main(argv=None) -> int:
         raise ValueError("cache-bucket-buffer phải >= cache-batch-size")
     if args.cache_shard_size < 1 or args.cache_io_threads < 0 or args.cache_io_queue_size < 0:
         raise ValueError("cache shard/io config không hợp lệ")
+    if args.cache_auto_batch_start_size < 1:
+        raise ValueError("cache-auto-batch-start-size phải >= 1")
+    if args.cache_auto_batch_max_size < args.cache_auto_batch_start_size:
+        raise ValueError("cache-auto-batch-max-size phải >= cache-auto-batch-start-size")
+    if not 0.0 < args.cache_auto_batch_safety_fraction <= 1.0:
+        raise ValueError("cache-auto-batch-safety-fraction phải thuộc (0, 1]")
+    if args.cache_auto_batch_growth_factor <= 1.0:
+        raise ValueError("cache-auto-batch-growth-factor phải > 1")
+    if args.cache_auto_batch_target_vram_gb is not None and args.cache_auto_batch_target_vram_gb <= 0.0:
+        raise ValueError("cache-auto-batch-target-vram-gb phải > 0")
     if args.progress_interval_tokens < 1:
         raise ValueError("progress-interval-tokens phải >= 1")
 
@@ -482,9 +543,20 @@ def main(argv=None) -> int:
         cache_bucket_buffer=int(args.cache_bucket_buffer),
         cache_shard_size=int(args.cache_shard_size),
         cache_attention_backend=str(args.cache_attention_backend),
+        cache_backend=str(args.cache_backend),
         cache_io_threads=int(args.cache_io_threads),
         cache_io_queue_size=int(args.cache_io_queue_size),
         cache_batch_profile=str(args.cache_batch_profile) if args.cache_batch_profile else None,
+        cache_auto_batch=bool(args.cache_auto_batch),
+        cache_auto_batch_target_vram_gb=(
+            None
+            if args.cache_auto_batch_target_vram_gb is None
+            else float(args.cache_auto_batch_target_vram_gb)
+        ),
+        cache_auto_batch_start_size=int(args.cache_auto_batch_start_size),
+        cache_auto_batch_safety_fraction=float(args.cache_auto_batch_safety_fraction),
+        cache_auto_batch_max_size=int(args.cache_auto_batch_max_size),
+        cache_auto_batch_growth_factor=float(args.cache_auto_batch_growth_factor),
         progress_interval_tokens=int(args.progress_interval_tokens),
         local_files_only=bool(args.local_files_only),
         resume=bool(args.resume),

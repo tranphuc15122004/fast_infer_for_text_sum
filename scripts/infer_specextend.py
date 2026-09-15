@@ -49,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
                         action=argparse.BooleanOptionalAction, default=True,
                         help="enable/disable SpecExtend hybrid attention")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--trace-file", default=None,
+                        help="optional aggregate Horizon-CMR JSONL trace path")
     parser.add_argument("--output", required=True)
     return parser
 
@@ -90,6 +92,9 @@ def main() -> None:
         env["SPECEXTEND_BASE_MODEL"] = args.base_model
     if args.draft_model:
         env["SPECEXTEND_DRAFT_MODEL"] = args.draft_model
+    if args.trace_file:
+        env["SPECEXTEND_TRACE_FILE"] = str(Path(args.trace_file).resolve())
+        env["SPECEXTEND_TRACE_DATASET"] = Path(args.input_file).stem
     env["SPECEXTEND_WARMUP_RUNS"] = str(args.warmup_runs)
     env["SPECEXTEND_MAX_INPUT_TOKENS"] = str(args.max_input_tokens)
     env["SPECEXTEND_SEED"] = str(args.seed)
@@ -105,6 +110,13 @@ def main() -> None:
         line.strip() for line in stdout.splitlines()
         if line.strip() and "Generated " in line and " tokens in " in line
     ]
+    stats_results = []
+    for line in stdout.splitlines():
+        if line.startswith("SPECEXTEND_STATS_JSON "):
+            try:
+                stats_results.append(json.loads(line.split(" ", 1)[1]))
+            except json.JSONDecodeError:
+                continue
     source_rows = [
         json.loads(line)
         for line in input_file.read_text(encoding="utf-8").splitlines()
@@ -154,6 +166,19 @@ def main() -> None:
             "peak_memory_gb": None,
             "returncode": proc.returncode,
             "result_lines": result_lines[index:index + 1],
+            "accept_length_list": (
+                stats_results[index].get("accept_length_list")
+                if index < len(stats_results) else None
+            ),
+            "avg_accept_length": (
+                stats_results[index].get("avg_accept_length")
+                if index < len(stats_results) else None
+            ),
+            "cycle_count": (
+                len(stats_results[index].get("accept_length_list", []))
+                if index < len(stats_results) else None
+            ),
+            "trace_file": str(Path(args.trace_file).resolve()) if args.trace_file else None,
             "log_tail": log[-2000:],
         })
     if not parsed_results:

@@ -30,6 +30,7 @@ ARGS=(
 )
 [[ -n "${BASE_MODEL:-}" ]] && ARGS+=(--base-model "$BASE_MODEL")
 [[ -n "${DRAFT_MODEL:-}" ]] && ARGS+=(--draft-model "$DRAFT_MODEL")
+[[ -n "${TRACE_FILE:-}" ]] && ARGS+=(--trace-file "$TRACE_FILE")
 if [[ "${USE_SPECEXTEND:-1}" == "1" ]]; then
   ARGS+=(--use-specextend)
 else

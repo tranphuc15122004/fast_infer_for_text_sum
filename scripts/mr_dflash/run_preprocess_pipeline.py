@@ -91,11 +91,13 @@ class PipelineOptions:
     cache_attention_backend: str = "sdpa"
     cache_io_threads: int = 2
     cache_io_queue_size: int = 4
-    # Auto-batch profile được tạo trước cache trên một GPU rồi dùng cố định
-    # cho mọi worker theo bucket độ dài. ``cache_batch_profile`` cho phép
-    # truyền profile đã tạo từ trước và bỏ qua stage profile.
+    # SGLang auto-batch bắt đầu từ ``cache_auto_batch_start_size`` rồi tăng
+    # theo từng bucket; profile throughput chỉ còn là token-budget hint.
+    # ``cache_batch_profile`` vẫn dành cho HF legacy/fixed schedule.
     cache_auto_batch: bool = False
     cache_auto_batch_target_vram_gb: float = 170.0
+    cache_auto_batch_start_size: int = 1
+    cache_auto_batch_safety_fraction: float = 0.95
     cache_auto_batch_max_size: int = 128
     cache_auto_batch_growth_factor: float = 2.0
     cache_batch_profile: Optional[str] = None
@@ -604,6 +606,10 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                                 "--auto-batch",
                                 "--auto-batch-target-vram-gb",
                                 str(options.cache_auto_batch_target_vram_gb),
+                                "--auto-batch-start-size",
+                                str(options.cache_auto_batch_start_size),
+                                "--auto-batch-safety-fraction",
+                                str(options.cache_auto_batch_safety_fraction),
                                 "--auto-batch-max-size",
                                 str(options.cache_auto_batch_max_size),
                                 "--auto-batch-growth-factor",
@@ -682,6 +688,10 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                             "--auto-batch",
                             "--auto-batch-target-vram-gb",
                             str(options.cache_auto_batch_target_vram_gb),
+                            "--auto-batch-start-size",
+                            str(options.cache_auto_batch_start_size),
+                            "--cache-auto-batch-safety-fraction",
+                            str(options.cache_auto_batch_safety_fraction),
                             "--auto-batch-max-size",
                             str(options.cache_auto_batch_max_size),
                             "--auto-batch-growth-factor",
@@ -759,6 +769,8 @@ def pipeline_config_hash(options: PipelineOptions) -> str:
         "cache_startup_stagger_seconds",
         "cache_auto_batch",
         "cache_auto_batch_target_vram_gb",
+        "cache_auto_batch_start_size",
+        "cache_auto_batch_safety_fraction",
         "cache_auto_batch_max_size",
         "cache_auto_batch_growth_factor",
         "regenerate_auto_batch",
@@ -1507,6 +1519,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="mục tiêu VRAM cache mỗi GPU; mặc định 170GB trên B200 180GB",
     )
     parser.add_argument(
+        "--cache-auto-batch-start-size",
+        type=int,
+        default=1,
+        help="batch khởi đầu SGLang adaptive; mặc định 1, sau đó tăng dần",
+    )
+    parser.add_argument(
+        "--cache-auto-batch-safety-fraction",
+        type=float,
+        default=0.95,
+        help="tỷ lệ token-pool an toàn trước hard capacity; mặc định 0.95",
+    )
+    parser.add_argument(
         "--cache-auto-batch-max-size",
         type=int,
         default=128,
@@ -1679,6 +1703,12 @@ def main(argv=None) -> int:
         raise ValueError("cache-startup-stagger-seconds không được âm")
     if args.cache_auto_batch_max_size < 1:
         raise ValueError("cache-auto-batch-max-size phải >= 1")
+    if args.cache_auto_batch_start_size < 1:
+        raise ValueError("cache-auto-batch-start-size phải >= 1")
+    if args.cache_auto_batch_start_size > args.cache_auto_batch_max_size:
+        raise ValueError("cache-auto-batch-start-size phải <= cache-auto-batch-max-size")
+    if not 0.0 < args.cache_auto_batch_safety_fraction <= 1.0:
+        raise ValueError("cache-auto-batch-safety-fraction phải thuộc (0, 1]")
     if args.cache_auto_batch_growth_factor <= 1.0:
         raise ValueError("cache-auto-batch-growth-factor phải > 1")
     if args.cache_auto_batch_target_vram_gb <= 0.0:
@@ -1724,6 +1754,8 @@ def main(argv=None) -> int:
         cache_io_queue_size=int(args.cache_io_queue_size),
         cache_auto_batch=bool(args.cache_auto_batch),
         cache_auto_batch_target_vram_gb=float(args.cache_auto_batch_target_vram_gb),
+        cache_auto_batch_start_size=int(args.cache_auto_batch_start_size),
+        cache_auto_batch_safety_fraction=float(args.cache_auto_batch_safety_fraction),
         cache_auto_batch_max_size=int(args.cache_auto_batch_max_size),
         cache_auto_batch_growth_factor=float(args.cache_auto_batch_growth_factor),
         cache_batch_profile=str(args.cache_batch_profile) if args.cache_batch_profile else None,

@@ -54,6 +54,7 @@ def test_build_stage_plan_runs_complete_phase1_chain(tmp_path: Path) -> None:
     assert "validate_pilot_dataset.py" in plan[1].command[1]
     assert "tokenize_dataset.py" in plan[2].command[1]
     assert "cache_target_features.py" in plan[3].command[1]
+    assert plan[3].command[plan[3].command.index("--cache-backend") + 1] == "hf"
     assert "--require-generated" in plan[1].command
     assert options.output_root / "target_features_smoke" / "train" / "manifest.json" in plan[3].artifacts
 
@@ -78,6 +79,64 @@ def test_build_stage_plan_keeps_cache_provenance_paths_aligned(tmp_path: Path) -
     assert regenerated in plan[2].command
     assert tokenized in plan[3].command
     assert cache in plan[3].command
+
+
+def test_build_stage_plan_can_select_specforge_sglang_cache_backend(tmp_path: Path) -> None:
+    from run_phase1_smoke import SmokeOptions, build_stage_plan
+
+    options = SmokeOptions(
+        input_path=tmp_path / "pilot_prompts.jsonl",
+        output_root=tmp_path / "phase1_smoke",
+        target_model_path="/models/Qwen3-4B",
+        cache_backend="specforge_sglang",
+    )
+    plan = build_stage_plan(options)
+
+    cache_command = plan[3].command
+    assert cache_command[cache_command.index("--cache-backend") + 1] == "specforge_sglang"
+
+
+def test_build_stage_plan_forwards_adaptive_sglang_cache_controls(tmp_path: Path) -> None:
+    from run_phase1_smoke import SmokeOptions, build_stage_plan
+
+    options = SmokeOptions(
+        input_path=tmp_path / "pilot_prompts.jsonl",
+        output_root=tmp_path / "phase1_smoke",
+        target_model_path="/models/Qwen3-4B",
+        cache_backend="specforge_sglang",
+        cache_auto_batch=True,
+        cache_auto_batch_start_size=1,
+        cache_auto_batch_safety_fraction=0.95,
+        cache_auto_batch_target_vram_gb=170.0,
+        cache_auto_batch_max_size=128,
+    )
+    cache_command = build_stage_plan(options)[3].command
+
+    assert "--auto-batch" in cache_command
+    assert cache_command[cache_command.index("--auto-batch-start-size") + 1] == "1"
+    assert cache_command[cache_command.index("--auto-batch-safety-fraction") + 1] == "0.95"
+    assert cache_command[cache_command.index("--auto-batch-target-vram-gb") + 1] == "170.0"
+    assert cache_command[cache_command.index("--auto-batch-max-size") + 1] == "128"
+
+
+def test_cli_preserves_sglang_backend_in_dry_run(tmp_path: Path, capsys) -> None:
+    from run_phase1_smoke import main
+
+    assert (
+        main(
+            [
+                "--input",
+                str(tmp_path / "pilot_prompts.jsonl"),
+                "--output-root",
+                str(tmp_path / "phase1_smoke"),
+                "--cache-backend",
+                "specforge_sglang",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert "--cache-backend specforge_sglang" in capsys.readouterr().out
 
 
 def test_materialize_subset_writes_audit_manifest_without_touching_source(

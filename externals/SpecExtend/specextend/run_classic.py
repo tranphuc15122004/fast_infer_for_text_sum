@@ -3,7 +3,11 @@ import torch
 import os
 import json
 from accelerate import Accelerator 
-from termcolor import colored
+try:
+    from termcolor import colored
+except ImportError:  # cosmetic dependency; keep offline smoke/import usable
+    def colored(text, *_args, **_kwargs):
+        return str(text)
 import argparse
 
 
@@ -41,6 +45,23 @@ def load_texts_from_jsonl(path: str, max_samples: int = None):
             texts.append(text)
     return texts
 
+
+def encode_with_input_limit(tokenizer, text: str, max_input_tokens: int = 0):
+    """Encode one prompt and optionally preserve its leftmost token prefix.
+
+    The Horizon-CMR launcher passes this limit so smoke/pilot runs can be
+    bounded on a 16 GiB T4.  The supplied SpecExtend JSONL already contains
+    the summarization instruction at the beginning of each prompt; retaining
+    the left prefix therefore preserves the instruction while enforcing the
+    requested token budget.
+    """
+    input_ids = tokenizer.encode(
+        text, return_tensors="pt", add_special_tokens=True
+    )
+    if max_input_tokens and input_ids.shape[1] > max_input_tokens:
+        input_ids = input_ids[:, :max_input_tokens]
+    return input_ids
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run SpecExtend inference on a JSONL file of texts."
@@ -65,6 +86,11 @@ def main():
         "--max_gen_len", "-max",
         type=int, default=256,
         help="Maximum number of tokens to generate(default: 256)."
+    )
+    parser.add_argument(
+        "--max_input_tokens",
+        type=int, default=0,
+        help="Truncate each encoded prompt to this many tokens (0 disables)."
     )
     parser.add_argument(
         "--use_specextend",
@@ -118,8 +144,8 @@ def main():
     print(colored(f'Warming up GPUs...', 'yellow'))
     warmup_runs = int(os.environ.get("SPECEXTEND_WARMUP_RUNS", "3"))
     for idx, text in enumerate(texts[:1]):
-        input_ids = tokenizer.encode(
-            text, return_tensors="pt", add_special_tokens=True
+        input_ids = encode_with_input_limit(
+            tokenizer, text, args.max_input_tokens
         ).to(accelerator.device)
 
         for _ in range(warmup_runs):
@@ -140,8 +166,9 @@ def main():
     for idx, text in enumerate(texts):
         seed_everything(seed)
         print(colored(f"\n=== Sample {idx+1}/{len(texts)} ===", 'yellow'))
-        input_ids = tokenizer.encode(
-            text, return_tensors="pt", add_special_tokens=True
+        os.environ["SPECEXTEND_TRACE_SAMPLE_ID"] = str(idx)
+        input_ids = encode_with_input_limit(
+            tokenizer, text, args.max_input_tokens
         ).to(accelerator.device)
 
         results = model.spgenerate(
@@ -156,6 +183,11 @@ def main():
             retrieve_every_n_steps=4,
             retrieval_verbose=False
         )
+        print("SPECEXTEND_STATS_JSON " + json.dumps({
+            "sample_id": idx,
+            "input_tokens": int(input_ids.shape[1]),
+            **results,
+        }, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

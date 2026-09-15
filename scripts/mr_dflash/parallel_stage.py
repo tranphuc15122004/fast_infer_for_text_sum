@@ -407,6 +407,7 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
                 [
                     "--auto-batch",
                     "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-start-size", str(args.auto_batch_start_size),
                     "--auto-batch-max-size", str(args.auto_batch_max_size),
                     "--auto-batch-growth-factor", str(args.auto_batch_growth_factor),
                 ]
@@ -457,6 +458,8 @@ def _build_worker_command(args: argparse.Namespace, root: Path, rank: int, num_s
                 [
                     "--auto-batch",
                     "--auto-batch-target-vram-gb", str(args.auto_batch_target_vram_gb),
+                    "--auto-batch-start-size", str(args.auto_batch_start_size),
+                    "--auto-batch-safety-fraction", str(args.cache_auto_batch_safety_fraction),
                     "--auto-batch-max-size", str(args.auto_batch_max_size),
                     "--auto-batch-growth-factor", str(args.auto_batch_growth_factor),
                 ]
@@ -803,6 +806,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="mục tiêu VRAM mỗi GPU; mặc định 170GB cho B200 180GB",
     )
     parser.add_argument(
+        "--auto-batch-start-size",
+        type=int,
+        default=1,
+        help="batch khởi đầu cho adaptive mode; mặc định 1, sau đó tăng dần",
+    )
+    parser.add_argument(
+        "--cache-auto-batch-safety-fraction",
+        type=float,
+        default=0.95,
+        help="tỷ lệ token-pool cache an toàn trước hard capacity; mặc định 0.95",
+    )
+    parser.add_argument(
         "--auto-batch-max-size",
         type=int,
         default=128,
@@ -926,6 +941,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("generation-batch-size phải >= 1")
     if args.auto_batch_max_size < args.generation_batch_size:
         raise ValueError("auto-batch-max-size phải >= generation-batch-size")
+    if args.auto_batch_start_size < 1:
+        raise ValueError("auto-batch-start-size phải >= 1")
+    if args.auto_batch_start_size > args.auto_batch_max_size:
+        raise ValueError("auto-batch-start-size phải <= auto-batch-max-size")
+    if not 0.0 < args.cache_auto_batch_safety_fraction <= 1.0:
+        raise ValueError("cache-auto-batch-safety-fraction phải thuộc (0, 1]")
     if args.auto_batch_growth_factor <= 1.0:
         raise ValueError("auto-batch-growth-factor phải > 1")
     if args.auto_batch_target_vram_gb <= 0.0:
@@ -1033,6 +1054,8 @@ def main(argv=None) -> int:
         "generation_batch_size": int(args.generation_batch_size),
         "auto_batch": bool(args.auto_batch),
         "auto_batch_target_vram_gb": float(args.auto_batch_target_vram_gb),
+        "auto_batch_start_size": int(args.auto_batch_start_size),
+        "cache_auto_batch_safety_fraction": float(args.cache_auto_batch_safety_fraction),
         "auto_batch_max_size": int(args.auto_batch_max_size),
         "auto_batch_growth_factor": float(args.auto_batch_growth_factor),
         "stall_timeout_seconds": float(args.stall_timeout_seconds),

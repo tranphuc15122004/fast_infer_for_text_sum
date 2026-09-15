@@ -500,6 +500,8 @@ def cache_dataset(
     cache_memory_fraction: float = 0.99,
     auto_batch: bool = False,
     auto_batch_target_vram_gb: Optional[float] = None,
+    auto_batch_start_size: int = 1,
+    auto_batch_safety_fraction: float = 0.95,
     auto_batch_max_size: int = 128,
     auto_batch_growth_factor: float = 2.0,
 ) -> Dict[str, int]:
@@ -512,6 +514,9 @@ def cache_dataset(
             "tokenization và tránh tokenize lại trong worker"
         )
     attention_backend = _effective_attention_backend(cache_backend, attention_backend)
+    adaptive_cache = bool(
+        auto_batch and str(cache_backend).lower() == "specforge_sglang"
+    )
     if batch_size < 1:
         raise ValueError("batch_size phải >= 1")
     if io_threads < 0 or io_queue_size < 0:
@@ -524,6 +529,12 @@ def cache_dataset(
         raise ValueError("cache_max_total_tokens phải >= 1")
     if int(auto_batch_max_size) < int(batch_size):
         raise ValueError("auto_batch_max_size phải >= batch_size")
+    if int(auto_batch_start_size) < 1:
+        raise ValueError("auto_batch_start_size phải >= 1")
+    if int(auto_batch_start_size) > int(auto_batch_max_size):
+        raise ValueError("auto_batch_start_size phải <= auto_batch_max_size")
+    if not 0.0 < float(auto_batch_safety_fraction) <= 1.0:
+        raise ValueError("auto_batch_safety_fraction phải thuộc (0, 1]")
     if float(auto_batch_growth_factor) <= 1.0:
         raise ValueError("auto_batch_growth_factor phải > 1")
     if auto_batch_target_vram_gb is not None and float(auto_batch_target_vram_gb) <= 0.0:
@@ -638,7 +649,7 @@ def cache_dataset(
             cache_max_total_tokens=effective_cache_max_total_tokens,
             cache_memory_fraction=effective_cache_memory_fraction,
             throughput_profile=throughput_schedule,
-            auto_batch=bool(auto_batch and str(cache_backend).lower() == "specforge_sglang"),
+            auto_batch=adaptive_cache,
             auto_batch_max_size=int(auto_batch_max_size),
             auto_batch_target_vram_gb=auto_batch_target_vram_gb,
         )
@@ -659,6 +670,16 @@ def cache_dataset(
                 retry_hint=str(Path(output_path) / "retry_hint.json"),
             )
         raise
+    runtime_token_capacity = getattr(capturer, "max_total_tokens", None)
+    runtime_safe_token_capacity = None
+    if adaptive_cache and runtime_token_capacity is not None:
+        runtime_safe_token_capacity = max(
+            1,
+            int(
+                int(runtime_token_capacity)
+                * float(auto_batch_safety_fraction)
+            ),
+        )
     reporter.update(
         "model_ready",
         target_model_path=str(target_model_path),
@@ -683,6 +704,16 @@ def cache_dataset(
         requested_cache_memory_fraction=float(cache_memory_fraction),
         auto_batch=bool(auto_batch),
         auto_batch_target_vram_gb=auto_batch_target_vram_gb,
+        auto_batch_start_size=int(auto_batch_start_size),
+        auto_batch_safety_fraction=float(auto_batch_safety_fraction),
+        runtime_token_capacity=(
+            None if runtime_token_capacity is None else int(runtime_token_capacity)
+        ),
+        runtime_safe_token_capacity=(
+            None
+            if runtime_safe_token_capacity is None
+            else int(runtime_safe_token_capacity)
+        ),
         auto_batch_max_size=int(auto_batch_max_size),
         auto_batch_growth_factor=float(auto_batch_growth_factor),
         io_threads=int(io_threads),
@@ -765,6 +796,20 @@ def cache_dataset(
         "skipped_invalid": 0,
         "capture_errors": 0,
     }
+    if adaptive_cache:
+        stats.update(
+            {
+                "auto_batch_start_size": int(auto_batch_start_size),
+                "auto_batch_safety_fraction": float(auto_batch_safety_fraction),
+                "auto_batch_max_size": int(auto_batch_max_size),
+                "auto_batch_growth_factor": float(auto_batch_growth_factor),
+                "auto_batch_target_vram_gb": (
+                    None
+                    if auto_batch_target_vram_gb is None
+                    else float(auto_batch_target_vram_gb)
+                ),
+            }
+        )
     skipped_report_path = Path(skipped_report) if skipped_report else Path(output_path) / "skipped.jsonl"
     workload = _estimate_workload(
         data_path=data_path,
@@ -874,15 +919,20 @@ def cache_dataset(
             pass
 
     buffer: List[Dict[str, Any]] = []
-    adaptive_cache = bool(
-        auto_batch and str(cache_backend).lower() == "specforge_sglang"
-    )
     cache_controller = (
         AdaptiveBatchController(
-            initial_batch_size=int(batch_size),
+            # Adaptive SGLang mode starts from a small safe batch.  The
+            # built-in throughput profile is a token-budget hint, not a fixed
+            # initial batch size or a hard throughput ceiling.
+            initial_batch_size=int(auto_batch_start_size),
             max_batch_size=int(auto_batch_max_size),
             growth_factor=float(auto_batch_growth_factor),
             target_vram_gb=auto_batch_target_vram_gb,
+            safety_margin_gb=(
+                float(auto_batch_target_vram_gb) * (1.0 - float(auto_batch_safety_fraction))
+                if auto_batch_target_vram_gb is not None
+                else 0.0
+            ),
         )
         if adaptive_cache
         else None
@@ -929,7 +979,10 @@ def cache_dataset(
                         batch_key,
                         attempted_batch_size=len(batch),
                     )
-                    if capturer.device.type == "cuda":
+                    recover_from_oom = getattr(capturer, "recover_from_oom", None)
+                    if callable(recover_from_oom):
+                        recover_from_oom()
+                    elif capturer.device.type == "cuda":
                         torch.cuda.empty_cache()
                     reporter.update(
                         "auto_batch_oom",
@@ -994,12 +1047,27 @@ def cache_dataset(
                 record_skip(sample["id"], kind="write_error", error=repr(exc))
                 stats["capture_errors"] += 1
         if cache_controller is not None and allow_growth:
+            safe_ceiling = adaptive_batch_ceiling(len(batch[0]["input_ids"]))
             next_batch = cache_controller.record_success(
                 batch_key,
                 # SpecForge preallocates a static pool at startup, so request
                 # peak telemetry is not a useful stopping signal here.
                 peak_vram_gb=None,
+                max_next_batch_size=safe_ceiling,
             )
+            if next_batch <= len(batch) and len(batch) >= safe_ceiling:
+                reporter.update(
+                    "auto_batch_guard_hold",
+                    batch_key=batch_key,
+                    completed_batch_size=len(batch),
+                    safe_ceiling=int(safe_ceiling),
+                    runtime_safe_token_capacity=(
+                        None
+                        if runtime_safe_token_capacity is None
+                        else int(runtime_safe_token_capacity)
+                    ),
+                    auto_batch_profile=cache_controller.snapshot(),
+                )
             reporter.update(
                 "auto_batch_grown",
                 batch_key=batch_key,
@@ -1040,6 +1108,28 @@ def cache_dataset(
 
     rows = iter_cache_rows()
 
+    def adaptive_batch_ceiling(sample_length: int) -> int:
+        """Predict a safe batch before issuing the next SGLang forward.
+
+        SGLang exposes the actual token-pool capacity after static-pool
+        profiling.  Reserving only ``auto_batch_safety_fraction`` of that
+        capacity lets us reject ``current_batch + 1`` before the allocator
+        reaches its hard boundary.  The token cap remains a second guard.
+        """
+        length = max(1, int(sample_length))
+        ceiling = int(auto_batch_max_size)
+        if effective_cache_max_total_tokens is not None:
+            ceiling = min(
+                ceiling,
+                max(1, int(effective_cache_max_total_tokens) // length),
+            )
+        if runtime_safe_token_capacity is not None:
+            ceiling = min(
+                ceiling,
+                max(1, int(runtime_safe_token_capacity) // length),
+            )
+        return max(1, ceiling)
+
     def next_batch_size(sample_length: Optional[int] = None) -> int:
         controller_key = (
             None if sample_length is None else cache_batch_key(sample_length)
@@ -1069,11 +1159,7 @@ def cache_dataset(
         else:
             selected = batch_size
         if cache_controller is not None and controller_key is not None:
-            selected = cache_controller.batch_size(
-                controller_key,
-                default=int(selected),
-            )
-            # Keep an explicitly supplied token cap as a hard safety limit.
+            token_cap = None
             if effective_cache_max_total_tokens is not None:
                 token_cap = int(effective_cache_max_total_tokens) // int(sample_length)
                 if token_cap < 1:
@@ -1081,7 +1167,21 @@ def cache_dataset(
                         "cache-max-total-tokens nhỏ hơn một sample: "
                         f"{effective_cache_max_total_tokens} < {sample_length}"
                     )
+            # Do not seed adaptive mode from the fixed profile batch.  Start
+            # from the explicitly configured safe size and grow only after a
+            # successful capture; token_cap remains an independent hard limit.
+            adaptive_start = int(auto_batch_start_size)
+            if token_cap is not None:
+                adaptive_start = min(adaptive_start, token_cap)
+            selected = cache_controller.batch_size(
+                controller_key,
+                default=max(1, adaptive_start),
+            )
+            # Keep an explicitly supplied token cap as a hard safety limit.
+            if token_cap is not None:
                 selected = min(selected, token_cap)
+        if cache_controller is not None and sample_length is not None:
+            selected = min(selected, adaptive_batch_ceiling(int(sample_length)))
         if num_samples is None:
             return selected
         remaining = int(num_samples) - writer.total_samples
@@ -1280,6 +1380,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="mục tiêu static-pool VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
     )
     parser.add_argument(
+        "--auto-batch-start-size",
+        type=int,
+        default=1,
+        help="batch khởi đầu cho adaptive SGLang; mặc định 1, sau đó tăng dần",
+    )
+    parser.add_argument(
+        "--auto-batch-safety-fraction",
+        type=float,
+        default=0.95,
+        help="tỷ lệ token-pool an toàn trước hard capacity; mặc định 0.95",
+    )
+    parser.add_argument(
         "--auto-batch-max-size",
         type=int,
         default=128,
@@ -1370,6 +1482,8 @@ def main(argv=None) -> None:
         cache_memory_fraction=args.cache_memory_fraction,
         auto_batch=args.auto_batch,
         auto_batch_target_vram_gb=args.auto_batch_target_vram_gb,
+        auto_batch_start_size=args.auto_batch_start_size,
+        auto_batch_safety_fraction=args.auto_batch_safety_fraction,
         auto_batch_max_size=args.auto_batch_max_size,
         auto_batch_growth_factor=args.auto_batch_growth_factor,
     )

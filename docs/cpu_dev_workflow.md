@@ -30,11 +30,12 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 - Venv: `.venv/` (Python 3.12.13), đã cài **`requirements.local.txt`** (không phải
   `requirements.txt`).
-- `requirements.local.txt` = bản sao `requirements.txt` đã:
-  - Thay `vllm @ file://...` → `vllm==0.24.0` (PyPI), torch/audio/vision bỏ `+cu130`.
+- `requirements.local.txt` = profile local/CPU riêng đã:
+  - Dùng `vllm==0.24.0` theo package name, không dùng `file://`; torch/audio/vision
+    bỏ `+cu130`.
   - `nixl-cu13` hạ 1.3.0 → 1.2.0 (khớp `nixl==1.2.0`).
-  - Comment các package không có trên PyPI / cần hệ thống: `deep_ep`, `eviseq`,
-    `flashinfer-jit-cache(+cu130)`, `pyrouge`, `python-apt(+ubuntu4.1)`,
+  - Bỏ các binary/server-only hoặc package cần system library khỏi profile local:
+    `deep_ep`, `eviseq`, `flashinfer-jit-cache(+cu130)`, `pyrouge`, `python-apt`,
     `dbus-python`, `PyGObject`, `mooncake-transfer-engine` (cp310-only),
     `flash_attn` (sdist build fail: nvcc 12.4 vs torch cu130).
   - `deepspeed==0.19.3` cài OK từ sdist (pure wheel).
@@ -94,6 +95,6 @@ Khi gặp `AttributeError: 'shape'`/`__getattr__` từ tokenization_utils_base �
 - `flash_attn` chưa cài → baseline cần flash-attn không chạy được (kể cả CPU nếu
   script import thẳng `flash_attn`).
 - vllm 0.24.0 kernels cần GPU → chạy vllm inference trên máy này không khả thi.
-- `setup_venv.sh --check` luôn báo lỗi thiếu local requirement sources
-  (`deep_ep`/`eviseq`/vllm wheel) trên máy này — bình thường, không phải lỗi venv.
+- `setup_venv.sh --check` không kiểm tra private artifact (`deep_ep`/`eviseq`)
+  vì chúng không nằm trong shared manifest; thiếu chúng không phải lỗi venv.
 - Không cài package cần `sudo` (libdbus-1-dev, libcairo2-dev...) — máy không có quyền.

@@ -10,7 +10,11 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-from termcolor import colored
+try:
+    from termcolor import colored
+except ImportError:  # cosmetic dependency only
+    def colored(text, *_args, **_kwargs):
+        return str(text)
 
 def timer(func):
     def wrapper(*args, **kwargs):

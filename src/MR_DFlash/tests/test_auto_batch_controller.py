@@ -23,9 +23,11 @@ def test_auto_batch_grows_until_vram_target_then_stops() -> None:
 
     assert controller.batch_size("short") == 4
     assert controller.record_success("short", peak_vram_gb=60.0) == 8
-    assert controller.record_success("short", peak_vram_gb=120.0) == 16
-    assert controller.record_success("short", peak_vram_gb=170.0) == 16
-    assert controller.batch_size("short") == 16
+    # The predictor refuses the exponential jump to 16 because the observed
+    # slope predicts that it would cross the 170 GB target.
+    assert controller.record_success("short", peak_vram_gb=120.0) == 11
+    assert controller.record_success("short", peak_vram_gb=160.0) == 11
+    assert controller.batch_size("short") == 11
 
 
 def test_auto_batch_oom_halves_batch_and_keeps_other_bucket() -> None:
@@ -78,3 +80,35 @@ def test_oom_sets_search_bound_and_recovers_between_safe_and_failed_batch() -> N
     assert controller.record_success("short", peak_vram_gb=120.0) == 16
     assert controller.record_oom("short", attempted_batch_size=16) == 8
     assert controller.record_success("short", peak_vram_gb=130.0) == 12
+
+
+def test_auto_batch_predicts_one_more_sample_before_vram_safety_limit() -> None:
+    from auto_batch import AdaptiveBatchController
+
+    controller = AdaptiveBatchController(
+        initial_batch_size=1,
+        max_batch_size=128,
+        growth_factor=2.0,
+        target_vram_gb=170.0,
+        safety_margin_gb=2.0,
+    )
+
+    assert controller.record_success("8k", peak_vram_gb=100.0) == 2
+    assert controller.record_success("8k", peak_vram_gb=120.0) == 4
+    # Slope is 20 GB per sample.  Adding one sample to the 4-sample batch
+    # predicts 180 GB, above the 168 GB safe limit, so do not grow.
+    assert controller.record_success("8k", peak_vram_gb=160.0) == 4
+    assert controller.batch_size("8k") == 4
+
+
+def test_auto_batch_respects_runtime_token_safety_ceiling() -> None:
+    from auto_batch import AdaptiveBatchController
+
+    controller = AdaptiveBatchController(
+        initial_batch_size=1,
+        max_batch_size=128,
+        growth_factor=2.0,
+    )
+
+    assert controller.record_success("32k", peak_vram_gb=None, max_next_batch_size=2) == 2
+    assert controller.record_success("32k", peak_vram_gb=None, max_next_batch_size=2) == 2

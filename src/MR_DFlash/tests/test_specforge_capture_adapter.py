@@ -162,3 +162,79 @@ def test_specforge_maps_hf_default_attention_to_registered_backend() -> None:
         )
         == "torch_native"
     )
+
+
+def test_vendored_specforge_capture_supports_legacy_sglang_scheduler_module() -> None:
+    capture_source = (
+        Path(__file__).resolve().parents[3]
+        / "externals"
+        / "SpecForge"
+        / "specforge"
+        / "offline_capture"
+        / "sglang_backend"
+        / "capture.py"
+    ).read_text(encoding="utf-8")
+    assert "scheduler_dp_attn_mixin" in capture_source
+
+
+def test_specforge_capture_does_not_prefer_sssd_sglang_source(monkeypatch) -> None:
+    import specforge_capture
+
+    specforge_root = specforge_capture._specforge_root()
+    sssd_root = specforge_root.parent / "SSSD" / "python"
+    monkeypatch.setattr(sys, "path", [str(sssd_root), str(specforge_root)])
+
+    specforge_capture._ensure_specforge_importable()
+
+    assert str(sssd_root) not in sys.path
+    assert str(specforge_root) in sys.path
+
+
+def test_specforge_capture_places_kernel_caches_in_writable_runtime_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import specforge_capture
+
+    runtime_root = tmp_path / "runtime-cache"
+    for name in (
+        "FAST_INFER_CACHE_ROOT",
+        "FLASHINFER_WORKSPACE_BASE",
+        "TRITON_CACHE_DIR",
+        "TORCH_EXTENSIONS_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FAST_INFER_CACHE_ROOT", str(runtime_root))
+
+    paths = specforge_capture._prepare_runtime_caches()
+
+    assert paths["FAST_INFER_CACHE_ROOT"] == str(runtime_root)
+    for name, suffix in (
+        ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
+        ("TRITON_CACHE_DIR", "triton"),
+        ("TORCH_EXTENSIONS_DIR", "torch_extensions"),
+    ):
+        assert paths[name] == str(runtime_root / suffix)
+        assert (runtime_root / suffix).is_dir()
+
+
+def test_specforge_capture_falls_back_when_configured_kernel_cache_is_read_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import specforge_capture
+
+    runtime_root = tmp_path / "runtime-cache"
+    read_only = tmp_path / "read-only"
+    read_only.mkdir()
+    read_only.chmod(0o500)
+    try:
+        monkeypatch.setenv("FAST_INFER_CACHE_ROOT", str(runtime_root))
+        monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(read_only))
+        monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+        monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+
+        paths = specforge_capture._prepare_runtime_caches()
+
+        assert paths["FLASHINFER_WORKSPACE_BASE"] == str(runtime_root / "flashinfer")
+        assert (runtime_root / "flashinfer").is_dir()
+    finally:
+        read_only.chmod(0o700)

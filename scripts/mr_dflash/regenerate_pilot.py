@@ -435,6 +435,12 @@ def main(argv=None) -> None:
         help="mục tiêu peak VRAM mỗi GPU; ví dụ 170 trên B200 180GB",
     )
     parser.add_argument(
+        "--auto-batch-start-size",
+        type=int,
+        default=1,
+        help="batch khởi đầu cho adaptive generation; mặc định 1, sau đó tăng dần",
+    )
+    parser.add_argument(
         "--auto-batch-max-size",
         type=int,
         default=128,
@@ -465,6 +471,10 @@ def main(argv=None) -> None:
         raise ValueError("generation-batch-size phải >= 1")
     if args.auto_batch_max_size < args.generation_batch_size:
         raise ValueError("auto-batch-max-size phải >= generation-batch-size")
+    if args.auto_batch_start_size < 1:
+        raise ValueError("auto-batch-start-size phải >= 1")
+    if args.auto_batch_start_size > args.auto_batch_max_size:
+        raise ValueError("auto-batch-start-size phải <= auto-batch-max-size")
     if args.auto_batch_growth_factor <= 1.0:
         raise ValueError("auto-batch-growth-factor phải > 1")
     if args.auto_batch_target_vram_gb is not None and args.auto_batch_target_vram_gb <= 0:
@@ -578,7 +588,9 @@ def main(argv=None) -> None:
     generation_pending: List[Dict[str, Any]] = []
     generation_controller = (
         AdaptiveBatchController(
-            initial_batch_size=(1 if args.temperature > 0 else int(args.generation_batch_size)),
+            initial_batch_size=(
+                1 if args.temperature > 0 else int(args.auto_batch_start_size)
+            ),
             max_batch_size=(1 if args.temperature > 0 else int(args.auto_batch_max_size)),
             growth_factor=float(args.auto_batch_growth_factor),
             target_vram_gb=args.auto_batch_target_vram_gb,
@@ -900,6 +912,7 @@ def main(argv=None) -> None:
             "generation_batch_size": int(args.generation_batch_size),
             "auto_batch": bool(args.auto_batch),
             "auto_batch_target_vram_gb": args.auto_batch_target_vram_gb,
+            "auto_batch_start_size": int(args.auto_batch_start_size),
             "auto_batch_max_size": int(args.auto_batch_max_size),
             "auto_batch_growth_factor": float(args.auto_batch_growth_factor),
             "auto_batch_profile": (

@@ -84,8 +84,10 @@ flexprefill`.
 
 - Không có internet: không dùng installer online; model/dataset và mọi direct
   wheel URL phải được mirror/cache sẵn trên server.
-- `requirements.txt` chứa một số path server-specific (`deep_ep`, `eviseq`,
-  `vllm`) nên clone khác phải mount đúng các artefact đó.
+- `requirements.txt` chỉ chứa requirement theo tên/version hoặc artifact đã
+  mirror; không thêm `file://`, editable path, direct host URL hay package
+  snapshot Ubuntu vào manifest. Các artifact tùy chọn như `deep_ep`/`eviseq`
+  không thuộc shared manifest nếu chưa có package/index portable.
 - Model gated (Llama) cần `HF_TOKEN`; ưu tiên snapshot local.
 - `flash-attn`, `flashinfer`, Triton và vLLM phải khớp torch/CUDA/GPU.
 - Kết quả nằm ở `outputs/` (gitignored), không commit artifact.
@@ -95,10 +97,9 @@ flexprefill`.
 - Máy này **KHÔNG có sudo**; driver 550.163 (max CUDA 12.4) KHÔNG chạy được stack
   cu130 → **T4 chỉ dùng để dev/debug trên CPU**. Số liệu benchmark thật chạy trên
   server cu13. `torch.cuda.is_available()` luôn False; đừng cố sửa GPU trên máy này.
-- Venv `.venv/` đã cài qua **`requirements.local.txt`** (bản sao của `requirements.txt`
-  đã bỏ path server-specific + package không có trên PyPI: deep_ep, eviseq, vllm file://,
-  flashinfer-jit-cache, pyrouge, python-apt, dbus-python, PyGObject, mooncake,
-  flash_attn). KHÔNG cài trực tiếp từ `requirements.txt` trên máy này.
+- Venv `.venv/` đã cài qua **`requirements.local.txt`**, là profile CPU/local
+  riêng (bỏ các binary CUDA/server-only và package cần system library). KHÔNG
+  cài trực tiếp profile server cu130 này trên máy local.
 - Chạy script ở chế độ CPU (llmlingua có sẵn fallback CPU):
   ```bash
   CUDA_VISIBLE_DEVICES="" DEVICE=cpu SMOKE=1 bash scripts/run_llmlingua.sh
@@ -110,8 +111,9 @@ flexprefill`.
   - transformers 5.x: `apply_chat_template(..., return_tensors="pt")` mặc định trả
     `BatchEncoding` (không còn tensor thô như 4.x) → **phải thêm `return_dict=False`**
     trước khi dùng `.shape[1]`/`.to(device)`/`model.generate()`.
-- `setup_venv.sh --check` sẽ báo lỗi thiếu local requirement sources trên máy này
-  (deep_ep/eviseq/vllm wheel) — đó là bình thường, không phải lỗi venv.
+- `setup_venv.sh --check` không cần tìm local requirement source trong manifest
+  server; nếu thêm artifact private, phải đưa nó vào wheelhouse/profile riêng
+  và ghi rõ cách cài.
 - Chi tiết debug CPU + checklist: `docs/cpu_dev_workflow.md`.
 
 Chi tiết cài đặt/infer từng baseline: `docs/README.md` → `docs/baselines/*.md`.

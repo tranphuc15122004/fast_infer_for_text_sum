@@ -237,6 +237,7 @@ def test_pipeline_forwards_adaptive_batch_to_specforge_and_regenerate(tmp_path: 
         cache_backend="specforge_sglang",
         cache_auto_batch=True,
         cache_auto_batch_target_vram_gb=170.0,
+        cache_auto_batch_start_size=1,
         cache_auto_batch_max_size=128,
         cache_auto_batch_growth_factor=2.0,
         regenerate_auto_batch=True,
@@ -256,6 +257,11 @@ def test_pipeline_forwards_adaptive_batch_to_specforge_and_regenerate(tmp_path: 
         assert command[command.index("--auto-batch-target-vram-gb") + 1] == "170.0"
         assert command[command.index("--auto-batch-max-size") + 1] == expected_max
         assert command[command.index("--auto-batch-growth-factor") + 1] == "2.0"
+    assert cache.command[cache.command.index("--auto-batch-start-size") + 1] == "1"
+    assert (
+        cache.command[cache.command.index("--cache-auto-batch-safety-fraction") + 1]
+        == "0.95"
+    )
 
 
 def test_parallel_worker_forwards_adaptive_batch_flags(tmp_path: Path) -> None:
@@ -368,9 +374,106 @@ def test_specforge_auto_cache_grows_batches_from_profile(tmp_path: Path, monkeyp
         cache_backend="specforge_sglang",
         cache_max_total_tokens=64,
         auto_batch=True,
+        auto_batch_start_size=1,
         auto_batch_max_size=8,
     )
-    assert capturer.batch_sizes == [2, 4, 2]
+    assert capturer.batch_sizes == [1, 2, 4, 1]
+
+
+def test_specforge_auto_cache_start_size_overrides_builtin_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Adaptive SGLang mode must not use the fixed profile batch as a cap/start."""
+    script_dir = Path(__file__).resolve().parents[3] / "scripts" / "mr_dflash"
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import cache_target_features
+    from MR_DFlash.tokenized_data import write_tokenized_manifest
+
+    class TinyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    class FakeCapturer:
+        def __init__(self, *_args, **_kwargs):
+            self.tokenizer = TinyTokenizer()
+            self.device = torch.device("cpu")
+            self.layer_ids = [0, 1]
+            self.context_feature_dim = 4
+            self.model = type(
+                "Model", (), {"config": type("Config", (), {"hidden_size": 2})()}
+            )()
+            self.batch_sizes = []
+
+        def capture_batch(self, input_ids, attention_mask):
+            batch_size = int(input_ids.shape[0])
+            self.batch_sizes.append(batch_size)
+            if batch_size > 2:
+                raise torch.cuda.OutOfMemoryError("synthetic adaptive limit")
+            return [
+                torch.ones(int(length), 4, dtype=torch.bfloat16)
+                for length in attention_mask.sum(dim=-1).tolist()
+            ]
+
+        def close(self):
+            return None
+
+    capturer = FakeCapturer()
+    monkeypatch.setattr(cache_target_features, "_build_capturer", lambda **_kwargs: capturer)
+    tokenized = tmp_path / "tokenized"
+    tokenized.mkdir()
+    samples = [
+        {"id": f"s{index}", "input_ids": torch.arange(6), "loss_mask": torch.ones(6), "length": 6}
+        for index in range(8)
+    ]
+    torch.save({"samples": samples}, tokenized / "shard_00000.pt")
+    write_tokenized_manifest(
+        tokenized,
+        shards=[{"path": "shard_00000.pt", "count": 8}],
+        num_samples=8,
+        target_model="tiny-target",
+        feature_layer_ids=[0, 1],
+        chat_template="tiny",
+        max_length=64,
+        supervision_mode="last_assistant",
+    )
+    profile = tmp_path / "throughput.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "schema_version": "mr_dflash_cache_throughput_profile_v1",
+                "target_model_path": "tiny-target",
+                "feature_layer_ids": [0, 1],
+                "max_length": 64,
+                "requested_torch_dtype": "bfloat16",
+                "attention_backend": "flashinfer",
+                "buckets": [
+                    {"min_length": 1, "max_length": 64, "batch_size": 64, "token_budget": 4096}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache_target_features.cache_dataset(
+        target_model_path="tiny-target",
+        tokenized_path=str(tokenized),
+        output_path=str(tmp_path / "cache"),
+        max_length=64,
+        batch_size=1,
+        bucket_buffer_size=4,
+        shard_size=16,
+        layer_ids=[0, 1],
+        device="cpu",
+        throughput_profile=str(profile),
+        cache_backend="specforge_sglang",
+        cache_max_total_tokens=4096,
+        auto_batch=True,
+        auto_batch_start_size=1,
+        auto_batch_max_size=64,
+    )
+    assert capturer.batch_sizes[:3] == [1, 2, 4]
+    assert capturer.batch_sizes[:6] == [1, 2, 4, 2, 3, 2]
 
 
 def test_parallel_cache_worker_receives_batch_profile(tmp_path: Path) -> None:

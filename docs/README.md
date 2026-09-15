@@ -101,6 +101,27 @@ Nếu chỉ muốn kiểm tra filesystem trước khi dataset được copy, dù
 master config đã tồn tại; `--init` chỉ refresh block managed defaults của
 script, còn các đường dẫn model/checkpoint operator-owned vẫn giữ nguyên.
 
+Nếu operator muốn một venv cô lập riêng trên B200, dùng script pip này thay
+cho Python hệ thống:
+
+```bash
+export FAST_INFER_B200_VENV=/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum/.venv-b200
+bash scripts/setup_b200_venv.sh
+source "$FAST_INFER_B200_VENV/bin/activate"
+```
+
+Script tạo Python 3.12 venv mới rồi chạy `pip install -r requirements.txt`.
+Khi server không có internet, chuẩn bị wheelhouse đầy đủ và chạy:
+
+```bash
+export B200_OFFLINE=1
+export B200_WHEELHOUSE=/workspace/storage-shared/nlp/dungdx4/phuc_projects/offline_wheelhouse
+bash scripts/setup_b200_venv.sh
+```
+
+Target đã tồn tại sẽ không bị xoá tự động. `libnuma1` và `libnuma-dev` là
+system packages, cần được cài ngoài pip trước khi import `sglang-kernel`.
+
 Để mô phỏng đúng profile trên máy local, thay interpreter ở command runner:
 
 ```bash
@@ -228,10 +249,12 @@ Phân tích latency, memory và ROUGE của các scheme `random`, `lead`, `tfidf
 
 ## Ghi chú portability
 
-- `requirements.txt` là nguồn dependency duy nhất; các local wheel/editable path
-  trong đó phải tồn tại trên server.
+- `requirements.txt` là nguồn dependency duy nhất cho shared runtime; manifest
+  không chứa local wheel/editable path, direct host URL hoặc package Ubuntu.
+  Binary CUDA đặc thù phải được mirror vào offline wheelhouse theo đúng tên và
+  version đã pin.
 - Setup dùng `uv pip --offline`; không tải Python/package qua internet.
-- `setup_venv.sh --check` kiểm tra Python 3.12 và các local source path; dùng
+- `setup_venv.sh --check` kiểm tra Python 3.12 và shared venv; dùng
   `check_shared_env.py` để kiểm tra import/version/CUDA sau khi cài.
 - Có thể dùng `FAST_INFER_VENV` hoặc `FAST_INFER_PYTHON` để chỉ định interpreter;
   giá trị `FAST_INFER_PYTHON=python3` được resolve qua PATH.

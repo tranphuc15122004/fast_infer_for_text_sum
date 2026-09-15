@@ -13,6 +13,7 @@ from array import array
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, List, Optional, Type
 
 import torch
@@ -23,18 +24,73 @@ def _specforge_root() -> Path:
 
 
 def _ensure_specforge_importable() -> None:
-    # SpecForge itself is vendored separately from the SGLang fork it was
-    # pinned and tested with. Put both on the worker path so a server that
-    # does not install them as editable packages still uses the compatible
-    # repository implementation.
-    roots = (
-        _specforge_root().parent / "SSSD" / "python",
-        _specforge_root(),
-    )
-    for root_path in roots:
-        root = str(root_path)
-        if root_path.is_dir() and root not in sys.path:
-            sys.path.insert(0, root)
+    # SpecForge is vendored, but its SGLang contract is provided by the
+    # installed/pinned SGLang wheel.  The SGLang source tree vendored for the
+    # unrelated SSSD baseline has a different scheduler API and must not
+    # shadow that wheel on the MR-DFlash cache path.
+    specforge_root = _specforge_root()
+    sssd_sglang_root = specforge_root.parent / "SSSD" / "python"
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if Path(entry or ".").resolve() != sssd_sglang_root.resolve()
+    ]
+    root = str(specforge_root)
+    if specforge_root.is_dir() and root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _prepare_runtime_caches() -> dict[str, str]:
+    """Point JIT/kernel caches at a writable directory before SGLang import.
+
+    The standalone MR-DFlash pipeline is not launched through the shared shell
+    runtime helper.  Without this setup FlashInfer falls back to ``~/.cache``;
+    on the B200 server that path can be mounted read-only and the backend then
+    fails while opening ``flashinfer_jit.log`` before a model is loaded.
+    """
+
+    configured_root = Path(
+        os.environ.get("FAST_INFER_CACHE_ROOT", "/tmp/fast_infer_cache")
+    ).expanduser()
+
+    def writable(path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=path, prefix=".mr_dflash_write_test_", delete=True
+            ):
+                pass
+            return True
+        except OSError:
+            return False
+
+    root = configured_root
+    if not writable(root):
+        root = Path("/tmp/fast_infer_cache")
+        if not writable(root):
+            raise RuntimeError(
+                "không tìm thấy thư mục writable cho cache JIT; "
+                "đặt FAST_INFER_CACHE_ROOT tới một filesystem có quyền ghi"
+            )
+
+    values: dict[str, str] = {"FAST_INFER_CACHE_ROOT": str(root)}
+    for name, suffix in (
+        ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
+        ("TRITON_CACHE_DIR", "triton"),
+        ("TORCH_EXTENSIONS_DIR", "torch_extensions"),
+    ):
+        configured = Path(os.environ.get(name, str(root / suffix))).expanduser()
+        path = configured if writable(configured) else root / suffix
+        if not writable(path):
+            raise RuntimeError(
+                f"không thể ghi cache runtime {name} tại {configured}; "
+                f"fallback cũng không ghi được tại {path}"
+            )
+        values[name] = str(path)
+
+    for name, value in values.items():
+        os.environ[name] = value
+    return values
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -97,6 +153,10 @@ class SpecForgeTargetCapture:
         self.context_feature_dim = (
             len(self.layer_ids) * self.hidden_size if self.hidden_size else None
         )
+        runner_max_tokens = getattr(runner, "max_total_num_tokens", None)
+        self.max_total_tokens = (
+            None if runner_max_tokens is None else int(runner_max_tokens)
+        )
         self.device = torch.device(
             "cuda", torch.cuda.current_device()
         ) if torch.cuda.is_available() else torch.device("cpu")
@@ -120,6 +180,7 @@ class SpecForgeTargetCapture:
         target_revision: Optional[str] = None,
         **kwargs: Any,
     ) -> "SpecForgeTargetCapture":
+        _prepare_runtime_caches()
         try:
             owns_distributed = _ensure_single_process_distributed()
             _ensure_specforge_importable()
@@ -266,6 +327,16 @@ class SpecForgeTargetCapture:
         self._backend = None
         if self._owns_distributed:
             self._destroy_distributed()
+
+    def recover_from_oom(self) -> None:
+        """Release request/KV allocations before retrying the same samples."""
+        backend = self._backend
+        clear_pools = getattr(backend, "_clear_pools", None)
+        if callable(clear_pools):
+            clear_pools()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self.device)
 
 
 __all__ = ["SpecForgeTargetCapture"]

@@ -42,6 +42,28 @@ metric.
 bash scripts/run.sh specextend   # smoke: Llama-3.1-8B + EAGLE-3
 ```
 
+## Horizon-CMR pilot
+
+Nhánh chẩn đoán mới dùng đúng classic summarization path của upstream, tức
+`Vicuna-7B-v1.5-16k` + `Vicuna-68M`. Đây là lựa chọn phù hợp nhất trong các
+checkpoint cục bộ cho T4; Qwen3-4B không tương thích loader này và
+Llama-3.1 + EAGLE-3 cần nhiều VRAM hơn.
+
+```bash
+bash scripts/run_specextend_horizon.sh smoke
+bash scripts/run_specextend_horizon.sh 4k
+bash scripts/run_specextend_horizon.sh 8k
+```
+
+Runner kiểm tra CUDA trước khi load model. Khi bật `SPECEXTEND_TRACE_FILE`,
+classic path ghi thêm trace JSONL gồm selected CMR chunks, aggregate target
+attention ở retrieval checkpoints, acceptance theo cycle và cycle wall time.
+Trace chỉ là telemetry; không đưa hindsight signal vào runtime policy.
+
+Artifact nằm dưới
+`outputs/specextend_horizon_cmr/2026-09-13_horizon_cmr/`. Không gọi CPU,
+fallback attention hoặc một run OOM là baseline GPU thành công.
+
 Cấu hình trong master: `SPECEXTEND_SCRIPT=run_eagle.py`,
 `SPECEXTEND_MODEL_NAME`, `MODEL_TARGET`, `MODEL_EAGLE_DRAFT`,
 `SPECEXTEND_DATA_FILE` (jsonl có trường `text`), `SPECEXTEND_MAX_SAMPLES`,
