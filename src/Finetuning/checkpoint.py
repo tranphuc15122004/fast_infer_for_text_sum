@@ -13,6 +13,11 @@ from typing import Any, Mapping
 import torch
 
 
+_DRAFT_EXPORT_STATE = "draft_state_dict.pt"
+_DRAFT_EXPORT_METADATA = "draft_metadata.json"
+_DRAFT_EXPORT_COMPLETE = "COMPLETE"
+
+
 def capture_rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -38,6 +43,58 @@ def _model_state(model: Any) -> dict[str, Any]:
     if hasattr(model, "checkpoint_state_filter"):
         state = model.checkpoint_state_filter(state)
     return dict(state)
+
+
+def export_draft(
+    output_dir: str | Path,
+    draft_model: torch.nn.Module,
+    metadata: Mapping[str, Any],
+) -> Path:
+    """Atomically export portable draft weights plus strict provenance."""
+
+    destination = Path(output_dir)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
+    try:
+        torch.save(dict(draft_model.state_dict()), staging / _DRAFT_EXPORT_STATE)
+        (staging / _DRAFT_EXPORT_METADATA).write_text(
+            json.dumps(dict(metadata), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (staging / _DRAFT_EXPORT_COMPLETE).write_text("ok\n", encoding="utf-8")
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.replace(staging, destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return destination
+
+
+def load_draft_initialization(
+    export_dir: str | Path,
+    draft_model: torch.nn.Module,
+    expected_metadata: Mapping[str, Any],
+) -> None:
+    """Strictly load a portable draft export after provenance validation."""
+
+    source = Path(export_dir)
+    required = (_DRAFT_EXPORT_STATE, _DRAFT_EXPORT_METADATA, _DRAFT_EXPORT_COMPLETE)
+    missing = [name for name in required if not (source / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"portable draft export is incomplete: missing {missing}")
+    stored_metadata = json.loads(
+        (source / _DRAFT_EXPORT_METADATA).read_text(encoding="utf-8")
+    )
+    if stored_metadata != dict(expected_metadata):
+        raise ValueError("draft export metadata mismatch")
+    state = torch.load(source / _DRAFT_EXPORT_STATE, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise ValueError("portable draft state must be a tensor mapping")
+    try:
+        draft_model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(f"draft export state mismatch: {exc}") from exc
 
 
 class CheckpointManager:
@@ -72,6 +129,8 @@ class CheckpointManager:
         scheduler: Any,
         trainer_state: Mapping[str, Any],
         extra: Mapping[str, Any],
+        *,
+        draft_export_metadata: Mapping[str, Any] | None = None,
     ) -> Path:
         destination = self._step_dir(step)
         if destination.exists():
@@ -80,7 +139,8 @@ class CheckpointManager:
             tempfile.mkdtemp(prefix=f".{self.run_id}-step{step}-", dir=self.output_dir)
         )
         try:
-            torch.save(_model_state(model), staging / "draft_state_dict.pt")
+            draft_state = _model_state(model)
+            torch.save(draft_state, staging / "draft_state_dict.pt")
             torch.save(optimizer.state_dict(), staging / "optimizer.pt")
             torch.save(scheduler.state_dict(), staging / "scheduler.pt")
             torch.save(capture_rng_state(), staging / "rng_state.pt")
@@ -92,6 +152,22 @@ class CheckpointManager:
                 json.dumps(dict(extra), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            if draft_export_metadata is not None:
+                draft_export = staging / "draft_export"
+                draft_export.mkdir()
+                torch.save(draft_state, draft_export / _DRAFT_EXPORT_STATE)
+                (draft_export / _DRAFT_EXPORT_METADATA).write_text(
+                    json.dumps(
+                        dict(draft_export_metadata),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                (draft_export / _DRAFT_EXPORT_COMPLETE).write_text(
+                    "ok\n", encoding="utf-8"
+                )
             (staging / "COMPLETE").write_text("ok\n", encoding="utf-8")
             os.replace(staging, destination)
         except Exception:
@@ -184,4 +260,10 @@ class CheckpointManager:
         }
 
 
-__all__ = ["CheckpointManager", "capture_rng_state", "restore_rng_state"]
+__all__ = [
+    "CheckpointManager",
+    "capture_rng_state",
+    "export_draft",
+    "load_draft_initialization",
+    "restore_rng_state",
+]

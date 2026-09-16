@@ -6,9 +6,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
+
+
+DEFAULT_SUMMARY_PROMPT_TEMPLATE = (
+    "Hãy tóm tắt văn bản sau bằng tiếng Việt. "
+    "Chỉ trả lời bằng bản tóm tắt:\n\n{document}"
+)
 
 
 @dataclass(frozen=True)
@@ -42,16 +48,25 @@ def load_summary_jsonl(
     dropped.
     """
 
+    return list(iter_summary_jsonl(path, max_samples=max_samples))
+
+
+def iter_summary_jsonl(
+    path: str | Path,
+    max_samples: int | None = None,
+) -> Iterator[SummaryRecord]:
+    """Yield local JSONL records without materializing a real corpus in RAM."""
+
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"summary JSONL file not found: {source}")
     if max_samples is not None and max_samples < 0:
         raise ValueError("max_samples must be non-negative")
 
-    records: list[SummaryRecord] = []
+    yielded = 0
     with source.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            if max_samples is not None and len(records) >= max_samples:
+            if max_samples is not None and yielded >= max_samples:
                 break
             if not line.strip():
                 continue
@@ -78,19 +93,18 @@ def load_summary_jsonl(
                 if key not in {"id", "document", "summary"}
             }
             try:
-                records.append(
-                    SummaryRecord(
-                        id=payload["id"],
-                        document=payload["document"],
-                        summary=payload["summary"],
-                        metadata=metadata,
-                    )
+                record = SummaryRecord(
+                    id=payload["id"],
+                    document=payload["document"],
+                    summary=payload["summary"],
+                    metadata=metadata,
                 )
             except TypeError as exc:
                 raise ValueError(
                     f"summary JSONL line {line_number} has invalid field types"
                 ) from exc
-    return records
+            yielded += 1
+            yield record
 
 
 def _as_token_id_list(value: Any) -> list[int]:
@@ -122,6 +136,16 @@ def _as_token_id_list(value: Any) -> list[int]:
 def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
     encoded = tokenizer(text, add_special_tokens=False)
     return _as_token_id_list(encoded)
+
+
+def render_summary_user_prompt(document: str, prompt_template: str) -> str:
+    """Insert a document into the single explicit summarization instruction."""
+
+    if not isinstance(prompt_template, str) or prompt_template.count("{document}") != 1:
+        raise ValueError(
+            "prompt_template must contain the {document} placeholder exactly once"
+        )
+    return prompt_template.format(document=document)
 
 
 def _template_kwargs(tokenizer: Any, chat_template: str | None) -> dict[str, Any]:
@@ -224,11 +248,62 @@ def _tokenizer_control_ids(tokenizer: Any) -> set[int]:
     return control_ids
 
 
+def render_summary_prompt(
+    record: SummaryRecord,
+    tokenizer: Any,
+    max_length: int,
+    *,
+    max_source_tokens: int,
+    max_summary_tokens: int,
+    chat_template: str = "qwen3",
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+) -> torch.Tensor:
+    """Render a generation prompt while reserving space for target output."""
+
+    if max_length < 1:
+        raise ValueError("max_length must be positive")
+    if max_source_tokens < 0 or max_summary_tokens < 1:
+        raise ValueError("source and summary token budgets must be non-negative/positive")
+    prompt_limit = max_length - max_summary_tokens
+    if prompt_limit < 1:
+        raise ValueError("max_length must leave room for a generation prompt")
+    user_prompt = render_summary_user_prompt(record.document, prompt_template)
+    prefix_ids = _apply_chat_template(
+        tokenizer,
+        [{"role": "user", "content": user_prompt}],
+        add_generation_prompt=True,
+        chat_template=chat_template,
+    )
+    source_ids = _tokenize_text(tokenizer, record.document)
+    if not source_ids:
+        if len(prefix_ids) > prompt_limit:
+            raise ValueError("chat template exceeds reserved prompt budget")
+        return torch.tensor(prefix_ids, dtype=torch.long)
+    source_start = _find_subsequence(prefix_ids, source_ids, 0)
+    if source_start is None:
+        raise ValueError("cannot locate document content span in chat template")
+    source_end = source_start + len(source_ids)
+    fixed_prefix = prefix_ids[:source_start]
+    suffix_after_source = prefix_ids[source_end:]
+    capacity = prompt_limit - len(fixed_prefix) - len(suffix_after_source)
+    if capacity < 0:
+        raise ValueError("chat template exceeds reserved prompt budget")
+    used_source_tokens = min(len(source_ids), max_source_tokens, capacity)
+    return torch.tensor(
+        fixed_prefix + source_ids[:used_source_tokens] + suffix_after_source,
+        dtype=torch.long,
+    )
+
+
 def render_summary_example(
     record: SummaryRecord,
     tokenizer: Any,
     max_length: int,
     chat_template: str = "qwen3",
+    *,
+    max_source_tokens: int | None = None,
+    max_summary_tokens: int | None = None,
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
 ) -> dict[str, torch.Tensor]:
     """Render one record with the supplied local tokenizer.
 
@@ -243,9 +318,15 @@ def render_summary_example(
         raise TypeError("record must be a SummaryRecord")
     if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 1:
         raise ValueError("max_length must be a positive integer")
+    if max_source_tokens is not None and max_source_tokens < 0:
+        raise ValueError("max_source_tokens must be non-negative when provided")
+    if max_summary_tokens is not None and max_summary_tokens < 1:
+        raise ValueError("max_summary_tokens must be positive when provided")
+    if max_summary_tokens is not None and max_source_tokens is None:
+        raise ValueError("max_summary_tokens requires max_source_tokens")
 
     messages = [
-        {"role": "user", "content": record.document},
+        {"role": "user", "content": render_summary_user_prompt(record.document, prompt_template)},
         {"role": "assistant", "content": record.summary},
     ]
     full_ids = _apply_chat_template(
@@ -280,6 +361,43 @@ def render_summary_example(
     else:
         assistant_end = assistant_start + len(summary_ids)
 
+    if max_source_tokens is not None:
+        source_ids = _tokenize_text(tokenizer, record.document)
+        source_start = _find_subsequence(prefix_ids, source_ids, 0)
+        if source_start is None:
+            raise ValueError("cannot locate document content span in chat template")
+        source_end = source_start + len(source_ids)
+        content_ids = full_ids[assistant_start:assistant_end]
+        if max_summary_tokens is not None:
+            content_ids = content_ids[:max_summary_tokens]
+        fixed_prefix = prefix_ids[:source_start]
+        suffix_after_source = prefix_ids[source_end:]
+        suffix_after_summary = full_ids[assistant_end:]
+        fixed_length = (
+            len(fixed_prefix)
+            + len(suffix_after_source)
+            + len(content_ids)
+            + len(suffix_after_summary)
+        )
+        if fixed_length > max_length:
+            raise ValueError(
+                "chat template and reserved summary exceed max_length; "
+                "increase max_length or lower max_summary_tokens"
+            )
+        used_source_tokens = min(
+            len(source_ids),
+            max_source_tokens,
+            max_length - fixed_length,
+        )
+        budgeted_prefix = (
+            fixed_prefix
+            + source_ids[:used_source_tokens]
+            + suffix_after_source
+        )
+        assistant_start = len(budgeted_prefix)
+        assistant_end = assistant_start + len(content_ids)
+        full_ids = budgeted_prefix + content_ids + suffix_after_summary
+
     input_ids = torch.tensor(full_ids[:max_length], dtype=torch.long)
     clipped_end = min(assistant_end, input_ids.shape[0])
     clipped_start = min(assistant_start, input_ids.shape[0])
@@ -313,6 +431,10 @@ def render_summary_example(
 __all__ = [
     "SummaryRecord",
     "build_summary_loss_mask",
+    "iter_summary_jsonl",
     "load_summary_jsonl",
+    "DEFAULT_SUMMARY_PROMPT_TEMPLATE",
+    "render_summary_user_prompt",
+    "render_summary_prompt",
     "render_summary_example",
 ]

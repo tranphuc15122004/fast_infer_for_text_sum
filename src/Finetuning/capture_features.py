@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from itertools import chain
 import os
@@ -12,6 +13,7 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
+from .data import DEFAULT_SUMMARY_PROMPT_TEMPLATE
 from .features import (
     FEATURE_MANIFEST_FILENAME,
     FeatureManifest,
@@ -128,6 +130,7 @@ def _load_local_target(
     target_model_path: Path,
     device: torch.device,
     dtype: torch.dtype,
+    trust_remote_code: bool,
 ) -> Any:
     if not target_model_path.is_dir():
         raise FileNotFoundError(
@@ -142,6 +145,7 @@ def _load_local_target(
         str(target_model_path),
         local_files_only=True,
         torch_dtype=dtype,
+        trust_remote_code=trust_remote_code,
     )
     model = model.to(device)
     model.eval()
@@ -208,10 +212,15 @@ def capture_dataset(
     target_model_path: str | Path,
     prepared_examples: Iterable[Mapping[str, Any]],
     output_dir: str | Path,
-    target_layer_ids: Iterable[int],
+    target_layer_ids: Iterable[int] | None,
     max_length: int,
     device: str | torch.device,
     dtype: torch.dtype | str,
+    *,
+    num_draft_layers: int | None = None,
+    trust_remote_code: bool = False,
+    tokenizer_id: str | None = None,
+    prompt_contract: Mapping[str, Any] | None = None,
 ) -> FeatureManifest:
     """Capture prepared token examples into an atomic local feature store."""
 
@@ -227,12 +236,26 @@ def capture_dataset(
         _validate_feature_output_dir(destination)
     else:
         destination.mkdir(parents=True)
-    model = _load_local_target(model_path, device_obj, requested_dtype)
+    model = _load_local_target(
+        model_path,
+        device_obj,
+        requested_dtype,
+        trust_remote_code=trust_remote_code,
+    )
     config = _target_config(model)
     num_layers = int(getattr(config, "num_hidden_layers", 0))
     hidden_size = int(getattr(config, "hidden_size", 0))
     if num_layers < 1 or hidden_size < 1:
         raise ValueError("local target model config lacks num_hidden_layers/hidden_size")
+    if target_layer_ids is None:
+        if num_draft_layers is None or num_draft_layers < 1:
+            raise ValueError(
+                "capture_dataset requires target_layer_ids or a positive "
+                "num_draft_layers"
+            )
+        from .model import build_target_layer_ids
+
+        target_layer_ids = build_target_layer_ids(num_layers, num_draft_layers)
     layer_ids = _resolve_layer_ids(target_layer_ids, num_layers)
 
     examples = iter(prepared_examples)
@@ -258,7 +281,8 @@ def capture_dataset(
     manifest = FeatureManifest(
         model_id=str(model_path),
         revision=getattr(config, "_commit_hash", None),
-        tokenizer_id=None,
+        tokenizer_id=tokenizer_id,
+        prompt_contract=dict(prompt_contract) if prompt_contract is not None else None,
         layer_ids=layer_ids,
         hidden_size=hidden_size,
         max_length=max_length,
@@ -299,4 +323,92 @@ def capture_dataset(
             shutil.rmtree(staging)
 
 
-__all__ = ["capture_dataset"]
+def _layer_ids_argument(value: str) -> list[int]:
+    try:
+        layer_ids = [int(part) for part in value.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--target-layer-ids must be comma-separated integers"
+        ) from exc
+    if not layer_ids:
+        raise argparse.ArgumentTypeError("--target-layer-ids must not be empty")
+    return layer_ids
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Capture frozen Qwen hidden states for offline DFlash training"
+    )
+    parser.add_argument("--input", required=True, help="Teacher-trajectory JSONL")
+    parser.add_argument("--output", required=True, help="Feature-store directory")
+    parser.add_argument("--target-model-path", required=True)
+    layer_selection = parser.add_mutually_exclusive_group(required=True)
+    layer_selection.add_argument("--target-layer-ids", type=_layer_ids_argument)
+    layer_selection.add_argument("--num-draft-layers", type=int)
+    parser.add_argument("--max-length", required=True, type=int)
+    parser.add_argument("--max-source-tokens", required=True, type=int)
+    parser.add_argument("--max-summary-tokens", required=True, type=int)
+    parser.add_argument("--chat-template", default="qwen3")
+    parser.add_argument("--prompt-template", default=DEFAULT_SUMMARY_PROMPT_TEMPLATE)
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--torch-dtype", default="bfloat16")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Capture one immutable feature generation from a local JSONL trajectory."""
+
+    args = _parser().parse_args(argv)
+    if args.max_source_tokens < 0 or args.max_summary_tokens < 1:
+        raise ValueError("source budget must be non-negative and summary budget positive")
+    if args.num_draft_layers is not None and args.num_draft_layers < 1:
+        raise ValueError("--num-draft-layers must be positive")
+    if args.max_source_tokens + args.max_summary_tokens > args.max_length:
+        raise ValueError("source and summary token budgets exceed --max-length")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
+        local_files_only=True,
+    )
+    from .prepare_data import iter_summary_examples
+
+    prompt_contract = {
+        "chat_template": args.chat_template,
+        "max_source_tokens": args.max_source_tokens,
+        "max_summary_tokens": args.max_summary_tokens,
+        "prompt_template": args.prompt_template,
+    }
+    manifest = capture_dataset(
+        target_model_path=args.target_model_path,
+        prepared_examples=iter_summary_examples(
+            args.input,
+            tokenizer,
+            max_length=args.max_length,
+            chat_template=args.chat_template,
+            max_samples=args.max_samples,
+            max_source_tokens=args.max_source_tokens,
+            max_summary_tokens=args.max_summary_tokens,
+            prompt_template=args.prompt_template,
+        ),
+        output_dir=args.output,
+        target_layer_ids=args.target_layer_ids,
+        num_draft_layers=args.num_draft_layers,
+        trust_remote_code=args.trust_remote_code,
+        max_length=args.max_length,
+        device=args.device,
+        dtype=args.torch_dtype,
+        tokenizer_id=str(Path(args.target_model_path)),
+        prompt_contract=prompt_contract,
+    )
+    print(json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = ["capture_dataset", "main"]

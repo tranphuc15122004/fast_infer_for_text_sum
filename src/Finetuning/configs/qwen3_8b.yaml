@@ -5,14 +5,24 @@ model:
   num_draft_layers: 5
   block_size: 16
   target_layer_ids: null
+  # Optional portable export from a previous Finetuning run; not for --resume-from.
+  draft_init_path: null
 data:
-  train_data_path: /absolute/path/to/document_summary.jsonl
-  hidden_states_path: null
+  # Tạo bằng: python -m Finetuning.capture_features --input teacher_train.jsonl ...
+  train_data_path: null
+  hidden_states_path: /absolute/path/to/features_train
   eval_data_path: null
-  eval_hidden_states_path: null
+  eval_hidden_states_path: /absolute/path/to/features_eval
   max_length: 2048
+  max_source_tokens: 1536
+  max_summary_tokens: 384
   chat_template: qwen3
+  prompt_template: "Hãy tóm tắt văn bản sau bằng tiếng Việt. Chỉ trả lời bằng bản tóm tắt:\n\n{document}"
   feature_dtype: bfloat16
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
 training:
   strategy: dflash
   num_epochs: 1
@@ -34,6 +44,7 @@ training:
   eval_interval: 100
   log_interval: 10
   seed: 42
+  shuffle: true
 output_dir: /absolute/path/to/outputs/qwen3_8b_dflash
 run_id: qwen3-8b
 device: auto

@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from .data import DEFAULT_SUMMARY_PROMPT_TEMPLATE
+
 
 _DTYPES = {"float32", "float16", "bfloat16"}
 _BACKENDS = {"eager", "sdpa", "flex_attention"}
@@ -23,6 +25,7 @@ class ModelConfig:
     block_size: int = 16
     target_layer_ids: list[int] | None = None
     layer_types: list[str] | None = None
+    draft_init_path: str | None = None
     trust_remote_code: bool = False
 
 
@@ -33,8 +36,15 @@ class DataConfig:
     eval_data_path: str | None = None
     eval_hidden_states_path: str | None = None
     max_length: int = 2048
+    max_source_tokens: int | None = None
+    max_summary_tokens: int | None = None
     chat_template: str = "qwen3"
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE
     feature_dtype: str = "float32"
+    num_workers: int = 0
+    pin_memory: bool = True
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
 
 
 @dataclass
@@ -60,6 +70,7 @@ class TrainingConfig:
     log_interval: int = 10
     seed: int = 42
     hardware_peak_tflops: float | None = None
+    shuffle: bool = True
 
 
 @dataclass
@@ -89,6 +100,34 @@ class RunConfig:
             raise ValueError("num_draft_layers must be positive and block_size >= 2")
         if self.data.max_length < self.model.block_size:
             raise ValueError("data.max_length must be at least model.block_size")
+        if (
+            not isinstance(self.data.prompt_template, str)
+            or self.data.prompt_template.count("{document}") != 1
+        ):
+            raise ValueError(
+                "data.prompt_template must contain the {document} placeholder exactly once"
+            )
+        if self.data.max_source_tokens is not None and self.data.max_source_tokens < 0:
+            raise ValueError("data.max_source_tokens must be non-negative when provided")
+        if self.data.max_summary_tokens is not None and self.data.max_summary_tokens < 1:
+            raise ValueError("data.max_summary_tokens must be positive when provided")
+        if (
+            self.data.max_summary_tokens is not None
+            and self.data.max_source_tokens is None
+        ):
+            raise ValueError("data.max_summary_tokens requires data.max_source_tokens")
+        if (
+            self.data.max_source_tokens is not None
+            and self.data.max_summary_tokens is not None
+            and self.data.max_source_tokens + self.data.max_summary_tokens > self.data.max_length
+        ):
+            raise ValueError("source and summary token budgets exceed data.max_length")
+        if self.data.num_workers < 0:
+            raise ValueError("data.num_workers must be non-negative")
+        if self.data.prefetch_factor < 1:
+            raise ValueError("data.prefetch_factor must be positive")
+        if self.data.persistent_workers and self.data.num_workers == 0:
+            raise ValueError("data.persistent_workers requires data.num_workers > 0")
         if self.training.batch_size <= 0 or self.training.accumulation_steps <= 0:
             raise ValueError("batch_size and accumulation_steps must be positive")
         if self.training.num_epochs <= 0:
@@ -101,19 +140,29 @@ class RunConfig:
             raise ValueError("run_id must be a simple directory-safe name")
         if self.synthetic:
             return self
-        sources = [self.data.train_data_path, self.data.hidden_states_path]
-        if sum(value is not None for value in sources) != 1:
+        if self.data.train_data_path is not None:
             raise ValueError(
-                "exactly one of data.train_data_path or "
-                "data.hidden_states_path must be configured"
+                "data.train_data_path is not a training input; generate teacher "
+                "trajectories and capture features before training"
+            )
+        if self.data.hidden_states_path is None:
+            raise ValueError(
+                "data.hidden_states_path must point to a pre-captured feature store"
+            )
+        if (
+            self.data.max_source_tokens is None
+            or self.data.max_summary_tokens is None
+        ):
+            raise ValueError(
+                "real training requires explicit data.max_source_tokens and "
+                "data.max_summary_tokens to validate the captured prompt contract"
             )
         if not self.model.target_model_path:
             raise ValueError("model.target_model_path is required for real training")
-        eval_sources = [self.data.eval_data_path, self.data.eval_hidden_states_path]
-        if sum(value is not None for value in eval_sources) > 1:
+        if self.data.eval_data_path is not None:
             raise ValueError(
-                "at most one of data.eval_data_path or "
-                "data.eval_hidden_states_path may be configured"
+                "data.eval_data_path is not an evaluation input; capture validation "
+                "features before training"
             )
         if self.model.target_layer_ids is not None:
             if not self.model.target_layer_ids or any(

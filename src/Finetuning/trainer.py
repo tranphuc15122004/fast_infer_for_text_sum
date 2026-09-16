@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 import torch
 
-from .checkpoint import CheckpointManager, restore_rng_state
+from .checkpoint import CheckpointManager, load_draft_initialization, restore_rng_state
 from .evaluation import Evaluator
 from .schedule import build_scheduler, current_lr, resolve_total_steps, validate_fixed_accumulation_plan
 from .strategy import StepContext, StepOutput, TrainBatch
@@ -50,6 +50,7 @@ class Trainer:
         hardware_peak_tflops: float | None = None,
         device: torch.device | str | None = None,
         extra_checkpoint_state: dict[str, Any] | None = None,
+        draft_export_metadata: dict[str, Any] | None = None,
         resume_from: str | Path | None = None,
     ) -> None:
         if batch_size <= 0 or accumulation_steps <= 0 or num_epochs <= 0:
@@ -75,15 +76,12 @@ class Trainer:
         self.eval_interval = max(0, eval_interval)
         self.hardware_peak_tflops = hardware_peak_tflops
         self.extra_checkpoint_state = extra_checkpoint_state or {}
-        self._train_items = self._materialize_if_needed(train_dataloader)
-        if not self._train_items:
+        self.draft_export_metadata = draft_export_metadata
+        self._train_loader = train_dataloader
+        if self._loader_length(train_dataloader) == 0:
             raise ValueError("empty training loader")
-        self._validation_items = (
-            self._materialize_if_needed(validation_dataloader)
-            if validation_dataloader is not None
-            else None
-        )
-        num_samples = len(self._train_items) * batch_size
+        self._validation_loader = validation_dataloader
+        num_samples = self._loader_length(train_dataloader) * batch_size
         validate_fixed_accumulation_plan(
             num_samples=num_samples,
             batch_size=batch_size,
@@ -127,12 +125,17 @@ class Trainer:
             self._resume(resume_from)
 
     @staticmethod
-    def _materialize_if_needed(value: Iterable[Any] | None) -> list[Any] | None:
-        if value is None:
-            return None
-        if isinstance(value, list):
-            return value
-        return list(value)
+    def _loader_length(value: Iterable[Any]) -> int:
+        try:
+            length = len(value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise TypeError(
+                "trainer requires a sized, re-iterable dataloader; "
+                "stream data through a DataLoader instead of a generator"
+            ) from exc
+        if length < 0:
+            raise ValueError("dataloader length must be non-negative")
+        return int(length)
 
     def _write_record(self, record: dict[str, Any]) -> None:
         with self.metrics_path.open("a", encoding="utf-8") as handle:
@@ -158,6 +161,7 @@ class Trainer:
                 "total_steps": self.total_steps,
                 **self.extra_checkpoint_state,
             },
+            draft_export_metadata=self.draft_export_metadata,
         )
 
     def _resume(self, path: str | Path) -> None:
@@ -166,7 +170,18 @@ class Trainer:
         load_module = module
         if hasattr(self.strategy, "dflash_model"):
             load_module = self.strategy.dflash_model.draft_model
-        load_module.load_state_dict(state["draft_state_dict"], strict=False)
+        if self.draft_export_metadata is not None:
+            # A DFlash resume must preserve the frozen target, selected target
+            # layers and draft architecture.  The embedded export provides a
+            # strict state-dict and metadata boundary; silently using
+            # ``strict=False`` here could otherwise produce a corrupted run.
+            load_draft_initialization(
+                state["path"] / "draft_export",
+                load_module,
+                self.draft_export_metadata,
+            )
+        else:
+            load_module.load_state_dict(state["draft_state_dict"], strict=False)
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         trainer_state = state.get("trainer_state", {})
@@ -180,36 +195,73 @@ class Trainer:
         return self._save()
 
     def evaluate(self) -> dict[str, float]:
-        if self._validation_items is None:
+        if self._validation_loader is None:
             raise ValueError("validation loader is not configured")
         return self.evaluator.evaluate_in_memory(
             self.strategy,
-            self._validation_items,
+            self._validation_loader,
             self.device,
         )
 
     def fit(self) -> int:
-        if self._validation_items is not None and not self._validation_items:
+        if self._validation_loader is not None and self._loader_length(self._validation_loader) == 0:
             raise ValueError("empty validation loader")
         module = self.strategy.trainable_module()
         module.train()
         self.optimizer.zero_grad(set_to_none=True)
+        window_loss_num = 0.0
+        window_loss_den = 0.0
+        window_uses_loss_terms: bool | None = None
+        window_tokens = 0
+        step_started: float | None = None
         for epoch in range(self.num_epochs):
-            for item_index, raw_batch in enumerate(self._train_items):
+            for item_index, raw_batch in enumerate(self._train_loader):
                 if self.global_step >= self.total_steps:
                     break
                 started = time.perf_counter()
+                if self.micro_step % self.accumulation_steps == 0:
+                    step_started = started
+                    window_loss_num = 0.0
+                    window_loss_den = 0.0
+                    window_uses_loss_terms = None
+                    window_tokens = 0
                 output: StepOutput = self.strategy.forward_loss(
                     _as_batch(raw_batch),
                     StepContext(self.global_step, self.total_steps),
                 )
                 if not torch.isfinite(output.loss.detach()).all():
                     raise ValueError("non-finite loss encountered")
-                (output.loss / self.accumulation_steps).backward()
+                uses_loss_terms = output.loss_terms is not None
+                if window_uses_loss_terms is None:
+                    window_uses_loss_terms = uses_loss_terms
+                elif window_uses_loss_terms != uses_loss_terms:
+                    raise ValueError("loss_terms must be present for every microbatch in an accumulation window")
+                if uses_loss_terms:
+                    numerator, denominator = output.loss_terms
+                    numerator = torch.as_tensor(numerator).reshape(())
+                    denominator = torch.as_tensor(denominator).detach().reshape(())
+                    if not torch.isfinite(numerator.detach()) or not torch.isfinite(denominator):
+                        raise ValueError("non-finite additive loss term encountered")
+                    if float(denominator.cpu()) <= 0:
+                        raise ValueError("additive loss denominator must be positive")
+                    (numerator / self.accumulation_steps).backward()
+                    window_loss_num += float(numerator.detach().cpu())
+                    window_loss_den += float(denominator.cpu())
+                else:
+                    (output.loss / self.accumulation_steps).backward()
                 self.micro_step += 1
                 at_boundary = self.micro_step % self.accumulation_steps == 0
+                if isinstance(raw_batch, dict) and "input_ids" in raw_batch:
+                    window_tokens += int(torch.as_tensor(raw_batch["input_ids"]).numel())
                 if not at_boundary:
                     continue
+                if window_uses_loss_terms:
+                    if window_loss_den <= 0:
+                        raise ValueError("accumulated additive loss denominator must be positive")
+                    scale = self.accumulation_steps / window_loss_den
+                    for parameter in module.parameters():
+                        if parameter.requires_grad and parameter.grad is not None:
+                            parameter.grad.mul_(scale)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in module.parameters() if parameter.requires_grad],
                     self.max_grad_norm,
@@ -218,11 +270,13 @@ class Trainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-                elapsed = max(time.perf_counter() - started, 1e-9)
-                loss = float(output.loss.detach().cpu())
-                tokens = 0
-                if isinstance(raw_batch, dict) and "input_ids" in raw_batch:
-                    tokens = int(torch.as_tensor(raw_batch["input_ids"]).numel())
+                elapsed = max(time.perf_counter() - (step_started or started), 1e-9)
+                loss = (
+                    window_loss_num / window_loss_den
+                    if window_uses_loss_terms
+                    else float(output.loss.detach().cpu())
+                )
+                tokens = window_tokens
                 mfu = None
                 if self.hardware_peak_tflops is not None:
                     # A transparent 6*N*token estimate; report null unless a
@@ -253,7 +307,7 @@ class Trainer:
                 if self.global_step % self.save_interval == 0:
                     self._save()
                 if (
-                    self._validation_items is not None
+                    self._validation_loader is not None
                     and self.eval_interval > 0
                     and self.global_step % self.eval_interval == 0
                 ):
