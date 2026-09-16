@@ -233,6 +233,34 @@ def test_offline_dataset_reads_cpu_tensor_records(tmp_path) -> None:
     assert all(value.device.type == "cpu" for value in record.values())
 
 
+def test_offline_dataset_defers_tensor_deserialization_until_getitem(
+    tmp_path, monkeypatch
+) -> None:
+    _require_feature_api()
+    manifest = tiny_manifest()
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(manifest.to_dict()), encoding="utf-8"
+    )
+    _write_feature(tmp_path / "feature_000000.pt")
+    _write_feature(tmp_path / "feature_000001.pt")
+    import Finetuning.features as feature_module
+
+    calls = 0
+    original_load = feature_module._load_record
+
+    def counted_load(path):
+        nonlocal calls
+        calls += 1
+        return original_load(path)
+
+    monkeypatch.setattr(feature_module, "_load_record", counted_load)
+    dataset = OfflineFeatureDataset(tmp_path)
+
+    assert calls == 0
+    _ = dataset[0]
+    assert calls == 1
+
+
 def test_offline_dataset_requires_manifest_before_loading(tmp_path) -> None:
     _require_feature_api()
 
@@ -431,3 +459,143 @@ def test_capture_dataset_fails_on_missing_snapshot_and_width_mismatch(
         capture_dataset(
             str(snapshot), examples, tmp_path / "out", [0], 3, "cpu", torch.float32
         )
+
+
+def test_capture_cli_writes_prompt_provenance_from_a_lazy_jsonl_source(
+    tmp_path, monkeypatch
+) -> None:
+    from Finetuning.capture_features import main
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    source = tmp_path / "teacher.jsonl"
+    source.write_text(
+        json.dumps(
+            {"id": "vi-1", "document": "một hai", "summary": "tóm tắt đủ"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = FakeTargetModel()
+
+    class Tokenizer:
+        eos_token_id = 99
+        pad_token_id = 0
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": [20 + index for index, _ in enumerate(text.split())]}
+
+        def apply_chat_template(self, messages, **_kwargs):
+            ids = [1]
+            for message in messages:
+                ids.extend(self(message["content"])["input_ids"])
+            return ids + [2, 3]
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: Tokenizer()),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForCausalLM,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: model),
+    )
+    output = tmp_path / "features"
+
+    main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--target-model-path",
+            str(snapshot),
+            "--target-layer-ids",
+            "0,2",
+            "--max-length",
+            "32",
+            "--max-source-tokens",
+            "16",
+            "--max-summary-tokens",
+            "8",
+            "--device",
+            "cpu",
+            "--torch-dtype",
+            "float32",
+        ]
+    )
+
+    manifest = OfflineFeatureDataset(output).manifest
+    assert manifest.tokenizer_id == str(snapshot)
+    assert manifest.prompt_contract == {
+        "chat_template": "qwen3",
+        "max_source_tokens": 16,
+        "max_summary_tokens": 8,
+        "prompt_template": (
+            "Hãy tóm tắt văn bản sau bằng tiếng Việt. "
+            "Chỉ trả lời bằng bản tóm tắt:\n\n{document}"
+        ),
+    }
+
+
+def test_capture_cli_can_resolve_target_layers_from_draft_layer_count(
+    tmp_path, monkeypatch
+) -> None:
+    from Finetuning.capture_features import main
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    source = tmp_path / "teacher.jsonl"
+    source.write_text(
+        json.dumps(
+            {"id": "vi-1", "document": "một hai", "summary": "tóm tắt đủ"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = FakeTargetModel()
+
+    class Tokenizer:
+        eos_token_id = 99
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": [20 + index for index, _ in enumerate(text.split())]}
+
+        def apply_chat_template(self, messages, *, add_generation_prompt, **_kwargs):
+            ids = [1]
+            for message in messages:
+                if message["role"] == "user":
+                    ids.extend([4, *self(message["content"])["input_ids"], 5])
+                else:
+                    ids.extend([6, 7, *self(message["content"])["input_ids"]])
+            return ids + ([6, 7] if add_generation_prompt else [99])
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: Tokenizer()),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForCausalLM,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: model),
+    )
+    output = tmp_path / "features"
+
+    main(
+        [
+            "--input", str(source), "--output", str(output),
+            "--target-model-path", str(snapshot),
+            "--num-draft-layers", "2",
+            "--max-length", "32", "--max-source-tokens", "16",
+            "--max-summary-tokens", "8", "--device", "cpu",
+            "--torch-dtype", "float32",
+        ]
+    )
+
+    assert OfflineFeatureDataset(output).manifest.layer_ids == [1, 0]

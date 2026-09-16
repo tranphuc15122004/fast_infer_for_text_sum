@@ -10,6 +10,8 @@ try:
     from Finetuning.checkpoint import (
         CheckpointManager,
         capture_rng_state,
+        export_draft,
+        load_draft_initialization,
         restore_rng_state,
     )
     from Finetuning.schedule import build_scheduler
@@ -129,3 +131,51 @@ def test_checkpoint_rotation_keeps_only_requested_complete_steps(tmp_path) -> No
         "rotate-step2",
         "rotate-step3",
     ]
+
+
+def test_portable_draft_export_warm_starts_only_matching_metadata(tmp_path) -> None:
+    _require_api()
+    source = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        source.weight.fill_(0.25)
+    metadata = {
+        "target_model_path": "/models/qwen3",
+        "target_layer_ids": [1, 9, 17, 25, 33],
+        "block_size": 16,
+        "mask_token_id": 151669,
+    }
+    export_path = tmp_path / "portable"
+
+    export_draft(export_path, source, metadata)
+    restored = nn.Linear(2, 2, bias=False)
+    load_draft_initialization(export_path, restored, metadata)
+
+    assert torch.equal(restored.weight, source.weight)
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        load_draft_initialization(
+            export_path,
+            nn.Linear(2, 2, bias=False),
+            {**metadata, "block_size": 8},
+        )
+
+
+def test_checkpoint_can_embed_portable_draft_export(tmp_path) -> None:
+    _require_api()
+    strategy = _Strategy()
+    optimizer = torch.optim.AdamW(strategy.trainable_module().parameters(), lr=0.1)
+    scheduler = build_scheduler(optimizer, total_steps=1)
+    metadata = {"target_model_path": "/models/qwen3", "block_size": 16}
+
+    path = CheckpointManager(tmp_path, "export").save(
+        1,
+        strategy,
+        optimizer,
+        scheduler,
+        {"global_step": 1},
+        {},
+        draft_export_metadata=metadata,
+    )
+    restored = nn.Linear(2, 2, bias=False)
+    load_draft_initialization(path / "draft_export", restored, metadata)
+
+    assert torch.equal(restored.weight, strategy.module.draft_model.weight)

@@ -13,13 +13,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
-from .capture_features import capture_dataset
+from .checkpoint import load_draft_initialization
 from .config import RunConfig, apply_cli_overrides, load_run_config
 from .dflash_family_model import OnlineDFlashModel
 from .evaluation import Evaluator
-from .features import OfflineFeatureDataset, collate_features
+from .features import FeatureManifest, OfflineFeatureDataset, collate_features
 from .model import DFlashDraftModel, build_target_layer_ids
-from .prepare_data import prepare_summary_examples
 from .strategy import DFlashTrainStrategy
 from .trainer import Trainer
 
@@ -140,23 +139,96 @@ def _build_strategy(
         loss_type=config.training.loss_type,
         dpace_alpha=config.training.dpace_alpha,
     ).to(device)
-    return DFlashTrainStrategy(model)
+    strategy = DFlashTrainStrategy(model)
+    strategy.draft_export_metadata = {
+        "target_model_path": config.model.target_model_path,
+        "target_layer_ids": layer_ids,
+        "block_size": config.model.block_size,
+        "mask_token_id": mask_token_id,
+        "torch_dtype": config.model.torch_dtype,
+        "draft_config": draft_config.to_dict(),
+    }
+    return strategy
 
 
-def _loader(dataset: OfflineFeatureDataset, batch_size: int) -> list[dict[str, torch.Tensor]]:
+def _loader(
+    dataset: OfflineFeatureDataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> DataLoader:
     if len(dataset) < batch_size:
         raise ValueError("feature dataset is smaller than batch_size")
-    data_loader = DataLoader(
+    kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "drop_last": True,
+        "collate_fn": collate_features,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=True,
-        collate_fn=collate_features,
+        **kwargs,
     )
-    batches = list(data_loader)
-    if not batches:
-        raise ValueError("feature dataset produced no complete batches")
-    return batches
+
+
+def _same_local_path(left: str, right: str) -> bool:
+    return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
+        strict=False
+    )
+
+
+def _validate_feature_manifest(
+    manifest: FeatureManifest,
+    config: RunConfig,
+    target_layer_ids: list[int],
+) -> None:
+    """Reject caches not captured for this frozen target and prompt contract."""
+
+    target_path = config.model.target_model_path
+    assert target_path is not None
+    expected_contract = {
+        "chat_template": config.data.chat_template,
+        "max_source_tokens": config.data.max_source_tokens,
+        "max_summary_tokens": config.data.max_summary_tokens,
+        "prompt_template": config.data.prompt_template,
+    }
+    if not _same_local_path(manifest.model_id, target_path):
+        raise ValueError(
+            "feature manifest target differs from model.target_model_path: "
+            f"{manifest.model_id!r} != {target_path!r}"
+        )
+    if manifest.tokenizer_id is None or not _same_local_path(
+        manifest.tokenizer_id, target_path
+    ):
+        raise ValueError(
+            "feature manifest tokenizer_id does not match model.target_model_path"
+        )
+    if manifest.layer_ids != target_layer_ids:
+        raise ValueError(
+            "feature manifest layer_ids do not match the DFlash target-layer selection"
+        )
+    if manifest.max_length != config.data.max_length:
+        raise ValueError(
+            "feature manifest max_length does not match data.max_length"
+        )
+    if manifest.hidden_states_dtype != f"torch.{config.data.feature_dtype}":
+        raise ValueError(
+            "feature manifest hidden_states_dtype does not match data.feature_dtype"
+        )
+    if manifest.prompt_contract != expected_contract:
+        raise ValueError(
+            "feature manifest prompt_contract does not match the configured "
+            "chat template and token budgets"
+        )
 
 
 def _build_synthetic(config: RunConfig, device: torch.device):
@@ -226,24 +298,9 @@ def _load_real_runtime(config: RunConfig, device: torch.device):
         raise ValueError("target model must expose input embeddings and lm_head")
     layer_ids = _target_layer_ids(config, target_config)
     train_feature_path = config.data.hidden_states_path
-    if train_feature_path is None:
-        examples = prepare_summary_examples(
-            config.data.train_data_path,
-            tokenizer,
-            max_length=config.data.max_length,
-            chat_template=config.data.chat_template,
-        )
-        train_feature_path = str(config.resolved_output_dir / "features")
-        capture_dataset(
-            target_model_path=target_path,
-            prepared_examples=examples,
-            output_dir=train_feature_path,
-            target_layer_ids=layer_ids,
-            max_length=config.data.max_length,
-            device=device,
-            dtype=config.data.feature_dtype,
-        )
+    assert train_feature_path is not None
     train_dataset = OfflineFeatureDataset(train_feature_path)
+    _validate_feature_manifest(train_dataset.manifest, config, layer_ids)
     strategy = _build_strategy(
         config,
         target_config,
@@ -258,26 +315,29 @@ def _load_real_runtime(config: RunConfig, device: torch.device):
             "feature width does not match DFlash draft: "
             f"{train_dataset.manifest.feature_width} != {expected_width}"
         )
-    train_batches = _loader(train_dataset, config.training.batch_size)
+    train_batches = _loader(
+        train_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=config.training.shuffle,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory and device.type == "cuda",
+        persistent_workers=config.data.persistent_workers,
+        prefetch_factor=config.data.prefetch_factor,
+    )
     eval_path = config.data.eval_hidden_states_path
-    if eval_path is None and config.data.eval_data_path is not None:
-        eval_examples = prepare_summary_examples(
-            config.data.eval_data_path,
-            tokenizer,
-            max_length=config.data.max_length,
-            chat_template=config.data.chat_template,
+    eval_batches = None
+    if eval_path:
+        eval_dataset = OfflineFeatureDataset(eval_path)
+        _validate_feature_manifest(eval_dataset.manifest, config, layer_ids)
+        eval_batches = _loader(
+            eval_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            num_workers=config.data.num_workers,
+            pin_memory=config.data.pin_memory and device.type == "cuda",
+            persistent_workers=config.data.persistent_workers,
+            prefetch_factor=config.data.prefetch_factor,
         )
-        eval_path = str(config.resolved_output_dir / "eval_features")
-        capture_dataset(
-            target_model_path=target_path,
-            prepared_examples=eval_examples,
-            output_dir=eval_path,
-            target_layer_ids=layer_ids,
-            max_length=config.data.max_length,
-            device=device,
-            dtype=config.data.feature_dtype,
-        )
-    eval_batches = _loader(OfflineFeatureDataset(eval_path), config.training.batch_size) if eval_path else None
     del target
     return strategy, train_batches, eval_batches
 
@@ -295,6 +355,14 @@ def run_training(config: RunConfig, *, resume_from: str | Path | None = None) ->
     device = _resolve_device(config)
     _seed_everything(config.training.seed, device)
     strategy, train_batches, eval_batches = _assemble(config, device)
+    if resume_from is not None and config.model.draft_init_path is not None:
+        raise ValueError("model.draft_init_path cannot be combined with resume_from")
+    if config.model.draft_init_path is not None:
+        load_draft_initialization(
+            config.model.draft_init_path,
+            strategy.dflash_model.draft_model,
+            strategy.draft_export_metadata,
+        )
     trainer = Trainer(
         strategy=strategy,
         train_dataloader=train_batches,
@@ -316,6 +384,7 @@ def run_training(config: RunConfig, *, resume_from: str | Path | None = None) ->
         hardware_peak_tflops=config.training.hardware_peak_tflops,
         device=device,
         extra_checkpoint_state={"resolved_config": config.to_dict()},
+        draft_export_metadata=strategy.draft_export_metadata,
         resume_from=resume_from,
     )
     trainer.fit()

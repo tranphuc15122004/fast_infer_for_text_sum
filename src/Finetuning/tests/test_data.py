@@ -10,6 +10,7 @@ try:
         SummaryRecord,
         build_summary_loss_mask,
         load_summary_jsonl,
+        render_summary_prompt,
         render_summary_example,
     )
 except ModuleNotFoundError as exc:  # Red phase: the adapter is not ported yet.
@@ -128,7 +129,12 @@ def test_render_summary_example_is_qwen_compatible_and_causally_truncated() -> N
         summary="Tóm tắt ngắn gọn",
     )
 
-    example = render_summary_example(record, tokenizer, max_length=12)
+    example = render_summary_example(
+        record,
+        tokenizer,
+        max_length=12,
+        prompt_template="{document}",
+    )
 
     assert set(("input_ids", "loss_mask")).issubset(example)
     assert example["input_ids"].ndim == 1
@@ -146,6 +152,48 @@ def test_render_summary_example_rejects_short_supervision_after_truncation() -> 
         render_summary_example(record, FakeQwenTokenizer(), max_length=32)
 
 
+def test_render_reserves_summary_budget_before_truncating_document() -> None:
+    _require_data_api()
+    tokenizer = FakeQwenTokenizer()
+    record = SummaryRecord(
+        id="long-source",
+        document="một hai ba bốn năm sáu bảy tám",
+        summary="tóm tắt đủ dài",
+    )
+
+    example = render_summary_example(
+        record,
+        tokenizer,
+        max_length=12,
+        max_source_tokens=2,
+        max_summary_tokens=3,
+        prompt_template="{document}",
+    )
+
+    assert int(example["loss_mask"].sum()) == 3
+    assert example["loss_mask"][-1].item() == 0
+    assert example["input_ids"].shape[0] <= 12
+
+
+def test_generation_prompt_reserves_the_teacher_response_budget() -> None:
+    _require_data_api()
+    prompt = render_summary_prompt(
+        SummaryRecord(
+            id="prompt",
+            document="một hai ba bốn năm sáu bảy tám",
+            summary="reference không dùng để tạo prompt",
+        ),
+        FakeQwenTokenizer(),
+        max_length=12,
+        max_source_tokens=2,
+        max_summary_tokens=3,
+        prompt_template="{document}",
+    )
+
+    assert prompt.ndim == 1
+    assert prompt.shape[0] <= 9
+
+
 def test_render_fallback_does_not_supervise_control_token_suffix() -> None:
     _require_data_api()
     record = SummaryRecord(id="mismatch", document="Tài liệu", summary="Một bản")
@@ -155,3 +203,58 @@ def test_render_fallback_does_not_supervise_control_token_suffix() -> None:
     control_positions = (example["input_ids"] == 97) | (example["input_ids"] == 99)
     assert example["loss_mask"][control_positions].sum().item() == 0
     assert example["loss_mask"].sum().item() == 2
+
+
+def test_prepare_summary_iterator_streams_rendered_examples(tmp_path) -> None:
+    from Finetuning.prepare_data import iter_summary_examples
+
+    source = tmp_path / "teacher.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                '{"id":"one","document":"một hai","summary":"tóm tắt đủ"}',
+                '{"id":"two","document":"ba bốn","summary":"tóm tắt đủ"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    examples = iter_summary_examples(
+        source,
+        FakeQwenTokenizer(),
+        max_length=32,
+        max_samples=1,
+    )
+
+    assert not isinstance(examples, list)
+    first = next(examples)
+    assert first["id"] == "one"
+    assert first["input_ids"].ndim == 1
+    with pytest.raises(StopIteration):
+        next(examples)
+
+
+def test_default_prompt_explicitly_requests_a_vietnamese_summary() -> None:
+    _require_data_api()
+
+    class RecordingTokenizer(FakeQwenTokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages = []
+
+        def apply_chat_template(self, conversation, **kwargs):
+            self.messages.append(conversation)
+            return super().apply_chat_template(conversation, **kwargs)
+
+    tokenizer = RecordingTokenizer()
+    render_summary_prompt(
+        SummaryRecord(id="directive", document="nội dung", summary="tham chiếu"),
+        tokenizer,
+        max_length=64,
+        max_source_tokens=32,
+        max_summary_tokens=8,
+    )
+
+    assert tokenizer.messages[0][0]["content"].startswith("Hãy tóm tắt")
+    assert tokenizer.messages[0][0]["content"].endswith("nội dung")

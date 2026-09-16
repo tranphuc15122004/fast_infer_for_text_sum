@@ -519,7 +519,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
-    ) -> torch.LongTensor:
+        return_stats: bool = False,
+    ) -> torch.LongTensor | tuple[torch.LongTensor, dict[str, Any]]:
         """Run the upstream speculative-generation boundary for DFlash."""
 
         self.eval()
@@ -561,6 +562,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
 
         start = input_ids.shape[1]
+        acceptance_lengths: list[int] = []
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
@@ -597,6 +599,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
+            acceptance_lengths.append(int(acceptance_length))
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -631,4 +634,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
+        if return_stats:
+            return output_ids, {"acceptance_lengths": acceptance_lengths}
         return output_ids

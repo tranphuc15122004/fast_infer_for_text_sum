@@ -181,3 +181,79 @@ def test_trainer_reports_mfu_only_when_peak_is_configured(tmp_path) -> None:
     trainer.fit()
     record = json.loads((tmp_path / "metrics.jsonl").read_text().splitlines()[0])
     assert record["mfu"] == 0.0
+
+
+def test_trainer_accumulation_normalizes_additive_loss_terms(tmp_path) -> None:
+    _require_api()
+
+    class WeightedStrategy:
+        name = "weighted"
+
+        def __init__(self) -> None:
+            self.parameter = nn.Parameter(torch.tensor(0.0))
+            self.module = nn.Module()
+            self.module.register_parameter("weight", self.parameter)
+            self.calls = 0
+
+        def trainable_module(self) -> nn.Module:
+            return self.module
+
+        def forward_loss(self, _batch, _ctx) -> StepOutput:
+            coefficient, denominator = ((2.0, 1.0), (-6.0, 10.0))[self.calls]
+            self.calls += 1
+            numerator = self.parameter * coefficient
+            return StepOutput(
+                loss=numerator / denominator,
+                metrics={},
+                loss_terms=(numerator, torch.tensor(denominator)),
+            )
+
+    strategy = WeightedStrategy()
+    trainer = Trainer(
+        strategy=strategy,
+        train_dataloader=[{}, {}],
+        output_dir=tmp_path,
+        run_id="weighted",
+        batch_size=1,
+        accumulation_steps=2,
+        num_epochs=1,
+        max_steps=1,
+        learning_rate=0.1,
+        warmup_ratio=0.0,
+    )
+
+    trainer.fit()
+
+    # d((2w - 6w) / (1 + 10))/dw < 0, so AdamW must move w upward.
+    assert strategy.parameter.item() > 0
+
+
+def test_trainer_rejects_resume_with_incompatible_draft_provenance(tmp_path) -> None:
+    _require_api()
+    metadata = {"target_model_path": "/models/qwen3", "block_size": 16}
+    first = Trainer(
+        strategy=_CountingStrategy(),
+        train_dataloader=_train_loader(),
+        output_dir=tmp_path,
+        run_id="source",
+        batch_size=1,
+        accumulation_steps=1,
+        num_epochs=1,
+        max_steps=1,
+        draft_export_metadata=metadata,
+    )
+    first.fit()
+
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        Trainer(
+            strategy=_CountingStrategy(),
+            train_dataloader=_train_loader(),
+            output_dir=tmp_path,
+            run_id="target",
+            batch_size=1,
+            accumulation_steps=1,
+            num_epochs=1,
+            max_steps=2,
+            draft_export_metadata={**metadata, "block_size": 8},
+            resume_from=first.checkpoint_manager.latest_dir(),
+        )

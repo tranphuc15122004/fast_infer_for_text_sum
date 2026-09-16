@@ -62,6 +62,7 @@ class FeatureManifest:
     max_length: int
     revision: str | None = None
     tokenizer_id: str | None = None
+    prompt_contract: dict[str, Any] | None = None
     feature_width: int | None = None
     input_ids_dtype: str = "torch.int64"
     loss_mask_dtype: str = "torch.float32"
@@ -113,6 +114,10 @@ class FeatureManifest:
             raise ValueError(
                 f"unsupported feature manifest schema {self.schema_version!r}"
             )
+        if self.prompt_contract is not None:
+            if not isinstance(self.prompt_contract, Mapping):
+                raise ValueError("feature manifest prompt_contract must be an object")
+            self.prompt_contract = dict(self.prompt_contract)
 
     @property
     def dtype(self) -> str:
@@ -126,6 +131,7 @@ class FeatureManifest:
             "model_id": self.model_id,
             "revision": self.revision,
             "tokenizer_id": self.tokenizer_id,
+            "prompt_contract": self.prompt_contract,
             "layer_ids": list(self.layer_ids),
             "hidden_size": int(self.hidden_size),
             "feature_width": int(self.feature_width),
@@ -148,6 +154,11 @@ class FeatureManifest:
             model_id=str(payload["model_id"]),
             revision=payload.get("revision"),
             tokenizer_id=payload.get("tokenizer_id"),
+            prompt_contract=(
+                dict(payload["prompt_contract"])
+                if payload.get("prompt_contract") is not None
+                else None
+            ),
             layer_ids=list(payload["layer_ids"]),
             hidden_size=int(payload["hidden_size"]),
             feature_width=(
@@ -335,10 +346,10 @@ class OfflineFeatureDataset(Dataset[dict[str, torch.Tensor]]):
                 )
         if not self._paths:
             raise ValueError(f"offline feature directory has no tensor records: {self.root}")
-        # Validate at construction so a loader never starts with a bad width,
-        # dtype, or sequence contract hidden in a later worker.
-        for path in self._paths:
-            validate_feature_record(_load_record(path), self.manifest)
+        # Do not deserialize a whole corpus here: a Qwen hidden-state store can
+        # be hundreds of GiB.  Capture validates each record before publishing
+        # its immutable generation, while __getitem__ validates again at the
+        # consumption boundary (including worker processes).
 
     def __len__(self) -> int:
         return len(self._paths)
