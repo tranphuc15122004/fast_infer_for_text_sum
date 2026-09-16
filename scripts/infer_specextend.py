@@ -134,6 +134,7 @@ def main() -> None:
     method = "specextend_eagle" if args.script == "run_eagle.py" else "specextend_classic"
     for index, (generated_tokens, elapsed_s) in enumerate(parsed_results):
         source = source_rows[index] if index < len(source_rows) else {}
+        measured = stats_results[index] if index < len(stats_results) else {}
         elapsed_ms = round(elapsed_s * 1000.0, 3)
         writer.add({
             "method": method,
@@ -142,6 +143,9 @@ def main() -> None:
             "draft_model": args.draft_model,
             "model_name": args.model_name,
             "script": args.script,
+            "retrieval_policy": os.environ.get(
+                "SPECEXTEND_RETRIEVAL_POLICY", "cmr32"
+            ),
             "task_type": source.get("task_type"),
             "sample_id": source.get("id", index),
             "reference_output": source.get("reference"),
@@ -150,7 +154,7 @@ def main() -> None:
             "measurement_scope": "decode_only",
             "max_input_tokens": args.max_input_tokens,
             "smoke": args.smoke,
-            "input_tokens": None,
+            "input_tokens": measured.get("input_tokens"),
             "retained_tokens": None,
             "output_tokens": generated_tokens,
             "batch_size": 1,
@@ -163,7 +167,7 @@ def main() -> None:
             "throughput_tok_s": round(generated_tokens / elapsed_s, 3) if elapsed_s > 0 else None,
             "decode_throughput_tok_s": round(generated_tokens / elapsed_s, 3) if elapsed_s > 0 else None,
             "qps": None,
-            "peak_memory_gb": None,
+            "peak_memory_gb": measured.get("peak_memory_gb"),
             "returncode": proc.returncode,
             "result_lines": result_lines[index:index + 1],
             "accept_length_list": (
@@ -171,13 +175,12 @@ def main() -> None:
                 if index < len(stats_results) else None
             ),
             "avg_accept_length": (
-                stats_results[index].get("avg_accept_length")
-                if index < len(stats_results) else None
+                measured.get("avg_accept_length") if measured else None
             ),
             "cycle_count": (
-                len(stats_results[index].get("accept_length_list", []))
-                if index < len(stats_results) else None
+                len(measured.get("accept_length_list", [])) if measured else None
             ),
+            "timing": measured.get("timing"),
             "trace_file": str(Path(args.trace_file).resolve()) if args.trace_file else None,
             "log_tail": log[-2000:],
         })

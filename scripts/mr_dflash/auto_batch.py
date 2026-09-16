@@ -22,14 +22,18 @@ class _BatchState:
     last_success_batch_size: Optional[int] = None
     oom_count: int = 0
     upper_bound: Optional[int] = None
+    last_effective_length: Optional[int] = None
 
 
 class AdaptiveBatchController:
     """Grow a batch per length/budget bucket and back off after OOM.
 
     ``default`` in :meth:`batch_size` lets a caller provide a starting point
-    for a new bucket.  SGLang cache mode intentionally uses a small safe start,
-    then applies a token-capacity guard and OOM backoff while growing.
+    for a new bucket. ``effective_length`` lets the caller look ahead at the
+    next padded request; a longer request is scaled down from the last safe
+    batch before the forward is issued. SGLang cache mode intentionally uses a
+    small safe start, then applies a token-capacity guard and OOM backoff while
+    growing.
     """
 
     def __init__(
@@ -41,6 +45,7 @@ class AdaptiveBatchController:
         target_vram_gb: Optional[float] = None,
         hard_vram_gb: Optional[float] = None,
         safety_margin_gb: float = 0.0,
+        length_safety_factor: float = 0.85,
     ) -> None:
         if int(initial_batch_size) < 1:
             raise ValueError("initial_batch_size phải >= 1")
@@ -60,6 +65,8 @@ class AdaptiveBatchController:
             raise ValueError("hard_vram_gb phải >= target_vram_gb")
         if float(safety_margin_gb) < 0.0:
             raise ValueError("safety_margin_gb không được âm")
+        if not 0.0 < float(length_safety_factor) <= 1.0:
+            raise ValueError("length_safety_factor phải thuộc (0, 1]")
         if (
             target_vram_gb is not None
             and float(safety_margin_gb) >= float(target_vram_gb)
@@ -75,7 +82,10 @@ class AdaptiveBatchController:
             None if hard_vram_gb is None else float(hard_vram_gb)
         )
         self.safety_margin_gb = float(safety_margin_gb)
+        self.length_safety_factor = float(length_safety_factor)
         self._states: dict[str, _BatchState] = {}
+        self._last_success_batch_size: Optional[int] = None
+        self._last_success_length: Optional[int] = None
 
     def _state(self, key: str, default: Optional[int] = None) -> _BatchState:
         name = str(key)
@@ -87,8 +97,35 @@ class AdaptiveBatchController:
             self._states[name] = state
         return state
 
-    def batch_size(self, key: str, default: Optional[int] = None) -> int:
-        return int(self._state(key, default).current)
+    def batch_size(
+        self,
+        key: str,
+        default: Optional[int] = None,
+        *,
+        effective_length: Optional[int] = None,
+    ) -> int:
+        state = self._state(key, default)
+        if effective_length is not None:
+            length = int(effective_length)
+            if length < 1:
+                raise ValueError("effective_length phải >= 1")
+            reference_batch = state.last_success_batch_size
+            reference_length = state.last_effective_length
+            if reference_batch is None or reference_length is None:
+                reference_batch = self._last_success_batch_size
+                reference_length = self._last_success_length
+            if reference_batch is not None and reference_length is not None and length > reference_length:
+                predicted = max(
+                    1,
+                    math.floor(
+                        float(reference_batch)
+                        * float(reference_length)
+                        / float(length)
+                        * self.length_safety_factor
+                    ),
+                )
+                state.current = min(int(state.current), predicted)
+        return int(state.current)
 
     def record_success(
         self,
@@ -96,6 +133,7 @@ class AdaptiveBatchController:
         *,
         peak_vram_gb: Optional[float],
         max_next_batch_size: Optional[int] = None,
+        effective_length: Optional[int] = None,
     ) -> int:
         state = self._state(key)
         if max_next_batch_size is not None and int(max_next_batch_size) < 1:
@@ -106,6 +144,8 @@ class AdaptiveBatchController:
 
         previous_peak = state.last_peak_vram_gb
         previous_batch = state.last_success_batch_size
+        if effective_length is not None and int(effective_length) < 1:
+            raise ValueError("effective_length phải >= 1")
         if peak_vram_gb is not None:
             peak = float(peak_vram_gb)
             if peak < 0.0:
@@ -114,6 +154,11 @@ class AdaptiveBatchController:
             state.last_success_batch_size = int(state.current)
             if self.target_vram_gb is not None and peak >= self._safe_vram_limit:
                 state.target_reached = True
+        if effective_length is not None:
+            state.last_effective_length = int(effective_length)
+        if effective_length is not None:
+            self._last_success_batch_size = int(state.current)
+            self._last_success_length = int(effective_length)
         if state.target_reached or state.current >= ceiling:
             return int(state.current)
 
@@ -192,6 +237,8 @@ class AdaptiveBatchController:
                 "last_peak_vram_gb": state.last_peak_vram_gb,
                 "hard_vram_gb": self.hard_vram_gb,
                 "last_success_batch_size": state.last_success_batch_size,
+                "last_effective_length": state.last_effective_length,
+                "length_safety_factor": self.length_safety_factor,
                 "oom_count": int(state.oom_count),
                 "upper_bound": state.upper_bound,
             }

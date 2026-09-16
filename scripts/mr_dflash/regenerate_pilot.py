@@ -767,7 +767,13 @@ def main(argv=None) -> None:
             grouped: Dict[str, List[Dict[str, Any]]] = {}
             for pending_item in generation_pending:
                 grouped.setdefault(_generation_batch_key(pending_item), []).append(pending_item)
-            for candidate_key, candidate_items in grouped.items():
+            ordered_groups = sorted(
+                grouped.items(),
+                key=lambda pair: min(
+                    int(item.get("prompt_tokens", 0)) for item in pair[1]
+                ),
+            )
+            for candidate_key, candidate_items in ordered_groups:
                 candidate_limit = (
                     1
                     if args.temperature > 0
@@ -777,6 +783,20 @@ def main(argv=None) -> None:
                     candidate_limit = generation_controller.batch_size(
                         candidate_key,
                         default=int(args.generation_batch_size),
+                    )
+                    lookahead = sorted(
+                        candidate_items,
+                        key=lambda item: int(item.get("prompt_tokens", 0)),
+                    )[: max(1, candidate_limit)]
+                    lookahead_length = max(
+                        int(item.get("prompt_tokens", 0))
+                        + int(item.get("generation_budget", 0))
+                        for item in lookahead
+                    )
+                    candidate_limit = generation_controller.batch_size(
+                        candidate_key,
+                        default=candidate_limit,
+                        effective_length=max(1, lookahead_length),
                     )
                 if force or len(candidate_items) >= candidate_limit:
                     selected_key = candidate_key
@@ -794,6 +814,21 @@ def main(argv=None) -> None:
                     default=int(args.generation_batch_size),
                 )
             candidates = grouped[selected_key]
+            if generation_controller is not None:
+                lookahead = sorted(
+                    candidates,
+                    key=lambda item: int(item.get("prompt_tokens", 0)),
+                )[: max(1, effective_batch_size)]
+                lookahead_length = max(
+                    int(item.get("prompt_tokens", 0))
+                    + int(item.get("generation_budget", 0))
+                    for item in lookahead
+                )
+                effective_batch_size = generation_controller.batch_size(
+                    selected_key,
+                    default=effective_batch_size,
+                    effective_length=max(1, lookahead_length),
+                )
             group = list(
                 select_generation_group(candidates, max_batch_size=effective_batch_size)
             )
@@ -838,10 +873,16 @@ def main(argv=None) -> None:
                         prompt_tokens=int(item["prompt_tokens"]),
                     )
                 responses_batch = [""] * len(group)
+            effective_length = max(
+                int(item.get("prompt_tokens", 0))
+                + int(item.get("generation_budget", 0))
+                for item in group
+            )
             if generation_controller is not None and attempted_batch_size >= effective_batch_size:
                 generation_controller.record_success(
                     selected_key,
                     peak_vram_gb=getattr(args, "_last_peak_vram_gb", None),
+                    effective_length=max(1, effective_length),
                 )
             group_ids = {id(item) for item in group}
             generation_pending[:] = [

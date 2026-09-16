@@ -22,9 +22,10 @@ LEVEL="${1:-smoke}"
 case "$LEVEL" in
   smoke) DATA_FILE="$DATA_ROOT/govreport_512.jsonl"; SAMPLES="${HORIZON_SAMPLES:-1}"; INPUT_LIMIT="${HORIZON_INPUT_LIMIT:-512}"; GEN="${HORIZON_MAX_NEW_TOKENS:-64}" ;;
   1k) DATA_FILE="$DATA_ROOT/govreport_1K.jsonl"; SAMPLES="${HORIZON_SAMPLES:-1}"; INPUT_LIMIT="${HORIZON_INPUT_LIMIT:-1024}"; GEN="${HORIZON_MAX_NEW_TOKENS:-128}" ;;
+  2k) DATA_FILE="$DATA_ROOT/govreport_2K.jsonl"; SAMPLES="${HORIZON_SAMPLES:-1}"; INPUT_LIMIT="${HORIZON_INPUT_LIMIT:-2048}"; GEN="${HORIZON_MAX_NEW_TOKENS:-256}" ;;
   4k) DATA_FILE="$DATA_ROOT/govreport_4K.jsonl"; SAMPLES="${HORIZON_SAMPLES:-20}"; INPUT_LIMIT="${HORIZON_INPUT_LIMIT:-4096}"; GEN="${HORIZON_MAX_NEW_TOKENS:-256}" ;;
   8k) DATA_FILE="$DATA_ROOT/govreport_8K.jsonl"; SAMPLES="${HORIZON_SAMPLES:-20}"; INPUT_LIMIT="${HORIZON_INPUT_LIMIT:-8192}"; GEN="${HORIZON_MAX_NEW_TOKENS:-256}" ;;
-  *) echo "usage: $0 {smoke|1k|4k|8k}" >&2; exit 2 ;;
+  *) echo "usage: $0 {smoke|1k|2k|4k|8k}" >&2; exit 2 ;;
 esac
 
 mkdir -p "$OUT_ROOT/logs" "$OUT_ROOT/traces" "$OUT_ROOT/analysis"

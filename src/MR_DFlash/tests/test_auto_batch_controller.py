@@ -128,3 +128,25 @@ def test_auto_batch_exposes_hard_vram_cap_separately_from_soft_target() -> None:
     # Soft target stops ordinary growth; hard cap remains available for
     # telemetry/validation when allocator granularity overshoots the target.
     assert controller.record_success("32k", peak_vram_gb=162.5) == 2
+
+
+def test_auto_batch_uses_upcoming_length_to_reduce_next_batch_before_forward() -> None:
+    from auto_batch import AdaptiveBatchController
+
+    controller = AdaptiveBatchController(
+        initial_batch_size=1,
+        max_batch_size=64,
+        growth_factor=2.0,
+        length_safety_factor=0.85,
+    )
+    assert controller.record_success(
+        "length_bucket",
+        peak_vram_gb=None,
+        effective_length=1000,
+    ) == 2
+    # The next look-ahead batch is twice as long.  Reduce before issuing its
+    # forward instead of discovering the mismatch through an OOM.
+    assert controller.batch_size(
+        "length_bucket",
+        effective_length=2000,
+    ) == 1

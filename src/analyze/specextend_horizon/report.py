@@ -46,14 +46,41 @@ def build_report(run_root: Path, level: str, preflight: Path, result: Path, trac
     torch_info = pf.get("torch", {})
     target = pf.get("model_choice", {}).get("target", {})
     draft = pf.get("model_choice", {}).get("draft", {})
-    status = "PASS" if pf.get("status") == "PASS" and rs["sample_rows"] > 0 else "BLOCKED / INCOMPLETE"
+    run_status = "SUCCESS" if pf.get("status") == "PASS" and rs["sample_rows"] > 0 else "BLOCKED / INCOMPLETE"
+    depth = oracle.get("depth_analysis", {})
+    per_depth = depth.get("per_depth", {})
+    depth_values = [
+        (int(raw_depth), value)
+        for raw_depth, value in per_depth.items()
+    ]
+    depth_values.sort(key=lambda item: item[0])
+    missing_by_depth = [
+        value.get("mean_missing_mass_fraction")
+        for _, value in depth_values
+        if isinstance(value.get("mean_missing_mass_fraction"), (int, float))
+    ]
+    missing_trend = (
+        missing_by_depth[-1] - missing_by_depth[0]
+        if len(missing_by_depth) >= 2 else None
+    )
+    correlation = depth.get("correlation_missing_mass_vs_rejection")
+    h1_supported = (
+        run_status == "SUCCESS"
+        and len(depth_values) >= 2
+        and isinstance(correlation, (int, float))
+        and correlation > 0
+        and isinstance(missing_trend, (int, float))
+        and missing_trend > 0
+    )
+    hypothesis_status = "SUPPORTED" if h1_supported else "NOT SUPPORTED"
 
     lines = [
         f"# Báo cáo SpecExtend Horizon-CMR — {level}",
         "",
         "## Trạng thái kết luận",
         "",
-        f"- **Status:** `{status}`",
+        f"- **Run status:** `{run_status}`",
+        f"- **H1 hypothesis:** `{hypothesis_status}`",
         f"- **Run root:** `{run_root}`",
         f"- **Preflight status:** `{pf.get('status', 'N/A')}`",
         f"- **Inference sample records:** `{rs['sample_rows']}`",
@@ -72,6 +99,10 @@ def build_report(run_root: Path, level: str, preflight: Path, result: Path, trac
         "Gate tiếp tục: accepted-token gain >=20% hoặc additional E2E reduction >=15% "
         "so với SpecExtend. Không có gate nào được đánh giá nếu trace không có "
         "target-attention và baseline không chạy hoàn chỉnh.",
+        "",
+        "Kết quả H1 chỉ được coi là được hỗ trợ khi missing future mass tăng theo "
+        "depth và có quan hệ dương với rejection. `Run status=SUCCESS` chỉ nói job "
+        "đã chạy thành công; không đồng nghĩa H1 PASS.",
         "",
         "## 2. Cấu hình thực nghiệm",
         "",
@@ -114,9 +145,9 @@ def build_report(run_root: Path, level: str, preflight: Path, result: Path, trac
         f"- Result rows: `{rs['rows']}`; sample rows: `{rs['sample_rows']}`; return codes: `{rs['returncodes']}`.",
     ]
     if rs["sample_records"]:
-        lines += ["", "| sample | input | output | decode ms | throughput | avg accept | cycles |", "|---:|---:|---:|---:|---:|---:|---:|"]
+        lines += ["", "| sample | input | output | decode ms | tok/s | avg accept | cycles | peak VRAM GiB |", "|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for row in rs["sample_records"]:
-            lines.append("| {sample_id} | {input_tokens} | {output_tokens} | {decode_ms} | {throughput_tok_s} | {avg_accept_length} | {cycle_count} |".format(**{key: fmt(row.get(key)) for key in ("sample_id", "input_tokens", "output_tokens", "decode_ms", "throughput_tok_s", "avg_accept_length", "cycle_count")}))
+            lines.append("| {sample_id} | {input_tokens} | {output_tokens} | {decode_ms} | {throughput_tok_s} | {avg_accept_length} | {cycle_count} | {peak_memory_gb} |".format(**{key: fmt(row.get(key)) for key in ("sample_id", "input_tokens", "output_tokens", "decode_ms", "throughput_tok_s", "avg_accept_length", "cycle_count", "peak_memory_gb")}))
     else:
         lines += ["", "Chưa có sample inference thành công; không có measured acceptance/E2E metric để báo cáo."]
 
@@ -162,30 +193,97 @@ def build_report(run_root: Path, level: str, preflight: Path, result: Path, trac
     else:
         lines.append("Chưa có acceptance curve vì chưa có cycle trace.")
 
+    timing = oracle.get("timing", {})
+    if timing:
+        lines += [
+            "",
+            "## 7. H0.5 — Phân rã thời gian đo được",
+            "",
+            "Các giá trị dưới đây là tổng và trung bình trên cycle trace. "
+            "`target verify` là forward target/tree verification; "
+            "`verify + next draft` gồm acceptance bookkeeping và block draft tiếp theo; "
+            "`retrieval/cache update` là cập nhật full/working draft cache. "
+            "Các thành phần không được instrument không được suy diễn thành zero.",
+            "",
+            "| Thành phần | Tổng giây | Trung bình/cycle | Số quan sát |",
+            "|---|---:|---:|---:|",
+        ]
+        for key, label in (
+            ("cycle_time_s", "cycle wall time"),
+            ("target_verify_time_s", "target verify"),
+            ("verify_and_draft_time_s", "verify + next draft"),
+            ("draft_time_s", "draft model"),
+            ("retrieval_update_time_s", "retrieval/cache update"),
+            ("cycle_overhead_time_s", "cycle overhead"),
+        ):
+            value = timing.get(key, {})
+            lines.append(
+                f"| {label} | {fmt(value.get('sum'))} | {fmt(value.get('mean'))} | {fmt(value.get('n'))} |"
+            )
+        lines += [
+            "",
+            "Amdahl ceiling chưa được gọi là một speedup thực tế: trace này mới "
+            "phân rã baseline. Horizon context hiện chưa được chạy lại với một "
+            "policy khác nên overlap/projected ratio không phải E2E result.",
+        ]
+
+    depth_points = sum(
+        int(value.get("n", 0)) for value in depth.get("per_depth", {}).values()
+    )
     lines += [
         "",
-        "## 7. Diễn giải và không diễn giải",
+        "## 8. H1 — Horizon mismatch theo speculative depth",
+        "",
+        f"- Cycle có aggregate target attention: `{oracle.get('attention_available_cycles', 0)}`/{oracle.get('cycle_records', 0)}.",
+        f"- Depth-points có per-depth target attention: `{depth_points}`.",
+        f"- Pearson correlation giữa missing future mass và rejection: `{fmt(depth.get('correlation_missing_mass_vs_rejection'))}`.",
+        "",
+        "| Depth | N | CMR recall trong horizon | CMR precision | Jaccard | Missing mass | Rejection rate |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    if depth.get("per_depth"):
+        for raw_depth, value in sorted(depth["per_depth"].items(), key=lambda item: int(item[0])):
+            lines.append(
+                f"| {raw_depth} | {value.get('n')} | {fmt(value.get('mean_recall_current_in_horizon'))} | "
+                f"{fmt(value.get('mean_precision_current_vs_horizon'))} | {fmt(value.get('mean_jaccard'))} | "
+                f"{fmt(value.get('mean_missing_mass_fraction'))} | {fmt(value.get('rejection_rate'))} |"
+            )
+    else:
+        lines.append("| N/A | 0 | N/A | N/A | N/A | N/A | N/A |")
+    lines += [
+        "",
+        "`Missing mass` là tổng attention của các source chunks nằm ngoài current "
+        "CMR, chuẩn hóa theo source mass ở depth đó. `Rejection rate` là fraction "
+        "cycle có `accepted_tokens < depth`. Các metrics H1 chỉ tính trên cycle "
+        "có per-depth target attention; cycle thiếu trace không bị tính overlap bằng 0.",
+    ]
+
+    lines += [
+        "",
+        "## 9. Diễn giải và không diễn giải",
         "",
         "Nếu preflight/inference bị block, đây là báo cáo triển khai và kiểm chứng "
         "khả năng chạy, không phải bằng chứng H1 pass/fail. Đặc biệt không được dùng "
         "smoke cũ hoặc CPU để lấp vào kết quả 4K/8K.",
         "",
-        "Trace hiện tại là chunk-level aggregate của last target layer tại các "
-        "retrieval checkpoints. Nó đủ để kiểm tra instrumentation và tạo oracle "
-        "pilot khi có GPU, nhưng không thay thế full attention-head study.",
+        "Trace là last-target-layer attention trên verification-tree queries. "
+        "Bản có per-depth fields dùng cho H1; nó vẫn là chunk-level average trên "
+        "các branching queries cùng depth, không phải actual oracle re-draft.",
         "",
-        "## 8. Artifact và reproducibility",
+        "## 10. Artifact và reproducibility",
         "",
         f"- Preflight: `{preflight}`",
         f"- Raw result: `{result}`",
         f"- Trace: `{trace}`",
         f"- Oracle summary: tạo offline từ `{trace}` bằng `horizon_oracle.py`.",
         "",
-        "## 9. PASS/FAIL hiện tại",
+        "## 11. PASS/FAIL hiện tại",
         "",
         "- Baseline SpecExtend 4K/8K: chỉ PASS khi có measured successful samples ở đúng level.",
-        "- H1 horizon oracle: `NOT EVALUATED` nếu không có target attention trace hoặc không có baseline completed.",
-        "- Predictor/architecture: chưa được mở.",
+        f"- H1 horizon mismatch: `{hypothesis_status}`; missing-mass trend first-to-last depth = `{fmt(missing_trend)}`, Pearson missing-mass/rejection = `{fmt(correlation)}`.",
+        "- H2 causal add-back, H3 simple alternatives và H4 actual oracle re-draft: "
+        "`NOT RUN`, vì H1 không đạt gate sequential; không được suy diễn projected overlap "
+        "thành causal hoặc E2E gain.",
     ]
     return "\n".join(lines) + "\n"
 

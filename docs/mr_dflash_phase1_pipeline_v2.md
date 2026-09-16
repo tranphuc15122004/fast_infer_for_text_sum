@@ -60,6 +60,7 @@ Giá trị khuyến nghị hiện tại:
 | growth factor | 2.0 | tăng nhanh khi batch trước thành công |
 | max batch | 128 | trần khẩn cấp, không phải batch cố định |
 | cache safety fraction | 0.95 | dự phòng cho token pool/allocator |
+| length look-ahead safety | 0.85 | dự phòng khi sample kế tiếp dài hơn |
 
 ### Regeneration
 
@@ -71,6 +72,18 @@ giữ batch hiện tại.
 Nếu batch lớn bị OOM, cùng nhóm sample được giữ lại và thử lại với batch nhỏ
 hơn. Sau OOM, controller tìm kiếm giữa batch an toàn và batch lỗi thay vì luôn
 quay về batch 1.
+
+Trước khi forward, regeneration nhìn trước các sample ngắn nhất sẽ được đưa vào
+batch tiếp theo và ước lượng effective length:
+
+```text
+effective_length = prompt_tokens + generation_budget
+batch_next <= batch_safe × length_safe / length_next × 0.85
+```
+
+Khi length tăng trong cùng bucket hoặc chuyển sang bucket mới, batch được giảm
+trước khi chạy. Sample ngắn đầu run vẫn cho phép bước nhảy lớn; khi sample dài
+dần, controller tự chuyển sang bước nhỏ hơn.
 
 ### Hidden cache
 
@@ -84,6 +97,11 @@ batch <= runtime_token_capacity / padded_length
 
 Cache bắt đầu từ batch 1 theo từng length bucket. OOM giữ nguyên CPU buffer,
 giảm batch, giải phóng cache nếu backend hỗ trợ rồi capture lại đúng sample.
+
+Cache không chỉ nhìn `buffer[0]`: trước mỗi forward nó tính padded length của
+toàn bộ nhóm candidate. Nếu nhóm sắp tới chứa sample dài hơn, batch được cap
+theo padded length và token capacity trước khi gọi SGLang. Sau mỗi batch, length
+thực tế được lưu làm mốc để warm-start bucket kế tiếp.
 
 Hard cap được kiểm tra khi parse cấu hình và truyền vào worker. Runtime adaptive
 dừng theo soft target; allocator/OOM là hàng rào cuối cùng.

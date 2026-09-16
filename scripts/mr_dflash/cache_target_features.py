@@ -1113,6 +1113,10 @@ def cache_dataset(
                 # peak telemetry is not a useful stopping signal here.
                 peak_vram_gb=None,
                 max_next_batch_size=safe_ceiling,
+                effective_length=max(
+                    len(sample["input_ids"])
+                    for sample in batch
+                ),
             )
             if next_batch <= len(batch) and len(batch) >= safe_ceiling:
                 reporter.update(
@@ -1193,7 +1197,11 @@ def cache_dataset(
             )
         return max(1, ceiling)
 
-    def next_batch_size(sample_length: Optional[int] = None) -> int:
+    def next_batch_size(
+        sample_length: Optional[int] = None,
+        *,
+        effective_length: Optional[int] = None,
+    ) -> int:
         controller_key = (
             None if sample_length is None else cache_batch_key(sample_length)
         )
@@ -1239,6 +1247,11 @@ def cache_dataset(
             selected = cache_controller.batch_size(
                 controller_key,
                 default=max(1, adaptive_start),
+                effective_length=(
+                    int(effective_length)
+                    if effective_length is not None
+                    else int(sample_length)
+                ),
             )
             # Keep an explicitly supplied token cap as a hard safety limit.
             if token_cap is not None:
@@ -1249,6 +1262,37 @@ def cache_dataset(
             return selected
         remaining = int(num_samples) - writer.total_samples
         return max(0, min(selected, remaining))
+
+    def select_buffer_batch_size(buffer: List[Dict[str, Any]]) -> int:
+        """Choose a batch using the padded length of the look-ahead group.
+
+        Looking only at ``buffer[0]`` is unsafe when a candidate batch crosses
+        a length boundary: the last sample can force a much larger padded
+        forward. Recompute the decision with that prospective padded length
+        before issuing the model call, so the controller backs off before an
+        avoidable OOM.
+        """
+        if not buffer:
+            return 0
+        first_length = len(buffer[0]["input_ids"])
+        selected = min(next_batch_size(first_length), len(buffer))
+        while selected > 1:
+            padded_length = max(
+                len(sample["input_ids"]) for sample in buffer[:selected]
+            )
+            if padded_length <= first_length:
+                break
+            capped = min(
+                selected,
+                next_batch_size(
+                    padded_length,
+                    effective_length=padded_length,
+                ),
+            )
+            if capped >= selected:
+                break
+            selected = max(1, capped)
+        return selected
 
     for row_index, row in enumerate(rows):
         stats["seen"] += 1
@@ -1289,7 +1333,7 @@ def cache_dataset(
             # predictable; token-budget logic still controls each batch.
             buffer[:] = sort_cache_buffer(buffer)
             while buffer:
-                current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
+                current_batch_size = select_buffer_batch_size(buffer)
                 if current_batch_size == 0:
                     buffer.clear()
                     break
@@ -1298,7 +1342,10 @@ def cache_dataset(
                 # debug hoặc số sample còn lại quá ít.
                 if len(buffer) < current_batch_size:
                     break
-                batch_key = cache_batch_key(len(buffer[0]["input_ids"]))
+                batch_padded_length = max(
+                    len(sample["input_ids"]) for sample in buffer[:current_batch_size]
+                )
+                batch_key = cache_batch_key(batch_padded_length)
                 processed = process(
                     buffer[:current_batch_size],
                     batch_key=batch_key,
@@ -1312,13 +1359,16 @@ def cache_dataset(
                     break
     buffer[:] = sort_cache_buffer(buffer)
     while buffer and (num_samples is None or writer.total_samples < int(num_samples)):
-        current_batch_size = next_batch_size(len(buffer[0]["input_ids"]))
+        current_batch_size = select_buffer_batch_size(buffer)
         if current_batch_size == 0:
             break
         # Batch cuối có thể nhỏ hơn schedule khi shard kết thúc; đây là batch
         # an toàn vì nó chỉ giảm memory, không làm tăng padding length.
         current_batch_size = min(current_batch_size, len(buffer))
-        batch_key = cache_batch_key(len(buffer[0]["input_ids"]))
+        batch_padded_length = max(
+            len(sample["input_ids"]) for sample in buffer[:current_batch_size]
+        )
+        batch_key = cache_batch_key(batch_padded_length)
         processed = process(
             buffer[:current_batch_size],
             batch_key=batch_key,

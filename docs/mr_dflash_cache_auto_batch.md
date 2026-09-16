@@ -64,6 +64,12 @@ hết hạn sẽ được host mới reclaim. Mỗi sample được retry tối 
 vẫn lỗi ở batch 1 được ghi vào `quarantine.jsonl`. Merge cuối vẫn giữ thứ tự
 canonical của input và không ghi trùng sample.
 
+Trước mỗi forward, cache nhìn trước cả nhóm candidate và dùng padded length của
+sample dài nhất trong nhóm, không chỉ dùng length của sample đầu tiên. Khi
+length bucket kế tiếp dài hơn, batch được warm-start theo tỷ lệ token của batch
+an toàn trước đó và giảm trước khi chạy; điều này tránh thử một batch lớn rồi
+mới phát hiện OOM.
+
 Parent hiển thị một tqdm tổng hợp trên cả hai GPU; `completed/total` tính theo
 sample của toàn input, còn heartbeat chi tiết từng worker nằm trong
 `parallel_cache_<split>/rank_*/progress.json`.

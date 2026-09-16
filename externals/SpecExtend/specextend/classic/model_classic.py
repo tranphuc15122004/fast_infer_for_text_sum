@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import os
+import random
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -45,6 +47,8 @@ class SPModel(nn.Module):
         self._last_retrieve_attn_scores = False
         self._last_target_attention_shape = None
         self._last_target_attention_error = None
+        self._last_draft_total_s = 0.0
+        self._last_retrieval_update_s = 0.0
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -95,12 +99,205 @@ class SPModel(nn.Module):
             )
             return None
 
+    def _source_chunk_attention_by_depth(self, input_len, prefix_len, position_ids):
+        """Aggregate last-layer source attention by speculative depth.
+
+        The target attention tensor has one row per verification-tree query.
+        Rows are grouped by absolute position relative to the currently
+        accepted prefix. This is diagnostic-only hindsight telemetry and is
+        never fed to the live CMR policy.
+        """
+        attention = getattr(self, "attn_scores", None)
+        chunks = getattr(self, "chunks", None) or getattr(self, "selected_chunks", None)
+        if attention is None or not chunks:
+            return None
+        try:
+            attention = attention.detach().float()
+            if attention.ndim != 4:
+                return None
+            # [batch, heads, queries, kv] -> [queries, kv]
+            attention = attention.mean(dim=1).squeeze(0)
+            if attention.ndim != 2:
+                return None
+            positions = position_ids.detach().view(-1).to("cpu").tolist()
+            query_count = min(len(positions), int(attention.shape[0]))
+            source_limit = min(int(input_len), int(attention.shape[-1]))
+            by_depth: dict[str, list[dict[str, float]]] = {}
+            for query_index in range(query_count):
+                depth = int(positions[query_index]) - int(prefix_len)
+                if depth <= 0:
+                    continue
+                row = attention[query_index]
+                scores: dict[str, float] = {}
+                for chunk_id, start, end in chunks:
+                    start = max(0, int(start))
+                    end = min(source_limit, int(end))
+                    if end <= start:
+                        continue
+                    scores[str(chunk_id)] = float(row[start:end].mean().item())
+                if scores:
+                    by_depth.setdefault(str(depth), []).append(scores)
+
+            aggregated: dict[str, dict[str, float]] = {}
+            for depth, rows in by_depth.items():
+                ids = sorted({chunk_id for row in rows for chunk_id in row}, key=str)
+                aggregated[depth] = {
+                    chunk_id: sum(row.get(chunk_id, 0.0) for row in rows) / len(rows)
+                    for chunk_id in ids
+                }
+            return aggregated or None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _target_candidate_diagnostics(logits, draft_input_ids):
+        """Measure how target verification ranks the draft candidates.
+
+        This is a compact D3 diagnostic: full vocabulary logits are consumed
+        immediately and only candidate ranks/top-1 agreement are written to
+        the trace.  No logits tensor is retained in the JSONL artifact.
+        """
+        try:
+            target_logits = logits[0].detach()
+            candidates = draft_input_ids[0].detach().to(target_logits.device)
+            count = min(int(target_logits.shape[0]), int(candidates.numel()))
+            if count <= 0:
+                return None
+            target_logits = target_logits[:count]
+            candidates = candidates[:count]
+            candidate_scores = target_logits.gather(1, candidates.view(-1, 1)).squeeze(1)
+            ranks = 1 + (target_logits > candidate_scores.unsqueeze(1)).sum(dim=1)
+            target_top1 = target_logits.argmax(dim=1)
+            return {
+                "draft_candidate_ids": [int(x) for x in candidates.to("cpu").tolist()],
+                "target_top1_ids": [int(x) for x in target_top1.to("cpu").tolist()],
+                "target_rank_of_draft": [int(x) for x in ranks.to("cpu").tolist()],
+                "target_top1_agreement": float(
+                    (target_top1 == candidates).float().mean().item()
+                ),
+                "target_rank_of_draft_mean": float(ranks.float().mean().item()),
+            }
+        except (AttributeError, RuntimeError, TypeError, ValueError, IndexError):
+            return None
+
     @staticmethod
     def _trace_chunks(chunks):
         return [
             {"id": int(chunk_id), "start": int(start), "end": int(end)}
             for chunk_id, start, end in (chunks or [])
         ]
+
+    def _select_control_chunks(self, *, retrieval: bool = False):
+        """Return a diagnostic draft-context selection for D0--D3.
+
+        ``cmr32`` is the unchanged SpecExtend policy.  The controls are
+        selected through ``SPECEXTEND_RETRIEVAL_POLICY`` and only affect the
+        draft working cache; target verification and the full target cache are
+        unchanged.
+        """
+        policy = getattr(self, "retrieval_policy", "cmr32")
+        chunks = list(getattr(self, "chunks", []) or [])
+        if not chunks:
+            return []
+        k = min(self._control_top_k(), len(chunks))
+        if policy == "full":
+            return chunks
+        if policy == "recent32":
+            return chunks[-k:]
+        if policy == "shuffled32":
+            seed = int(os.environ.get("SPECEXTEND_SEED", "42"))
+            selected = list(chunks)
+            random.Random(seed + int(getattr(self, "timestep", 0))).shuffle(selected)
+            return selected[:k]
+        if policy.startswith("cmr"):
+            return None
+        raise ValueError(
+            f"Unknown SPECEXTEND_RETRIEVAL_POLICY={policy!r}; choose "
+            "cmr32/cmr64/cmr128, recent32, shuffled32 or full"
+        )
+
+    def _control_top_k(self) -> int:
+        """Return the selected chunk budget for a diagnostic policy."""
+        policy = getattr(self, "retrieval_policy", "cmr32")
+        if policy.startswith("cmr"):
+            suffix = policy[3:]
+            if suffix.isdigit() and int(suffix) > 0:
+                return int(suffix)
+        return int(getattr(self, "retrieve_top_k", 32))
+
+    def _fixed_control_chunks(self):
+        """Load an optional fixed chunk set for matched-prefix replay."""
+        raw = os.environ.get("SPECEXTEND_FIXED_CHUNK_IDS", "").strip()
+        if not raw:
+            return None
+        raw_timestep = os.environ.get("SPECEXTEND_FIXED_AT_TIMESTEP", "").strip()
+        if raw_timestep:
+            try:
+                if int(raw_timestep) != int(getattr(self, "timestep", 0)):
+                    return None
+            except ValueError:
+                return None
+        try:
+            ids = {int(value) for value in json.loads(raw)}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not ids:
+            return None
+        chunks = list(getattr(self, "chunks", []) or [])
+        selected = [chunk for chunk in chunks if int(chunk[0]) in ids]
+        return selected or None
+
+    @classmethod
+    def _load_model_weights_compat(cls, model, model_path):
+        """Repair Transformers-5 loading of the legacy SpecExtend classes.
+
+        The classic SpecExtend model classes were copied from an older
+        Transformers release.  With the current Transformers loader, a local
+        safetensors checkpoint can produce a successful-looking load report
+        while leaving the ordinary parameters at their random initialization
+        (the rotary buffer is the only reported missing key).  That failure
+        makes the draft emit garbage and drives acceptance to zero.
+
+        Copying one tensor at a time through ``safe_open`` avoids materializing
+        a second copy of the 7B target checkpoint in GPU memory.  This is a
+        compatibility repair only; it does not alter inference semantics for
+        correctly loaded checkpoints.
+        """
+        path = Path(str(model_path))
+        if not path.is_dir():
+            return model
+        safetensor_path = path / "model.safetensors"
+        if not safetensor_path.exists():
+            return model
+
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return model
+
+        parameters = dict(model.named_parameters())
+        copied = 0
+        with safe_open(str(safetensor_path), framework="pt", device="cpu") as handle:
+            available = set(handle.keys())
+            for name, parameter in parameters.items():
+                if name not in available:
+                    continue
+                value = handle.get_tensor(name)
+                if tuple(value.shape) != tuple(parameter.shape):
+                    raise ValueError(
+                        f"Checkpoint shape mismatch for {name}: "
+                        f"file={tuple(value.shape)} model={tuple(parameter.shape)}"
+                    )
+                parameter.data.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+                copied += 1
+
+        if copied == 0:
+            raise RuntimeError(f"No checkpoint tensors copied from {safetensor_path}")
+        print(
+            f"[SpecExtend] compatibility loader copied {copied} parameter tensors "
+            f"from {safetensor_path}"
+        )
+        return model
 
     @classmethod
     def from_pretrained(
@@ -117,6 +314,13 @@ class SPModel(nn.Module):
         draft_model = KVLlamaForCausalLM_retrieval.from_pretrained(
             draft_model_path, **kwargs
         )
+
+        # Keep this after the upstream call so the patch is also effective on
+        # Transformers versions whose loader silently skips legacy custom
+        # class parameters.  On the official Vicuna pair this copies the
+        # exact public safetensors into the already-dispatched modules.
+        base_model = cls._load_model_weights_compat(base_model, base_model_path)
+        draft_model = cls._load_model_weights_compat(draft_model, draft_model_path)
 
         model = cls(
             base_model,
@@ -309,6 +513,8 @@ class SPModel(nn.Module):
 
     @torch.no_grad()
     def draft(self,input_ids,nodes,threshold,max_depth):
+        draft_started = time.perf_counter()
+        retrieval_elapsed = 0.0
         len_posi = input_ids.shape[1]-1
         ###### Initial Forward to generate top_k branches ######
         if hasattr(self, "draft_stable_kv") and self.draft_stable_kv is not None:
@@ -339,8 +545,10 @@ class SPModel(nn.Module):
 
         if self.use_retrieval_cache:
             newly_appended_len = input_ids.shape[-1] - self.total_seq_len
+            retrieval_started = time.perf_counter()
             self.update_full_draft_cache(draft_outputs[1], tokens_appended=newly_appended_len)
             self.draft_stable_kv = self.update_working_cache_retrieval_main(top_k_chunks=self.retrieve_top_k)
+            retrieval_elapsed += time.perf_counter() - retrieval_started
             
             if self.retrieval_verbose:
                 self.print_retrieved_chunks()
@@ -393,7 +601,8 @@ class SPModel(nn.Module):
 
         if self.use_retrieval_cache:
             position_ids += target_model_pos_diff
-        
+        self._last_draft_total_s = time.perf_counter() - draft_started
+        self._last_retrieval_update_s = retrieval_elapsed
         return input_ids, position_ids, tree_output["attention_mask"], tree_output["parent_last"]
 
     @torch.no_grad()
@@ -414,9 +623,29 @@ class SPModel(nn.Module):
             retrieval_chunk_size=32,
             retrieve_top_k=32,
             retrieve_every_n_steps=8,
-    ):   
+    ):
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        input_len = input_ids.shape[1]
+        prefix_input_len = input_ids.shape[1]
+        input_len = prefix_input_len
+        raw_source_input_len = os.environ.get("SPECEXTEND_ORIGINAL_INPUT_LEN", "").strip()
+        if raw_source_input_len:
+            try:
+                candidate_source_len = int(raw_source_input_len)
+                if 0 < candidate_source_len <= prefix_input_len:
+                    input_len = candidate_source_len
+            except ValueError:
+                pass
+
+        timing_enabled = os.environ.get("SPECEXTEND_TIMING", "0").strip().lower() in {
+            "1", "true", "yes"
+        }
+
+        def sync_cuda():
+            if timing_enabled and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         self._horizon_trace_sample_id = os.environ.get("SPECEXTEND_TRACE_SAMPLE_ID")
         # Warmup calls do not set a sample id and must not contaminate the
@@ -435,6 +664,9 @@ class SPModel(nn.Module):
             "retrieve_every_n_steps": int(retrieve_every_n_steps),
             "max_new_tokens": int(max_new_tokens),
             "use_specextend": bool(use_specextend),
+            "retrieval_policy": os.environ.get(
+                "SPECEXTEND_RETRIEVAL_POLICY", "cmr32"
+            ),
         })
         
         self.use_retrieval_cache = use_specextend
@@ -454,6 +686,19 @@ class SPModel(nn.Module):
         self.retrieve_top_k = retrieve_top_k
         self.retrieval_verbose = retrieval_verbose
         self.retrieve_every_n_steps = retrieve_every_n_steps
+        self.retrieval_policy = os.environ.get(
+            "SPECEXTEND_RETRIEVAL_POLICY", "cmr32"
+        ).strip().lower()
+        if self.retrieval_policy == "source_aware":
+            self.retrieval_policy = "cmr32"
+        valid_control_policies = {
+            "cmr32", "cmr64", "cmr128", "recent32", "shuffled32", "full"
+        }
+        if self.retrieval_policy not in valid_control_policies:
+            raise ValueError(
+                "Unsupported SPECEXTEND_RETRIEVAL_POLICY="
+                f"{self.retrieval_policy!r}"
+            )
         self.num_chunks_old = 0
         self.retrieval_condition = False
         self.last_chunk_scores = None
@@ -468,7 +713,10 @@ class SPModel(nn.Module):
         else:
             logits_processor = None
 
-        self.full_cache_budget = input_len + max_new_tokens + 100
+        # A replay prefix can already contain accepted output tokens.  Cache
+        # allocation must cover that whole prefix, while ``input_len`` remains
+        # the original prompt/source boundary used by retrieval diagnostics.
+        self.full_cache_budget = prefix_input_len + max_new_tokens + 100
 
         # initialize caches
         if self.use_retrieval_cache:
@@ -488,6 +736,8 @@ class SPModel(nn.Module):
         self.current_length_data = current_length_data
     
         start_time = datetime.now()
+        initial_start = time.perf_counter()
+        sync_cuda()
         
         # Prefill target model and draft model + initial draft
         draft_input_ids,draft_position_ids,tree_attention_mask,last_token,parent, outputs = self(
@@ -500,21 +750,47 @@ class SPModel(nn.Module):
         tree_attention_mask=torch.cat([torch.zeros(1,tree_attention_mask.size(1),dtype=tree_attention_mask.dtype,device=tree_attention_mask.device),tree_attention_mask],dim=0)
         tree_attention_mask = torch.cat([torch.ones(tree_attention_mask.size(0), 1,dtype=tree_attention_mask.dtype,device=tree_attention_mask.device), tree_attention_mask],
                                         dim=1)
+        sync_cuda()
+        initial_elapsed = time.perf_counter() - initial_start
+        initial_draft_elapsed = float(self._last_draft_total_s)
+        initial_retrieval_elapsed = float(self._last_retrieval_update_s)
 
         new_token = 0
         total_tokens_list = []
         accept_length_list = []
+        timing_totals = {
+            "initial_prefill_and_draft_s": initial_elapsed,
+            "initial_draft_s": initial_draft_elapsed,
+            "initial_retrieval_update_s": initial_retrieval_elapsed,
+            "target_verify_s": 0.0,
+            "verify_and_draft_s": 0.0,
+            "draft_s": 0.0,
+            "retrieval_update_s": 0.0,
+            "cycle_overhead_s": 0.0,
+        }
         while True:
             assert past_key_values[0][0].shape[2]==draft_position_ids[0]
             cycle_start = time.perf_counter()
+            sync_cuda()
             current_chunks = self._trace_chunks(getattr(self, "selected_chunks", None))
             current_chunk_scores = getattr(self, "last_chunk_scores", None)
+            cycle_prefix_token_ids = (
+                [int(x) for x in input_ids[0].detach().to("cpu").tolist()]
+                if os.environ.get("SPECEXTEND_TRACE_PREFIX", "0").lower()
+                in {"1", "true", "yes"} else None
+            )
+            target_start = time.perf_counter()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_input_ids,
                 past_key_values,
                 draft_position_ids,
                 tree_attention_mask
+            )
+            sync_cuda()
+            target_elapsed = time.perf_counter() - target_start
+            candidate_diagnostics = self._target_candidate_diagnostics(
+                logits, draft_input_ids
             )
 
             # ``verify`` immediately drafts the next block and the retrieval
@@ -523,8 +799,16 @@ class SPModel(nn.Module):
             # does not affect the current CMR selection.
             horizon_chunk_scores = None
             horizon_chunk_ids = []
+            horizon_chunk_scores_by_depth = None
+            query_position_ids = None
             if self.retrieval_condition:
+                query_position_ids = draft_position_ids.detach().view(-1).to("cpu").tolist()
                 horizon_chunk_scores = self._source_chunk_attention(input_len)
+                horizon_chunk_scores_by_depth = self._source_chunk_attention_by_depth(
+                    input_len=input_len,
+                    prefix_len=input_ids.shape[1],
+                    position_ids=draft_position_ids,
+                )
                 if horizon_chunk_scores:
                     horizon_chunk_ids = [
                         int(chunk_id) if str(chunk_id).lstrip("-").isdigit() else chunk_id
@@ -536,6 +820,7 @@ class SPModel(nn.Module):
 
             old_len = input_ids.shape[1]
 
+            verify_start = time.perf_counter()
             input_ids, best_candidate, accept_length, draft_input_ids, draft_position_ids, tree_attention_mask, parent=verify(input_ids,
                                                                       logits,
                                                                       draft_input_ids,
@@ -549,6 +834,18 @@ class SPModel(nn.Module):
                                                                       threshold,
                                                                       max_depth,
                                                                       logits_processor)
+            sync_cuda()
+            verify_elapsed = time.perf_counter() - verify_start
+            draft_elapsed = float(self._last_draft_total_s)
+            retrieval_elapsed = float(self._last_retrieval_update_s)
+            cycle_elapsed = time.perf_counter() - cycle_start
+            timing_totals["target_verify_s"] += target_elapsed
+            timing_totals["verify_and_draft_s"] += verify_elapsed
+            timing_totals["draft_s"] += draft_elapsed
+            timing_totals["retrieval_update_s"] += retrieval_elapsed
+            timing_totals["cycle_overhead_s"] += max(
+                0.0, cycle_elapsed - target_elapsed - verify_elapsed
+            )
             
             accept_length_list.append(accept_length.item() if isinstance(accept_length, torch.Tensor) else int(accept_length))
 
@@ -575,18 +872,31 @@ class SPModel(nn.Module):
                 "accepted_before": int(new_token),
                 "accept_length": accepted_length_int,
                 "accepted_tokens": accepted_length_int + 1,
+                "source_input_tokens": int(input_len),
                 "current_chunk_ids": [chunk["id"] for chunk in current_chunks],
                 "current_chunks": current_chunks,
+                "prefix_token_ids": cycle_prefix_token_ids,
                 "current_chunk_scores": current_chunk_scores,
+                "retrieval_policy": self.retrieval_policy,
+                "candidate_diagnostics": candidate_diagnostics,
                 "horizon_chunk_ids": horizon_chunk_ids,
                 "horizon_chunk_scores": horizon_chunk_scores,
+                "horizon_chunk_scores_by_depth": horizon_chunk_scores_by_depth,
+                "query_position_ids": query_position_ids,
                 "horizon_context_tokens": horizon_context_tokens or None,
                 "current_context_tokens": current_context_tokens or None,
                 "target_attention_available": horizon_chunk_scores is not None,
                 "retrieve_attn_scores": bool(self._last_retrieve_attn_scores),
                 "target_attention_shape": self._last_target_attention_shape,
                 "target_attention_error": self._last_target_attention_error,
-                "cycle_time_s": time.perf_counter() - cycle_start,
+                "cycle_time_s": cycle_elapsed,
+                "target_verify_time_s": target_elapsed,
+                "verify_and_draft_time_s": verify_elapsed,
+                "draft_time_s": draft_elapsed,
+                "retrieval_update_time_s": retrieval_elapsed,
+                "cycle_overhead_time_s": max(
+                    0.0, cycle_elapsed - target_elapsed - verify_elapsed
+                ),
             })
 
             generated_tokens_list = print_newly_accepted_tokens(old_len, input_ids,
@@ -596,6 +906,14 @@ class SPModel(nn.Module):
 
             self.timestep += 1
 
+            stop_cycle = os.environ.get("SPECEXTEND_REPLAY_STOP_CYCLE", "").strip()
+            if stop_cycle:
+                try:
+                    if len(accept_length_list) >= int(stop_cycle):
+                        break
+                except ValueError:
+                    pass
+
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
             if new_token > max_new_tokens:
@@ -604,6 +922,14 @@ class SPModel(nn.Module):
         # Calculate eval metrics
         avg_accept_length = round(sum(accept_length_list)/len(accept_length_list), 3)
         inference_time = (datetime.now() - start_time).total_seconds()
+
+        sync_cuda()
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated() / (1024 ** 3)
+            if torch.cuda.is_available() else None
+        )
+        timing_totals["inference_wall_s"] = inference_time
+        timing_totals["cycle_count"] = len(accept_length_list)
 
         total_generated = new_token
         tokens_per_sec = round(total_generated/inference_time,2)
@@ -621,7 +947,9 @@ class SPModel(nn.Module):
             'inference_time': inference_time,
             'accept_length_list': accept_length_list,
             'tokens_per_sec': tokens_per_sec,
-            'avg_accept_length': avg_accept_length
+            'avg_accept_length': avg_accept_length,
+            'peak_memory_gb': round(peak_memory_gb, 4) if peak_memory_gb is not None else None,
+            'timing': timing_totals,
         }
 
         return results
@@ -777,13 +1105,25 @@ class SPModel(nn.Module):
     def update_working_cache_retrieval(self, top_k_chunks: int = 15,
                                        do_retrieval=False,
                                        is_updated_chunks=False) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        # initial cache: use recent chunks (we don't have attn scores yet)
-        if not hasattr(self, "selected_chunks"):
+        # The diagnostic controls bypass attention-based CMR selection while
+        # retaining the same target prefix and full target cache.  The default
+        # ``cmr32`` path below remains the original SpecExtend behavior.
+        fixed_chunks = self._fixed_control_chunks()
+        control_chunks = (
+            fixed_chunks
+            if fixed_chunks is not None
+            else self._select_control_chunks(retrieval=do_retrieval)
+        )
+        if control_chunks is not None:
+            self.selected_chunks = control_chunks
+        elif not hasattr(self, "selected_chunks"):
+            # Initial cache: use recent chunks because no target attention is
+            # available yet (the original SpecExtend behavior).
             num_init = min(self.retrieve_top_k, len(self.chunks))
             self.selected_chunks = self.chunks[-num_init:]
         
         # Only retrieve top-k upon retrieval condition
-        if do_retrieval:
+        if do_retrieval and control_chunks is None:
             attn = self.attn_scores_final
 
             n = len(self.chunks)
@@ -811,7 +1151,7 @@ class SPModel(nn.Module):
             lengths = (ends - starts).float() 
             chunk_means = chunk_sums / lengths  # shape: [num_chunks]
             
-            k = min(top_k_chunks, chunk_means.size(0))
+            k = min(self._control_top_k(), chunk_means.size(0))
             topk = torch.topk(chunk_means, k=k)
             selected_indices = topk.indices  # indices into the list of chunks
             selected_chunks = [self.chunks[i] for i in selected_indices.tolist()]
@@ -830,8 +1170,15 @@ class SPModel(nn.Module):
             self.attn_scores = None
             self.attn_scores_final = None
 
+        elif do_retrieval:
+            # The controls still trigger at the same retrieval checkpoints,
+            # but do not consume target attention to select chunks.
+            self.retrieval_condition = False
+            self.attn_scores = None
+            self.attn_scores_final = None
+
         # if new chunk is added, automatically update
-        if is_updated_chunks:
+        if is_updated_chunks and control_chunks is None:
             # grab the newly created chunk
             new_chunk = self.chunks[-1]  # (chunk_id, start, end)
             new_chunk_id = new_chunk[0]

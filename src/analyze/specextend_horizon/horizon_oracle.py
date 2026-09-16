@@ -137,6 +137,10 @@ def _projected_cost(record: dict[str, Any]) -> dict[str, float | None]:
 
 def analyze_records(records: list[dict[str, Any]], top_k: int = 32) -> dict[str, Any]:
     cycle_records = [record for record in records if record.get("type") == "cycle"]
+    attention_records = [
+        record for record in cycle_records
+        if record.get("horizon_chunk_scores") is not None
+    ]
     overlaps: list[dict[str, Any]] = []
     projected: list[dict[str, Any]] = []
     accepted = []
@@ -154,10 +158,100 @@ def analyze_records(records: list[dict[str, Any]], top_k: int = 32) -> dict[str,
         projected.append(_projected_cost(record))
         accepted.append(record)
 
-    def mean(key: str) -> float | None:
-        values = [_finite(row.get(key)) for row in overlaps]
+    def mean(key: str, rows: list[dict[str, Any]] | None = None) -> float | None:
+        values = [_finite(row.get(key)) for row in (rows or overlaps)]
         values = [value for value in values if value is not None]
         return sum(values) / len(values) if values else None
+
+    valid_overlaps = [
+        row for row, record in zip(overlaps, cycle_records)
+        if record.get("horizon_chunk_scores") is not None
+    ]
+
+    depth_points: dict[int, list[dict[str, float]]] = defaultdict(list)
+    for record in attention_records:
+        current_ids = set(record.get("current_chunk_ids") or [])
+        accepted_tokens = record.get("accepted_tokens")
+        try:
+            accepted_tokens = int(accepted_tokens)
+        except (TypeError, ValueError):
+            accepted_tokens = None
+        by_depth = record.get("horizon_chunk_scores_by_depth") or {}
+        for raw_depth, score_map in by_depth.items():
+            try:
+                depth = int(raw_depth)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(score_map, dict) or not score_map:
+                continue
+            horizon_ids = {
+                int(chunk_id) if str(chunk_id).lstrip("-").isdigit() else chunk_id
+                for chunk_id in weighted_top_ids(score_map, top_k)
+            }
+            intersection = len(current_ids & horizon_ids)
+            total_mass = sum(
+                value for value in (_finite(v) for v in score_map.values())
+                if value is not None and value > 0
+            )
+            missing_mass = sum(
+                value for chunk_id, value in (
+                    (str(k), _finite(v)) for k, v in score_map.items()
+                )
+                if value is not None and value > 0 and chunk_id not in {str(x) for x in current_ids}
+            )
+            depth_points[depth].append({
+                "recall": intersection / len(horizon_ids) if horizon_ids else 0.0,
+                "precision": intersection / len(current_ids) if current_ids else 0.0,
+                "jaccard": intersection / len(current_ids | horizon_ids)
+                if current_ids | horizon_ids else 0.0,
+                "missing_mass_fraction": missing_mass / total_mass if total_mass > 0 else 0.0,
+                "rejected": float(
+                    accepted_tokens is not None and accepted_tokens < depth
+                ),
+            })
+
+    def pearson(rows: list[dict[str, float]], x_key: str, y_key: str) -> float | None:
+        pairs = [
+            (_finite(row.get(x_key)), _finite(row.get(y_key)))
+            for row in rows
+        ]
+        pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+        if len(pairs) < 2:
+            return None
+        x_mean = sum(x for x, _ in pairs) / len(pairs)
+        y_mean = sum(y for _, y in pairs) / len(pairs)
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in pairs)
+        x_var = sum((x - x_mean) ** 2 for x, _ in pairs)
+        y_var = sum((y - y_mean) ** 2 for _, y in pairs)
+        denominator = math.sqrt(x_var * y_var)
+        return numerator / denominator if denominator > 0 else None
+
+    depth_summary: dict[str, Any] = {}
+    all_depth_rows: list[dict[str, float]] = []
+    for depth, rows in sorted(depth_points.items()):
+        all_depth_rows.extend(rows)
+        depth_summary[str(depth)] = {
+            "n": len(rows),
+            "mean_recall_current_in_horizon": sum(r["recall"] for r in rows) / len(rows),
+            "mean_precision_current_vs_horizon": sum(r["precision"] for r in rows) / len(rows),
+            "mean_jaccard": sum(r["jaccard"] for r in rows) / len(rows),
+            "mean_missing_mass_fraction": sum(r["missing_mass_fraction"] for r in rows) / len(rows),
+            "rejection_rate": sum(r["rejected"] for r in rows) / len(rows),
+        }
+
+    timing_keys = (
+        "cycle_time_s", "target_verify_time_s", "verify_and_draft_time_s",
+        "draft_time_s", "retrieval_update_time_s", "cycle_overhead_time_s",
+    )
+    timing: dict[str, Any] = {"cycles": len(cycle_records)}
+    for key in timing_keys:
+        values = [_finite(row.get(key)) for row in cycle_records]
+        values = [value for value in values if value is not None]
+        timing[key] = {
+            "sum": sum(values) if values else None,
+            "mean": sum(values) / len(values) if values else None,
+            "n": len(values),
+        }
 
     ratios = [
         _finite(row.get("horizon_to_current_context_ratio"))
@@ -169,11 +263,24 @@ def analyze_records(records: list[dict[str, Any]], top_k: int = 32) -> dict[str,
         "cycle_records": len(cycle_records),
         "attention_available_cycles": attention_available,
         "overlap": {
-            "mean_recall_current_in_horizon": mean("recall_current_in_horizon"),
-            "mean_precision_current_vs_horizon": mean("precision_current_vs_horizon"),
-            "mean_jaccard": mean("jaccard"),
+            "valid_cycle_records": len(attention_records),
+            "mean_recall_current_in_horizon": mean("recall_current_in_horizon", valid_overlaps),
+            "mean_precision_current_vs_horizon": mean("precision_current_vs_horizon", valid_overlaps),
+            "mean_jaccard": mean("jaccard", valid_overlaps),
             "per_cycle": overlaps,
         },
+        "depth_analysis": {
+            "available_depths": sorted(depth_summary, key=lambda value: int(value)),
+            "per_depth": depth_summary,
+            "correlation_missing_mass_vs_rejection": pearson(
+                all_depth_rows, "missing_mass_fraction", "rejected"
+            ),
+            "interpretation": (
+                "Depth metrics are valid only for cycles with per-depth target "
+                "attention. A rejection is accepted_tokens < speculative depth."
+            ),
+        },
+        "timing": timing,
         "projected_cost": {
             "mean_horizon_to_current_context_ratio": sum(ratios) / len(ratios) if ratios else None,
             "mean_projected_speedup": (
