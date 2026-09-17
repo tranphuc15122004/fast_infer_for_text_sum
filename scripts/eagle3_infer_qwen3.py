@@ -120,43 +120,101 @@ def timed_generate(
     total_token: int,
     spec: bool,
     is_llama3: bool = True,
-) -> tuple[torch.Tensor, int, int, float, list[int]]:
+    include_phase_timings: bool = False,
+) -> tuple:
     """Run EAGLE (spec=True) or naive (spec=False) decoding.
 
-    The model returns decode-only latency: prefill is excluded, matching the
-    DFlash benchmark. For EAGLE, acceptance_lengths contains the number of
+    The legacy return shape is kept unless ``include_phase_timings`` is true.
+    In the latter case the model also returns a canonical prefill/decode/e2e
+    timing dictionary. For EAGLE, acceptance_lengths contains the number of
     output tokens committed by each draft-verify iteration (accepted draft
     tokens plus the target fallback token).
     """
     max_length = input_ids.shape[1] + max_new_tokens + total_token + 32
     if spec:
-        output_ids, new_tokens, idx, elapsed, acceptance_lengths = model.eagenerate(
+        results = model.eagenerate(
             input_ids,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
             max_length=max_length,
             log=True,
             return_stats=True,
+            return_phase_timings=include_phase_timings,
             is_llama3=is_llama3,
         )
+        if include_phase_timings:
+            output_ids, _, idx, elapsed, acceptance_lengths, phase_timings = results
+        else:
+            output_ids, _, idx, elapsed, acceptance_lengths = results
+            phase_timings = None
         steps = len(acceptance_lengths)
     else:
-        output_ids, new_tokens, idx, elapsed = model.naivegenerate(
+        results = model.naivegenerate(
             input_ids,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
             max_length=max_length,
             log=True,
             return_stats=True,
+            return_phase_timings=include_phase_timings,
             is_llama3=is_llama3,
         )
+        if include_phase_timings:
+            output_ids, new_tokens, idx, elapsed, phase_timings = results
+        else:
+            output_ids, new_tokens, idx, elapsed = results
+            phase_timings = None
         steps = int(idx) + 1
         acceptance_lengths = []
 
     # Use the returned sequence as the source of truth after max-token
     # truncation, rather than relying on the internal loop counter.
     new_tokens = int(output_ids.shape[1] - input_ids.shape[1])
+    if include_phase_timings:
+        return (
+            output_ids,
+            new_tokens,
+            steps,
+            float(elapsed),
+            acceptance_lengths,
+            phase_timings or {},
+        )
     return output_ids, new_tokens, steps, float(elapsed), acceptance_lengths
+
+
+def build_eagle_timing_fields(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    prefill_ms: float | None,
+    decode_ms: float | None,
+    e2e_ms: float | None,
+) -> dict[str, object]:
+    """Map EAGLE phase timings into the repository's canonical schema."""
+
+    prefill = float(prefill_ms) if prefill_ms is not None else None
+    decode = float(decode_ms) if decode_ms is not None else None
+    e2e = float(e2e_ms) if e2e_ms is not None else None
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "prefill_ms": round(prefill, 3) if prefill is not None else None,
+        "ttft_ms": round(prefill, 3) if prefill is not None else None,
+        "decode_ms": round(decode, 3) if decode is not None else None,
+        "e2e_ms": round(e2e, 3) if e2e is not None else None,
+        "tpot_ms": round(decode / output_tokens, 3)
+        if decode is not None and output_tokens > 0
+        else None,
+        "throughput_tok_s": round(output_tokens / (e2e / 1000.0), 3)
+        if e2e is not None and e2e > 0 and output_tokens > 0
+        else None,
+        "decode_throughput_tok_s": round(output_tokens / (decode / 1000.0), 3)
+        if decode is not None and decode > 0 and output_tokens > 0
+        else None,
+        "measurement_scope": "full_e2e"
+        if prefill is not None and e2e is not None
+        else "decode_only",
+    }
 
 
 def decode_answer(tokenizer, output_ids: torch.Tensor, input_len: int) -> str:
@@ -378,22 +436,38 @@ def main() -> None:
 
                 seed_everything(sample_seed)
                 with torch.inference_mode():
-                    out_ids, new_tokens, tree_steps, eagle_time, acceptance_lengths = timed_generate(
+                    (
+                        out_ids,
+                        new_tokens,
+                        tree_steps,
+                        eagle_time,
+                        acceptance_lengths,
+                        eagle_phases,
+                    ) = timed_generate(
                         model, input_ids, args.temperature,
                         args.max_new_tokens, args.total_token, spec=True,
                         is_llama3=True,
+                        include_phase_timings=True,
                     )
                     answer = decode_answer(tokenizer, out_ids, input_len)
 
                     if not args.skip_naive:
                         seed_everything(sample_seed)
-                        _, naive_tokens, _, naive_time, _ = timed_generate(
+                        (
+                            _,
+                            naive_tokens,
+                            _,
+                            naive_time,
+                            _,
+                            naive_phases,
+                        ) = timed_generate(
                             model, input_ids, args.temperature,
                             args.max_new_tokens, args.total_token, spec=False,
                             is_llama3=True,
+                            include_phase_timings=True,
                         )
                     else:
-                        naive_tokens, naive_time = None, None
+                        naive_tokens, naive_time, naive_phases = None, None, {}
 
                 # DFlash reports the unweighted mean of each generation's
                 # per-verification acceptance lengths.
@@ -433,6 +507,18 @@ def main() -> None:
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
                 }
+                record.update(
+                    build_eagle_timing_fields(
+                        input_tokens=input_len,
+                        output_tokens=new_tokens,
+                        prefill_ms=eagle_phases.get("prefill_ms"),
+                        decode_ms=eagle_phases.get("decode_ms", eagle_time * 1000.0),
+                        e2e_ms=eagle_phases.get("e2e_ms"),
+                    )
+                )
+                record["peak_memory_gb"] = eagle_phases.get("peak_memory_gb")
+                record["eagle_phase_timings"] = eagle_phases
+                record["naive_phase_timings"] = naive_phases
                 reference = question.get("reference") or question.get("answer")
                 if record["task_type"] == "code_completion":
                     metrics.add_code_completion(record, answer, reference)

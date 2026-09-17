@@ -245,6 +245,12 @@ def main():
                 )
     print(colored(f'Warmup complete!', 'yellow'))
 
+    stats_file = os.environ.get("SPECEXTEND_STATS_FILE")
+    if stats_file:
+        stats_path = Path(stats_file)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.unlink(missing_ok=True)
+
     for idx, input_ids in enumerate(encoded_inputs):
         seed_everything(seed)
         print(colored(f"\n=== Sample {idx+1}/{len(texts)} ===", 'yellow'))
@@ -259,10 +265,51 @@ def main():
                 is_llama3=True,
                 log=True,
                 return_stats=True,
+                return_phase_timings=True,
             )
-            _, generated, _, decode_time, acceptance_lengths = results
+            (
+                output_ids,
+                generated,
+                _,
+                decode_time,
+                acceptance_lengths,
+                phase_timings,
+            ) = results
             elapsed = decode_time if decode_time > 0 else time.perf_counter() - start
             tokens_per_sec = generated / elapsed if elapsed > 0 else 0.0
+            if stats_file:
+                input_len = int(input_ids.shape[1])
+                text = tokenizer.decode(
+                    output_ids[0, input_len:],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ).strip()
+                payload = {
+                    "sample_index": idx,
+                    "input_tokens": input_len,
+                    "output_tokens": int(generated),
+                    "text": text,
+                    "decode_ms": round(float(phase_timings.get("decode_ms", decode_time * 1000.0)), 3),
+                    "prefill_ms": phase_timings.get("prefill_ms"),
+                    "ttft_ms": phase_timings.get("ttft_ms"),
+                    "e2e_ms": phase_timings.get("e2e_ms"),
+                    "peak_memory_gb": phase_timings.get("peak_memory_gb"),
+                    "accept_length_list": acceptance_lengths,
+                    "avg_accept_length": (
+                        sum(acceptance_lengths) / len(acceptance_lengths)
+                        if acceptance_lengths else None
+                    ),
+                    "measurement_scope": phase_timings.get(
+                        "measurement_scope", "decode_only"
+                    ),
+                }
+                with stats_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                print(
+                    "SPECEXTEND_STATS_JSON "
+                    + json.dumps(payload, ensure_ascii=False),
+                    flush=True,
+                )
             print(colored(
                 f"\nGenerated {generated} tokens in {elapsed:.2f}s. "
                 f"\nToken/sec: {tokens_per_sec:.2f}"

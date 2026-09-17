@@ -155,12 +155,36 @@ cho child Python và vẫn áp dụng timeout của master config. Nếu baselin
 treo, xem log live trước khi timeout; sau timeout trạng thái và `log_tail`
 được ghi vào `run_manifest.json`.
 
+Sau khi mỗi cell kết thúc, runner chạy thêm metric audit hậu xử lý (không chạy
+infer lại) và in một dòng grep-friendly dạng:
+
+```text
+[metrics-audit] dflash/gov_report records=100 status={'success': 100} ...
+```
+
+Audit chi tiết được lưu tại
+`<run>/logs/<baseline>_<dataset>.metrics.json`; mỗi sample trong JSONL canonical
+có thêm `metric_audit`, còn summary có `metric_audit_summary`. Audit nêu rõ
+scope (`full_e2e`, `e2e_only`, `decode_only`), các timing bắt buộc bị thiếu,
+quality text/reference/metric coverage, token budget validity và speedup pair
+không hợp lệ. Vì vậy có thể kiểm tra nhanh:
+
+```bash
+rg "\[metrics-audit\]" outputs/longbench_100_14k/<run-id>/logs
+cat outputs/longbench_100_14k/<run-id>/logs/metrics_audit.log
+cat outputs/longbench_100_14k/<run-id>/logs/eagle3_gov_report.metrics.json
+# Audit lại một artifact đã có, không chạy inference:
+python scripts/audit_benchmark_metrics.py \
+  --run-dir outputs/longbench_100_14k/<run-id> \
+  --expected-output-tokens 2048
+```
+
 Với `vanilla_hf` và `vanilla_fa`, log từng mẫu có thêm
 `prefill_ms`, `decode_ms`, `decode_tok_s`, `cache` và `attn`. Hai baseline này dùng
-`StaticCache` khi Transformers hỗ trợ, đồng thời cấp phát attention mask một
-lần cho cả request. `cache=static` là đường chạy tối ưu; nếu thấy
-`cache=generate` thì runtime đã rơi về compatibility fallback và cần kiểm tra
-version Transformers trước khi benchmark dài. `attn` cho biết backend thực tế
+attention mask cấp phát một lần cho cả request. `vanilla_hf` dùng `StaticCache`
+khi Transformers hỗ trợ; `vanilla_fa` cố ý dùng `cache=dynamic_fa_safe` để tránh
+corruption đã biết khi kết hợp FlashAttention-2 với StaticCache. `cache=generate`
+cho biết runtime rơi về compatibility fallback. `attn` cho biết backend thực tế
 được model resolve, giúp phát hiện trường hợp `vanilla_fa` được yêu cầu nhưng
 không chạy bằng FlashAttention-2.
 
@@ -347,8 +371,10 @@ Cơ chế:
   latency/throughput mỗi sample giữ nguyên ý nghĩa. Model được load một lần cho
   mỗi shard → cần N× VRAM; guard `--min-free-gb` được kiểm tra trên **từng** GPU
   được chọn.
-- FAFO và SSSD chỉ trả `scope=aggregate` cho cả process: khi bật DP, mỗi shard
-  báo aggregate cho riêng batch của nó. Summary gộp đánh dấu
+- SSSD vẫn chỉ trả `scope=aggregate` cho cả process. FAFO qua adapter hiện ghi
+  per-sample sidecar; nếu sidecar đầy đủ thì mỗi shard có sample record riêng,
+  còn summary vẫn giữ `measurement_scope=e2e_only` vì chưa tách prefill/TTFT.
+  Summary gộp đánh dấu
   `shard_aggregate_semantics: "per_shard"` — **không** so sánh throughput của
   shard nhỏ với aggregate của cả cell chạy tuần tự.
 - Cell chỉ `success` khi **mọi** shard thành công. Shard lỗi/timeout làm cell

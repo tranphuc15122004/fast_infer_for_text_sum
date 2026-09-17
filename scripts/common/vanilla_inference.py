@@ -18,6 +18,7 @@ from common.benchmark_runtime import (
 )
 from common.data_loader import load_records
 from common.input_utils import truncate_input_ids
+from common.quality_guard import is_degenerate_output
 from common.reproducibility import seed_everything
 
 
@@ -177,6 +178,20 @@ def _build_static_cache(
     return cache, "static"
 
 
+def _should_use_static_cache(attention_backend: str | None) -> bool:
+    """Return whether the manual cache path is safe for this attention backend.
+
+    Flash-Attention 2 combined with the Transformers ``StaticCache`` path has
+    produced silently corrupted repeated-token outputs on some server
+    combinations.  Keep the optimized static path for eager attention, while
+    making FA use the public dynamic-cache semantics until its output parity is
+    revalidated.  This only changes cache allocation; model weights, prompts,
+    and decoding policy remain unchanged.
+    """
+
+    return attention_backend != "flash_attention_2"
+
+
 def _timed_generate(
     model: Any,
     input_ids: torch.Tensor,
@@ -203,12 +218,15 @@ def _timed_generate(
         model_dtype = next(model.parameters()).dtype
     except (AttributeError, StopIteration):
         model_dtype = _dtype(getattr(args, "dtype", "float32"))
-    static_cache, cache_backend = _build_static_cache(
-        model,
-        max_cache_len=input_length + int(args.max_new_tokens),
-        device=device,
-        dtype=model_dtype,
-    )
+    if _should_use_static_cache(getattr(args, "attention_backend", None)):
+        static_cache, cache_backend = _build_static_cache(
+            model,
+            max_cache_len=input_length + int(args.max_new_tokens),
+            device=device,
+            dtype=model_dtype,
+        )
+    else:
+        static_cache, cache_backend = None, "dynamic_fa_safe"
     try:
         prefill_start = time.perf_counter()
         prefill_kwargs = {
@@ -423,6 +441,17 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             text=text,
             reference_output=sample.get("reference"),
         )
+        record["output_quality_guard"] = {
+            "degenerate_repetition": is_degenerate_output(text),
+            "action": "annotate_only",
+        }
+        if record["output_quality_guard"]["degenerate_repetition"]:
+            print(
+                f"[{method}][{sample['id']}] warning: output has a strong "
+                "repeated-n-gram collapse signal; inference result is retained "
+                "for audit but should not be used as a quality comparison.",
+                flush=True,
+            )
         record["run_id"] = args.run_id
         record["task_type"] = sample.get("raw", {}).get("task_type")
         writer.add(record)

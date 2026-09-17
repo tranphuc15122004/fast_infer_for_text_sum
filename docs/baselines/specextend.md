@@ -80,7 +80,12 @@ tự gắn). Đặt vào `data/` và trỏ `INPUT_FILE="data/<file>.jsonl"`.
 
 ## Output
 
-`outputs/specextend_smoke.jsonl` — returncode + số dòng summary sinh được.
+`outputs/specextend_smoke.jsonl` — per-sample timing, acceptance statistics,
+text/reference và semantic quality khi chạy nhánh Llama 3.1 + EAGLE-3. Adapter
+đọc sidecar `sample_metrics.jsonl` do upstream ghi sau mỗi lần generate; các
+phase `prefill_ms`, `ttft_ms`, `decode_ms`, `e2e_ms` và peak memory được đo
+trong cùng request. Nếu chạy classic path không phát sidecar, record giữ
+`measurement_scope=decode_only` và không tự suy diễn E2E.
 
 ## Troubleshooting
 

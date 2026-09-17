@@ -328,6 +328,7 @@ class EaModel(nn.Module):
             log=False,
             is_llama3=False,
             return_stats=False,
+            return_phase_timings=False,
 
     ):
         if is_llama3:
@@ -363,13 +364,23 @@ class EaModel(nn.Module):
             self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
+        request_start = None
+        if return_phase_timings:
+            torch.cuda.reset_peak_memory_stats(input_ids.device)
+            torch.cuda.synchronize(input_ids.device)
+            request_start = time.perf_counter()
         reset_tree_mode(self)
         # prefill
+        prefill_start = time.perf_counter() if return_phase_timings else None
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         # Match DFlash's decode-only timing: prefill and initial draft
         # construction are excluded from the measured interval.
+        prefill_ms = None
+        if return_phase_timings:
+            torch.cuda.synchronize(input_ids.device)
+            prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
         if return_stats:
             torch.cuda.synchronize()
             decode_start = time.perf_counter()
@@ -433,6 +444,27 @@ class EaModel(nn.Module):
             torch.cuda.synchronize()
             decode_time = time.perf_counter() - decode_start
 
+        phase_timings = None
+        if return_phase_timings:
+            torch.cuda.synchronize(input_ids.device)
+            e2e_ms = (time.perf_counter() - request_start) * 1000.0
+            decode_ms = (
+                float(decode_time) * 1000.0
+                if return_stats
+                else max(e2e_ms - float(prefill_ms or 0.0), 0.0)
+            )
+            phase_timings = {
+                "prefill_ms": round(float(prefill_ms or 0.0), 3),
+                "ttft_ms": round(float(prefill_ms or 0.0), 3),
+                "decode_ms": round(decode_ms, 3),
+                "e2e_ms": round(e2e_ms, 3),
+                "measurement_scope": "full_e2e",
+                "peak_memory_gb": round(
+                    torch.cuda.max_memory_allocated(input_ids.device) / (1024**3),
+                    6,
+                ),
+            }
+
         # A speculative step can overshoot max_new_tokens.  For benchmark
         # statistics, report the actually returned sequence length, as DFlash
         # does after truncation. Preserve the legacy return path otherwise.
@@ -442,6 +474,15 @@ class EaModel(nn.Module):
         if not log:
             return input_ids
         if return_stats:
+            if return_phase_timings:
+                return (
+                    input_ids,
+                    new_token,
+                    idx,
+                    decode_time,
+                    acceptance_lengths,
+                    phase_timings,
+                )
             return input_ids, new_token, idx, decode_time, acceptance_lengths
         else:
             return input_ids, new_token, idx
@@ -458,6 +499,7 @@ class EaModel(nn.Module):
             log=False,
             is_llama3=False,
             return_stats=False,
+            return_phase_timings=False,
 
     ):
         if is_llama3:
@@ -494,9 +536,19 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+        request_start = None
+        if return_phase_timings:
+            torch.cuda.reset_peak_memory_stats(input_ids.device)
+            torch.cuda.synchronize(input_ids.device)
+            request_start = time.perf_counter()
+        prefill_start = time.perf_counter() if return_phase_timings else None
         outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
         # Exclude prefill from decoding latency, matching DFlash's
         # time_per_output_token measurement.
+        prefill_ms = None
+        if return_phase_timings:
+            torch.cuda.synchronize(input_ids.device)
+            prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
         if return_stats:
             torch.cuda.synchronize()
             decode_start = time.perf_counter()
@@ -528,12 +580,35 @@ class EaModel(nn.Module):
             torch.cuda.synchronize()
             decode_time = time.perf_counter() - decode_start
 
+        phase_timings = None
+        if return_phase_timings:
+            torch.cuda.synchronize(input_ids.device)
+            e2e_ms = (time.perf_counter() - request_start) * 1000.0
+            decode_ms = (
+                float(decode_time) * 1000.0
+                if return_stats
+                else max(e2e_ms - float(prefill_ms or 0.0), 0.0)
+            )
+            phase_timings = {
+                "prefill_ms": round(float(prefill_ms or 0.0), 3),
+                "ttft_ms": round(float(prefill_ms or 0.0), 3),
+                "decode_ms": round(decode_ms, 3),
+                "e2e_ms": round(e2e_ms, 3),
+                "measurement_scope": "full_e2e",
+                "peak_memory_gb": round(
+                    torch.cuda.max_memory_allocated(input_ids.device) / (1024**3),
+                    6,
+                ),
+            }
+
         if return_stats:
             input_ids = input_ids[:, :input_len + max_new_tokens]
             new_token = input_ids.shape[1] - input_len
         if not log:
             return input_ids
         if return_stats:
+            if return_phase_timings:
+                return input_ids, new_token, idx, decode_time, phase_timings
             return input_ids, new_token, idx, decode_time
         else:
             return input_ids, new_token, idx

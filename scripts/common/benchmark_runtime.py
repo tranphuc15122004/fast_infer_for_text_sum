@@ -154,6 +154,7 @@ def _common_record(
         "temperature": config.get("temperature"),
         "max_new_tokens": config.get("max_new_tokens"),
         "warmup_runs": config.get("warmup_runs", 0),
+        "measurement_scope": config.get("measurement_scope", "full_e2e"),
         "text": None,
         "reference_output": None,
         "extra_metrics": dict(config.get("extra_metrics", {}) or {}),

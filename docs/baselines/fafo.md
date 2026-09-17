@@ -42,3 +42,10 @@ bash scripts/run.sh fafo --smoke
   nếu hai record có số output token khác nhau.
 - Timing upstream đã đồng bộ CUDA trước và sau `generate`; vì vậy throughput là
   thời gian thực thi trên GPU thay vì chỉ là thời gian enqueue phía host.
+- Khi chạy qua `scripts/infer_fafo.py`, adapter đặt `FAFO_STATS_FILE` để upstream
+  ghi sidecar per-sample sau bước clamp `max_new_tokens`. Sidecar bổ sung
+  `sample_id`, input/output tokens, text, E2E ms, throughput, peak memory và
+  ROUGE/BLEU nếu có reference. `OVERALL GEN` chỉ được giữ ở
+  `lookahead_tokens`, không được dùng làm output token công khai.
+- FAFO hiện vẫn chưa tách được prefill/TTFT khỏi `generate`; các record mới ghi
+  rõ `measurement_scope=e2e_only` thay vì nội suy metric thiếu.

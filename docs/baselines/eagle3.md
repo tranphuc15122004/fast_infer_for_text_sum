@@ -50,7 +50,10 @@ DATA_FILE="data/user_prompts.jsonl" bash scripts/run.sh eagle3
 ## Output
 
 `outputs/eagle3_qwen3_qa.jsonl` — per-question: new_tokens, tree_steps,
-accept_length, eagle/naive tok/s, speedup + summary cuối.
+accept_length, eagle/naive tok/s, speedup, text/reference quality và phase
+timing chuẩn `prefill_ms`, `ttft_ms`, `decode_ms`, `e2e_ms` + summary cuối.
+Đường gọi không bật telemetry vẫn giữ return shape decode-only cũ; phase timing
+chỉ được bật bởi benchmark adapter để không làm thay đổi các caller upstream.
 
 Trên Transformers 5, loader legacy của EAGLE có thể báo load thành công nhưng
 không copy đủ tensor target và để buffer RoPE non-persistent ở trạng thái

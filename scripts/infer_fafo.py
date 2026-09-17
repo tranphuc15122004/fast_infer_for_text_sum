@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from common import io_util, verify
+from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.paths import ROOT
 from common.reproducibility import seed_everything
@@ -111,9 +111,95 @@ def _resolve_repo_path(value: str | None) -> Path | None:
 
 
 def generated_tokens_within_budget(generated_tokens: int, max_new_tokens: int) -> bool:
-    """Return whether an upstream lookahead stayed within our token budget."""
+    """Return whether public generated tokens stayed within our budget."""
 
     return 0 < int(generated_tokens) <= max(1, int(max_new_tokens))
+
+
+def build_fafo_sample_records(
+    source_records: list[dict[str, Any]],
+    stats_rows: list[dict[str, Any]],
+    *,
+    method: str,
+    dataset: str,
+    model: str,
+    max_new_tokens: int,
+) -> list[dict[str, Any]]:
+    """Convert FAFO's optional per-sample sidecar into canonical records.
+
+    ``OVERALL GEN`` is intentionally not used here: it counts internal FAFO
+    lookahead work.  The sidecar is written after FAFO clamps the returned
+    sequence to the public generation budget, so its output token count is the
+    benchmark-visible value.
+    """
+
+    output: list[dict[str, Any]] = []
+    for row in stats_rows:
+        index = int(row.get("sample_index", len(output)))
+        if index >= len(source_records):
+            continue
+        source = source_records[index]
+        if str(source.get("id", "")).startswith("__fafo_warmup__"):
+            continue
+        output_tokens = int(row.get("output_tokens") or 0)
+        e2e_ms = row.get("e2e_ms")
+        decode_ms = row.get("decode_ms", e2e_ms)
+        if e2e_ms is not None:
+            e2e_ms = round(float(e2e_ms), 3)
+        if decode_ms is not None:
+            decode_ms = round(float(decode_ms), 3)
+        reference = source.get("reference") or source.get("answer")
+        text = row.get("text")
+        record = {
+            "method": method,
+            "dataset": dataset,
+            "task_type": source.get("raw", {}).get("task_type")
+            or source.get("task_type"),
+            "status": "success"
+            if output_tokens > 0 and output_tokens <= max(1, int(max_new_tokens))
+            else "failed",
+            "scope": "sample",
+            "measurement_scope": "e2e_only",
+            "model": model,
+            "input_tokens": row.get("input_tokens"),
+            "retained_tokens": None,
+            "output_tokens": output_tokens or None,
+            "batch_size": 1,
+            "selector_latency_ms": None,
+            "ttft_ms": row.get("ttft_ms"),
+            "prefill_ms": row.get("prefill_ms"),
+            "decode_ms": decode_ms,
+            "tpot_ms": round(decode_ms / output_tokens, 3)
+            if decode_ms is not None and output_tokens > 0
+            else None,
+            "e2e_ms": e2e_ms,
+            "throughput_tok_s": round(output_tokens / (e2e_ms / 1000.0), 3)
+            if e2e_ms is not None and e2e_ms > 0 and output_tokens > 0
+            else None,
+            "decode_throughput_tok_s": round(output_tokens / (decode_ms / 1000.0), 3)
+            if decode_ms is not None and decode_ms > 0 and output_tokens > 0
+            else None,
+            "qps": None,
+            "peak_memory_gb": row.get("peak_memory_gb"),
+            "avg_accept_length": row.get("avg_accept_length"),
+            "acceptance_rate": None,
+            "draft_latency_ms": None,
+            "verification_latency_ms": None,
+            "rejected_draft_ratio": None,
+            "sample_id": source.get("id", index),
+            "text": text,
+            "reference_output": reference,
+            "sample_index": index,
+            "lookahead_tokens": row.get("lookahead_tokens"),
+        }
+        if text and reference:
+            if record["task_type"] == "code_completion":
+                metrics.add_code_completion(record, text, reference)
+            else:
+                rouge.add_rouge(record, text, reference)
+                metrics.add_semantic(record, text, reference)
+        output.append(record)
+    return output
 
 
 def prepare_fafo_records(
@@ -169,10 +255,13 @@ def _parse_log(log: str) -> dict[str, float | int | None]:
     """Extract timing metrics from FAFO's per-step or aggregate log format."""
 
     time_match = re.findall(r"time:\s*([0-9.eE+-]+)", log, flags=re.IGNORECASE)
-    token_match = re.findall(
-        r"(?:generated\s+tokens|OVERALL\s+GEN)\s*:\s*([0-9]+)",
+    generated_match = re.findall(
+        r"generated\s+tokens\s*:\s*([0-9]+)",
         log,
         flags=re.IGNORECASE,
+    )
+    lookahead_match = re.findall(
+        r"OVERALL\s+GEN\s*:\s*([0-9]+)", log, flags=re.IGNORECASE
     )
     stat_match = re.findall(
         r"\bSTAT\s*\[\s*([0-9.eE+-]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9.eE+-]+)\s*\]",
@@ -184,7 +273,8 @@ def _parse_log(log: str) -> dict[str, float | int | None]:
         flags=re.IGNORECASE,
     )
     e2e_s = float(time_match[-1]) if time_match else None
-    output_tokens = int(token_match[-1]) if token_match else None
+    output_tokens = int(generated_match[-1]) if generated_match else None
+    lookahead_tokens = int(lookahead_match[-1]) if lookahead_match else None
     throughput = float(average_match[-1]) if average_match else None
     if stat_match:
         _, _, stat_tokens, stat_time = stat_match[-1]
@@ -201,6 +291,7 @@ def _parse_log(log: str) -> dict[str, float | int | None]:
     return {
         "e2e_s": e2e_s,
         "output_tokens": output_tokens,
+        "lookahead_tokens": lookahead_tokens,
         "throughput": throughput,
     }
 
@@ -254,6 +345,8 @@ def main() -> None:
     process_returncode = 1
     process_log = ""
     raw_result: Any = None
+    stats_file = runtime_dir / "sample_metrics.jsonl"
+    stats_file.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="fafo-input-") as temp_dir:
         temp_root = Path(temp_dir)
         dataset_path = temp_root / "one_sample.jsonl"
@@ -293,6 +386,7 @@ def main() -> None:
         print("+ " + " ".join(command))
         child_env = _runtime_env()
         child_env["FAFO_SEED"] = str(args.seed)
+        child_env["FAFO_STATS_FILE"] = str(stats_file)
         proc = subprocess.run(
             command,
             cwd=FAFO_ROOT,
@@ -310,7 +404,68 @@ def main() -> None:
             raw_result = json.loads(raw_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             raw_result = None
+    sidecar_rows: list[dict[str, Any]] = []
+    if stats_file.is_file():
+        for line in stats_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                sidecar_rows.append(row)
     parsed = _parse_log(process_log)
+
+    # Prefer the public per-sample sidecar whenever available.  It is emitted
+    # after FAFO clamps the returned sequence; the aggregate log's OVERALL GEN
+    # is internal lookahead work and must never be used as output_tokens.
+    sample_records = build_fafo_sample_records(
+        runtime_records if "runtime_records" in locals() else records,
+        sidecar_rows,
+        method=f"fafo_{args.kv_method}",
+        dataset=data_file.name if data_file else "prompt",
+        model=args.model,
+        max_new_tokens=args.max_new_tokens,
+    )
+    if sample_records:
+        for sample_record in sample_records:
+            sample_record["raw_result"] = raw_result
+            sample_record["returncode"] = process_returncode
+            sample_record["warmup_injected"] = len(runtime_records) > len(records)
+            sample_record["kv_method"] = args.kv_method
+            sample_record["smoke"] = args.smoke
+            sample_record["log_tail"] = process_log[-3000:]
+            writer.add(sample_record)
+        expected_samples = len(records)
+        successful_samples = sum(
+            1 for item in sample_records if item.get("status") == "success"
+        )
+        checks = [
+            (process_returncode == 0, f"FAFO process exit code = {process_returncode}"),
+            (len(sample_records) == expected_samples,
+             f"per-sample telemetry rows = {len(sample_records)} / {expected_samples}"),
+            (successful_samples == expected_samples,
+             f"valid public generations = {successful_samples} / {expected_samples}"),
+        ]
+        summary = {
+            "type": "summary",
+            "method": f"fafo_{args.kv_method}",
+            "returncode": process_returncode,
+            "scope": "sample",
+            "measurement_scope": "e2e_only",
+            "num_samples": expected_samples,
+            "successful_samples": successful_samples,
+            "checks_passed": all(ok for ok, _ in checks),
+            "runtime_dir": str(runtime_dir),
+            "lookahead_tokens": parsed.get("lookahead_tokens"),
+        }
+        writer.finalize(summary)
+        io_util.print_table(list(summary.items()))
+        print(f"Saved to: {output_path}")
+        verify.finish("FAFO", checks)
+        return
+
     e2e_s = parsed["e2e_s"]
     output_tokens = parsed["output_tokens"]
     e2e_ms = round(float(e2e_s) * 1000, 3) if e2e_s is not None else None
@@ -318,7 +473,7 @@ def main() -> None:
     budget_ok = generated_tokens_within_budget(output_number, args.max_new_tokens)
     if output_number > args.max_new_tokens:
         print(
-            f"[FAFO] upstream lookahead generated {output_number} tokens, "
+            f"[FAFO] public generation returned {output_number} tokens, "
             f"over requested budget {args.max_new_tokens}; marking run failed",
             file=sys.stderr,
             flush=True,

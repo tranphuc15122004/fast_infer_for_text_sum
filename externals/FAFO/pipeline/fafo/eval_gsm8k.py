@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import logging
@@ -56,6 +57,18 @@ def run_eval(
         )
 
     return processed_result, raw_result
+
+
+def _write_metric_sidecar(row):
+    """Append public per-sample telemetry when the harness requests it."""
+
+    path = os.environ.get("FAFO_STATS_FILE")
+    if not path:
+        return
+    sidecar = os.path.abspath(path)
+    os.makedirs(os.path.dirname(sidecar), exist_ok=True)
+    with open(sidecar, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 @torch.inference_mode()
 def get_model_answers(
@@ -119,6 +132,7 @@ def get_model_answers(
         # Generation launches asynchronous CUDA work.  Synchronize both ends
         # so the measured interval is device time, not host enqueue time.
         if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
         start_time = time.perf_counter()
         if pipeline_config['fafo']:
@@ -203,6 +217,22 @@ def get_model_answers(
             conversation.append({"role": "assistant", "content": output})
 
         turns.append(output)
+
+        _write_metric_sidecar(
+            {
+                "sample_index": question_idx,
+                "input_tokens": input_len,
+                "output_tokens": int(tokens),
+                "e2e_ms": round(gap_time * 1000.0, 3),
+                "decode_ms": round(gap_time * 1000.0, 3),
+                "text": output,
+                "measurement_scope": "e2e_only",
+                "peak_memory_gb": (
+                    round(torch.cuda.max_memory_allocated() / (1024**3), 6)
+                    if torch.cuda.is_available() else None
+                ),
+            }
+        )
 
         choices.append({"index": step, "turns": turns, "prompts" : prompts})
 

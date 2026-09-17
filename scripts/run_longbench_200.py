@@ -39,6 +39,10 @@ from common.benchmark_runtime import (  # noqa: E402
     runtime_metadata,
 )
 from common.data_loader import normalize  # noqa: E402
+from common.metric_audit import (  # noqa: E402
+    audit_output_file,
+    format_audit_log,
+)
 from common.longbench_adapter import (  # noqa: E402
     BASELINES,
     DISABLED_MATRIX_BASELINES,
@@ -59,12 +63,10 @@ EXTERNAL_REFERENCE_BASELINES = {
 }
 
 # Baselines whose child process emits ONE aggregate record for the whole input
-# instead of one record per sample (FAFO wraps the upstream pipeline, SSSD
-# reports vLLM server totals).  Data-parallel sharding is still useful for
-# wall-clock, but each shard then reports its own aggregate; the merged summary
-# records that explicitly so per-shard throughput is never mistaken for a
-# full-cell aggregate.
-AGGREGATE_ONLY_BASELINES = frozenset({"fafo", "sssd"})
+# instead of one record per sample. SSSD reports vLLM server totals; FAFO now
+# emits per-sample records through its optional adapter sidecar. Data-parallel
+# sharding remains aggregate-only for SSSD, while FAFO can be joined by sample.
+AGGREGATE_ONLY_BASELINES = frozenset({"sssd"})
 
 
 def _split(value: str | Sequence[str] | None) -> list[str]:
@@ -467,6 +469,52 @@ def _write_status_file(
         }
     )
     return len(records)
+
+
+def _audit_cell_output(
+    output_path: Path,
+    *,
+    baseline: str,
+    dataset: str,
+    run_dir: Path,
+    expected_output_tokens: int | None,
+) -> dict[str, Any]:
+    """Audit one cell and emit a grep-friendly live log line."""
+
+    if not output_path.is_file():
+        return {}
+    audit_path = run_dir / "logs" / f"{baseline}_{dataset}.metrics.json"
+    try:
+        summary = audit_output_file(
+            output_path,
+            baseline=baseline,
+            dataset=dataset,
+            audit_path=audit_path,
+            expected_output_tokens=expected_output_tokens,
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(
+            f"[metrics-audit] {baseline}/{dataset} ERROR "
+            f"could not audit {output_path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"metric_audit_error": str(exc)}
+    line = format_audit_log(
+        baseline=baseline,
+        dataset=dataset,
+        summary=summary,
+        audit_path=audit_path,
+    )
+    combined_log = run_dir / "logs" / "metrics_audit.log"
+    combined_log.parent.mkdir(parents=True, exist_ok=True)
+    with combined_log.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    print(line, flush=True)
+    return {
+        "metric_audit_path": str(audit_path),
+        "metric_audit_summary": summary,
+    }
 
 
 def _safe_env(cuda_visible_devices: str | None = None) -> dict[str, str]:
@@ -2490,6 +2538,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_id=run_id,
                 )
                 cell.update(status=status, reason=reason, returncode=0)
+                cell.update(
+                    _audit_cell_output(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        run_dir=run_dir,
+                        expected_output_tokens=max_new_tokens,
+                    )
+                )
                 manifest["cells"].append(cell)
                 print(f"[{baseline}/{dataset}] {status}: {reason}", flush=True)
                 continue
@@ -2509,6 +2566,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_id=run_id,
                 )
                 cell.update(status=check["status"], reason=check["reason"])
+                cell.update(
+                    _audit_cell_output(
+                        output_path,
+                        baseline=baseline,
+                        dataset=dataset,
+                        run_dir=run_dir,
+                        expected_output_tokens=max_new_tokens,
+                    )
+                )
                 manifest["cells"].append(cell)
                 print(
                     f"[{baseline}/{dataset}] {check['status']}: {check['reason']}",
@@ -2550,6 +2616,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         run_id=run_id,
                     )
                     cell.update(status="unsupported_dataset", reason=reason)
+                    cell.update(
+                        _audit_cell_output(
+                            output_path,
+                            baseline=baseline,
+                            dataset=dataset,
+                            run_dir=run_dir,
+                            expected_output_tokens=max_new_tokens,
+                        )
+                    )
                     manifest["cells"].append(cell)
                     continue
             else:
@@ -2579,6 +2654,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         run_id=run_id,
                     )
                     cell.update(status="unsupported_dataset", reason=reason)
+                    cell.update(
+                        _audit_cell_output(
+                            output_path,
+                            baseline=baseline,
+                            dataset=dataset,
+                            run_dir=run_dir,
+                            expected_output_tokens=max_new_tokens,
+                        )
+                    )
                     manifest["cells"].append(cell)
                     continue
 
@@ -2639,6 +2723,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         config=cfg,
                         run_id=run_id,
                     )
+            cell.update(
+                _audit_cell_output(
+                    output_path,
+                    baseline=baseline,
+                    dataset=dataset,
+                    run_dir=run_dir,
+                    expected_output_tokens=max_new_tokens,
+                )
+            )
             manifest["cells"].append(cell)
             print(
                 f"[{baseline}/{dataset}] {child['status']} in "
