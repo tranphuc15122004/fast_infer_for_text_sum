@@ -436,7 +436,7 @@ def preflight_baseline(
                 ),
             )
 
-    if baseline in {"sssd", "fafo"} and result["status"] == "ready":
+    if baseline == "sssd" and result["status"] == "ready":
         result.update(
             status="aggregate_only",
             reason="upstream runner emits aggregate timing; per-sample timing is unavailable",
@@ -534,7 +534,7 @@ def build_adapter_command(
         return command
 
     if baseline == "magicdec":
-        return [
+        command = [
             python,
             str(ROOT / "scripts" / "infer_magicdec.py"),
             "--model-pth",
@@ -558,7 +558,18 @@ def build_adapter_command(
             "--local-files-only" if bool(cfg.get("local_files_only", True)) else "--no-local-files-only",
             "--output",
             str(output),
-        ] + (["--smoke"] if smoke else [])
+        ]
+        if bool(cfg.get("magicdec_self_spec", False)):
+            command += [
+                "--self-spec",
+                "--gamma",
+                str(cfg.get("magicdec_gamma", 3)),
+                "--draft-budget",
+                str(cfg.get("magicdec_draft_budget", 257)),
+                "--window-size",
+                str(cfg.get("magicdec_window_size", 128)),
+            ]
+        return command + (["--smoke"] if smoke else [])
 
     if baseline == "dflash":
         command = [
@@ -772,6 +783,10 @@ def baseline_config_from_env(baseline: str, env: Mapping[str, str] | None = None
         "sssd_adaptive": values.get("SSSD_ADAPTIVE", "0") == "1",
         "magicdec_model_pth": values.get("LONG_BENCH_MAGICDEC_MODEL_PTH") or values.get("CHECKPOINT_MAGICDEC"),
         "magicdec_model_name": values.get("LONG_BENCH_MAGICDEC_MODEL_NAME") or values.get("MODEL_MAGICDEC_NAME") or values.get("MODEL_TARGET"),
+        "magicdec_self_spec": values.get("MAGICDEC_SELF_SPEC", "1") == "1",
+        "magicdec_gamma": int(values.get("MAGICDEC_GAMMA", "3")),
+        "magicdec_draft_budget": int(values.get("MAGICDEC_DRAFT_BUDGET", "257")),
+        "magicdec_window_size": int(values.get("MAGICDEC_WINDOW_SIZE", "128")),
         "fafo_kv_method": values.get("LONG_BENCH_FAFO_KV_METHOD") or values.get("FAFO_KV_METHOD", "stream-llm"),
         "fafo_use_flash": values.get("FAFO_USE_FLASH", "0") == "1",
         "eagle_total_token": int(values.get("LONG_BENCH_EAGLE_TOTAL_TOKEN", "60")),

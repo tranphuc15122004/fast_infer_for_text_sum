@@ -379,8 +379,10 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
     if spec:
         group["speculative"] = spec
     speedup = metrics.aggregate_speedup(records)
-    if speedup:
+    speedup_coverage = metrics.speedup_pair_coverage(records)
+    if speedup or any(item["available"] for item in speedup_coverage.values()):
         group["speedup"] = speedup
+        group["speedup_coverage"] = speedup_coverage
         scopes = sorted(
             {
                 str(record["speedup_scope"])
@@ -604,13 +606,25 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
             if label not in seen:
                 seen.add(label)
                 col_meta.append(("speedup", key, "ratio"))
+        for key in group.get("speedup_coverage", {}):
+            label = f"{key}_pair_ratio"
+            if label not in seen:
+                seen.add(label)
+                col_meta.append(("speedup_coverage", key, "ratio"))
         for key in group.get("semantic", {}):
             label = f"{key}_mean"
             if label not in seen:
                 seen.add(label)
                 col_meta.append(("semantic", key, "mean"))
 
-    header = ["dataset", "method", "num_records", "num_reference_joined"] + [c[1] + "_" + c[2] for c in col_meta]
+    def column_name(section: str, key: str, stat: str) -> str:
+        if section == "speedup_coverage":
+            return f"{key}_pair_ratio"
+        return f"{key}_{stat}"
+
+    header = ["dataset", "method", "num_records", "num_reference_joined"] + [
+        column_name(*column) for column in col_meta
+    ]
     lines = [",".join(header)]
     for ds, method in order:
         group = result["metrics"][ds][method]
@@ -621,6 +635,10 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             elif section == "speedup":
                 v = group.get("speedup", {}).get(key)
+                row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+            elif section == "speedup_coverage":
+                coverage = group.get("speedup_coverage", {}).get(key, {})
+                v = coverage.get("ratio") if isinstance(coverage, dict) else None
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             else:
                 agg = group.get(section, {}).get(key)
@@ -672,16 +690,33 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
                 f"| {_fmt(sp.get('qps'))} | {_fmt(sp.get('peak_memory_gb'))} |"
             )
         md.append("")
+        md.append("### Speculative decoding (mean)")
+        md.append("")
+        md.append("| method | τ / avg_accept_length | acceptance rate | draft ms | verification ms | rejected draft ratio |")
+        md.append("|---|---:|---:|---:|---:|---:|")
+        for method, group in sorted(groups.items()):
+            spec = group.get("speculative", {})
+            md.append(
+                f"| {method} | {_fmt(spec.get('avg_accept_length'))} "
+                f"| {_fmt(spec.get('acceptance_rate'))} "
+                f"| {_fmt(spec.get('draft_latency_ms'))} "
+                f"| {_fmt(spec.get('verification_latency_ms'))} "
+                f"| {_fmt(spec.get('rejected_draft_ratio'))} |"
+            )
+        md.append("")
         md.append("### Speedup so với dense/reference (ratio mean)")
         md.append("")
-        md.append("| method | ESR | DSR | prefill | TTFT |")
-        md.append("|---|---|---|---|---|")
+        md.append("| method | ESR | DSR | prefill | TTFT | ESR pairs | DSR pairs |")
+        md.append("|---|---|---|---|---|---|---|")
         for method, group in sorted(groups.items()):
             su = group.get("speedup", {})
+            coverage = group.get("speedup_coverage", {})
             md.append(
                 f"| {method} | {_fmt(su.get('esr'))} "
                 f"| {_fmt(su.get('dsr'))} | {_fmt(su.get('prefill_speedup'))} "
-                f"| {_fmt(su.get('ttft_speedup'))} |"
+                f"| {_fmt(su.get('ttft_speedup'))} "
+                f"| {_fmt((coverage.get('esr') or {}).get('ratio'))} "
+                f"| {_fmt((coverage.get('dsr') or {}).get('ratio'))} |"
             )
         md.append("")
         md.append("### Semantic (mean)")

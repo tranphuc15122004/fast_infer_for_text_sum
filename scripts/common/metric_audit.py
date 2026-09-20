@@ -16,6 +16,16 @@ from typing import Any, Mapping, Sequence
 
 AUDIT_SCHEMA_VERSION = 1
 
+BASELINE_MEASUREMENT_SCOPE = {
+    "vanilla_hf": "full_e2e",
+    "vanilla_fa": "full_e2e",
+    "magicdec": "full_e2e",
+    "eagle3": "full_e2e",
+    "dflash": "full_e2e",
+    "specextend": "full_e2e",
+    "fafo": "e2e_only",
+}
+
 _TIMING_BY_SCOPE = {
     "full_e2e": (
         "input_tokens",
@@ -51,6 +61,98 @@ _QUALITY_FIELDS = (
     "code_exact_match",
     "code_edit_similarity",
 )
+
+# Raw metrics are the values that must be emitted by the inference process.
+# Throughput, ratios, and speedups can be recomputed from these values and are
+# therefore deliberately not part of this hard contract.
+_COMMON_DIRECT_FIELDS = (
+    "input_tokens",
+    "retained_tokens",
+    "output_tokens",
+    "batch_size",
+    "model_load_ms",
+    "e2e_ms",
+    "peak_memory_gb",
+    "device",
+)
+_FULL_E2E_DIRECT_FIELDS = (
+    "prefill_ms",
+    "ttft_ms",
+    "decode_ms",
+)
+_SPECULATIVE_DIRECT_FIELDS = (
+    "acceptance_lengths",
+    "draft_latency_ms",
+    "verification_latency_ms",
+    "draft_tokens_proposed",
+    "draft_tokens_accepted",
+)
+_TEXT_QUALITY_FIELDS = (
+    "rouge1_p",
+    "rouge1_r",
+    "rouge1_f",
+    "rouge2_p",
+    "rouge2_r",
+    "rouge2_f",
+    "rougeL_p",
+    "rougeL_r",
+    "rougeL_f",
+    "rougeLsum_p",
+    "rougeLsum_r",
+    "rougeLsum_f",
+    "bleu1",
+    "bleu2",
+    "bleu3",
+    "bleu4",
+    "length_ratio",
+)
+_CODE_QUALITY_FIELDS = (
+    "code_exact_match",
+    "code_edit_similarity",
+)
+_SPECULATIVE_BASELINES = {"magicdec", "eagle3", "dflash", "specextend"}
+_DERIVED_ISSUES = {
+    "speedup_invalid",
+    "missing_tpot_ms",
+    "missing_throughput_tok_s",
+    "missing_decode_throughput_tok_s",
+}
+_QUALITY_FIELDS = tuple(
+    dict.fromkeys(_QUALITY_FIELDS + _TEXT_QUALITY_FIELDS + _CODE_QUALITY_FIELDS)
+)
+
+
+def required_direct_metrics(baseline: str) -> tuple[str, ...]:
+    """Return the raw fields required for one canonical baseline.
+
+    This function intentionally excludes derived values such as throughput,
+    speedup, acceptance rate, and rejected ratio.  Those are calculated by
+    the collector from the raw fields and acceptance traces.
+    """
+
+    scope = BASELINE_MEASUREMENT_SCOPE.get(baseline)
+    if scope is None:
+        return ()
+    fields = list(_COMMON_DIRECT_FIELDS)
+    if scope == "full_e2e":
+        fields.extend(_FULL_E2E_DIRECT_FIELDS)
+    if baseline in _SPECULATIVE_BASELINES:
+        fields.extend(_SPECULATIVE_DIRECT_FIELDS)
+    return tuple(fields)
+
+
+def _missing_quality_fields(record: Mapping[str, Any]) -> list[str]:
+    reference_present = bool(str(record.get("reference_output") or "").strip())
+    text_present = bool(str(record.get("text") or record.get("answer") or "").strip())
+    if not reference_present or not text_present:
+        return []
+    task_type = str(record.get("task_type") or "").lower()
+    required = (
+        _CODE_QUALITY_FIELDS
+        if "code" in task_type
+        else _TEXT_QUALITY_FIELDS
+    )
+    return [field for field in required if not _is_present(record.get(field))]
 
 
 def _is_present(value: object) -> bool:
@@ -229,6 +331,134 @@ def summarize_audits(audits: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def validate_cell_metric_contract(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    baseline: str,
+    expected_samples: int,
+    expected_output_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Validate the canonical metric contract for one baseline/dataset cell.
+
+    This is intentionally stricter than :func:`audit_record`: the audit is a
+    diagnostic, while this function decides whether a cell is eligible for
+    aggregation.  Speedup-invalid pairs are counted but do not invalidate the
+    whole cell; all core timing, token-budget, sample-coverage and quality
+    failures do.
+    """
+
+    expected_scope = BASELINE_MEASUREMENT_SCOPE.get(baseline)
+    sample_records = [
+        record for record in records if record.get("type") != "summary"
+    ]
+    audits = [
+        audit_record(record, expected_output_tokens=expected_output_tokens)
+        for record in sample_records
+    ]
+    expected_ids = [
+        str(record.get("sample_id"))
+        for record in sample_records
+        if record.get("sample_id") is not None
+    ]
+    duplicate_ids = sorted(
+        sample_id
+        for sample_id, count in Counter(expected_ids).items()
+        if count > 1
+    )
+    missing_field_counts: Counter[str] = Counter()
+    missing_direct_field_counts: Counter[str] = Counter()
+    missing_quality_field_counts: Counter[str] = Counter()
+    issue_counts: Counter[str] = Counter()
+    invalid_records: list[Any] = []
+    scopes = Counter()
+    valid_speedup_pairs = 0
+    for record, audit in zip(sample_records, audits):
+        scope = str(record.get("measurement_scope") or "unknown")
+        scopes[scope] += 1
+        for field in audit["timing"].get("missing", []):
+            missing_field_counts[field] += 1
+        for issue in audit.get("issues", []):
+            issue_counts[str(issue)] += 1
+        hard_issues = [
+            issue
+            for issue in audit.get("issues", [])
+            if issue not in _DERIVED_ISSUES
+        ]
+        if record.get("status", "success") == "success":
+            direct_missing = [
+                field
+                for field in required_direct_metrics(baseline)
+                if not _is_present(record.get(field))
+            ]
+            for field in direct_missing:
+                missing_direct_field_counts[field] += 1
+                issue_counts[f"missing_{field}"] += 1
+                hard_issues.append(f"missing_{field}")
+
+            quality_missing = _missing_quality_fields(record)
+            for field in quality_missing:
+                missing_quality_field_counts[field] += 1
+            if quality_missing and "missing_quality_metric" not in audit.get(
+                "issues", []
+            ):
+                issue_counts["missing_quality_metric"] += 1
+                hard_issues.append("missing_quality_metric")
+        if expected_scope is not None and scope != expected_scope:
+            issue_counts["unexpected_measurement_scope"] += 1
+            hard_issues.append("unexpected_measurement_scope")
+        guard = record.get("output_quality_guard")
+        if baseline == "vanilla_fa" and (
+            record.get("degenerate_repetition")
+            or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
+        ):
+            issue_counts["degenerate_repetition"] += 1
+            hard_issues.append("degenerate_repetition")
+        if hard_issues:
+            invalid_records.append(record.get("sample_id"))
+        if record.get("speedup_valid") is True:
+            valid_speedup_pairs += 1
+
+    coverage_ok = len(sample_records) == int(expected_samples)
+    unique_count = len(set(expected_ids))
+    if not coverage_ok:
+        issue_counts["sample_count_mismatch"] += 1
+    if unique_count != len(expected_ids):
+        issue_counts["duplicate_sample_id"] += len(duplicate_ids)
+    if expected_scope is None:
+        issue_counts["unknown_baseline_scope"] += 1
+    hard_failure = bool(
+        invalid_records
+        or not coverage_ok
+        or duplicate_ids
+        or expected_scope is None
+    )
+    return {
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "status": "metric_incomplete" if hard_failure else "complete",
+        "baseline": baseline,
+        "expected_scope": expected_scope,
+        "observed_samples": len(sample_records),
+        "expected_samples": int(expected_samples),
+        "unique_sample_ids": unique_count,
+        "duplicate_sample_ids": duplicate_ids,
+        "scope_counts": dict(scopes),
+        "missing_field_counts": dict(missing_field_counts),
+        "required_direct_metrics": list(required_direct_metrics(baseline)),
+        "missing_direct_field_counts": dict(missing_direct_field_counts),
+        "missing_quality_field_counts": dict(missing_quality_field_counts),
+        "issue_counts": dict(issue_counts),
+        "invalid_sample_ids": invalid_records[:20],
+        "valid_speedup_pairs": valid_speedup_pairs,
+        "speedup_pair_ratio": round(
+            valid_speedup_pairs / len(sample_records), 4
+        )
+        if sample_records
+        else 0.0,
+        "decode_metrics_available": expected_scope != "e2e_only",
+        "records": audits,
+    }
+
+
 def audit_output_file(
     output_path: Path,
     *,
@@ -236,6 +466,7 @@ def audit_output_file(
     dataset: str,
     audit_path: Path,
     expected_output_tokens: int | None = None,
+    expected_samples: int | None = None,
 ) -> dict[str, Any]:
     """Attach audits to a JSONL output and write a sidecar audit JSON file."""
 
@@ -253,9 +484,19 @@ def audit_output_file(
         row["metric_audit"] = audit
         audits.append(audit)
     summary = summarize_audits(audits)
+    metric_contract = None
+    if expected_samples is not None:
+        metric_contract = validate_cell_metric_contract(
+            rows,
+            baseline=baseline,
+            expected_samples=expected_samples,
+            expected_output_tokens=expected_output_tokens,
+        )
     for row in rows:
         if row.get("type") == "summary":
             row["metric_audit_summary"] = summary
+            if metric_contract is not None:
+                row["metric_contract"] = metric_contract
     output_path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
@@ -269,6 +510,13 @@ def audit_output_file(
         "summary": summary,
         "records": audits,
     }
+    if metric_contract is not None:
+        payload["metric_contract"] = metric_contract
+        # The runner consumes the returned summary to gate strict cells.  Keep
+        # the contract on that object as well as in the persisted audit JSON;
+        # otherwise every otherwise-valid cell is treated as incomplete
+        # because the caller cannot see the contract status.
+        summary["metric_contract"] = metric_contract
     audit_path = Path(audit_path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(

@@ -208,6 +208,11 @@ def build_sample_record(
         config=config,
     )
     record["input_tokens"] = int(input_tokens)
+    # Methods without context selection retain the complete prompt.  A
+    # compression/reduction adapter can override this through config.
+    record["retained_tokens"] = int(
+        config.get("retained_tokens", input_tokens)
+    )
     record["output_tokens"] = int(output_tokens)
     record["text"] = text
     record["reference_output"] = reference_output

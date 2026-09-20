@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from common import io_util
+from common import io_util, metrics, rouge
 from common.benchmark_runtime import (
     build_sample_record,
     measure_call,
@@ -419,6 +419,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
+        task_type = sample.get("raw", {}).get("task_type") or sample.get("task_type")
         timing["model_load_ms"] = model_load_ms
         record = build_sample_record(
             method=method,
@@ -445,6 +446,11 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             "degenerate_repetition": is_degenerate_output(text),
             "action": "annotate_only",
         }
+        if task_type == "code_completion":
+            metrics.add_code_completion(record, text, sample.get("reference"))
+        else:
+            rouge.add_rouge(record, text, sample.get("reference"))
+            metrics.add_semantic(record, text, sample.get("reference"))
         if record["output_quality_guard"]["degenerate_repetition"]:
             print(
                 f"[{method}][{sample['id']}] warning: output has a strong "
@@ -453,7 +459,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
                 flush=True,
             )
         record["run_id"] = args.run_id
-        record["task_type"] = sample.get("raw", {}).get("task_type")
+        record["task_type"] = task_type
         writer.add(record)
         successful += 1
         print(
@@ -467,6 +473,11 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             flush=True,
         )
 
+    quality = (
+        metrics.aggregate_code_completion(writer.records)
+        if any(r.get("task_type") == "code_completion" for r in writer.records)
+        else metrics.aggregate_semantic(writer.records)
+    )
     summary = {
         "type": "summary",
         "method": method,
@@ -480,6 +491,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "attention_backend": args.attention_backend,
         "effective_attention_backend": effective_attention_backend or "unknown",
         "runtime": metadata,
+        **quality,
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

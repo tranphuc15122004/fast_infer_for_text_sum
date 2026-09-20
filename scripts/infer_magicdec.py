@@ -64,6 +64,241 @@ def _canonical_next_token(logits, temperature: float):
     return scores.argmax(dim=-1, keepdim=True)
 
 
+def summarize_magicdec_acceptance(
+    acceptance_lengths: list[int], *, gamma: int, draft_tokens_proposed: int | None = None
+) -> dict[str, float | None]:
+    """Summarize MagicDec self-spec acceptance at the decode-step scope.
+
+    Each ``acceptance_lengths`` entry is the number of tokens committed by one
+    draft/verification round, including the bonus target token.  Therefore a
+    round with no accepted draft token still has length one.  The acceptance
+    rate intentionally counts only draft tokens, matching MagicDec's upstream
+    ``accept_nums = accepted_draft + 1`` convention.
+    """
+    if not acceptance_lengths:
+        return {
+            "avg_accept_length": None,
+            "acceptance_rate": None,
+            "rejected_draft_ratio": None,
+        }
+    average = sum(float(value) for value in acceptance_lengths) / len(acceptance_lengths)
+    proposed = (
+        int(draft_tokens_proposed)
+        if draft_tokens_proposed is not None
+        else len(acceptance_lengths) * max(int(gamma), 0)
+    )
+    accepted_draft = sum(max(int(value) - 1, 0) for value in acceptance_lengths)
+    acceptance_rate = accepted_draft / proposed if proposed else None
+    return {
+        "avg_accept_length": round(average, 4),
+        "acceptance_rate": round(acceptance_rate, 4) if acceptance_rate is not None else None,
+        "rejected_draft_ratio": (
+            round(1.0 - acceptance_rate, 4)
+            if acceptance_rate is not None
+            else None
+        ),
+    }
+
+
+def _self_spec_acceptance(
+    draft_tokens: list[int], target_tokens: list[int], eos_ids: set[int]
+) -> tuple[int, int]:
+    """Return ``(committed_length, bonus_index)`` for one verify round."""
+    accepted_draft = 0
+    for draft, target in zip(draft_tokens, target_tokens):
+        if draft in eos_ids or draft != target:
+            break
+        accepted_draft += 1
+    return accepted_draft + 1, accepted_draft
+
+
+def _append_bounded_tokens(
+    generated: list[torch.Tensor], token_ids: torch.Tensor, remaining: int
+) -> int:
+    """Append at most ``remaining`` one-row tokens and return the count."""
+    if remaining <= 0:
+        return 0
+    bounded = token_ids[:, :remaining]
+    if bounded.shape[1]:
+        generated.append(bounded.clone())
+    return int(bounded.shape[1])
+
+
+def _eos_ids(tokenizer) -> set[int]:
+    eos = tokenizer.eos_token_id
+    values = eos if isinstance(eos, (list, tuple, set)) else [eos]
+    result = {int(value) for value in values if value is not None}
+    if tokenizer.unk_token_id is not None:
+        result.add(int(tokenizer.unk_token_id))
+    else:
+        try:
+            fallback = tokenizer.encode(
+                "<|eot_id|>", add_special_tokens=False
+            )
+            if fallback:
+                result.add(int(fallback[-1]))
+        except (TypeError, ValueError, IndexError):
+            pass
+    return result
+
+
+def _generate_magicdec_self_spec(
+    engine,
+    input_ids: torch.Tensor,
+    *,
+    tokenizer,
+    args: argparse.Namespace,
+    device: torch.device,
+    max_new_tokens: int | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Generate one prompt with MagicDec's upstream self-spec loop.
+
+    The target model is used for both branches: ``speculate`` uses the
+    compressed draft KV cache and ``verify`` evaluates the speculative block
+    with the target KV cache.  The cache rollback/commit sequence mirrors
+    ``externals/MagicDec/tests/SnapKV/selfspec_benchmark.py`` while keeping
+    per-request output and acceptance telemetry for the LongBench schema.
+    """
+    gamma = int(args.gamma)
+    if gamma <= 0:
+        raise ValueError("MagicDec self-spec gamma must be positive")
+    if int(args.draft_budget) <= int(args.window_size):
+        raise ValueError("MagicDec draft budget must exceed window size")
+
+    generation_budget = (
+        resolve_generation_budget(args.max_new_tokens)
+        if max_new_tokens is None
+        else max(1, int(max_new_tokens))
+    )
+    eos_ids = _eos_ids(tokenizer)
+    if args.reset_peak_memory:
+        torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    request_start = time.perf_counter()
+    prefill_start = time.perf_counter()
+    logits = engine.encode(input_ids)
+    torch.cuda.synchronize(device)
+    prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
+
+    next_token = _canonical_next_token(logits, args.temperature)
+    generated: list[torch.Tensor] = []
+    generated_count = 0
+    acceptance_lengths: list[int] = []
+    draft_tokens_proposed = 0
+    draft_tokens_accepted = 0
+    draft_latency_ms = 0.0
+    verification_latency_ms = 0.0
+
+    while generated_count < generation_budget:
+        remaining = generation_budget - generated_count
+        # A speculative round always commits one bonus/target token.  Limit
+        # the final draft width so no token beyond max_new_tokens is ever
+        # appended or counted in the public record.
+        step_gamma = min(gamma, max(remaining - 1, 0))
+        if step_gamma == 0:
+            generated_count += _append_bounded_tokens(
+                generated, next_token, remaining
+            )
+            break
+        draft_tokens_proposed += step_gamma
+
+        tokens_buffer = torch.zeros(
+            (1, step_gamma + 1), device=device, dtype=torch.long
+        )
+        tokens_buffer[:, :1] = next_token
+
+        torch.cuda.synchronize(device)
+        draft_start = time.perf_counter()
+        for index in range(step_gamma):
+            draft_logits = engine.speculate(
+                tokens_buffer[:, index : index + 1]
+            )
+            tokens_buffer[:, index + 1 : index + 2] = _canonical_next_token(
+                draft_logits, args.temperature
+            )
+        torch.cuda.synchronize(device)
+        draft_latency_ms += (time.perf_counter() - draft_start) * 1000.0
+
+        torch.cuda.synchronize(device)
+        verification_start = time.perf_counter()
+        target_tokens = engine.verify(tokens_buffer)
+        torch.cuda.synchronize(device)
+        verification_latency_ms += (
+            time.perf_counter() - verification_start
+        ) * 1000.0
+
+        draft_token_ids = [
+            int(value) for value in tokens_buffer[0, 1:].tolist()
+        ]
+        target_token_ids = [
+            int(value) for value in target_tokens[0].tolist()
+        ]
+        accept_length, bonus_index = _self_spec_acceptance(
+            draft_token_ids, target_token_ids[:step_gamma], eos_ids
+        )
+        acceptance_lengths.append(accept_length)
+        draft_tokens_accepted += max(accept_length - 1, 0)
+
+        # verify() speculatively appended gamma+1 positions to both cache
+        # views. Roll them back, then commit exactly the accepted prefix.
+        rollback = step_gamma + 1
+        engine.cachelens -= rollback
+        engine.paged_kv_last_page_len -= rollback
+        engine.draft_cachelens -= rollback
+        engine.draft_paged_kv_last_page_len -= rollback
+        engine.cachelens += accept_length
+        engine.paged_kv_last_page_len += accept_length
+        engine.draft_cachelens += accept_length
+        engine.draft_paged_kv_last_page_len += accept_length
+
+        accepted_tokens = tokens_buffer[:, :accept_length]
+        generated_count += _append_bounded_tokens(
+            generated, accepted_tokens, remaining
+        )
+        if any(int(value) in eos_ids for value in accepted_tokens[0].tolist()):
+            break
+        if generated_count >= generation_budget:
+            break
+
+        bonus = target_tokens[:, bonus_index : bonus_index + 1]
+        if int(bonus[0, 0]) in eos_ids:
+            generated_count += _append_bounded_tokens(
+                generated, bonus, generation_budget - generated_count
+            )
+            break
+        next_token = bonus
+
+    torch.cuda.synchronize(device)
+    request_end = time.perf_counter()
+    e2e_ms = (request_end - request_start) * 1000.0
+    decode_ms = e2e_ms - prefill_ms
+    peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+    acceptance = summarize_magicdec_acceptance(
+        acceptance_lengths,
+        gamma=gamma,
+        draft_tokens_proposed=draft_tokens_proposed,
+    )
+    generated_ids = (
+        torch.cat(generated, dim=1)
+        if generated
+        else torch.empty((1, 0), device=device, dtype=torch.long)
+    )
+    return torch.cat([input_ids, generated_ids], dim=1), {
+        "prefill_ms": round(prefill_ms, 3),
+        "ttft_ms": round(prefill_ms, 3),
+        "decode_ms": round(max(decode_ms, 0.0), 3),
+        "e2e_ms": round(e2e_ms, 3),
+        "peak_memory_gb": round(peak_gb, 6),
+        "acceptance_lengths": acceptance_lengths,
+        "draft_latency_ms": round(draft_latency_ms, 3),
+        "verification_latency_ms": round(verification_latency_ms, 3),
+        "speculative_steps": len(acceptance_lengths),
+        "draft_tokens_proposed": draft_tokens_proposed,
+        "draft_tokens_accepted": draft_tokens_accepted,
+        **acceptance,
+    }
+
+
 def _run_canonical(args: argparse.Namespace) -> None:
     """Run MagicDec's SnapKV engine on arbitrary canonical prompt JSONL."""
     import torch
@@ -94,13 +329,23 @@ def _run_canonical(args: argparse.Namespace) -> None:
     max_sequence = max(128, ((max_input + args.max_new_tokens + 127) // 128) * 128)
 
     load_start = time.perf_counter()
-    engine = LMBackend(dtype=dtype, device="cuda:0")
+    engine = LMBackend(
+        dtype=dtype,
+        device="cuda:0",
+        dec_len=args.gamma + 1 if args.self_spec else 1,
+        draft_dec_len=1 if args.self_spec else None,
+    )
     engine.load_model(Path(args.model_pth), use_tp=False, rank_group=[0])
-    engine.setup_caches(max_batch_size=1, max_seq_length=max_sequence)
+    engine.setup_caches(
+        max_batch_size=1,
+        max_seq_length=max_sequence,
+        draft_budget=args.draft_budget if args.self_spec else 0,
+        window_size=args.window_size,
+    )
     torch.cuda.synchronize(device)
     model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)
 
-    def generate(input_ids, *, max_new_tokens=None):
+    def generate_target_only(input_ids, *, max_new_tokens=None):
         generation_budget = (
             resolve_generation_budget(args.max_new_tokens)
             if max_new_tokens is None
@@ -138,6 +383,18 @@ def _run_canonical(args: argparse.Namespace) -> None:
             "peak_memory_gb": round(peak_gb, 6),
         }
 
+    def generate(input_ids, *, max_new_tokens=None):
+        if args.self_spec:
+            return _generate_magicdec_self_spec(
+                engine,
+                input_ids,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                max_new_tokens=max_new_tokens,
+            )
+        return generate_target_only(input_ids, max_new_tokens=max_new_tokens)
+
     warmup_ids = tokenizer("Hello", return_tensors="pt", add_special_tokens=True).input_ids.to(device)
     for _ in range(max(args.warmup_runs, 0)):
         seed_everything(args.seed)
@@ -167,6 +424,10 @@ def _run_canonical(args: argparse.Namespace) -> None:
                 "gpu_name": torch.cuda.get_device_name(0),
                 "dtype": str(dtype).removeprefix("torch."),
                 "attention_backend": "magicdec_snapkv",
+                "self_spec": bool(args.self_spec),
+                "gamma": args.gamma if args.self_spec else None,
+                "draft_budget": args.draft_budget if args.self_spec else None,
+                "window_size": args.window_size if args.self_spec else None,
                 "seed": args.seed,
                 "temperature": args.temperature,
                 "max_new_tokens": args.max_new_tokens,
@@ -180,18 +441,21 @@ def _run_canonical(args: argparse.Namespace) -> None:
                 text=text,
                 timing={**timing, "model_load_ms": model_load_ms},
                 config=config,
+                acceptance_lengths=timing.get("acceptance_lengths"),
+                speculative_metrics=timing,
             )
             if sample.get("raw", {}).get("task_type") == "code_completion":
                 metrics.add_code_completion(record, text, sample.get("reference"))
             else:
                 rouge.add_rouge(record, text, sample.get("reference"))
+                metrics.add_semantic(record, text, sample.get("reference"))
             writer.add(record)
             checks += [verify.check_new_tokens(output_tokens), verify.check_output_text(text)]
 
     quality = (
         metrics.aggregate_code_completion(writer.records)
         if any(r.get("task_type") == "code_completion" for r in writer.records)
-        else rouge.aggregate_rouge(writer.records)
+        else metrics.aggregate_semantic(writer.records)
     )
     writer.finalize({
         "type": "summary",
@@ -208,7 +472,18 @@ def _run_canonical(args: argparse.Namespace) -> None:
     verify.finish("MagicDec LongBench", checks)
 
 
-def build_magicdec_record(*, sample, args, input_tokens, output_tokens, text, timing, config):
+def build_magicdec_record(
+    *,
+    sample,
+    args,
+    input_tokens,
+    output_tokens,
+    text,
+    timing,
+    config,
+    acceptance_lengths=None,
+    speculative_metrics=None,
+):
     from common.benchmark_runtime import build_sample_record
 
     record = build_sample_record(
@@ -227,6 +502,35 @@ def build_magicdec_record(*, sample, args, input_tokens, output_tokens, text, ti
     record["scope"] = "sample"
     record["status"] = "success"
     record["magicdec_model_pth"] = str(args.model_pth)
+    record["magicdec_self_spec"] = bool(config.get("self_spec", False))
+    record["magicdec_gamma"] = config.get("gamma")
+    record["magicdec_draft_budget"] = config.get("draft_budget")
+    record["magicdec_window_size"] = config.get("window_size")
+    if acceptance_lengths is not None:
+        record["acceptance_lengths"] = [int(value) for value in acceptance_lengths]
+        record["avg_accept_length"] = (
+            sum(float(value) for value in acceptance_lengths)
+            / len(acceptance_lengths)
+            if acceptance_lengths
+            else None
+        )
+    else:
+        record["acceptance_lengths"] = None
+        record["avg_accept_length"] = None
+    for key in (
+        "acceptance_rate",
+        "draft_latency_ms",
+        "verification_latency_ms",
+        "rejected_draft_ratio",
+        "draft_tokens_proposed",
+        "draft_tokens_accepted",
+        "speculative_steps",
+    ):
+        record[key] = (
+            speculative_metrics.get(key)
+            if speculative_metrics is not None
+            else None
+        )
     return record
 
 
@@ -239,7 +543,7 @@ def main() -> None:
     parser.add_argument("--max-len", type=int, default=2176,
                         help="must be divisible by 128")
     parser.add_argument("--self-spec", action="store_true",
-                        help="run tests/SnapKV/selfspec_benchmark.py instead of dense")
+                        help="run SnapKV self-spec with per-sample acceptance telemetry")
     parser.add_argument("--gamma", type=int, default=3)
     parser.add_argument("--draft-budget", type=int, default=257)
     parser.add_argument("--num-runs", type=int, default=1)
@@ -268,6 +572,14 @@ def main() -> None:
         args.prefix_len = min(args.prefix_len, 1024)
         args.max_len = ((args.prefix_len + 128) // 128) * 128
         args.num_runs = 1
+
+    if args.self_spec:
+        if args.gamma <= 0:
+            raise SystemExit("--gamma must be positive for MagicDec self-spec")
+        if args.window_size <= 0 or args.draft_budget <= args.window_size:
+            raise SystemExit("--draft-budget must be greater than --window-size")
+        if (args.draft_budget - 1) % 128 != 0:
+            raise SystemExit("--draft-budget must satisfy (draft_budget - 1) % 128 == 0")
 
     if args.data_file:
         if args.max_samples is None:

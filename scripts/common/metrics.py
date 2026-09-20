@@ -344,9 +344,73 @@ def aggregate_speed(
     return out
 
 
+def _acceptance_length_from_record(record: Mapping) -> Optional[float]:
+    """Read one sample's mean accepted length from supported trace formats.
+
+    Baselines do not expose one identical field: EAGLE emits ``accept_length``,
+    DFlash emits block-level ``acceptance_lengths`` and SpecExtend emits
+    ``accept_length_list``.  A precomputed per-sample ``avg_accept_length`` is
+    preferred when present.  The returned value is always the mean for one
+    sample; aggregation across samples is deliberately done by
+    :func:`mean_acceptance_length` so long generations do not get extra weight.
+    """
+    value = record.get("avg_accept_length")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+
+    value = record.get("accept_length")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+
+    for key in ("acceptance_lengths", "accept_length_list"):
+        values = record.get(key)
+        if not isinstance(values, (list, tuple)):
+            continue
+        numeric = [
+            float(item)
+            for item in values
+            if isinstance(item, (int, float)) and math.isfinite(float(item))
+        ]
+        if numeric:
+            return mean(numeric)
+    return None
+
+
+def mean_acceptance_length(records: Sequence[Mapping]) -> Optional[float]:
+    """Return mean acceptance length (paper ``τ``) over successful samples.
+
+    Failed rows, aggregate/summary rows and rows without an acceptance trace
+    are excluded.  The result is ``None`` when the run did not expose a valid
+    acceptance trace, rather than silently treating it as ``1``.
+    """
+    values: list[float] = []
+    for record in records:
+        if record.get("status", "success") != "success":
+            continue
+        if record.get("type") == "summary" or record.get("scope") == "aggregate":
+            continue
+        value = _acceptance_length_from_record(record)
+        if value is not None:
+            values.append(value)
+    return mean(values) if values else None
+
+
 def aggregate_speculative(records: Sequence[Mapping]) -> dict:
     """{key: {mean, median, p90, std}} cho các key speculative decoding."""
-    return aggregate_speed(records, keys=SPEC_KEYS, include_derived=False)
+    out = aggregate_speed(records, keys=SPEC_KEYS, include_derived=False)
+    tau = mean_acceptance_length(records)
+    if tau is not None:
+        values = []
+        for record in records:
+            if record.get("status", "success") != "success":
+                continue
+            if record.get("type") == "summary" or record.get("scope") == "aggregate":
+                continue
+            value = _acceptance_length_from_record(record)
+            if value is not None:
+                values.append(value)
+        out["avg_accept_length"] = agg_numeric(values) or {}
+    return out
 
 
 def _first_positive(record: Mapping, keys: Sequence[str]) -> Optional[float]:
@@ -391,3 +455,27 @@ def aggregate_speedup(records: Sequence[Mapping]) -> dict:
         if method_values:
             out[name] = round(mean(dense_values) / mean(method_values), 4)
     return out
+
+
+def speedup_pair_coverage(records: Sequence[Mapping]) -> dict:
+    """Report how many records provide valid dense/method timing pairs."""
+
+    coverage: dict = {}
+    for name, (dense_key, method_keys) in SPEEDUP_TIMINGS.items():
+        available = 0
+        valid = 0
+        for record in records:
+            dense = _first_positive(record, (dense_key,))
+            method = _first_positive(record, method_keys)
+            if dense is None or method is None:
+                continue
+            available += 1
+            if record.get("speedup_valid") is not False:
+                valid += 1
+        coverage[name] = {
+            "available": bool(available),
+            "valid": valid,
+            "total": len(records),
+            "ratio": round(valid / len(records), 4) if records else 0.0,
+        }
+    return coverage

@@ -20,6 +20,7 @@ try:
 except ImportError:
     KVQwen3ForCausalLM = None
 from .utils import *
+from .utils import _finish_cuda_phase, _start_cuda_phase
 from .kv_cache import initialize_past_key_values
 
 from .cnets import Model
@@ -370,10 +371,14 @@ class EaModel(nn.Module):
             torch.cuda.synchronize(input_ids.device)
             request_start = time.perf_counter()
         reset_tree_mode(self)
+        phase_events = {
+            "draft_events": [],
+            "verification_events": [],
+        } if return_phase_timings and torch.cuda.is_available() else None
         # prefill
         prefill_start = time.perf_counter() if return_phase_timings else None
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
+            input_ids, self, past_key_values, logits_processor, timing=phase_events
         )
         # Match DFlash's decode-only timing: prefill and initial draft
         # construction are excluded from the measured interval.
@@ -385,6 +390,8 @@ class EaModel(nn.Module):
             torch.cuda.synchronize()
             decode_start = time.perf_counter()
         acceptance_lengths = []
+        draft_tokens_proposed = 0
+        draft_tokens_accepted = 0
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
@@ -393,6 +400,10 @@ class EaModel(nn.Module):
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # Target model forward, get logits
+            verification_start = None
+            if phase_events is not None:
+                verification_start = torch.cuda.Event(enable_timing=True)
+                verification_start.record()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -409,12 +420,22 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            if phase_events is not None:
+                verification_end = torch.cuda.Event(enable_timing=True)
+                verification_end.record()
+                phase_events["verification_events"].append(
+                    (verification_start, verification_end)
+                )
             # EAGLE's update step emits the accepted draft path plus one
             # target token, which is the same convention used by DFlash.
+            accept_length_int = int(accept_length)
+            draft_tokens_proposed += max(int(candidates.shape[-1]) - 1, 0)
+            draft_tokens_accepted += max(accept_length_int, 0)
             if return_stats:
-                acceptance_lengths.append(int(accept_length) + 1)
+                acceptance_lengths.append(accept_length_int + 1)
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
+            draft_start = _start_cuda_phase(phase_events, "draft_events")
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -429,6 +450,7 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p
             )
+            _finish_cuda_phase(phase_events, "draft_events", draft_start)
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -453,12 +475,34 @@ class EaModel(nn.Module):
                 if return_stats
                 else max(e2e_ms - float(prefill_ms or 0.0), 0.0)
             )
+            def _event_total_ms(name):
+                return round(sum(
+                    start.elapsed_time(end)
+                    for start, end in (phase_events or {}).get(name, [])
+                ), 3)
+
+            draft_latency_ms = _event_total_ms("draft_events")
+            verification_latency_ms = _event_total_ms("verification_events")
+            proposed = int(draft_tokens_proposed)
+            accepted = int(draft_tokens_accepted)
+            acceptance_rate = accepted / proposed if proposed else None
             phase_timings = {
                 "prefill_ms": round(float(prefill_ms or 0.0), 3),
                 "ttft_ms": round(float(prefill_ms or 0.0), 3),
                 "decode_ms": round(decode_ms, 3),
                 "e2e_ms": round(e2e_ms, 3),
                 "measurement_scope": "full_e2e",
+                "draft_latency_ms": draft_latency_ms,
+                "verification_latency_ms": verification_latency_ms,
+                "draft_tokens_proposed": proposed,
+                "draft_tokens_accepted": accepted,
+                "acceptance_rate": round(acceptance_rate, 4)
+                if acceptance_rate is not None else None,
+                "rejected_draft_ratio": round(1.0 - acceptance_rate, 4)
+                if acceptance_rate is not None else None,
+                "avg_accept_length": round(
+                    sum(acceptance_lengths) / len(acceptance_lengths), 4
+                ) if acceptance_lengths else None,
                 "peak_memory_gb": round(
                     torch.cuda.max_memory_allocated(input_ids.device) / (1024**3),
                     6,

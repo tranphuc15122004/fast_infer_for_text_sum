@@ -187,6 +187,12 @@ def test_preflight_checks_local_dflash_and_cuda():
     assert "cuda.is_available" in text
 
 
+def test_modal_longbench_preflight_profile_excludes_unrelated_server_modules():
+    text = (ROOT / "scripts/check_shared_env.py").read_text()
+    assert "modal-longbench" in text
+    assert "PROFILE_MODULES" in text
+
+
 def test_preflight_treats_flash_attn_as_optional_shared_artifact():
     text = (ROOT / "scripts/check_shared_env.py").read_text()
     assert 'OPTIONAL_MODULES = {"flash_attn"}' in text

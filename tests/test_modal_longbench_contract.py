@@ -102,6 +102,48 @@ def test_modal_runtime_venv_is_created_with_system_site_packages(tmp_path):
     assert probe.stdout.strip() == "True"
 
 
+def test_modal_runtime_preflight_uses_the_persistent_venv():
+    runner = load_modal_runner()
+
+    command = runner.build_runtime_preflight_command(
+        python=Path("/mnt/fast-infer/venv/bin/python")
+    )
+
+    assert command == [
+        "/mnt/fast-infer/venv/bin/python",
+        "/workspace/fast_infer_text_sum/scripts/check_shared_env.py",
+        "--profile",
+        "modal-longbench",
+    ]
+
+
+def test_modal_provenance_records_remote_venv_and_gpu():
+    runner = load_modal_runner()
+
+    provenance = runner.build_modal_provenance(
+        run_id="modal-smoke",
+        runtime_python=Path("/mnt/fast-infer/venv/bin/python"),
+        venv_dir=Path("/mnt/fast-infer/venv"),
+        volume_name="fast-infer-text-sum-cache",
+        gpu_type="A100-80GB",
+        runtime={
+            "python_version": "3.12.13",
+            "python_executable": "/mnt/fast-infer/venv/bin/python",
+            "sys_prefix": "/mnt/fast-infer/venv",
+            "sys_base_prefix": "/usr/local",
+            "torch_version": "2.11.0",
+            "cuda_available": True,
+            "gpu_name": "NVIDIA A100-SXM4-80GB",
+        },
+    )
+
+    assert provenance["platform"] == "modal"
+    assert provenance["run_id"] == "modal-smoke"
+    assert provenance["venv"] == "/mnt/fast-infer/venv"
+    assert provenance["modal_gpu"] == "A100-80GB"
+    assert provenance["runtime"]["cuda_available"] is True
+
+
 def test_modal_runner_command_forwards_benchmark_selection():
     runner = load_modal_runner()
 

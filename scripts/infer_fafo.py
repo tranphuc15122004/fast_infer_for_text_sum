@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -143,11 +144,8 @@ def build_fafo_sample_records(
             continue
         output_tokens = int(row.get("output_tokens") or 0)
         e2e_ms = row.get("e2e_ms")
-        decode_ms = row.get("decode_ms", e2e_ms)
         if e2e_ms is not None:
             e2e_ms = round(float(e2e_ms), 3)
-        if decode_ms is not None:
-            decode_ms = round(float(decode_ms), 3)
         reference = source.get("reference") or source.get("answer")
         text = row.get("text")
         record = {
@@ -162,25 +160,27 @@ def build_fafo_sample_records(
             "measurement_scope": "e2e_only",
             "model": model,
             "input_tokens": row.get("input_tokens"),
-            "retained_tokens": None,
+            "retained_tokens": row.get("input_tokens"),
             "output_tokens": output_tokens or None,
             "batch_size": 1,
+            "device": row.get("device"),
+            "gpu_name": row.get("gpu_name"),
             "selector_latency_ms": None,
-            "ttft_ms": row.get("ttft_ms"),
-            "prefill_ms": row.get("prefill_ms"),
-            "decode_ms": decode_ms,
-            "tpot_ms": round(decode_ms / output_tokens, 3)
-            if decode_ms is not None and output_tokens > 0
-            else None,
+            # FAFO's upstream timer covers the whole generate call.  It does
+            # not expose a separate prefill/TTFT/decode phase, so never copy
+            # E2E into a more specific timing field.
+            "ttft_ms": None,
+            "prefill_ms": None,
+            "decode_ms": None,
+            "tpot_ms": None,
             "e2e_ms": e2e_ms,
             "throughput_tok_s": round(output_tokens / (e2e_ms / 1000.0), 3)
             if e2e_ms is not None and e2e_ms > 0 and output_tokens > 0
             else None,
-            "decode_throughput_tok_s": round(output_tokens / (decode_ms / 1000.0), 3)
-            if decode_ms is not None and decode_ms > 0 and output_tokens > 0
-            else None,
+            "decode_throughput_tok_s": None,
             "qps": None,
             "peak_memory_gb": row.get("peak_memory_gb"),
+            "model_load_ms": row.get("model_load_ms"),
             "avg_accept_length": row.get("avg_accept_length"),
             "acceptance_rate": None,
             "draft_latency_ms": None,
@@ -205,21 +205,53 @@ def build_fafo_sample_records(
 def prepare_fafo_records(
     records: list[dict[str, Any]], *, smoke: bool
 ) -> list[dict[str, Any]]:
-    """Add one hidden compile warmup when one real request is benchmarked.
+    """Add one hidden compile warmup before every measured request set.
 
-    FAFO excludes the first request only when the evaluator receives more than
-    one question.  A one-sample representative run therefore used to include
-    torch.compile/flex-attention setup in the measured latency, even though a
-    multi-sample run did not.  Keep the warmup independent of ``smoke`` so the
-    timing contract is stable for both profiles.
+    FAFO excludes the first request from its aggregate throughput only when
+    the evaluator receives more than one question.  Injecting the warmup for
+    every run makes one-sample and multi-sample measurements use the same
+    timing contract.  The caller must discard the synthetic row by ID.
     """
 
     del smoke  # retained in the API for callers/tests that pass profile state
-    if len(records) != 1:
+    if not records:
         return records
     warmup = dict(records[0])
     warmup["id"] = f"__fafo_warmup__{records[0]['id']}"
     return [warmup, *records]
+
+
+def validate_fafo_sidecar(
+    runtime_records: list[dict[str, Any]],
+    stats_rows: list[dict[str, Any]],
+) -> tuple[bool, str | None]:
+    """Require exactly one sidecar row for every non-warmup input record."""
+
+    expected = {
+        index: str(record.get("id"))
+        for index, record in enumerate(runtime_records)
+        if not str(record.get("id", "")).startswith("__fafo_warmup__")
+    }
+    observed: list[int] = []
+    for row in stats_rows:
+        try:
+            index = int(row["sample_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if index in expected:
+            observed.append(index)
+
+    counts = Counter(observed)
+    duplicates = sorted(index for index, count in counts.items() if count > 1)
+    missing = [expected[index] for index in sorted(set(expected) - set(observed))]
+    if duplicates or missing:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing sample sidecar rows for {missing[:5]}")
+        if duplicates:
+            details.append(f"duplicate sample sidecar indices {duplicates[:5]}")
+        return False, "; ".join(details)
+    return True, None
 
 
 def resolve_smoke_budget(max_new_tokens: int) -> int:
@@ -417,18 +449,23 @@ def main() -> None:
                 sidecar_rows.append(row)
     parsed = _parse_log(process_log)
 
+    runtime_records = runtime_records if "runtime_records" in locals() else records
+    sidecar_complete, sidecar_reason = validate_fafo_sidecar(
+        runtime_records, sidecar_rows
+    )
+
     # Prefer the public per-sample sidecar whenever available.  It is emitted
     # after FAFO clamps the returned sequence; the aggregate log's OVERALL GEN
     # is internal lookahead work and must never be used as output_tokens.
     sample_records = build_fafo_sample_records(
-        runtime_records if "runtime_records" in locals() else records,
+        runtime_records,
         sidecar_rows,
         method=f"fafo_{args.kv_method}",
         dataset=data_file.name if data_file else "prompt",
         model=args.model,
         max_new_tokens=args.max_new_tokens,
     )
-    if sample_records:
+    if sidecar_complete and len(sample_records) == len(records):
         for sample_record in sample_records:
             sample_record["raw_result"] = raw_result
             sample_record["returncode"] = process_returncode
@@ -466,62 +503,32 @@ def main() -> None:
         verify.finish("FAFO", checks)
         return
 
-    e2e_s = parsed["e2e_s"]
-    output_tokens = parsed["output_tokens"]
-    e2e_ms = round(float(e2e_s) * 1000, 3) if e2e_s is not None else None
-    output_number = int(output_tokens) if output_tokens is not None else 0
-    budget_ok = generated_tokens_within_budget(output_number, args.max_new_tokens)
-    if output_number > args.max_new_tokens:
-        print(
-            f"[FAFO] public generation returned {output_number} tokens, "
-            f"over requested budget {args.max_new_tokens}; marking run failed",
-            file=sys.stderr,
-            flush=True,
+    failure_reason = sidecar_reason or (
+        f"per-sample telemetry rows = {len(sample_records)} / {len(records)}"
+    )
+    for source in records:
+        writer.add(
+            {
+                "method": f"fafo_{args.kv_method}",
+                "dataset": data_file.name if data_file else "prompt",
+                "task_type": source.get("raw", {}).get("task_type"),
+                "status": "failed",
+                "scope": "sample",
+                "measurement_scope": "e2e_only",
+                "model": args.model,
+                "sample_id": source.get("id"),
+                "sample_failure_reason": failure_reason,
+                "returncode": process_returncode,
+                "raw_result": raw_result,
+                "log_tail": process_log[-3000:],
+            }
         )
-    record = {
-        "method": f"fafo_{args.kv_method}",
-        "dataset": data_file.name if data_file else "prompt",
-        "task_type": records[0].get("raw", {}).get("task_type"),
-        "status": "success"
-        if process_returncode == 0 and budget_ok
-        else "failed",
-        "scope": "sample" if len(records) == 1 else "aggregate",
-        "model": args.model,
-        "input_tokens": None,
-        "retained_tokens": None,
-        "output_tokens": output_tokens,
-        "batch_size": len(records),
-        "selector_latency_ms": None,
-        "ttft_ms": None,
-        "tpot_ms": round(e2e_ms / output_number, 3) if e2e_ms and output_number else None,
-        "e2e_ms": e2e_ms,
-        "throughput_tok_s": parsed["throughput"],
-        "qps": round(1 / float(e2e_s), 6) if e2e_s and e2e_s > 0 else None,
-        "peak_memory_gb": None,
-        "avg_accept_length": None,
-        "acceptance_rate": None,
-        "draft_latency_ms": None,
-        "verification_latency_ms": None,
-        "rejected_draft_ratio": None,
-        "sample_ids": [sample["id"] for sample in records],
-        "sample_id": records[0]["id"] if len(records) == 1 else None,
-        "warmup_injected": len(runtime_records) > len(records),
-        "kv_method": args.kv_method,
-        "smoke": args.smoke,
-        "returncode": process_returncode,
-        "raw_result": raw_result,
-        "log_tail": process_log[-3000:],
-    }
-    writer.add(record)
 
     checks: list[tuple[bool, str]] = [
         (process_returncode == 0, f"FAFO process exit code = {process_returncode}"),
-        (output_number > 0, f"generated tokens = {output_number} (> 0)"),
-        (
-            budget_ok,
-            f"generated tokens = {output_number} <= budget {args.max_new_tokens}",
-        ),
-        (parsed["throughput"] is not None, "FAFO timing/throughput line parsed"),
+        (sidecar_complete, sidecar_reason or "per-sample telemetry is complete"),
+        (len(sample_records) == len(records),
+         f"per-sample telemetry rows = {len(sample_records)} / {len(records)}"),
     ]
     summary = {
         "type": "summary",
@@ -530,6 +537,9 @@ def main() -> None:
         "num_samples": len(records),
         "checks_passed": all(ok for ok, _ in checks),
         "runtime_dir": str(runtime_dir),
+        "measurement_scope": "e2e_only",
+        "sidecar_rows": len(sidecar_rows),
+        "sidecar_error": sidecar_reason,
     }
     writer.finalize(summary)
     io_util.print_table(list(summary.items()))

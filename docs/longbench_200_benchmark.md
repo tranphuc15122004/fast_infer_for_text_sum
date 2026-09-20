@@ -70,8 +70,15 @@ loader chung; các adapter đọc trực tiếp `context` cần dùng cùng rend
 - `summarization`: ROUGE-1/2/L và các metric semantic hiện có.
 - `code_completion`: `code_exact_match` và `code_edit_similarity` sau khi
   chuẩn hóa line ending, trailing whitespace và code fence.
-- Tốc độ vẫn dùng các field chung như `input_tokens`, `retained_tokens`,
-  `ttft_ms`, `e2e_ms`, `throughput_tok_s`.
+- Raw performance contract dùng `input_tokens`, `retained_tokens`,
+  `output_tokens`, `batch_size`, `model_load_ms`, `peak_memory_gb`, `device`
+  và E2E. Baseline `full_e2e` phải ghi thêm `prefill_ms`, `ttft_ms` và
+  `decode_ms`; speculative baseline ghi thêm acceptance trace,
+  `draft_latency_ms`, `verification_latency_ms` và số token draft đề xuất/
+  chấp nhận.
+- `tpot_ms`, throughput, acceptance rate, rejected ratio, retained ratio và
+  ESR/DSR/speedup là metric derived; collector tính lại từ raw record và
+  không dùng chúng làm điều kiện bắt buộc của một cell.
 
 Collector đọc cả tên file canonical `<dataset>.jsonl` và tên legacy
 `<dataset>_representative.jsonl`; mặc định mới là `data/longbench_100_14k`.
@@ -166,8 +173,10 @@ Audit chi tiết được lưu tại
 `<run>/logs/<baseline>_<dataset>.metrics.json`; mỗi sample trong JSONL canonical
 có thêm `metric_audit`, còn summary có `metric_audit_summary`. Audit nêu rõ
 scope (`full_e2e`, `e2e_only`, `decode_only`), các timing bắt buộc bị thiếu,
-quality text/reference/metric coverage, token budget validity và speedup pair
-không hợp lệ. Vì vậy có thể kiểm tra nhanh:
+raw metric bắt buộc bị thiếu, quality text/reference/metric coverage, token
+budget validity và speedup pair không hợp lệ. Speedup pair không hợp lệ chỉ là
+thông tin hậu xử lý, không biến một cell thành `metric_incomplete`. Vì vậy có
+thể kiểm tra nhanh:
 
 ```bash
 rg "\[metrics-audit\]" outputs/longbench_100_14k/<run-id>/logs
@@ -394,6 +403,11 @@ batch-1 **chia sẻ** một card:
 bash scripts/run_longbench_200.sh --config <master> --mode full \
   --gpu-ids 0,1,2,3 --data-parallel --dp-processes-per-gpu 4
 
+# ép mọi GPU dùng cùng số process; GPU ít VRAM trống nhất quyết định K
+bash scripts/run_longbench_200.sh --config <master> --mode full \
+  --gpu-ids 0,1,2,3 --data-parallel --dp-processes-per-gpu 4 \
+  --equal-gpu-slots
+
 # xem trước kế hoạch trên host mà không chạy gì
 bash scripts/run_longbench_200.sh --config <master> --list-gpus \
   --data-parallel --dp-processes-per-gpu 4
@@ -411,6 +425,13 @@ Với mặc định `budget=170`, `headroom=10`, `child-vram-gb=40` trên card 1
 không bao giờ xếp quá `usable`. Nếu muốn pack dày hơn, giảm `--child-vram-gb`
 (ví dụ 25 với Llama-3.1-8B + DFlash ở 14k) — nhưng chỉ nên làm **sau khi** xem
 `peak_memory_gb` đo được của cell đầu tiên.
+
+Khi bật `--equal-gpu-slots`, planner lấy `min(K, free_slots)` trên toàn bộ GPU
+được chọn rồi dùng cùng giá trị đó cho mọi GPU. Điều này tránh một GPU chạy nhiều
+process hơn GPU khác và làm workload dễ dự đoán hơn; nếu một GPU bị chiếm thêm
+VRAM, toàn bộ nhóm sẽ giảm xuống theo GPU đó hoặc chờ theo
+`--vram-wait-seconds`. Đây là quota/scheduling logic, không phải phân vùng phần
+cứng: các process vẫn chia sẻ SM và memory bandwidth của cùng một card.
 
 **Cơ chế bảo đảm không OOM và không job nào bị kill giữa chừng:**
 
@@ -444,8 +465,11 @@ dtype/backend, seed và cấu hình generation. Collector tính ESR/DSR sau khi 
 đủ cặp timing; không suy ra metric từ status record.
 
 MagicDec dùng nhánh canonical bổ sung trong `infer_magicdec.py`, gọi trực tiếp
-SnapKV engine với checkpoint `.pth` đã convert và tokenizer của model. Vì vậy
-master phải khai báo `LONG_BENCH_MAGICDEC_MODEL_PTH` cho checkpoint tương ứng;
+SnapKV engine với checkpoint `.pth` đã convert và tokenizer của model. LongBench
+bật self-spec theo mặc định (`MAGICDEC_SELF_SPEC=1`) để ghi acceptance trace
+theo từng sample và tính mean acceptance length τ; `MAGICDEC_SELF_SPEC=0` là
+target-only SnapKV và không có τ. Vì vậy master phải khai báo
+`LONG_BENCH_MAGICDEC_MODEL_PTH` cho checkpoint tương ứng;
 thiếu checkpoint/dependency sẽ thành status lỗi rõ ràng. SSSD và FAFO được ghi
 `scope=aggregate` khi upstream chỉ trả timing gộp; không nhân bản timing đó cho
 từng sample.

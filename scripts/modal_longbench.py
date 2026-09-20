@@ -141,12 +141,17 @@ def _build_image() -> modal.Image:
     ):
         # CUDA extensions can exhaust the build VM when Ninja auto-selects
         # every vCPU.  Keep the default conservative; callers can override it
-        # with MODAL_FLASH_ATTN_MAX_JOBS when building a larger image.
+        # with MODAL_FLASH_ATTN_MAX_JOBS when building a larger image.  The
+        # canonical smoke GPU is A100 (sm80), so avoid compiling kernels for
+        # every architecture unless the operator explicitly overrides it.
         image = image.env(
             {
                 "CC": "gcc",
                 "CXX": "g++",
-                "MAX_JOBS": os.environ.get("MODAL_FLASH_ATTN_MAX_JOBS", "4"),
+                "MAX_JOBS": os.environ.get("MODAL_FLASH_ATTN_MAX_JOBS", "2"),
+                "TORCH_CUDA_ARCH_LIST": os.environ.get(
+                    "MODAL_TORCH_CUDA_ARCH_LIST", "8.0"
+                ),
             }
         ).pip_install(
             "wheel==0.45.1", "ninja==1.13.0"
@@ -162,6 +167,10 @@ def _build_image() -> modal.Image:
             image = image.pip_install(
                 "flash-attn==2.8.3.post1",
                 extra_options="--no-build-isolation",
+                # Building the mirrored sdist is memory-heavy.  Use the
+                # canonical A100 builder so nvcc/compiler resources match the
+                # smoke target instead of silently falling back to CPU.
+                gpu=os.environ.get("MODAL_GPU", DEFAULT_GPU),
             )
     if _truthy("MODAL_INSTALL_VLLM"):
         image = image.pip_install("vllm==0.24.0")
@@ -352,6 +361,68 @@ def build_runner_command(
     return command
 
 
+def build_runtime_preflight_command(*, python: str | Path) -> list[str]:
+    """Build the environment-only check executed by the remote venv."""
+
+    return [
+        str(python),
+        str(REMOTE_ROOT / "scripts" / "check_shared_env.py"),
+        "--profile",
+        "modal-longbench",
+    ]
+
+
+def collect_runtime_probe(python: str | Path) -> dict[str, Any]:
+    """Collect runtime facts using the exact interpreter child jobs will use."""
+
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import json, platform, sys, torch; "
+                "value = {'python_version': platform.python_version(), "
+                "'python_executable': sys.executable, 'sys_prefix': sys.prefix, "
+                "'sys_base_prefix': sys.base_prefix, 'torch_version': torch.__version__, "
+                "'cuda_available': bool(torch.cuda.is_available()), "
+                "'cuda_version': torch.version.cuda, 'gpu_name': "
+                "(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None), "
+                "'gpu_count': (torch.cuda.device_count() if torch.cuda.is_available() else 0)}; "
+                "print(json.dumps(value))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    value = json.loads(probe.stdout)
+    if not isinstance(value, dict):
+        raise RuntimeError("Modal runtime probe did not return an object")
+    return value
+
+
+def build_modal_provenance(
+    *,
+    run_id: str,
+    runtime_python: Path,
+    venv_dir: Path,
+    volume_name: str,
+    gpu_type: str,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Build auditable provenance for a Modal run."""
+
+    return {
+        "platform": "modal",
+        "run_id": run_id,
+        "runtime_python": str(runtime_python),
+        "venv": str(venv_dir),
+        "volume": volume_name,
+        "modal_gpu": gpu_type,
+        "runtime": runtime,
+    }
+
+
 def _new_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"modal-{timestamp}-{uuid.uuid4().hex[:8]}"
@@ -431,6 +502,19 @@ def run_benchmark(
     selected_run_id = run_id or _new_run_id()
     venv_dir = VOLUME_MOUNT / "venv"
     runtime_python = ensure_runtime_venv(venv_dir, sys.executable)
+    runtime_probe = collect_runtime_probe(runtime_python)
+    if runtime_probe.get("python_version", "").split(".")[:2] != ["3", "12"]:
+        raise RuntimeError(
+            "Modal benchmark venv must use Python 3.12: "
+            f"{runtime_probe.get('python_version')}"
+        )
+    if runtime_probe.get("sys_prefix") == runtime_probe.get("sys_base_prefix"):
+        raise RuntimeError(
+            "Modal benchmark is not running inside the persistent venv: "
+            f"{runtime_probe.get('sys_prefix')}"
+        )
+    if not runtime_probe.get("cuda_available"):
+        raise RuntimeError("Modal benchmark requires torch.cuda.is_available()")
     environment = build_modal_env(
         model=model,
         eagle_model=eagle_model,
@@ -458,6 +542,29 @@ def run_benchmark(
     child_env.update(environment)
     write_master_config(Path(environment["FAST_INFER_MASTER_CONFIG"]), environment)
 
+    runtime_preflight = build_runtime_preflight_command(python=runtime_python)
+    print(
+        "[modal] runtime preflight:",
+        " ".join(shlex.quote(item) for item in runtime_preflight),
+        flush=True,
+    )
+    preflight = subprocess.run(
+        runtime_preflight,
+        cwd=str(REMOTE_ROOT),
+        env=child_env,
+        capture_output=True,
+        text=True,
+    )
+    if preflight.stdout:
+        print(preflight.stdout, end="", flush=True)
+    if preflight.stderr:
+        print(preflight.stderr, end="", file=sys.stderr, flush=True)
+    if preflight.returncode != 0:
+        raise RuntimeError(
+            "Modal shared environment preflight failed with exit code "
+            f"{preflight.returncode}"
+        )
+
     command = build_runner_command(
         mode=mode,
         baselines=baselines,
@@ -480,6 +587,24 @@ def run_benchmark(
 
     run_dir = output_dir / selected_run_id
     manifest_path = run_dir / "run_manifest.json"
+    provenance = build_modal_provenance(
+        run_id=selected_run_id,
+        runtime_python=runtime_python,
+        venv_dir=venv_dir,
+        volume_name=VOLUME_NAME,
+        gpu_type=GPU_TYPE,
+        runtime=runtime_probe,
+    )
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["modal_provenance"] = provenance
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[modal] provenance write warning: {exc}", file=sys.stderr, flush=True)
     try:
         CACHE_VOLUME.commit()
     except Exception as exc:

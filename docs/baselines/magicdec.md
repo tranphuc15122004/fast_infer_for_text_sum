@@ -62,6 +62,15 @@ checkpoint phải được convert dưới thư mục có tên `llama-3.1-8b`, c
 `LONG_BENCH_MAGICDEC_MODEL_PTH`. Tokenizer path khai báo qua
 `LONG_BENCH_MAGICDEC_MODEL_NAME` (mặc định là `LONG_BENCH_MODEL`).
 
+LongBench bật self-spec theo mặc định qua `MAGICDEC_SELF_SPEC=1`. Nhánh này
+dùng chính target model với draft KV đã nén của SnapKV, chạy vòng
+draft/verification tương tự upstream và ghi acceptance trace theo từng sample:
+`acceptance_lengths`, `avg_accept_length` (τ), `acceptance_rate`,
+`draft_latency_ms`, `verification_latency_ms` và `rejected_draft_ratio`.
+`MAGICDEC_GAMMA`, `MAGICDEC_DRAFT_BUDGET` và `MAGICDEC_WINDOW_SIZE` điều khiển
+vòng self-spec. Đặt `MAGICDEC_SELF_SPEC=0` chỉ khi muốn benchmark target-only
+SnapKV; khi đó τ vẫn phải để `N/A`.
+
 Trên Modal, runner mặc định tìm checkpoint tại
 `/mnt/fast-infer/checkpoints/magicdec/llama-3.1-8b/model.pth`; cần upload
 checkpoint vào Volume trước khi chạy. MagicDec dùng FlashInfer trực tiếp trong

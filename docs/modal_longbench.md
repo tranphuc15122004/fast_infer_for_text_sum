@@ -93,18 +93,39 @@ MODAL_GPU=A100-80GB \
   --preflight-only
 ```
 
-## Smoke rồi representative
+## Smoke canonical rồi chạy server full
 
 Mặc định app chỉ chọn `vanilla_hf` để xác nhận image/cache/data trước; mặc
-định này không đại diện cho toàn bộ ma trận baseline. Smoke đầu tiên:
+định này không đủ để gate toàn bộ ma trận. Canonical GPU smoke phải chạy đủ
+7 baseline × 5 dataset, mỗi ô một mẫu:
 
 ```bash
-MODAL_HF_SECRET=huggingface MODAL_GPU=A100-80GB \
+MODAL_HF_SECRET=huggingface \
+MODAL_GPU=A100-80GB \
+MODAL_INSTALL_FLASH_ATTN=1 \
+MODAL_INSTALL_FLASHINFER=1 \
   modal run scripts/modal_longbench.py \
   --mode smoke \
-  --baselines vanilla_hf \
-  --datasets "gov_report lcc"
+  --baselines "vanilla_hf vanilla_fa magicdec eagle3 dflash specextend fafo" \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --max-samples 1 \
+  --max-new-tokens 8 \
+  --max-input-tokens 4096 \
+  --timeout-seconds 900 \
+  --seed 42 \
+  --warmup-runs 3 \
+  --strict \
+  --collect \
+  --run-id modal-smoke-canonical
 ```
+
+Container chạy `scripts/check_shared_env.py --profile modal-longbench` bằng
+chính `/mnt/fast-infer/venv/bin/python` trước khi gọi runner. Thiếu
+FlashAttention, FlashInfer, model, draft model hoặc MagicDec checkpoint đều
+làm job fail; không bỏ qua baseline.
+
+Smoke Modal chỉ xác nhận CUDA, model loading, output schema, sidecar, metric
+audit và collector. Không đưa latency/speedup của A100 vào bảng chính thức.
 
 Sau khi smoke đạt, chạy profile representative canonical (`20 mẫu ×
 gov_report,lcc`) như sau:
@@ -130,6 +151,37 @@ MODAL_INSTALL_FLASH_ATTN=1 \
   --datasets "gov_report lcc" \
   --max-samples 20
 ```
+
+Sau khi smoke canonical đạt, full inference chạy bằng `python3` production
+trên server B200, không dùng venv Modal:
+
+```bash
+python3 scripts/setup_server_env.py --check
+python3 scripts/check_shared_env.py
+bash scripts/run_longbench_200.sh \
+  --config <master-config-server> \
+  --mode full \
+  --baselines "vanilla_hf vanilla_fa magicdec eagle3 dflash specextend fafo" \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --data-dir data/longbench_100_14k \
+  --output-dir outputs/Benchmark_results/longbench_full \
+  --run-id b200-full-5datasets-metrics-rerun \
+  --max-samples 100 \
+  --max-new-tokens 2048 \
+  --max-input-tokens 0 \
+  --temperature 0 \
+  --warmup-runs 3 \
+  --seed 42 \
+  --gpu-ids 0,1,2,3 \
+  --data-parallel \
+  --dp-processes-per-gpu 1 \
+  --strict \
+  --collect
+```
+
+`metrics_summary.{json,csv,md}` chỉ được phát hành khi đủ 35/35 cell, mỗi
+cell đủ 100 sample, metric contract hoàn chỉnh và speedup pair coverage đạt
+gate.
 
 Các model draft mặc định là Hugging Face repo ID. Có thể ghi đè bằng các cờ
 `--model`, `--eagle-model` và `--dflash-model`. `magicdec` không nằm trong ví

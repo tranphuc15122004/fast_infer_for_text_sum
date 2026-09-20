@@ -40,6 +40,7 @@ from common.benchmark_runtime import (  # noqa: E402
 )
 from common.data_loader import normalize  # noqa: E402
 from common.metric_audit import (  # noqa: E402
+    BASELINE_MEASUREMENT_SCOPE,
     audit_output_file,
     format_audit_log,
 )
@@ -101,6 +102,33 @@ def _filter_matrix_baselines(values: Sequence[str]) -> tuple[list[str], list[str
     return selected, skipped
 
 
+def _reference_quality_error(path: Path) -> str | None:
+    """Return a quality-guard failure that disqualifies a dense reference."""
+
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"reference is not readable JSONL: {exc}"
+    bad_samples: list[Any] = []
+    for row in rows:
+        if row.get("type") == "summary":
+            continue
+        guard = row.get("output_quality_guard")
+        is_degenerate = bool(
+            row.get("degenerate_repetition")
+            or (isinstance(guard, Mapping) and guard.get("degenerate_repetition"))
+        )
+        if is_degenerate:
+            bad_samples.append(row.get("sample_id"))
+    if bad_samples:
+        return f"degenerate output on samples {bad_samples[:5]}"
+    return None
+
+
 def _select_external_reference(
     run_dir: Path, dataset: str, baselines: Sequence[str]
 ) -> Path | None:
@@ -119,7 +147,11 @@ def _select_external_reference(
             continue
         seen.add(baseline)
         candidate = run_dir / baseline / f"{dataset}.jsonl"
-        if candidate.is_file() and candidate.stat().st_size > 0:
+        if (
+            candidate.is_file()
+            and candidate.stat().st_size > 0
+            and _reference_quality_error(candidate) is None
+        ):
             return candidate
     return None
 
@@ -478,6 +510,7 @@ def _audit_cell_output(
     dataset: str,
     run_dir: Path,
     expected_output_tokens: int | None,
+    expected_samples: int | None = None,
 ) -> dict[str, Any]:
     """Audit one cell and emit a grep-friendly live log line."""
 
@@ -491,6 +524,7 @@ def _audit_cell_output(
             dataset=dataset,
             audit_path=audit_path,
             expected_output_tokens=expected_output_tokens,
+            expected_samples=expected_samples,
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         print(
@@ -514,6 +548,7 @@ def _audit_cell_output(
     return {
         "metric_audit_path": str(audit_path),
         "metric_audit_summary": summary,
+        "metric_contract": summary.get("metric_contract"),
     }
 
 
@@ -844,6 +879,7 @@ def plan_shard_slots(
     child_gb: float,
     sample_count: int,
     usage: Mapping[int, Mapping[str, float]] | None,
+    equal_gpu_slots: bool = False,
 ) -> tuple[list[list[int]], dict[str, Any]]:
     """Return one device group per concurrent batch-1 child, plus the plan.
 
@@ -853,12 +889,31 @@ def plan_shard_slots(
     the effective concurrency is ``min(requested, what fits in the budget)``.
     """
     slots: list[list[int]] = []
-    per_group: list[dict[str, Any]] = []
-    for group in gpu_groups:
-        capacity = _group_capacity(
+    capacities = [
+        _group_capacity(
             group, usage, usable_gb=usable_gb, child_gb=child_gb
         )
-        if capacity["free_slots"] is None:
+        for group in gpu_groups
+    ]
+    known_slots = [
+        int(capacity["free_slots"])
+        for capacity in capacities
+        if capacity["free_slots"] is not None
+    ]
+    common_allowed = (
+        min([int(processes_per_gpu), *known_slots])
+        if equal_gpu_slots and known_slots
+        else int(processes_per_gpu)
+    )
+    per_group: list[dict[str, Any]] = []
+    for group, capacity in zip(gpu_groups, capacities):
+        if equal_gpu_slots:
+            # A common slot count keeps every selected GPU equally loaded.  If
+            # nvidia-smi is unavailable for a group, the known group with the
+            # least capacity still determines the safe common request; with no
+            # inventory at all we preserve the explicit operator request.
+            allowed = common_allowed
+        elif capacity["free_slots"] is None:
             allowed = int(processes_per_gpu)
         else:
             allowed = min(int(processes_per_gpu), int(capacity["free_slots"]))
@@ -886,6 +941,7 @@ def plan_shard_slots(
         "usable_gb": None if usable_gb is None else round(float(usable_gb), 1),
         "child_reserve_gb": round(float(child_gb), 1),
         "nvidia_smi_available": bool(usage),
+        "equal_gpu_slots": bool(equal_gpu_slots),
         "groups": per_group,
         "shard_slots": len(slots),
     }
@@ -900,6 +956,7 @@ def _wait_for_shard_slots(
     child_gb: float,
     sample_count: int,
     wait_seconds: float,
+    equal_gpu_slots: bool = False,
     poll_seconds: float = 15.0,
 ) -> tuple[list[list[int]], dict[str, Any], float]:
     """Block until at least one shard slot fits, or the wait budget expires.
@@ -919,6 +976,7 @@ def _wait_for_shard_slots(
             child_gb=child_gb,
             sample_count=sample_count,
             usage=None,
+            equal_gpu_slots=equal_gpu_slots,
         )
         plan["waited_seconds"] = 0.0
         return slots, plan, 0.0
@@ -934,6 +992,7 @@ def _wait_for_shard_slots(
             child_gb=child_gb,
             sample_count=sample_count,
             usage=usage,
+            equal_gpu_slots=equal_gpu_slots,
         )
         plan["waited_seconds"] = round(time.perf_counter() - started, 1)
         if slots or wait_seconds <= 0 or time.perf_counter() >= deadline:
@@ -1178,6 +1237,7 @@ def _run_data_parallel_cell(
     run_id: str,
     processes_per_gpu: int = 1,
     vram: Mapping[str, Any] | None = None,
+    equal_gpu_slots: bool = False,
 ) -> dict[str, Any]:
     """Run one matrix cell as concurrent batch-1 shards over the GPU pool.
 
@@ -1234,6 +1294,7 @@ def _run_data_parallel_cell(
         child_gb=child_gb,
         sample_count=len(normalized),
         wait_seconds=wait_seconds,
+        equal_gpu_slots=equal_gpu_slots,
     )
     plan["dataset"] = dataset
     if not slots:
@@ -1377,6 +1438,7 @@ def _run_data_parallel_cell(
             child_gb=child_gb,
             sample_count=1,
             wait_seconds=wait_seconds,
+            equal_gpu_slots=equal_gpu_slots,
         )
         print(
             f"[{baseline}/{dataset}] OOM retry {attempt}/{oom_retries}: "
@@ -1718,10 +1780,17 @@ def _normalize_child_output(
             row["throughput_tok_s"] = row["eagle_tok_s"]
         if row.get("dense_decode_ms") is None and row.get("naive_time") is not None:
             row["dense_decode_ms"] = round(float(row["naive_time"]) * 1000.0, 3)
-        if row.get("eagle_time") is not None:
+        if row.get("eagle_time") is not None and not all(
+            row.get(field) is not None
+            for field in ("prefill_ms", "ttft_ms", "decode_ms", "e2e_ms")
+        ):
             # EAGLE's upstream timer explicitly excludes prefill.  Keep that
             # fact visible instead of calling decode-only time "E2E".
             row.setdefault("measurement_scope", "decode_only")
+        elif row.get("measurement_scope") is None:
+            expected_scope = BASELINE_MEASUREMENT_SCOPE.get(baseline)
+            if expected_scope is not None:
+                row["measurement_scope"] = expected_scope
 
         sample_id = row.get("sample_id")
         source = by_id.get(str(sample_id)) if sample_id is not None else None
@@ -2083,6 +2152,14 @@ def _parser() -> argparse.ArgumentParser:
         "non-comparable (default: LONG_BENCH_DP_PROCESSES_PER_GPU or 1)",
     )
     parser.add_argument(
+        "--equal-gpu-slots",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LONG_BENCH_EQUAL_GPU_SLOTS", "0") == "1",
+        help="use one common process-slot count across all selected GPU groups; "
+        "the least-free GPU determines the safe count (env: "
+        "LONG_BENCH_EQUAL_GPU_SLOTS=1)",
+    )
+    parser.add_argument(
         "--vram-budget-gb",
         dest="vram_budget_gb",
         type=float,
@@ -2233,6 +2310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "child_reserve_gb": child_vram_gb,
         "wait_seconds": vram_wait_seconds,
         "oom_retries": oom_retries,
+        "equal_gpu_slots": bool(args.equal_gpu_slots),
     }
 
     # Parallel execution needs either several GPU groups or several processes
@@ -2263,13 +2341,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 child_gb=child_vram_gb,
                 sample_count=1_000_000,
                 usage=_vram_usage_by_gpu(),
+                equal_gpu_slots=bool(args.equal_gpu_slots),
             )
             print(
                 "\nParallel plan "
                 f"(--dp-gpus-per-shard {dp_gpus_per_shard}, "
                 f"--dp-processes-per-gpu {processes_per_gpu}, budget "
                 f"{vram_budget_gb:.0f} GiB, usable {vram_cfg['usable_gb']} GiB, "
-                f"reserve {child_vram_gb:.0f} GiB/child):"
+                f"reserve {child_vram_gb:.0f} GiB/child, "
+                f"equal-gpu-slots {bool(args.equal_gpu_slots)}):"
             )
             for entry in preview_plan["groups"]:
                 free = entry["free_gb"]
@@ -2323,6 +2403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             child_gb=child_vram_gb,
             sample_count=1_000_000,
             usage=_vram_usage_by_gpu(),
+            equal_gpu_slots=bool(args.equal_gpu_slots),
         )
         print(
             "[parallel] enabled: "
@@ -2338,7 +2419,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             + f" | VRAM budget {vram_budget_gb:.0f} GiB (usable "
             f"{vram_cfg['usable_gb']} GiB, reserve {child_vram_gb:.0f} GiB/child, "
-            f"wait {vram_wait_seconds}s, oom-retries {oom_retries})",
+            f"wait {vram_wait_seconds}s, oom-retries {oom_retries}, "
+            f"equal-gpu-slots {bool(args.equal_gpu_slots)})",
             flush=True,
         )
         if processes_per_gpu > 1:
@@ -2457,6 +2539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dp_requested": bool(parallel_requested),
         "dp_gpus_per_shard": dp_gpus_per_shard if dp_enabled else 1,
         "dp_processes_per_gpu": processes_per_gpu if dp_enabled else 1,
+        "equal_gpu_slots": bool(args.equal_gpu_slots) if dp_enabled else False,
         "dp_world_size": len(dp_groups) if dp_enabled else 1,
         "dp_gpu_groups": [list(group) for group in dp_groups] if dp_enabled else [],
         "dp_aggregate_only_baselines": sorted(AGGREGATE_ONLY_BASELINES & set(baselines)),
@@ -2467,6 +2550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "child_reserve_gb": child_vram_gb,
             "wait_seconds": vram_wait_seconds,
             "oom_retries": oom_retries,
+            "equal_gpu_slots": bool(args.equal_gpu_slots),
         },
         "runtime": runtime_metadata(),
         "cells": [],
@@ -2522,10 +2606,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     external_reference=str(external_reference_path),
                     external_reference_baseline=external_reference_baseline,
                     speedup_scope="external_reference",
-                )
+            )
             if args.preflight_only:
                 status = check["status"] if check["status"] != "ready" else "preflight_only"
                 reason = check["reason"] or "preflight completed; inference was not requested"
+                preflight_failed = status not in {"preflight_only", "aggregate_only"}
+                if preflight_failed and args.strict and not args.allow_unsupported:
+                    failures += 1
                 _write_status_file(
                     output_path,
                     baseline=baseline,
@@ -2537,7 +2624,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     config=cfg,
                     run_id=run_id,
                 )
-                cell.update(status=status, reason=reason, returncode=0)
+                cell.update(
+                    status=status,
+                    reason=reason,
+                    returncode=1 if preflight_failed else 0,
+                )
                 cell.update(
                     _audit_cell_output(
                         output_path,
@@ -2545,6 +2636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         run_dir=run_dir,
                         expected_output_tokens=max_new_tokens,
+                        expected_samples=len(normalized),
                     )
                 )
                 manifest["cells"].append(cell)
@@ -2552,7 +2644,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
 
             if check["status"] not in {"ready", "aggregate_only"}:
-                if args.strict and not args.allow_unsupported and args.mode != "smoke":
+                if args.strict and not args.allow_unsupported:
                     failures += 1
                 _write_status_file(
                     output_path,
@@ -2573,6 +2665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         dataset=dataset,
                         run_dir=run_dir,
                         expected_output_tokens=max_new_tokens,
+                        expected_samples=len(normalized),
                     )
                 )
                 manifest["cells"].append(cell)
@@ -2599,6 +2692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_id=run_id,
                     processes_per_gpu=processes_per_gpu,
                     vram=vram_cfg,
+                    equal_gpu_slots=bool(args.equal_gpu_slots),
                 )
                 if child["status"] == "unsupported_dataset":
                     reason = child.get("reason") or (
@@ -2623,6 +2717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             dataset=dataset,
                             run_dir=run_dir,
                             expected_output_tokens=max_new_tokens,
+                            expected_samples=len(normalized),
                         )
                     )
                     manifest["cells"].append(cell)
@@ -2661,6 +2756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             dataset=dataset,
                             run_dir=run_dir,
                             expected_output_tokens=max_new_tokens,
+                            expected_samples=len(normalized),
                         )
                     )
                     manifest["cells"].append(cell)
@@ -2723,15 +2819,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                         config=cfg,
                         run_id=run_id,
                     )
-            cell.update(
-                _audit_cell_output(
-                    output_path,
-                    baseline=baseline,
-                    dataset=dataset,
-                    run_dir=run_dir,
-                    expected_output_tokens=max_new_tokens,
-                )
+            audit_result = _audit_cell_output(
+                output_path,
+                baseline=baseline,
+                dataset=dataset,
+                run_dir=run_dir,
+                expected_output_tokens=max_new_tokens,
+                expected_samples=len(normalized),
             )
+            cell.update(audit_result)
+            contract = audit_result.get("metric_contract") or {}
+            if (
+                child.get("status") == "success"
+                and args.strict
+                and not args.allow_unsupported
+                and contract.get("status") != "complete"
+            ):
+                child["status"] = "metric_incomplete"
+                child["reason"] = (
+                    "metric contract failed: "
+                    f"{contract.get('issue_counts', {})}"
+                )
+                cell.update(
+                    status="metric_incomplete",
+                    reason=child["reason"],
+                )
+                failures += 1
             manifest["cells"].append(cell)
             print(
                 f"[{baseline}/{dataset}] {child['status']} in "

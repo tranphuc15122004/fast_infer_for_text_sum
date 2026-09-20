@@ -164,6 +164,7 @@ def main():
         print("No valid texts loaded; exiting.")
         return
 
+    model_load_start = time.perf_counter()
     if use_eagle3:
         model = EaModel.from_pretrained(
             use_eagle3=True,
@@ -185,6 +186,9 @@ def main():
             low_cpu_mem_usage=True,
             device_map="auto"
         ).eval()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    model_load_ms = round((time.perf_counter() - model_load_start) * 1000.0, 3)
     tokenizer = model.tokenizer
     accelerator = Accelerator()
     model, tokenizer = accelerator.prepare(model, tokenizer)
@@ -287,6 +291,11 @@ def main():
                 payload = {
                     "sample_index": idx,
                     "input_tokens": input_len,
+                    "device": str(input_ids.device),
+                    "gpu_name": (
+                        torch.cuda.get_device_name(input_ids.device)
+                        if torch.cuda.is_available() else None
+                    ),
                     "output_tokens": int(generated),
                     "text": text,
                     "decode_ms": round(float(phase_timings.get("decode_ms", decode_time * 1000.0)), 3),
@@ -294,10 +303,26 @@ def main():
                     "ttft_ms": phase_timings.get("ttft_ms"),
                     "e2e_ms": phase_timings.get("e2e_ms"),
                     "peak_memory_gb": phase_timings.get("peak_memory_gb"),
+                    "model_load_ms": model_load_ms,
+                    "draft_latency_ms": phase_timings.get("draft_latency_ms"),
+                    "verification_latency_ms": phase_timings.get(
+                        "verification_latency_ms"
+                    ),
+                    "draft_tokens_proposed": phase_timings.get(
+                        "draft_tokens_proposed"
+                    ),
+                    "draft_tokens_accepted": phase_timings.get(
+                        "draft_tokens_accepted"
+                    ),
+                    "acceptance_rate": phase_timings.get("acceptance_rate"),
+                    "rejected_draft_ratio": phase_timings.get(
+                        "rejected_draft_ratio"
+                    ),
                     "accept_length_list": acceptance_lengths,
-                    "avg_accept_length": (
+                    "avg_accept_length": phase_timings.get(
+                        "avg_accept_length",
                         sum(acceptance_lengths) / len(acceptance_lengths)
-                        if acceptance_lengths else None
+                        if acceptance_lengths else None,
                     ),
                     "measurement_scope": phase_timings.get(
                         "measurement_scope", "decode_only"

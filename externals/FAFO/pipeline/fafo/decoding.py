@@ -19,6 +19,18 @@ FUNC_MAP = {}
 CONFIG_MAP = {}
 
 
+def cap_accepted_tokens(
+    *, current_new_tokens: int, max_hit: int, budget: int | None
+) -> int:
+    """Return the number of candidate tokens allowed by the public budget."""
+
+    proposed = max(0, int(max_hit) + 1)
+    if budget is None or int(budget) <= 0:
+        return proposed
+    remaining = int(budget) - max(0, int(current_new_tokens))
+    return max(0, min(proposed, remaining))
+
+
 def get_device():
     if "LOCAL_RANK" not in CONFIG_MAP:
         return 0
@@ -509,6 +521,16 @@ def jacobi_greedy_search_multilevel(
             
             update_token_map(token_map, lst_token, past_tokens, new_results, prefix_tokens, LEVEL, WINDOW_SIZE, GUESS_SET_SIZE)
 
+            accepted_count = cap_accepted_tokens(
+                current_new_tokens=input_ids.shape[1] - init_len,
+                max_hit=max_hit,
+                budget=n_new_tokens,
+            )
+            if n_new_tokens and accepted_count <= 0:
+                this_peer_finished = True
+                break
+            max_hit = accepted_count - 1
+
 
             if ALWAYS_FWD_ONE:
                 for level in range(len(prefix_tokens) - 1):
@@ -607,7 +629,7 @@ def jacobi_greedy_search_multilevel(
         if stopping_criteria(input_ids, scores):
             this_peer_finished = True
 
-        if n_new_tokens and input_ids.shape[1] - init_len > n_new_tokens:
+        if n_new_tokens and input_ids.shape[1] - init_len >= n_new_tokens:
             this_peer_finished = True
 
         if this_peer_finished:

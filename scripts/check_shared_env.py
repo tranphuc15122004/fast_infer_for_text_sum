@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -69,6 +70,36 @@ DIST_NAMES = {
 }
 OPTIONAL_MODULES = {"flash_attn"}
 
+# The server profile intentionally remains broad.  Modal's canonical
+# LongBench image does not contain unrelated training/serving stacks such as
+# vLLM or SGLang; checking those modules would reject a valid benchmark image
+# before the selected adapters run.
+PROFILE_MODULES = {
+    "server": MODULES,
+    "modal-longbench": (
+        "torch",
+        "transformers",
+        "numpy",
+        "yaml",
+        "safetensors",
+        "tqdm",
+        "accelerate",
+        "datasets",
+        "rouge_score",
+        "sentencepiece",
+        "tokenizers",
+        "flashinfer",
+        "flash_attn",
+        "dflash",
+        "llmlingua",
+        "pipeline.fafo.decoding",
+    ),
+}
+PROFILE_OPTIONAL_MODULES = {
+    "server": OPTIONAL_MODULES,
+    "modal-longbench": set(),
+}
+
 
 def _version(module_name: str, module: object) -> str:
     value = getattr(module, "__version__", None)
@@ -85,7 +116,15 @@ def _version(module_name: str, module: object) -> str:
         return "unknown"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(PROFILE_MODULES),
+        default="server",
+        help="dependency profile to check (default: server)",
+    )
+    args = parser.parse_args(argv)
     cache_root = Path(
         os.environ.get("FAST_INFER_CACHE_ROOT", "/tmp/fast_infer_cache")
     )
@@ -107,23 +146,28 @@ def main() -> int:
     sys.path.insert(0, str(ROOT / "src"))
     sys.path.insert(0, str(ROOT / "externals" / "dflash"))
     sys.path.insert(0, str(ROOT / "externals" / "LLMLingua"))
+    sys.path.insert(0, str(ROOT / "externals" / "FAFO"))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     failures: list[str] = []
     print(f"python: {sys.executable}")
     print(f"version: {sys.version.split()[0]}")
-    print("mode: offline import-only (no model loading; MR-DFlash included)")
+    print(
+        "mode: offline import-only "
+        f"(profile={args.profile}; no model loading)"
+    )
     if sys.version_info[:2] != (3, 12):
         failures.append("Python 3.12 is required")
 
-    for module_name in MODULES:
+    optional_modules = PROFILE_OPTIONAL_MODULES[args.profile]
+    for module_name in PROFILE_MODULES[args.profile]:
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:  # binary imports can fail with varied errors
-            level = "WARN OPTIONAL" if module_name in OPTIONAL_MODULES else "FAIL"
+            level = "WARN OPTIONAL" if module_name in optional_modules else "FAIL"
             print(f"{level} {module_name}: {type(exc).__name__}: {exc}")
-            if module_name not in OPTIONAL_MODULES:
+            if module_name not in optional_modules:
                 failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
         else:
             print(f"PASS {module_name} {_version(module_name, module)}")

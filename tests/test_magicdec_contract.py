@@ -71,3 +71,92 @@ def test_magicdec_token_id_output_rejects_temperature_sampling():
 
     with pytest.raises(ValueError, match="token IDs"):
         module._canonical_next_token(engine_output, temperature=0.7)
+
+
+def test_magicdec_acceptance_summary_reports_mean_tau_and_draft_rate():
+    module = _load_magicdec_script()
+
+    result = module.summarize_magicdec_acceptance([1, 3, 4], gamma=4)
+
+    assert result["avg_accept_length"] == pytest.approx(2.6667)
+    assert result["acceptance_rate"] == pytest.approx(0.4167)
+    assert result["rejected_draft_ratio"] == pytest.approx(0.5833)
+
+
+def test_magicdec_eos_ids_match_upstream_eot_fallback():
+    module = _load_magicdec_script()
+
+    class Tokenizer:
+        eos_token_id = 2
+        unk_token_id = None
+
+        @staticmethod
+        def encode(value, add_special_tokens=False):
+            assert value == "<|eot_id|>"
+            assert add_special_tokens is False
+            return [128009]
+
+    assert module._eos_ids(Tokenizer()) == {2, 128009}
+
+
+def test_magicdec_record_carries_self_spec_acceptance_and_phase_metrics():
+    module = _load_magicdec_script()
+    args = type(
+        "Args",
+        (),
+        {
+            "data_file": "/tmp/gov_report.jsonl",
+            "model_name": "model",
+            "model_pth": "/tmp/model.pth",
+        },
+    )()
+
+    record = module.build_magicdec_record(
+        sample={"id": "s1", "reference": "answer", "raw": {"task_type": "qa"}},
+        args=args,
+        input_tokens=100,
+        output_tokens=8,
+        text="answer",
+        timing={"e2e_ms": 10.0},
+        config={"self_spec": True},
+        acceptance_lengths=[1, 3],
+        speculative_metrics={
+            "acceptance_rate": 0.25,
+            "draft_latency_ms": 2.0,
+            "verification_latency_ms": 4.0,
+            "rejected_draft_ratio": 0.75,
+        },
+    )
+
+    assert record["acceptance_lengths"] == [1, 3]
+    assert record["avg_accept_length"] == pytest.approx(2.0)
+    assert record["acceptance_rate"] == pytest.approx(0.25)
+    assert record["draft_latency_ms"] == pytest.approx(2.0)
+    assert record["verification_latency_ms"] == pytest.approx(4.0)
+
+
+def test_longbench_magicdec_command_can_enable_self_spec(tmp_path):
+    from common.longbench_adapter import build_adapter_command
+
+    command = build_adapter_command(
+        "magicdec",
+        config={
+            "python": "python3",
+            "magicdec_model_pth": "/tmp/model.pth",
+            "magicdec_model_name": "model",
+            "magicdec_self_spec": True,
+            "magicdec_gamma": 3,
+            "magicdec_draft_budget": 257,
+            "magicdec_window_size": 128,
+        },
+        data_file=tmp_path / "gov_report.jsonl",
+        output=tmp_path / "out.jsonl",
+        mode="full",
+        max_samples=1,
+        max_new_tokens=8,
+    )
+
+    assert command is not None
+    assert "--self-spec" in command
+    assert command[command.index("--gamma") + 1] == "3"
+    assert command[command.index("--draft-budget") + 1] == "257"

@@ -882,6 +882,27 @@ def test_longbench_selects_vanilla_fa_then_hf_as_external_reference(tmp_path):
     ) == vanilla_fa
 
 
+def test_longbench_does_not_use_degenerate_vanilla_fa_as_reference(tmp_path):
+    from run_longbench_200 import _select_external_reference
+
+    vanilla_hf = tmp_path / "vanilla_hf" / "gov_report.jsonl"
+    vanilla_fa = tmp_path / "vanilla_fa" / "gov_report.jsonl"
+    vanilla_hf.parent.mkdir()
+    vanilla_fa.parent.mkdir()
+    vanilla_hf.write_text(
+        '{"sample_id":"x","text":"normal output"}\n',
+        encoding="utf-8",
+    )
+    vanilla_fa.write_text(
+        '{"sample_id":"x","output_quality_guard":{"degenerate_repetition":true}}\n',
+        encoding="utf-8",
+    )
+
+    assert _select_external_reference(
+        tmp_path, "gov_report", ["vanilla_hf", "vanilla_fa"]
+    ) == vanilla_hf
+
+
 def test_longbench_joins_external_reference_metrics_by_sample_id(tmp_path):
     from run_longbench_200 import _attach_external_reference_metrics
 
@@ -963,6 +984,7 @@ def test_orchestrator_smoke_preflight_writes_manifest_without_loading_model(tmp_
             "--mode",
             "smoke",
             "--preflight-only",
+            "--no-strict",
             "--baselines",
             "vanilla_hf",
             "--datasets",
@@ -984,6 +1006,43 @@ def test_orchestrator_smoke_preflight_writes_manifest_without_loading_model(tmp_
     assert manifest["preflight_only"] is True
     # Preflight-only runs must not attempt metric aggregation.
     assert manifest["aggregate"]["status"] == "skipped"
+
+
+def test_strict_preflight_fails_missing_artifact(tmp_path, monkeypatch):
+    import run_longbench_200 as runner
+
+    monkeypatch.setattr(
+        runner,
+        "preflight_baseline",
+        lambda baseline, config=None, cuda_available=True: {
+            "status": "missing_checkpoint",
+            "reason": "path not found: /mnt/fast-infer/checkpoints/missing.pth",
+        },
+    )
+
+    result = runner.main(
+        [
+            "--mode",
+            "smoke",
+            "--preflight-only",
+            "--strict",
+            "--baselines",
+            "vanilla_hf",
+            "--datasets",
+            "lcc",
+            "--data-dir",
+            str(ROOT / "data" / "longbench_100_14k"),
+            "--max-samples",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 1
+    manifest = json.loads(next(tmp_path.glob("*/run_manifest.json")).read_text())
+    assert manifest["failure_count"] == 1
+    assert manifest["cells"][0]["status"] == "missing_checkpoint"
 
 
 def test_run_collector_forwards_strict_completeness(monkeypatch):
@@ -1450,6 +1509,36 @@ def test_vram_planner_packs_within_budget_and_backs_off_when_busy():
     assert len(few) == 2
 
 
+def test_vram_planner_equal_gpu_slots_uses_common_capacity():
+    import run_longbench_200 as runner
+
+    usage = {
+        0: {"total_gb": 180.0, "free_gb": 175.0, "used_gb": 5.0},
+        1: {"total_gb": 180.0, "free_gb": 135.0, "used_gb": 45.0},
+    }
+    slots, plan = runner.plan_shard_slots(
+        [[0], [1]],
+        processes_per_gpu=4,
+        usable_gb=160.0,
+        child_gb=40.0,
+        sample_count=10,
+        usage=usage,
+        equal_gpu_slots=True,
+    )
+
+    assert len(slots) == 4
+    assert plan["equal_gpu_slots"] is True
+    assert plan["processes_per_gpu_planned"] == 2
+    assert [entry["planned_processes"] for entry in plan["groups"]] == [2, 2]
+
+
+def test_equal_gpu_slots_cli_flag_defaults_off_and_can_be_enabled():
+    import run_longbench_200 as runner
+
+    assert runner._parser().parse_args([]).equal_gpu_slots is False
+    assert runner._parser().parse_args(["--equal-gpu-slots"]).equal_gpu_slots is True
+
+
 def test_cell_blocks_without_launching_when_card_is_full(tmp_path, monkeypatch):
     import run_longbench_200 as runner
 
@@ -1804,6 +1893,7 @@ def test_main_data_parallel_wiring_records_shards_in_manifest(tmp_path, monkeypa
     assert manifest["dp_gpu_groups"] == [[0], [1]]
     assert manifest["dp_gpus_per_shard"] == 1
     assert manifest["dp_processes_per_gpu"] == 1
+    assert manifest["equal_gpu_slots"] is False
     assert manifest["vram"] == {
         "budget_gb": 170.0,
         "headroom_gb": 10.0,
@@ -1811,6 +1901,7 @@ def test_main_data_parallel_wiring_records_shards_in_manifest(tmp_path, monkeypa
         "child_reserve_gb": 40.0,
         "wait_seconds": 600,
         "oom_retries": 1,
+        "equal_gpu_slots": False,
     }
     assert manifest["failure_count"] == 0
 

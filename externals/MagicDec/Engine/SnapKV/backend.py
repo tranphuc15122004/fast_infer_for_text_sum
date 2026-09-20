@@ -241,14 +241,16 @@ class LMBackend:
         seq_len = input_ids.shape[1]
         chunk_size = 128
         num_chunks = (seq_len + chunk_size - 1) // chunk_size  # Ceil division
-        is_last = False
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, seq_len)
             chunk_input_ids = input_ids[:, start_idx:end_idx]
             dec_len = end_idx-start_idx
-            if dec_len != chunk_size:
-                is_last = True
+            # The self-spec branch must build its compressed draft KV cache on
+            # the final prefill chunk even when the prompt length is exactly
+            # divisible by 128.  The old ``dec_len != chunk_size`` condition
+            # left that cache empty for such prompts.
+            is_last = i == num_chunks - 1
             self.pre_encode(dec_len=dec_len)                
             # if not benchmark:
             if self.is_spec and is_last:

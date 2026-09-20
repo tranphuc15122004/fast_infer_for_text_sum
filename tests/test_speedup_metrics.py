@@ -44,6 +44,30 @@ def test_aggregate_speedup_uses_ratio_of_mean_timings():
     assert result["ttft_speedup"] == pytest.approx(1.7308)
 
 
+def test_speedup_pair_coverage_reports_valid_ratio_by_metric():
+    coverage = metrics.speedup_pair_coverage(
+        [
+            {
+                "e2e_ms": 80.0,
+                "dense_e2e_ms": 160.0,
+                "decode_ms": None,
+                "dense_decode_ms": 60.0,
+                "speedup_valid": True,
+            },
+            {
+                "e2e_ms": 90.0,
+                "dense_e2e_ms": None,
+                "decode_ms": None,
+                "dense_decode_ms": None,
+                "speedup_valid": False,
+            },
+        ]
+    )
+
+    assert coverage["esr"] == {"available": True, "valid": 1, "total": 2, "ratio": 0.5}
+    assert coverage["dsr"]["available"] is False
+
+
 def test_normalize_record_exposes_dense_reference_timing_aliases():
     row = collect_metrics.normalize_record(
         {
@@ -81,6 +105,15 @@ def test_compute_group_reports_speedups_only_for_paired_timing_fields():
 
     assert paired["speedup"] == {"esr": 2.0, "dsr": 2.0}
     assert "speedup" not in unpaired
+
+
+def test_compute_group_includes_speedup_pair_coverage():
+    group = collect_metrics.compute_group(
+        [{"e2e_ms": 80.0, "dense_e2e_ms": 160.0, "speedup_valid": True}],
+        {},
+    )
+
+    assert group["speedup_coverage"]["esr"]["ratio"] == 1.0
 
 
 def test_compute_group_preserves_external_speedup_scope():
@@ -139,6 +172,10 @@ def test_reports_include_speedup_columns(tmp_path):
                     "num_records": 1,
                     "num_reference_joined": 1,
                     "speedup": {"esr": 2.0, "dsr": 1.5},
+                    "speedup_coverage": {
+                        "esr": {"available": True, "valid": 1, "total": 1, "ratio": 1.0},
+                        "dsr": {"available": True, "valid": 1, "total": 1, "ratio": 1.0},
+                    },
                 }
             }
         },
@@ -146,7 +183,11 @@ def test_reports_include_speedup_columns(tmp_path):
             "method": {
                 "num_records": 1,
                 "num_reference_joined": 1,
-                "speedup": {"esr": 2.0, "dsr": 1.5},
+                    "speedup": {"esr": 2.0, "dsr": 1.5},
+                    "speedup_coverage": {
+                        "esr": {"available": True, "valid": 1, "total": 1, "ratio": 1.0},
+                        "dsr": {"available": True, "valid": 1, "total": 1, "ratio": 1.0},
+                    },
             }
         },
     }
@@ -159,8 +200,10 @@ def test_reports_include_speedup_columns(tmp_path):
     csv_text = csv_path.read_text(encoding="utf-8")
     md_text = md_path.read_text(encoding="utf-8")
     assert "esr_ratio" in csv_text
+    assert "esr_pair_ratio" in csv_text
     assert "2.0000" in csv_text
     assert "Speedup so với dense/reference" in md_text
+    assert "ESR pairs" in md_text
 
 
 def test_llmlingua_dense_reference_guard_checks_prompt_and_generation_length():

@@ -36,16 +36,21 @@ bash scripts/run.sh fafo --smoke
 - Eval upstream GSM8K thêm prompt few-shot và trả timing/log aggregate; adapter
   chỉ dùng prompt đầu vào của workspace làm một câu hỏi smoke, không sửa file
   dataset/config vendored.
-- Khi chỉ chạy một mẫu, adapter tự thêm một mẫu ẩn để loại thời gian
-  `torch.compile`/FlexAttention của lần đầu; thời gian báo cáo lấy từ mẫu thật.
-  Smoke dùng chung budget 8 output token với Vanilla. Không so sánh speedup
-  nếu hai record có số output token khác nhau.
+- Adapter luôn thêm một mẫu ẩn trước tập đo để loại thời gian
+  `torch.compile`/FlexAttention của lần đầu; mẫu này không xuất hiện trong
+  output benchmark. Smoke dùng chung budget 8 output token với Vanilla. Không
+  so sánh speedup nếu hai record có số output token khác nhau.
 - Timing upstream đã đồng bộ CUDA trước và sau `generate`; vì vậy throughput là
   thời gian thực thi trên GPU thay vì chỉ là thời gian enqueue phía host.
 - Khi chạy qua `scripts/infer_fafo.py`, adapter đặt `FAFO_STATS_FILE` để upstream
-  ghi sidecar per-sample sau bước clamp `max_new_tokens`. Sidecar bổ sung
-  `sample_id`, input/output tokens, text, E2E ms, throughput, peak memory và
-  ROUGE/BLEU nếu có reference. `OVERALL GEN` chỉ được giữ ở
-  `lookahead_tokens`, không được dùng làm output token công khai.
+  ghi sidecar per-sample sau bước clamp `max_new_tokens`. Thiếu hoặc lệch
+  sidecar là lỗi cứng. Sidecar bổ sung `sample_id`, input/output tokens, text,
+  E2E ms, throughput, peak memory và ROUGE/BLEU nếu có reference.
+  `OVERALL GEN` chỉ được giữ ở `lookahead_tokens`, không được dùng làm output
+  token công khai.
 - FAFO hiện vẫn chưa tách được prefill/TTFT khỏi `generate`; các record mới ghi
-  rõ `measurement_scope=e2e_only` thay vì nội suy metric thiếu.
+  rõ `measurement_scope=e2e_only` thay vì nội suy metric thiếu; `decode_ms`,
+  `tpot_ms` và decode throughput phải để `null`. Model-load, input/retained/
+  output tokens, batch/device, E2E, throughput và peak memory vẫn được ghi
+  trực tiếp ở sidecar; model-load là process-level telemetry và không cộng vào
+  E2E của sample.

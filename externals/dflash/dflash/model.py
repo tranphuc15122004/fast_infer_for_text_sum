@@ -101,6 +101,8 @@ def dflash_generate(
 
     decode_start = _cuda_time() if return_stats else None
     acceptance_lengths = []
+    draft_events = []
+    verification_events = []
     start = num_input_tokens
     draft_prefill = True
 
@@ -108,6 +110,11 @@ def dflash_generate(
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
+            draft_start_event = (
+                torch.cuda.Event(enable_timing=True) if return_stats else None
+            )
+            if draft_start_event is not None:
+                draft_start_event.record()
             noise_embedding = target.model.embed_tokens(block_output_ids)
             draft_logits = target.lm_head(model(
                 target_hidden=target_hidden,
@@ -119,10 +126,19 @@ def dflash_generate(
             )[:, 1 - block_size :, :])
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
+            if draft_start_event is not None:
+                draft_end_event = torch.cuda.Event(enable_timing=True)
+                draft_end_event.record()
+                draft_events.append((draft_start_event, draft_end_event))
             if draft_prefill and return_stats:
                 draft_prefill = False
                 decode_start = _cuda_time()
 
+        verification_start_event = (
+            torch.cuda.Event(enable_timing=True) if return_stats else None
+        )
+        if verification_start_event is not None:
+            verification_start_event.record()
         output = target(
             block_output_ids,
             position_ids=block_position_ids,
@@ -133,6 +149,12 @@ def dflash_generate(
 
         posterior = sample(output.logits, temperature)
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        if verification_start_event is not None:
+            verification_end_event = torch.cuda.Event(enable_timing=True)
+            verification_end_event.record()
+            verification_events.append(
+                (verification_start_event, verification_end_event)
+            )
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
@@ -159,6 +181,12 @@ def dflash_generate(
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = _cuda_time() - decode_start
+    def _event_total_ms(events):
+        return round(sum(start.elapsed_time(end) for start, end in events), 3)
+
+    proposed = sum(max(int(block_size) - 1, 0) for _ in acceptance_lengths)
+    accepted = sum(max(int(length) - 1, 0) for length in acceptance_lengths)
+    acceptance_rate = accepted / proposed if proposed else None
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=num_input_tokens,
@@ -166,6 +194,18 @@ def dflash_generate(
         time_to_first_token=time_to_first_token,
         time_per_output_token=total_decode_time / num_output_tokens,
         acceptance_lengths=acceptance_lengths,
+        draft_latency_ms=_event_total_ms(draft_events),
+        verification_latency_ms=_event_total_ms(verification_events),
+        draft_tokens_proposed=proposed,
+        draft_tokens_accepted=accepted,
+        acceptance_rate=round(acceptance_rate, 4)
+        if acceptance_rate is not None else None,
+        rejected_draft_ratio=round(1.0 - acceptance_rate, 4)
+        if acceptance_rate is not None else None,
+        avg_accept_length=(
+            round(sum(acceptance_lengths) / len(acceptance_lengths), 4)
+            if acceptance_lengths else None
+        ),
     )
 
 

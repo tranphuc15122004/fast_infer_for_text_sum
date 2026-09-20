@@ -222,15 +222,23 @@ def get_model_answers(
             {
                 "sample_index": question_idx,
                 "input_tokens": input_len,
+                "device": (
+                    str(torch.cuda.current_device())
+                    if torch.cuda.is_available() else "cpu"
+                ),
+                "gpu_name": (
+                    torch.cuda.get_device_name()
+                    if torch.cuda.is_available() else None
+                ),
                 "output_tokens": int(tokens),
                 "e2e_ms": round(gap_time * 1000.0, 3),
-                "decode_ms": round(gap_time * 1000.0, 3),
                 "text": output,
                 "measurement_scope": "e2e_only",
                 "peak_memory_gb": (
                     round(torch.cuda.max_memory_allocated() / (1024**3), 6)
                     if torch.cuda.is_available() else None
                 ),
+                "model_load_ms": pipeline_config.get("_model_load_ms"),
             }
         )
 
@@ -266,8 +274,15 @@ def eval_gsm8k(config):
 
     # Load data
     questions = load_gsm8k(eval_config['dataset_path'])
-    # Load model
+    # Load model.  Keep this process-level measurement separate from request
+    # E2E: FAFO's upstream evaluator does not expose a per-phase timer.
+    model_load_start = time.perf_counter()
     model, tokenizer = load_model(pipeline_config=pipeline_config)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    pipeline_config["_model_load_ms"] = round(
+        (time.perf_counter() - model_load_start) * 1000.0, 3
+    )
     model.tokenizer = tokenizer
 
     processed_result, raw_result = run_eval(
