@@ -156,6 +156,26 @@ def _select_external_reference(
     return None
 
 
+def _select_external_reference_bundle(
+    run_dir: Path, baselines: Sequence[str]
+) -> Path | None:
+    """Select a completed dense-reference bundle for a baseline-first run."""
+
+    seen: set[str] = set()
+    for baseline in baselines:
+        if baseline in EXTERNAL_REFERENCE_BASELINES or baseline in seen:
+            continue
+        seen.add(baseline)
+        candidate = run_dir / baseline / "_bundle.jsonl"
+        if (
+            candidate.is_file()
+            and candidate.stat().st_size > 0
+            and _reference_quality_error(candidate) is None
+        ):
+            return candidate
+    return None
+
+
 def _attach_external_reference_metrics(
     path: Path,
     reference_path: Path,
@@ -445,6 +465,156 @@ def _load_selected(
             ) from exc
     normalized = [normalize(row, i) for i, row in enumerate(selected)]
     return selected, normalized
+
+
+def _bundle_longbench_records(
+    payloads: Sequence[
+        tuple[
+            str,
+            Sequence[Mapping[str, Any]],
+            Sequence[Mapping[str, Any]],
+        ]
+    ],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    """Concatenate dataset inputs in deterministic dataset-first order.
+
+    A full baseline run uses one child process per data-parallel shard.  The
+    child receives this bundle, so it loads the model once and then consumes
+    all selected datasets in order.  Sample IDs in the canonical LongBench
+    profile are dataset-qualified; reject duplicates instead of allowing a
+    split result to be assigned to the wrong dataset.
+    """
+
+    source_rows: list[dict[str, Any]] = []
+    normalized_rows: list[dict[str, Any]] = []
+    sample_to_dataset: dict[str, str] = {}
+    for dataset, source, normalized in payloads:
+        if len(source) != len(normalized):
+            raise ValueError(
+                f"{dataset}: source/normalized row count mismatch "
+                f"({len(source)} != {len(normalized)})"
+            )
+        for source_row, normalized_row in zip(source, normalized):
+            sample_id = normalized_row.get("id", source_row.get("id"))
+            if sample_id is None:
+                raise ValueError(f"{dataset}: sample is missing id")
+            key = str(sample_id)
+            if key in sample_to_dataset:
+                raise ValueError(f"duplicate sample_id in baseline bundle: {key}")
+            sample_to_dataset[key] = dataset
+            source_rows.append(dict(source_row))
+            normalized_rows.append(dict(normalized_row))
+    return source_rows, normalized_rows, sample_to_dataset
+
+
+def _split_bundle_sample_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    sample_to_dataset: Mapping[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Split bundled sample records back into canonical dataset cells."""
+
+    split: dict[str, list[dict[str, Any]]] = {
+        dataset: [] for dataset in dict.fromkeys(sample_to_dataset.values())
+    }
+    for row in rows:
+        if row.get("type") == "summary":
+            continue
+        sample_id = row.get("sample_id")
+        if sample_id is None:
+            raise ValueError("bundled output contains a sample row without sample_id")
+        dataset = sample_to_dataset.get(str(sample_id))
+        if dataset is None:
+            raise ValueError(f"bundled output contains unknown sample_id: {sample_id}")
+        output_row = dict(row)
+        output_row["dataset"] = dataset
+        split.setdefault(dataset, []).append(output_row)
+    return split
+
+
+def _materialize_bundle_outputs(
+    bundle_output: Path,
+    *,
+    output_paths: Mapping[str, Path],
+    sample_to_dataset: Mapping[str, str],
+    sample_order: Mapping[str, int],
+    baseline: str,
+    run_id: str,
+    data_parallel: bool,
+    processes_per_gpu: int,
+) -> dict[str, int]:
+    """Write one canonical ``<baseline>/<dataset>.jsonl`` per bundle slice."""
+
+    rows = [
+        json.loads(line)
+        for line in bundle_output.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    bundle_summary = next(
+        (row for row in rows if row.get("type") == "summary"), None
+    )
+    split = _split_bundle_sample_rows(rows, sample_to_dataset=sample_to_dataset)
+    counts: dict[str, int] = {}
+    rendered: dict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+    for dataset, output_path in output_paths.items():
+        sample_rows = sorted(
+            split.get(dataset, []),
+            key=lambda row: sample_order.get(str(row.get("sample_id")), len(sample_order)),
+        )
+        for row in sample_rows:
+            row["method"] = baseline
+            row["dataset"] = dataset
+            row["run_id"] = run_id
+        totals: dict[str, float] = {}
+        for field in (
+            "output_tokens",
+            "prefill_ms",
+            "ttft_ms",
+            "decode_ms",
+            "e2e_ms",
+        ):
+            values = [
+                float(row[field])
+                for row in sample_rows
+                if isinstance(row.get(field), (int, float))
+                and not isinstance(row.get(field), bool)
+            ]
+            if values:
+                totals[f"total_{field}"] = round(sum(values), 3)
+        summary: dict[str, Any] = {
+            "type": "summary",
+            "method": baseline,
+            "dataset": dataset,
+            "run_id": run_id,
+            "num_records": len(sample_rows),
+            "num_samples": len(sample_rows),
+            "num_aggregate_records": 0,
+            "baseline_bundle": True,
+            "bundle_source": str(bundle_output),
+            "bundle_sample_count": len(sample_to_dataset),
+            "data_parallel": bool(data_parallel),
+            **totals,
+        }
+        if int(processes_per_gpu) > 1:
+            summary["processes_per_gpu"] = int(processes_per_gpu)
+            summary["measurement_note"] = (
+                "shared_gpu: multiple batch-1 processes ran on the same card; "
+                "per-sample latency/throughput are not comparable with "
+                "one-process-per-card runs"
+            )
+        if bundle_summary is not None:
+            summary["bundle_summary"] = bundle_summary
+        rendered[dataset] = (sample_rows, summary)
+        counts[dataset] = len(sample_rows)
+
+    for dataset, output_path in output_paths.items():
+        sample_rows, summary = rendered[dataset]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            for row in sample_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    return counts
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -1826,6 +1996,372 @@ def _normalize_child_output(
     return observations
 
 
+def _run_baseline_bundle(
+    *,
+    baseline: str,
+    datasets: Sequence[str],
+    dataset_payloads: Mapping[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    run_dir: Path,
+    baselines: Sequence[str],
+    model: str | None,
+    cuda_available: bool,
+    data_parallel: bool,
+    gpu_groups: Sequence[Sequence[int]],
+    processes_per_gpu: int,
+    vram: Mapping[str, Any],
+    equal_gpu_slots: bool,
+    timeout_seconds: int,
+    run_id: str,
+    max_new_tokens: int,
+    temperature: float,
+    warmup_runs: int,
+    max_input_tokens: int,
+    seed: int,
+    smoke: bool,
+    strict: bool,
+    allow_unsupported: bool,
+    preflight_only: bool,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Run one baseline over all datasets in one model-owning bundle.
+
+    The bundled child input is ordered dataset-first.  Data-parallel mode then
+    partitions that single ordered stream across the requested GPU slots.  A
+    child therefore loads the target/draft model once and serves records from
+    all five datasets before exiting; the merged output is split back into the
+    normal per-dataset artifacts consumed by the collector.
+    """
+
+    payloads = [
+        (dataset, *dataset_payloads[dataset]) for dataset in datasets
+    ]
+    source_rows, normalized, sample_to_dataset = _bundle_longbench_records(payloads)
+    sample_order = {
+        str(row["id"]): index for index, row in enumerate(normalized)
+    }
+    bundle_name = f"bundle_{baseline}"
+    bundle_output = run_dir / baseline / "_bundle.jsonl"
+    bundle_input = run_dir / "inputs" / f"{baseline}_bundle.jsonl"
+    bundle_converted = run_dir / "inputs" / f"{baseline}_bundle_converted.jsonl"
+    output_paths = {
+        dataset: run_dir / baseline / f"{dataset}.jsonl"
+        for dataset in datasets
+    }
+
+    cfg = baseline_config_from_env(baseline)
+    cfg.update(
+        model=model or cfg.get("model"),
+        device=os.environ.get("LONG_BENCH_DEVICE", cfg.get("device", "cuda")),
+        temperature=temperature,
+        warmup_runs=warmup_runs,
+        max_input_tokens=max_input_tokens,
+        seed=seed,
+        smoke=smoke,
+        max_new_tokens=max_new_tokens,
+    )
+    external_reference_path = (
+        _select_external_reference_bundle(run_dir, baselines)
+        if baseline in EXTERNAL_REFERENCE_BASELINES
+        else None
+    )
+    external_reference_baseline = (
+        external_reference_path.parent.name
+        if external_reference_path is not None
+        else None
+    )
+    cfg["skip_reference"] = external_reference_path is not None
+    check = preflight_baseline(
+        baseline,
+        config=cfg,
+        cuda_available=cuda_available,
+    )
+
+    def _base_cell(dataset: str) -> dict[str, Any]:
+        cell: dict[str, Any] = {
+            "baseline": baseline,
+            "dataset": dataset,
+            "sample_count": len(dataset_payloads[dataset][1]),
+            "preflight": check,
+            "output": str(output_paths[dataset]),
+            "execution_order": "baseline_then_dataset",
+            "baseline_bundle": True,
+            "bundle_output": str(bundle_output),
+            "model_reused_across_datasets": True,
+        }
+        if external_reference_path is not None:
+            cell.update(
+                external_reference=(
+                    str(run_dir / external_reference_baseline / f"{dataset}.jsonl")
+                ),
+                external_reference_baseline=external_reference_baseline,
+                speedup_scope="external_reference",
+            )
+        return cell
+
+    cells: list[dict[str, Any]] = []
+    if preflight_only or check["status"] not in {"ready", "aggregate_only"}:
+        status = (
+            check["status"] if check["status"] != "ready" else "preflight_only"
+        )
+        reason = check["reason"] or (
+            "preflight completed; inference was not requested"
+            if preflight_only
+            else "baseline preflight did not pass"
+        )
+        failed = status not in {"preflight_only", "aggregate_only"}
+        for dataset in datasets:
+            output_path = output_paths[dataset]
+            records = dataset_payloads[dataset][1]
+            _write_status_file(
+                output_path,
+                baseline=baseline,
+                dataset=dataset,
+                records=records,
+                status=status,
+                reason=reason,
+                model=cfg.get("model"),
+                config=cfg,
+                run_id=run_id,
+            )
+            cell = _base_cell(dataset)
+            cell.update(status=status, reason=reason, returncode=1 if failed else 0)
+            cell.update(
+                _audit_cell_output(
+                    output_path,
+                    baseline=baseline,
+                    dataset=dataset,
+                    run_dir=run_dir,
+                    expected_output_tokens=max_new_tokens,
+                    expected_samples=len(records),
+                )
+            )
+            cells.append(cell)
+        return (len(datasets) if failed and strict and not allow_unsupported else 0), cells
+
+    _write_jsonl(bundle_input, source_rows)
+    if data_parallel:
+        child = _run_data_parallel_cell(
+            baseline=baseline,
+            dataset=bundle_name,
+            source_rows=source_rows,
+            normalized=normalized,
+            run_dir=run_dir,
+            output_path=bundle_output,
+            cfg=cfg,
+            gpu_groups=gpu_groups,
+            timeout_seconds=timeout_seconds,
+            run_id=run_id,
+            processes_per_gpu=processes_per_gpu,
+            vram=vram,
+            equal_gpu_slots=equal_gpu_slots,
+        )
+    else:
+        converted_input = convert_records_for_baseline(
+            baseline, normalized, bundle_converted
+        )
+        command = build_adapter_command(
+            baseline,
+            data_file=bundle_input,
+            converted_input=converted_input,
+            output=bundle_output,
+            max_samples=len(normalized),
+            max_new_tokens=max_new_tokens,
+            config=cfg,
+        )
+        if command is None:
+            child = {
+                "status": "unsupported_dataset",
+                "returncode": 1,
+                "reason": "adapter did not produce a command for baseline bundle",
+                "elapsed_ms": 0.0,
+                "output_exists": False,
+                "log": "",
+                "command": [],
+            }
+        else:
+            live_log = run_dir / "logs" / f"{baseline}_bundle.log"
+            print(
+                f"[{baseline}] launching one bundled process over "
+                f"{len(datasets)} dataset(s), {len(normalized)} sample(s)\n"
+                f"[{baseline}] live log: {live_log}",
+                flush=True,
+            )
+            child = _run_child(
+                command,
+                output=bundle_output,
+                log_path=live_log,
+                timeout_seconds=timeout_seconds,
+            )
+            if child["status"] == "success":
+                child["normalized_records"] = _normalize_child_output(
+                    bundle_output,
+                    baseline=baseline,
+                    dataset=bundle_name,
+                    source_records=normalized,
+                    config=cfg,
+                    run_id=run_id,
+                )
+
+    if child["status"] == "success":
+        if int(child.get("normalized_records") or 0) == 0:
+            child["status"] = "failed"
+            child["reason"] = "bundled child wrote no sample records"
+        elif external_reference_path is not None:
+            attached = _attach_external_reference_metrics(
+                bundle_output,
+                external_reference_path,
+                reference_baseline=str(external_reference_baseline),
+            )
+            child["external_reference_records"] = attached
+            if attached == 0:
+                child["external_reference_warning"] = (
+                    "no sample_id matched the selected Vanilla reference bundle"
+                )
+
+    materialized_counts: dict[str, int] = {}
+    if child["status"] == "success":
+        try:
+            materialized_counts = _materialize_bundle_outputs(
+                bundle_output,
+                output_paths=output_paths,
+                sample_to_dataset=sample_to_dataset,
+                sample_order=sample_order,
+                baseline=baseline,
+                run_id=run_id,
+                data_parallel=data_parallel,
+                processes_per_gpu=processes_per_gpu,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            child["status"] = "failed"
+            child["reason"] = f"could not split baseline bundle: {exc}"
+
+    failures = 0
+    for dataset in datasets:
+        output_path = output_paths[dataset]
+        expected = len(dataset_payloads[dataset][1])
+        cell = _base_cell(dataset)
+        cell.update(
+            bundle_status=child["status"],
+            bundle_elapsed_ms=child.get("elapsed_ms"),
+            bundle_shard_count=child.get("shard_count"),
+        )
+        if child["status"] == "success" and materialized_counts.get(dataset) != expected:
+            cell_status = "failed"
+            cell_reason = (
+                f"bundle split produced {materialized_counts.get(dataset, 0)}/"
+                f"{expected} samples"
+            )
+        else:
+            cell_status = child["status"]
+            cell_reason = child.get("reason")
+        if cell_status != "success" and not output_path.is_file():
+            _write_status_file(
+                output_path,
+                baseline=baseline,
+                dataset=dataset,
+                records=dataset_payloads[dataset][1],
+                status=cell_status,
+                reason=cell_reason or "bundled child process failed",
+                model=cfg.get("model"),
+                config=cfg,
+                run_id=run_id,
+            )
+        cell.update(status=cell_status, reason=cell_reason, returncode=child.get("returncode"))
+        audit_result = _audit_cell_output(
+            output_path,
+            baseline=baseline,
+            dataset=dataset,
+            run_dir=run_dir,
+            expected_output_tokens=max_new_tokens,
+            expected_samples=expected,
+        )
+        cell.update(audit_result)
+        contract = audit_result.get("metric_contract") or {}
+        if (
+            cell["status"] == "success"
+            and strict
+            and not allow_unsupported
+            and contract.get("status") != "complete"
+        ):
+            cell.update(
+                status="metric_incomplete",
+                reason=(
+                    "metric contract failed: "
+                    f"{contract.get('issue_counts', {})}"
+                ),
+            )
+        if cell["status"] != "success":
+            failures += 1
+        cells.append(cell)
+        print(
+            f"[{baseline}/{dataset}] {cell['status']} "
+            f"(bundled baseline; {child.get('elapsed_ms', 0.0)} ms)",
+            flush=True,
+        )
+    return failures, cells
+
+
+def _finish_run(
+    *,
+    manifest: dict[str, Any],
+    run_dir: Path,
+    data_dir: Path,
+    baselines: Sequence[str],
+    datasets: Sequence[str],
+    sample_count: int,
+    args: argparse.Namespace,
+    failures: int,
+    timeout_seconds: int,
+) -> int:
+    """Finalize the manifest and optionally collect canonical metrics."""
+
+    manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    manifest["failure_count"] = failures
+    manifest["cell_count"] = len(manifest["cells"])
+    clean_cells = bool(manifest["cells"]) and all(
+        cell.get("status") == "success" for cell in manifest["cells"]
+    )
+    if args.collect and not args.preflight_only:
+        aggregate = _run_collector(
+            run_dir,
+            data_dir,
+            baselines=baselines,
+            datasets=datasets,
+            expected_samples=sample_count,
+            strict=bool(args.strict) and clean_cells,
+            timeout_seconds=timeout_seconds,
+        )
+        if aggregate["status"] == "success":
+            print(
+                "[aggregate] metrics_summary.{json,csv,md} written to "
+                f"{run_dir}",
+                flush=True,
+            )
+        else:
+            print(
+                "[aggregate] collector failed "
+                f"(exit {aggregate.get('returncode')}); see {aggregate['log']}",
+                file=sys.stderr,
+                flush=True,
+            )
+    elif args.preflight_only:
+        aggregate = {
+            "status": "skipped",
+            "reason": "preflight-only run has no inference records to aggregate",
+        }
+    else:
+        aggregate = {
+            "status": "skipped",
+            "reason": "metric collection disabled with --no-collect",
+        }
+    manifest["aggregate"] = aggregate
+    _write_json(run_dir / "run_manifest.json", manifest)
+    print(f"Run manifest: {run_dir / 'run_manifest.json'}", flush=True)
+    strict_aggregate_failed = (
+        aggregate.get("status") == "failed" and bool(aggregate.get("strict"))
+    )
+    return 1 if (failures or strict_aggregate_failed) else 0
+
+
 # ---------------------------------------------------------------------------
 # GPU selection & inventory helpers
 # ---------------------------------------------------------------------------
@@ -2152,6 +2688,15 @@ def _parser() -> argparse.ArgumentParser:
         "non-comparable (default: LONG_BENCH_DP_PROCESSES_PER_GPU or 1)",
     )
     parser.add_argument(
+        "--reuse-model-per-baseline",
+        dest="reuse_model_per_baseline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="in full mode, bundle all selected datasets for each baseline so "
+        "each data-parallel child loads its model once; default on for full "
+        "and off for smoke/representative",
+    )
+    parser.add_argument(
         "--equal-gpu-slots",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("LONG_BENCH_EQUAL_GPU_SLOTS", "0") == "1",
@@ -2282,6 +2827,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.dp_processes_per_gpu
         if args.dp_processes_per_gpu is not None
         else _env_int("LONG_BENCH_DP_PROCESSES_PER_GPU", 1)
+    )
+    reuse_model_per_baseline = (
+        args.reuse_model_per_baseline
+        if args.reuse_model_per_baseline is not None
+        else args.mode == "full"
     )
     if vram_budget_gb < 0:
         raise SystemExit("--vram-budget-gb must be >= 0 (0 disables planning)")
@@ -2539,6 +3089,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dp_requested": bool(parallel_requested),
         "dp_gpus_per_shard": dp_gpus_per_shard if dp_enabled else 1,
         "dp_processes_per_gpu": processes_per_gpu if dp_enabled else 1,
+        "reuse_model_per_baseline": bool(reuse_model_per_baseline),
+        "execution_order": (
+            "baseline_then_dataset"
+            if reuse_model_per_baseline
+            else "dataset_then_baseline"
+        ),
         "equal_gpu_slots": bool(args.equal_gpu_slots) if dp_enabled else False,
         "dp_world_size": len(dp_groups) if dp_enabled else 1,
         "dp_gpu_groups": [list(group) for group in dp_groups] if dp_enabled else [],
@@ -2561,6 +3117,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"Run manifest (live): {run_dir / 'run_manifest.json'}",
         flush=True,
     )
+
+    if reuse_model_per_baseline:
+        dataset_payloads: dict[
+            str, tuple[list[dict[str, Any]], list[dict[str, Any]]]
+        ] = {}
+        for dataset in datasets:
+            source_rows, normalized = _load_selected(
+                data_dir, dataset, sample_count, seed=seed
+            )
+            dataset_payloads[dataset] = (source_rows, normalized)
+            _write_jsonl(run_dir / "inputs" / f"{dataset}.jsonl", source_rows)
+
+        failures = 0
+        for baseline in baselines:
+            baseline_failures, cells = _run_baseline_bundle(
+                baseline=baseline,
+                datasets=datasets,
+                dataset_payloads=dataset_payloads,
+                run_dir=run_dir,
+                baselines=baselines,
+                model=args.model,
+                cuda_available=cuda_available,
+                data_parallel=dp_enabled,
+                gpu_groups=dp_groups,
+                processes_per_gpu=processes_per_gpu,
+                vram=vram_cfg,
+                equal_gpu_slots=bool(args.equal_gpu_slots),
+                timeout_seconds=timeout_seconds,
+                run_id=run_id,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                warmup_runs=warmup_runs,
+                max_input_tokens=max_input_tokens,
+                seed=seed,
+                smoke=args.mode == "smoke",
+                strict=bool(args.strict),
+                allow_unsupported=bool(args.allow_unsupported),
+                preflight_only=bool(args.preflight_only),
+            )
+            failures += baseline_failures
+            manifest["cells"].extend(cells)
+
+        return _finish_run(
+            manifest=manifest,
+            run_dir=run_dir,
+            data_dir=data_dir,
+            baselines=baselines,
+            datasets=datasets,
+            sample_count=sample_count,
+            args=args,
+            failures=failures,
+            timeout_seconds=timeout_seconds,
+        )
 
     failures = 0
     for dataset in datasets:
@@ -2852,59 +3461,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
 
-    manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
-    manifest["failure_count"] = failures
-    manifest["cell_count"] = len(manifest["cells"])
-
-    # Aggregate metrics as part of the run so every finished run ships its own
-    # metrics_summary.{json,csv,md}.  Preflight-only runs write status rows
-    # instead of inference records, so aggregation is skipped for them.  Strict
-    # completeness is only meaningful when every cell actually succeeded;
-    # ``failures == 0`` is not enough because smoke and --allow-unsupported
-    # runs may record blocked cells without counting them as failures.
-    clean_cells = bool(manifest["cells"]) and all(
-        cell.get("status") == "success" for cell in manifest["cells"]
+    return _finish_run(
+        manifest=manifest,
+        run_dir=run_dir,
+        data_dir=data_dir,
+        baselines=baselines,
+        datasets=datasets,
+        sample_count=sample_count,
+        args=args,
+        failures=failures,
+        timeout_seconds=timeout_seconds,
     )
-    if args.collect and not args.preflight_only:
-        aggregate = _run_collector(
-            run_dir,
-            data_dir,
-            baselines=baselines,
-            datasets=datasets,
-            expected_samples=sample_count,
-            strict=bool(args.strict) and clean_cells,
-            timeout_seconds=timeout_seconds,
-        )
-        if aggregate["status"] == "success":
-            print(
-                "[aggregate] metrics_summary.{json,csv,md} written to "
-                f"{run_dir}",
-                flush=True,
-            )
-        else:
-            print(
-                "[aggregate] collector failed "
-                f"(exit {aggregate.get('returncode')}); see {aggregate['log']}",
-                file=sys.stderr,
-                flush=True,
-            )
-    elif args.preflight_only:
-        aggregate = {
-            "status": "skipped",
-            "reason": "preflight-only run has no inference records to aggregate",
-        }
-    else:
-        aggregate = {
-            "status": "skipped",
-            "reason": "metric collection disabled with --no-collect",
-        }
-    manifest["aggregate"] = aggregate
-    _write_json(run_dir / "run_manifest.json", manifest)
-    print(f"Run manifest: {run_dir / 'run_manifest.json'}", flush=True)
-    strict_aggregate_failed = (
-        aggregate.get("status") == "failed" and bool(aggregate.get("strict"))
-    )
-    return 1 if (failures or strict_aggregate_failed) else 0
 
 
 if __name__ == "__main__":

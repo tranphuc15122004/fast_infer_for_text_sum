@@ -332,6 +332,19 @@ host sẽ có cảnh báo trên stderr. Lựa chọn và snapshot đầy đủ (
 đồ visible) được ghi vào `run_manifest.json` ở các field `gpu_ids`/`gpu`. Khi
 `LONG_BENCH_DEVICE=cpu` (dev CPU) GPU vẫn được ghi lại nhưng compute chạy CPU.
 
+### Full baseline-first: giữ model qua 5 dataset
+
+Ở `--mode full`, runner mặc định chạy theo thứ tự **baseline → dataset**.
+Toàn bộ dataset được bundle theo thứ tự đã khai báo, mỗi child xử lý bundle đó
+rồi runner tách lại thành các file canonical `<baseline>/<dataset>.jsonl`.
+Nhờ vậy mỗi data-parallel shard chỉ load model một lần cho baseline, thay vì
+load lại một lần cho từng dataset. Artifact trung gian nằm ở
+`<run>/<baseline>/_bundle.jsonl`; không dùng file này trực tiếp để tổng hợp.
+
+Có thể tắt cơ chế này để quay về hành vi từng cell bằng
+`--no-reuse-model-per-baseline`. Smoke và representative mặc định vẫn giữ
+đường chạy từng cell để kiểm thử wiring ngắn và cô lập lỗi dễ hơn.
+
 ### Data-parallel: batch size 1 trên nhiều GPU
 
 Mặc định runner chạy tuần tự từng cell `(baseline, dataset)` trong **một**
@@ -353,15 +366,16 @@ Cơ chế:
   nhìn thấy. Pool được chia thành các **nhóm device**, mỗi nhóm 1 shard
   (`--dp-gpus-per-shard N`, mặc định 1 = 1 card/shard; `N>1` dành cho baseline
   cần song song trong cùng process). Số card phải chia hết cho `N`.
-- Mỗi cell được chia thành N shard, cân bằng theo **độ dài input token**
+- Ở full baseline-first, mỗi baseline bundle được chia thành N shard, cân bằng
+  theo **độ dài input token**
   (greedy longest-first, deterministic) chứ không chia đều số mẫu, vì mỗi row
   LongBench dài ngắn rất khác nhau.
 - Mỗi shard là một child process riêng, `CUDA_VISIBLE_DEVICES` chỉ chứa đúng
   nhóm GPU của nó, đọc file input riêng
-  (`<run>/inputs/shards/<dataset>.dp<k>.jsonl`) và ghi output riêng
-  (`<run>/<baseline>/shards/<dataset>.dp<k>.jsonl`, log
-  `<run>/logs/<baseline>_<dataset>.dp<k>.log`, stdout prefix
-  `[<baseline>_<dataset>.dp<k>]`). Các shard chạy **đồng thời**; timeout của
+  (`<run>/inputs/shards/<dataset-or-bundle>.dp<k>.jsonl`) và ghi output riêng
+  (`<run>/<baseline>/shards/<dataset-or-bundle>.dp<k>.jsonl`, log
+  `<run>/logs/<baseline>_<dataset-or-bundle>.dp<k>.log`, stdout prefix
+  `[<baseline>_<dataset-or-bundle>.dp<k>]`). Các shard chạy **đồng thời**; timeout của
   cell áp cho cả cell như trước.
 - Sau khi tất cả shard xong, runner gộp thành file canonical
   `<run>/<baseline>/<dataset>.jsonl` (đúng thứ tự mẫu gốc) và ghi một summary

@@ -243,6 +243,9 @@ GPU". Trên card lớn (180 GiB) có thể dùng thêm VRAM trống bằng
 `--dp-processes-per-gpu K` với trần `--vram-budget-gb` (mặc định 170, giữ
 `--vram-headroom-gb` 10): runner lập kế hoạch theo VRAM trống thực tế, **chờ**
 khi card chật và retry shard OOM thay vì kill job — xem mục "Tận dụng VRAM".
+Ở `--mode full`, mặc định runner bundle toàn bộ dataset theo từng baseline để
+mỗi shard giữ model trong process và xử lý lần lượt các dataset; dùng
+`--no-reuse-model-per-baseline` nếu cần quay về từng cell độc lập.
 Trước mỗi job, kiểm tra VRAM
 trống bằng `bash scripts/run_gpu_check.sh --config <master> [--gpu-ids N]
 [--min-free-gb GB]` (xem cùng mục tài liệu).
