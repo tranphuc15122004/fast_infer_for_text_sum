@@ -23,7 +23,8 @@ import modal
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = Path("/workspace/fast_infer_text_sum")
 VOLUME_MOUNT = Path("/mnt/fast-in")
-REMOTE_OUTPUT_ROOT = VOLUME_MOUNT / "outputs" / "recap_kv_v2"
+REMOTE_OUTPUT_ROOT_V2 = VOLUME_MOUNT / "outputs" / "recap_kv_v2"
+REMOTE_OUTPUT_ROOT_V3 = VOLUME_MOUNT / "outputs" / "recap_kv_v3"
 REMOTE_TARGET_MODEL = Path("/opt/models/Qwen3-0.6B")
 LOCAL_TARGET_MODEL = Path(
     os.environ.get("MODAL_RECAP_TARGET_LOCAL", "/home/tuantb/models/Qwen3-0.6B")
@@ -106,6 +107,12 @@ def build_runner_command(
     smoke: bool,
     python: str,
     experiment: str = "recap",
+    region_size: int = 1024,
+    block_size: int = 128,
+    reps_per_block: int = 4,
+    reps_per_region: int = 4,
+    hierarchy_mass_budget: float = 0.01,
+    hierarchy_layers: str = "last",
 ) -> list[str]:
     command = [
         python,
@@ -125,6 +132,18 @@ def build_runner_command(
         "cuda:0",
         "--dtype",
         "bfloat16",
+        "--region-size",
+        str(region_size),
+        "--block-size",
+        str(block_size),
+        "--reps-per-block",
+        str(reps_per_block),
+        "--reps-per-region",
+        str(reps_per_region),
+        "--hierarchy-mass-budget",
+        str(hierarchy_mass_budget),
+        "--hierarchy-layers",
+        hierarchy_layers,
     ]
     for input_path in inputs:
         command.extend(("--input", input_path))
@@ -148,6 +167,14 @@ def _new_run_id(mode: str) -> str:
     return f"{mode}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
 
 
+def output_root_for_experiment(experiment: str) -> Path:
+    if experiment == "hierarchy":
+        return REMOTE_OUTPUT_ROOT_V3
+    if experiment in {"recap", "lease"}:
+        return REMOTE_OUTPUT_ROOT_V2
+    raise ValueError("unsupported experiment")
+
+
 @app.function(
     image=IMAGE,
     gpu=GPU_TYPE,
@@ -163,10 +190,16 @@ def run_recap(
     max_samples: int | None = None,
     max_new_tokens: int | None = None,
     run_id: str = "",
+    region_size: int = 1024,
+    block_size: int = 128,
+    reps_per_block: int = 4,
+    reps_per_region: int = 4,
+    hierarchy_mass_budget: float = 0.01,
+    hierarchy_layers: str = "last",
 ) -> dict[str, object]:
     sample_limit, token_limit, smoke = resolve_options(mode, max_samples, max_new_tokens)
     selected_run_id = run_id or _new_run_id(mode)
-    output_dir = REMOTE_OUTPUT_ROOT / selected_run_id
+    output_dir = output_root_for_experiment(experiment) / selected_run_id
     runtime_python = ensure_runtime_venv(VOLUME_MOUNT / "venv", sys.executable)
     command = build_runner_command(
         target_model=target_model,
@@ -177,6 +210,12 @@ def run_recap(
         smoke=smoke,
         python=str(runtime_python),
         experiment=experiment,
+        region_size=region_size,
+        block_size=block_size,
+        reps_per_block=reps_per_block,
+        reps_per_region=reps_per_region,
+        hierarchy_mass_budget=hierarchy_mass_budget,
+        hierarchy_layers=hierarchy_layers,
     )
     environment = dict(os.environ)
     environment.update(
@@ -218,12 +257,18 @@ def build_parser():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "pilot"), default="smoke")
-    parser.add_argument("--experiment", choices=("recap", "lease"), default="lease")
+    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy"), default="lease")
     parser.add_argument("--target-model", default=str(REMOTE_TARGET_MODEL))
     parser.add_argument("--inputs", default="")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--region-size", type=int, default=1024)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--reps-per-block", type=int, default=4)
+    parser.add_argument("--reps-per-region", type=int, default=4)
+    parser.add_argument("--hierarchy-mass-budget", type=float, default=0.01)
+    parser.add_argument("--hierarchy-layers", default="last")
     return parser
 
 
@@ -236,6 +281,12 @@ def main(
     max_samples: int | None = None,
     max_new_tokens: int | None = None,
     run_id: str = "",
+    region_size: int = 1024,
+    block_size: int = 128,
+    reps_per_block: int = 4,
+    reps_per_region: int = 4,
+    hierarchy_mass_budget: float = 0.01,
+    hierarchy_layers: str = "last",
 ) -> None:
     _, _, smoke = resolve_options(mode, max_samples, max_new_tokens)
     selected_inputs = tuple(
@@ -249,6 +300,12 @@ def main(
         max_samples=max_samples,
         max_new_tokens=max_new_tokens,
         run_id=run_id,
+        region_size=region_size,
+        block_size=block_size,
+        reps_per_block=reps_per_block,
+        reps_per_region=reps_per_region,
+        hierarchy_mass_budget=hierarchy_mass_budget,
+        hierarchy_layers=hierarchy_layers,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result.get("returncode", 1) != 0:

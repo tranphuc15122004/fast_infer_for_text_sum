@@ -61,9 +61,12 @@ bash scripts/setup_b200_venv.sh
 
 `flash-attn==2.8.3.post1` hiện là source distribution trong mirror nên được
 để ngoài manifest. Vì vậy `pip install -r requirements.txt` có thể chạy trực
-tiếp trên server. Khi cần các baseline vanilla_fa, DFlash hoặc SpecExtend full,
-chạy thêm helper; helper patch bản source tạm sang C++20 để khớp header Torch
-2.14 và build với `MAX_JOBS=8`. Có thể đổi số job bằng
+tiếp trên server. Bản FA2 này chỉ dùng cho GPU Ampere/Ada/Hopper; không dùng
+cho `vanilla_fa` trên B200/Blackwell. Trên B200 phải cài runtime FA4 có
+`flash_attn.cute`; launcher sẽ tự chọn FA4 nếu module này có mặt và sẽ chặn
+trước benchmark nếu không có. Khi cần các baseline vanilla_fa trên GPU được
+FA2 hỗ trợ, DFlash hoặc SpecExtend full, chạy thêm helper; helper patch bản source
+tạm sang C++20 để khớp header Torch 2.14 và build với `MAX_JOBS=8`. Có thể đổi số job bằng
 `FLASH_ATTENTION_MAX_JOBS`. `flashinfer-jit-cache` không có trong mirror nên
 không nằm trong manifest; FlashInfer sẽ JIT vào `FLASHINFER_WORKSPACE_BASE`.
 
@@ -182,6 +185,30 @@ Script không ghi đè phần cấu hình operator-owned và không xoá dataset
 checkout. Nếu master config đã được tạo bởi script này, `--init` sẽ refresh
 block managed defaults (bao gồm `longbench_100_14k`); các đường dẫn model,
 draft model, MagicDec `.pth` và SSSD datastore vẫn do operator giữ nguyên.
+
+### Preflight vLLM/SGLang cho MR-DFlash
+
+Server runtime hiện hành phải resolve đúng vLLM `0.24.0`, SGLang `0.5.14` và
+adapter/patch SpecForge từ môi trường đã cài sẵn. Worker regenerate vLLM gọi
+OpenAI-compatible `/v1/completions`; worker không tự cài hoặc tự tải model.
+
+```bash
+python3 - <<'PY'
+import importlib.metadata as metadata
+for name in ("vllm", "sglang"):
+    print(name, metadata.version(name))
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+PY
+
+python3 scripts/mr_dflash/vllm_regenerate.py --help >/dev/null
+python3 scripts/mr_dflash/parallel_stage.py --help >/dev/null
+```
+
+Không đưa source SGLang vendored khác vào `PYTHONPATH`; chỉ thêm
+`externals/SpecForge` theo hướng dẫn khi adapter của SpecForge yêu cầu. Mỗi
+vLLM server phải chạy trên GPU riêng bằng `CUDA_VISIBLE_DEVICES`; dừng server
+farm trước khi dùng chính các GPU đó cho SGLang hidden-state cache.
 
 ## Chạy benchmark LongBench
 

@@ -215,6 +215,9 @@ def _shared_queue_config_hash(args: argparse.Namespace) -> str:
         "input": str(Path(args.input).resolve()),
         "tokenized_path": str(Path(args.tokenized_path).resolve()) if args.tokenized_path else None,
         "target_model_path": str(args.target_model_path),
+        "regenerate_backend": str(getattr(args, "regenerate_backend", "hf")),
+        "vllm_model": getattr(args, "vllm_model", None),
+        "vllm_server_addresses": list(getattr(args, "vllm_server_addresses", []) or []),
         "max_length": int(args.max_length),
         "max_new_tokens": int(args.max_new_tokens),
         "target_layer_ids": [int(value) for value in (args.target_layer_ids or [])],
@@ -277,7 +280,9 @@ def assign_shared_leases(
             "trước khi chuyển host"
         )
     pending = int(snapshot["pending"])
-    chunk_size = max(1, math.ceil(pending / max(1, len(args.gpu_ids)))) if pending else 1
+    balanced_chunk = max(1, math.ceil(pending / max(1, len(args.gpu_ids)))) if pending else 1
+    quantum = int(getattr(args, "queue_quantum_items", 0) or 0)
+    chunk_size = min(balanced_chunk, quantum) if quantum > 0 else balanced_chunk
     sample_ids_files: dict[int, Path] = {}
     leases: dict[int, Any] = {}
     for rank, _gpu_id in enumerate(args.gpu_ids):
@@ -577,9 +582,11 @@ def _build_worker_command(
     worker_shard_index = 0 if sample_ids_file is not None else rank
     worker_num_shards = 1 if sample_ids_file is not None else num_shards
     if args.mode == "regenerate":
+        use_vllm = getattr(args, "regenerate_backend", "hf") == "vllm"
+        worker_script = "vllm_regenerate.py" if use_vllm else "regenerate_pilot.py"
         command = [
             python,
-            str(Path(__file__).with_name("regenerate_pilot.py")),
+            str(Path(__file__).with_name(worker_script)),
             "--input", args.input,
             "--output", str(root / "output.jsonl"),
             "--manifest", str(root / "manifest.json"),
@@ -588,9 +595,6 @@ def _build_worker_command(
             "--max-new-tokens", str(args.max_new_tokens),
             "--temperature", str(args.temperature),
             "--seed", str(args.seed),
-            "--device", worker_device,
-            "--generation-batch-size", str(args.generation_batch_size),
-            "--torch-dtype", args.torch_dtype,
             "--shard-index", str(worker_shard_index),
             "--num-shards", str(worker_num_shards),
             "--overflow-policy", args.overflow_policy,
@@ -600,7 +604,32 @@ def _build_worker_command(
             "--progress-interval-tokens", str(args.progress_interval_tokens),
             "--output-batch-size", str(args.output_batch_size),
         ]
-        if args.auto_batch:
+        if use_vllm:
+            addresses = list(getattr(args, "vllm_server_addresses", []) or [])
+            if not addresses:
+                raise ValueError("vLLM regenerate cần --vllm-server-addresses")
+            address = addresses[rank % len(addresses)]
+            command.extend(
+                [
+                    "--server-address", address,
+                    "--vllm-model", args.vllm_model or args.target_model_path,
+                    "--request-concurrency", str(args.vllm_request_concurrency),
+                    "--request-concurrency-start", str(args.vllm_request_concurrency_start),
+                    "--max-batched-tokens", str(args.vllm_max_batched_tokens),
+                    "--request-growth-factor", str(args.vllm_request_growth_factor),
+                    "--request-timeout-seconds", str(args.vllm_request_timeout_seconds),
+                    "--request-retries", str(args.vllm_request_retries),
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "--device", worker_device,
+                    "--generation-batch-size", str(args.generation_batch_size),
+                    "--torch-dtype", args.torch_dtype,
+                ]
+            )
+        if args.auto_batch and not use_vllm:
             command.extend(
                 [
                     "--auto-batch",
@@ -989,6 +1018,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--queue-lease-ttl-seconds", type=float, default=300.0)
     parser.add_argument("--queue-lock-ttl-seconds", type=float, default=600.0)
     parser.add_argument("--queue-max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--queue-quantum-items",
+        type=int,
+        default=512,
+        help="số item tối đa mỗi lease; lease nhỏ giúp GPU nhanh lấy việc tiếp theo",
+    )
     parser.add_argument("--gpu-ids", type=int, nargs="+", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument(
@@ -1001,6 +1036,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--work-root", default=None)
     parser.add_argument("--target-model-path", required=True)
     parser.add_argument("--target-revision", default=None)
+    parser.add_argument(
+        "--regenerate-backend",
+        choices=["hf", "vllm"],
+        default="hf",
+        help="backend regenerate; vLLM dùng server farm và continuous batching",
+    )
+    parser.add_argument("--vllm-server-addresses", nargs="+", default=[])
+    parser.add_argument("--vllm-model", default=None)
+    parser.add_argument("--vllm-request-concurrency", type=int, default=64)
+    parser.add_argument("--vllm-request-concurrency-start", type=int, default=8)
+    parser.add_argument("--vllm-max-batched-tokens", type=int, default=262144)
+    parser.add_argument("--vllm-request-growth-factor", type=float, default=2.0)
+    parser.add_argument("--vllm-request-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--vllm-request-retries", type=int, default=2)
     parser.add_argument("--max-length", type=int, required=True)
     parser.add_argument(
         "--target-layer-ids",
@@ -1168,7 +1217,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise ValueError("queue TTL phải > 0")
     if args.queue_max_attempts < 1:
         raise ValueError("queue-max-attempts phải >= 1")
+    if args.queue_quantum_items < 1:
+        raise ValueError("queue-quantum-items phải >= 1")
+    if args.regenerate_backend == "vllm":
+        if not args.vllm_server_addresses:
+            raise ValueError("regenerate-backend=vllm cần --vllm-server-addresses")
+        if args.vllm_request_concurrency < 1 or args.vllm_request_concurrency_start < 1:
+            raise ValueError("vLLM request concurrency phải >= 1")
+        if args.vllm_request_concurrency_start > args.vllm_request_concurrency:
+            raise ValueError("vllm-request-concurrency-start phải <= vllm-request-concurrency")
+        if args.vllm_max_batched_tokens < 1 or args.vllm_request_retries < 0:
+            raise ValueError("vLLM request options không hợp lệ")
+        if args.vllm_request_growth_factor <= 1.0 or args.vllm_request_timeout_seconds <= 0:
+            raise ValueError("vLLM growth/timeout không hợp lệ")
     args.gpu_ids = _validate_gpu_ids(args.gpu_ids)
+    if args.regenerate_backend == "vllm" and len(args.vllm_server_addresses) < len(args.gpu_ids):
+        raise ValueError("cần ít nhất một vLLM server address cho mỗi GPU worker")
     if args.mode == "cache" and not args.target_layer_ids:
         raise ValueError("parallel cache phải truyền rõ --target-layer-ids")
     if args.target_layer_ids and any(int(value) < 0 for value in args.target_layer_ids):
@@ -1254,6 +1318,13 @@ def main(argv=None) -> int:
         "output": str(output_path),
         "manifest": str(manifest_path),
         "target_model_path": args.target_model_path,
+        "regenerate_backend": args.regenerate_backend,
+        "vllm_model": args.vllm_model,
+        "vllm_server_addresses": list(args.vllm_server_addresses),
+        "vllm_request_concurrency": int(args.vllm_request_concurrency),
+        "vllm_request_concurrency_start": int(args.vllm_request_concurrency_start),
+        "vllm_max_batched_tokens": int(args.vllm_max_batched_tokens),
+        "queue_quantum_items": int(args.queue_quantum_items),
         "max_length": int(args.max_length),
         "target_layer_ids": (
             [int(value) for value in args.target_layer_ids]

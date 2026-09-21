@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 from pathlib import Path
 import time
@@ -20,6 +21,11 @@ from common.data_loader import load_records
 from common.input_utils import truncate_input_ids
 from common.quality_guard import is_degenerate_output
 from common.reproducibility import seed_everything
+
+
+FLASH_ATTENTION_BACKENDS = frozenset(
+    {"flash_attention_2", "flash_attention_4"}
+)
 
 
 def build_parser(default_backend: str, description: str) -> argparse.ArgumentParser:
@@ -49,8 +55,12 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     )
     parser.add_argument(
         "--attention-backend",
-        choices=[default_backend],
-        default=default_backend,
+        choices=sorted(
+            {default_backend, "flash_attention_4"}
+            if default_backend == "flash_attention_2"
+            else {default_backend}
+        ),
+        default=os.environ.get("LONG_BENCH_ATTENTION_BACKEND", default_backend),
     )
     parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
     parser.add_argument("--smoke", action="store_true")
@@ -88,7 +98,9 @@ def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> 
     }
     if args.temperature > 0:
         kwargs["temperature"] = args.temperature
-    attention_mask = torch.ones_like(input_ids)
+    attention_mask = _attention_mask_for_backend(
+        torch.ones_like(input_ids), getattr(args, "attention_backend", None)
+    )
     return model.generate(input_ids, attention_mask=attention_mask, **kwargs)
 
 
@@ -135,6 +147,26 @@ def _build_decode_attention_mask(
         dtype=input_ids.dtype,
         device=input_ids.device,
     )
+
+
+def _attention_mask_for_backend(
+    attention_mask: torch.Tensor | None, attention_backend: str | None
+) -> torch.Tensor | None:
+    """Avoid routing a trivial mask through FlashAttention's varlen path.
+
+    A mask containing only ones carries no padding information.  Passing it to
+    older Transformers/FlashAttention combinations can nevertheless select
+    the unpadding (varlen) kernel, including for one-token KV-cache decode.
+    Returning ``None`` preserves the model's causal mask while using the
+    regular dense FlashAttention call.  Non-trivial masks must be retained.
+    """
+    if (
+        attention_backend in FLASH_ATTENTION_BACKENDS
+        and attention_mask is not None
+        and bool(torch.all(attention_mask != 0))
+    ):
+        return None
+    return attention_mask
 
 
 def _build_static_cache(
@@ -189,7 +221,34 @@ def _should_use_static_cache(attention_backend: str | None) -> bool:
     and decoding policy remain unchanged.
     """
 
-    return attention_backend != "flash_attention_2"
+    return attention_backend not in FLASH_ATTENTION_BACKENDS
+
+
+def _resolve_flash_attention_backend(
+    attention_backend: str,
+    *,
+    compute_capability: tuple[int, int] | None,
+    flash_attention_4_available: bool,
+) -> str:
+    """Resolve a FlashAttention implementation that is valid on this GPU.
+
+    FA2 is not a supported Blackwell implementation.  Silently continuing on
+    a B200 is dangerous because the kernel can return plausible-looking but
+    repeated token IDs.  Prefer FA4 when the runtime provides it; otherwise
+    fail before loading the model and before writing benchmark records.
+    """
+    if attention_backend != "flash_attention_2" or compute_capability is None:
+        return attention_backend
+    if int(compute_capability[0]) < 10:
+        return attention_backend
+    if flash_attention_4_available:
+        return "flash_attention_4"
+    raise RuntimeError(
+        "vanilla_fa requested FlashAttention-2 on Blackwell/B200, but FA2 is "
+        "not a supported backend for this GPU and flash_attn.cute (FA4) is "
+        "not installed; install a Blackwell-compatible FlashAttention-4 "
+        "runtime or run vanilla_fa on Ampere/Ada/Hopper"
+    )
 
 
 def _timed_generate(
@@ -231,7 +290,10 @@ def _timed_generate(
         prefill_start = time.perf_counter()
         prefill_kwargs = {
             "input_ids": input_ids,
-            "attention_mask": attention_mask[:, :input_length],
+            "attention_mask": _attention_mask_for_backend(
+                attention_mask[:, :input_length],
+                getattr(args, "attention_backend", None),
+            ),
             "use_cache": True,
             "return_dict": True,
         }
@@ -254,7 +316,10 @@ def _timed_generate(
                 current_length = input_length + len(generated)
                 step = model(
                     input_ids=next_token,
-                    attention_mask=attention_mask[:, :current_length],
+                    attention_mask=_attention_mask_for_backend(
+                        attention_mask[:, :current_length],
+                        getattr(args, "attention_backend", None),
+                    ),
                     past_key_values=past,
                     use_cache=True,
                     return_dict=True,
@@ -316,12 +381,37 @@ def _load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, An
     if device.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable; use orchestrator smoke preflight on this host")
 
-    if args.attention_backend == "flash_attention_2":
+    if args.attention_backend in FLASH_ATTENTION_BACKENDS:
+        requested_backend = args.attention_backend
+        compute_capability = (
+            torch.cuda.get_device_capability(device)
+            if device.type == "cuda"
+            else None
+        )
         try:
-            import flash_attn  # noqa: F401
+            flash_attention_4_available = (
+                importlib.util.find_spec("flash_attn.cute") is not None
+            )
+        except ModuleNotFoundError:
+            flash_attention_4_available = False
+        try:
+            args.attention_backend = _resolve_flash_attention_backend(
+                requested_backend,
+                compute_capability=compute_capability,
+                flash_attention_4_available=flash_attention_4_available,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        try:
+            if args.attention_backend == "flash_attention_4":
+                from flash_attn import cute as _flash_attention_cute  # noqa: F401
+            else:
+                import flash_attn  # noqa: F401
         except Exception as exc:
             raise SystemExit(
-                "vanilla_fa requires the installed flash-attn wheel; no fallback is allowed"
+                f"vanilla_fa requires the installed {args.attention_backend} "
+                "runtime; no fallback is allowed"
             ) from exc
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -362,6 +452,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     device = torch.device(args.device)
     records = load_records(Path(args.data_file), args.max_samples)
     data_name = Path(args.data_file).stem
+    requested_attention_backend = args.attention_backend
 
     load_start = time.perf_counter()
     model, tokenizer = _load_model(args, device)
@@ -383,9 +474,9 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "warmup_runs": args.warmup_runs,
         "batch_size": 1,
         "extra_metrics": {
-            "requested_attention_backend": args.attention_backend,
+            "requested_attention_backend": requested_attention_backend,
             "effective_attention_backend": effective_attention_backend
-            or "unknown",
+                or "unknown",
         },
     }
 
@@ -489,6 +580,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "model": args.model,
         "model_load_ms": model_load_ms,
         "attention_backend": args.attention_backend,
+        "requested_attention_backend": requested_attention_backend,
         "effective_attention_backend": effective_attention_backend or "unknown",
         "runtime": metadata,
         **quality,

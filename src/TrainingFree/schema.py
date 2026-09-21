@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 TRACE_SCHEMA_VERSION = "recap.trace.v1"
 LEASE_TRACE_SCHEMA_VERSION = "recap.lease.trace.v1"
+HIERARCHY_TRACE_SCHEMA_VERSION = "recap.hierarchy.trace.v1"
 
 
 def _vector(value: Any, name: str) -> list[float]:
@@ -131,4 +132,65 @@ def validate_lease_trace_record(record: Mapping[str, Any]) -> dict[str, Any]:
         for key in ("valid", "expired", "full_source_score"):
             if not isinstance(step.get(key), bool):
                 raise ValueError(f"lease step {key} must be boolean")
+    return result
+
+
+def validate_hierarchy_trace_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate compact V3 hierarchy routing/audit events."""
+
+    result = copy.deepcopy(dict(record))
+    if result.get("schema_version") != HIERARCHY_TRACE_SCHEMA_VERSION:
+        raise ValueError("invalid hierarchy trace schema_version")
+    if result.get("status") != "ok":
+        if not result.get("sample_id") or not result.get("error"):
+            raise ValueError("error hierarchy rows require sample_id and error")
+        return result
+    if not result.get("sample_id"):
+        raise ValueError("hierarchy trace requires sample_id")
+    try:
+        source_tokens = int(result.get("source_tokens", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source_tokens must be positive") from exc
+    if source_tokens <= 0:
+        raise ValueError("source_tokens must be positive")
+    steps = result.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("hierarchy trace steps must be a non-empty list")
+    finite_fields = (
+        "missed_attention_mass",
+        "max_missed_attention_mass",
+        "exact_expansion_fraction",
+        "index_overhead",
+        "routing_fraction",
+        "routing_time_ms",
+    )
+    integer_fields = (
+        "step",
+        "upper_bound_violations",
+        "active_qk_tokens",
+        "full_qk_tokens",
+        "routing_representatives",
+    )
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            raise ValueError("each hierarchy step must be an object")
+        for key in finite_fields:
+            try:
+                value = float(step[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"hierarchy step {index} field {key} must be finite") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"hierarchy step {index} field {key} must be finite")
+        for key in integer_fields:
+            try:
+                value = int(step[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"hierarchy step {index} field {key} must be integer") from exc
+            if value < 0:
+                raise ValueError(f"hierarchy step {index} field {key} must be non-negative")
+        for key in ("missed_attention_mass", "max_missed_attention_mass", "exact_expansion_fraction"):
+            if not 0.0 <= float(step[key]) <= 1.0:
+                raise ValueError(f"hierarchy {key} must be in [0, 1]")
+        if int(step["active_qk_tokens"]) > int(step["full_qk_tokens"]):
+            raise ValueError("active_qk_tokens must not exceed full_qk_tokens")
     return result

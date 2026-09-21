@@ -1,3 +1,91 @@
+# RECAP-KV V3 — thiết kế Global Observability + Local Exactness
+
+> Revision sau V2 lease pilot. V0/V2 bên dưới được giữ làm historical record
+> và negative controls; V3 thay thế query-drift lease bằng hierarchical routing.
+
+## V3 decision
+
+V2 cho thấy actual cold source mass chỉ khoảng 1.20% nhưng global certificate
+upper-bound tới 91.86%, khiến refresh rate 95.16%. Vì vậy query-drift lease
+không còn là foundation. V3 giữ toàn bộ source observable ở low resolution và
+chỉ materialize exact KV tại vùng có khả năng ảnh hưởng tới query hiện tại.
+
+Core principle:
+
+```text
+Global Observability + Local Exactness
+```
+
+Phase 1 chỉ là target-native routing simulation. Không xóa, quantize, offload
+hoặc thay đổi model attention thật trước khi routing gate đạt.
+
+## V3 method contract
+
+Source được tổ chức thành:
+
+```text
+document -> region -> block -> exact KV
+```
+
+Với block `B_i`, chọn deterministic representatives `P_i` và coverage radius
+`epsilon_i = max_j min_r ||k_j - p_ir||`. Với query `q`, block upper score là:
+
+```text
+U_i(q) = max_r q^T p_ir + ||q|| * epsilon_i
+upper_Z_i(q) = |B_i| * exp(U_i(q) / sqrt(d))
+```
+
+Global scan dùng representatives của mọi region, sau đó refinement theo
+region/block chỉ khi upper mass chưa chứng minh được là thấp. Full attention
+chỉ được dùng offline làm reference để đo missed mass; không được đưa future
+attention vào router.
+
+## Registered V3 defaults
+
+- target: existing `/home/tuantb/models/Qwen3-0.6B`;
+- region sizes: `512, 1024, 2048` tokens;
+- block sizes: `32, 64, 128` tokens;
+- representatives per block: `1, 2, 4, 8`;
+- target-native deterministic farthest-point representatives;
+- routing mass tolerance: `0.01` missed source attention mass;
+- exact expansion gate: `<= 0.30` source tokens;
+- index overhead gate: `<= 0.10` source-token equivalent;
+- datasets: 20 GovReport + 20 Multi-News for pilot;
+- Phase 1: no physical KV mutation.
+
+## V3 metrics and gates
+
+Mỗi cấu hình phải ghi:
+
+- representative/index overhead;
+- exact expansion fraction;
+- missed source attention mass;
+- upper-bound soundness violations;
+- routing time và estimated source QK FLOPs;
+- per-dataset/per-sample failure status.
+
+Phase 1 pass chỉ khi `missed_mass <= 0.01`, `exact_expansion <= 0.30`,
+`index_overhead <= 0.10` và upper-bound soundness không có violation trên
+fixtures/trace audit. Nếu không đạt, dừng trước physical implementation.
+
+## V3 validation scope
+
+- L0: representative coverage, upper-bound brute-force soundness, deterministic
+  routing, schema và finite-value checks trên CPU;
+- L1: Modal smoke với checkpoint/venv/GPU thật;
+- R5: offline routing pilot trên 40 document và configuration sweep nhỏ;
+- R6/physical: chưa mở trong V3 Phase 1.
+
+## Impact on Plan
+
+- V0 policy/evaluator/collector giữ nguyên làm negative controls.
+- V2 lease modules giữ nguyên để làm optional temporal diagnostic; không đổi
+  kết quả V2 đã ghi.
+- Thêm hierarchy core, collector và evaluator cho target-native representatives.
+- Runner/Modal thêm `--experiment hierarchy` và hierarchy artifacts, không
+  overwrite output V0/V2.
+- New subtasks 9–12 append vào implementation plan.
+
 # RECAP-KV V2 — thiết kế Source-State Lease
 
 > Revision được phê duyệt sau pilot V0. Nội dung V0 bên dưới được giữ làm

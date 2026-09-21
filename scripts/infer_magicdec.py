@@ -39,6 +39,34 @@ def resolve_generation_budget(max_new_tokens: int, *, warmup: bool = False) -> i
     return min(budget, 8) if warmup else budget
 
 
+def _ensure_magicdec_warmup_context(
+    input_ids: torch.Tensor, *, min_tokens: int, fill_token_id: int
+) -> torch.Tensor:
+    """Pad a self-spec warmup prompt to SnapKV's minimum context length.
+
+    SnapKV builds the draft cache from ``draft_budget - window_size`` past
+    positions.  A short warmup prompt therefore reaches ``gen_draft_kv`` with
+    a negative/undersized context even though a real LongBench prompt is long
+    enough.  The returned tensor is used only for warmup; benchmark prompts
+    remain untouched.
+    """
+    required = max(int(min_tokens), 0)
+    if input_ids.ndim != 2:
+        raise ValueError(
+            f"MagicDec warmup input_ids must be rank 2, got rank {input_ids.ndim}"
+        )
+    current = int(input_ids.shape[1])
+    if current >= required:
+        return input_ids
+    filler = torch.full(
+        (int(input_ids.shape[0]), required - current),
+        int(fill_token_id),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    return torch.cat([input_ids, filler], dim=1)
+
+
 def _canonical_next_token(logits, temperature: float):
     """Return one token from either MagicDec IDs or raw model logits.
 
@@ -395,7 +423,28 @@ def _run_canonical(args: argparse.Namespace) -> None:
             )
         return generate_target_only(input_ids, max_new_tokens=max_new_tokens)
 
-    warmup_ids = tokenizer("Hello", return_tensors="pt", add_special_tokens=True).input_ids.to(device)
+    warmup_ids = tokenizer(
+        "Hello", return_tensors="pt", add_special_tokens=True
+    ).input_ids
+    if args.self_spec:
+        fill_token_id = next(
+            (
+                token_id
+                for token_id in (
+                    tokenizer.pad_token_id,
+                    tokenizer.eos_token_id,
+                    tokenizer.unk_token_id,
+                )
+                if token_id is not None
+            ),
+            0,
+        )
+        warmup_ids = _ensure_magicdec_warmup_context(
+            warmup_ids,
+            min_tokens=max(int(args.draft_budget), int(args.window_size) + 1),
+            fill_token_id=int(fill_token_id),
+        )
+    warmup_ids = warmup_ids.to(device)
     for _ in range(max(args.warmup_runs, 0)):
         seed_everything(args.seed)
         with torch.inference_mode():

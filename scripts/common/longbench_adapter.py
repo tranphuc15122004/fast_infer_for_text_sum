@@ -273,6 +273,38 @@ def preflight_baseline(
                     f"({import_reason})"
                 ),
             )
+        elif installed and result["status"] == "ready" and cuda_available:
+            # FlashAttention-2 is not a supported Blackwell backend.  Detect
+            # B200 here so the matrix does not launch eight children that can
+            # only produce invalid repeated-token outputs.  The inference
+            # script repeats this guard because standalone launchers bypass
+            # this preflight.
+            try:
+                import torch
+
+                capability = (
+                    torch.cuda.get_device_capability(0)
+                    if torch.cuda.is_available()
+                    else None
+                )
+            except (RuntimeError, AssertionError, AttributeError):
+                capability = None
+            if capability is not None and int(capability[0]) >= 10:
+                fa4_installed, fa4_reason = _module_importable("flash_attn.cute")
+                result["requirements"]["flash_attention_4"] = {
+                    "available": fa4_installed,
+                    "reason": fa4_reason,
+                    "auto_selected_for_blackwell": fa4_installed,
+                }
+                if not fa4_installed:
+                    result.update(
+                        status="unsupported_hardware",
+                        reason=(
+                            "vanilla_fa requests FlashAttention-2 on Blackwell/B200, "
+                            "but FA2 is unsupported and flash_attn.cute (FA4) is "
+                            "not installed"
+                        ),
+                    )
 
     if baseline == "eagle3":
         draft_ok, draft_reason = _local_requirement(

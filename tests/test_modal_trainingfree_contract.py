@@ -84,3 +84,53 @@ def test_modal_lease_experiment_is_forwarded_to_trainingfree_runner() -> None:
 
     assert "--experiment" in command
     assert command[command.index("--experiment") + 1] == "lease"
+
+
+def test_modal_hierarchy_experiment_is_forwarded_to_trainingfree_runner() -> None:
+    runner = load_runner()
+
+    command = runner.build_runner_command(
+        target_model="/opt/models/Qwen3-0.6B",
+        inputs=["data/representative_100/govreport_representative.jsonl"],
+        output_dir=Path("/mnt/fast-in/outputs/recap_kv_v3/smoke"),
+        max_samples=1,
+        max_new_tokens=32,
+        smoke=True,
+        python="/mnt/fast-in/venv/bin/python",
+        experiment="hierarchy",
+    )
+
+    assert command[command.index("--experiment") + 1] == "hierarchy"
+
+
+def test_modal_hierarchy_uses_a_separate_volume_output_root() -> None:
+    runner = load_runner()
+
+    assert runner.output_root_for_experiment("hierarchy").as_posix().endswith("recap_kv_v3")
+    assert runner.output_root_for_experiment("lease").as_posix().endswith("recap_kv_v2")
+
+
+def test_modal_hierarchy_config_is_forwarded() -> None:
+    runner = load_runner()
+
+    command = runner.build_runner_command(
+        target_model="/opt/models/Qwen3-0.6B",
+        inputs=["data/representative_100/govreport_representative.jsonl"],
+        output_dir=Path("/mnt/fast-in/outputs/recap_kv_v3/smoke"),
+        max_samples=1,
+        max_new_tokens=32,
+        smoke=True,
+        python="/mnt/fast-in/venv/bin/python",
+        experiment="hierarchy",
+        region_size=512,
+        block_size=64,
+        reps_per_block=8,
+        reps_per_region=8,
+        hierarchy_mass_budget=0.01,
+        hierarchy_layers="last",
+    )
+
+    assert command[command.index("--region-size") + 1] == "512"
+    assert command[command.index("--block-size") + 1] == "64"
+    assert command[command.index("--reps-per-block") + 1] == "8"
+    assert command[command.index("--reps-per-region") + 1] == "8"

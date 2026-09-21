@@ -142,6 +142,30 @@ def test_parallel_queue_items_use_token_length_and_ignore_gpu_identity(tmp_path:
     assert [(item.sample_id, item.length) for item in items] == [("long", 30), ("short", 5)]
 
 
+def test_shared_lease_assignment_is_bounded_by_queue_quantum(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from parallel_stage import assign_shared_leases
+    from shared_scheduler import SharedLeaseQueue, WorkItem
+
+    queue = SharedLeaseQueue(tmp_path / "queue", stage="regenerate", config_hash="cfg")
+    queue.initialize([WorkItem(sample_id=f"s{i}", index=i, length=i) for i in range(10)])
+    args = SimpleNamespace(
+        gpu_ids=[0, 1],
+        queue_quantum_items=2,
+        mode="regenerate",
+        queue_root=None,
+        queue_lease_ttl_seconds=300.0,
+        queue_lock_ttl_seconds=600.0,
+        queue_max_attempts=3,
+    )
+
+    leases = assign_shared_leases(queue, args, tmp_path / "work")
+
+    assert {rank: len(lease.items) for rank, lease in leases.items()} == {0: 2, 1: 2}
+    assert queue.snapshot()["pending"] == 6
+
+
 def test_parallel_shared_scheduler_resumes_queued_assignments(tmp_path: Path, monkeypatch) -> None:
     import json
 

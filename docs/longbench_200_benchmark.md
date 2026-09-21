@@ -191,11 +191,18 @@ python scripts/audit_benchmark_metrics.py \
 Với `vanilla_hf` và `vanilla_fa`, log từng mẫu có thêm
 `prefill_ms`, `decode_ms`, `decode_tok_s`, `cache` và `attn`. Hai baseline này dùng
 attention mask cấp phát một lần cho cả request. `vanilla_hf` dùng `StaticCache`
-khi Transformers hỗ trợ; `vanilla_fa` cố ý dùng `cache=dynamic_fa_safe` để tránh
-corruption đã biết khi kết hợp FlashAttention-2 với StaticCache. `cache=generate`
+khi Transformers hỗ trợ; các backend FlashAttention dùng `cache=dynamic_fa_safe`
+để tránh corruption đã biết khi kết hợp FlashAttention với `StaticCache`. `cache=generate`
 cho biết runtime rơi về compatibility fallback. `attn` cho biết backend thực tế
 được model resolve, giúp phát hiện trường hợp `vanilla_fa` được yêu cầu nhưng
-không chạy bằng FlashAttention-2.
+không chạy bằng backend FlashAttention đã yêu cầu.
+
+Trên B200/Blackwell, không dùng FlashAttention-2. Preflight và launcher đều
+chặn cấu hình FA2 vì nhánh này không được hỗ trợ ổn định trên compute
+capability 10.x; nếu runtime có `flash_attn.cute` thì `vanilla_fa` tự chọn
+FlashAttention-4 và ghi cả backend yêu cầu lẫn backend thực tế vào metadata.
+Nếu không có FA4, cell được đánh dấu `unsupported_hardware` trước khi inference,
+không sinh metric tốc độ từ output lỗi.
 
 ### Tổng hợp metric tự động trong run
 

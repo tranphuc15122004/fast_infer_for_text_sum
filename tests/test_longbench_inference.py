@@ -278,6 +278,12 @@ def test_vanilla_parser_exposes_distinct_attention_defaults():
         fa_parser().parse_args(["--output", "x"]).attention_backend
         == "flash_attention_2"
     )
+    assert (
+        fa_parser()
+        .parse_args(["--output", "x", "--attention-backend", "flash_attention_4"])
+        .attention_backend
+        == "flash_attention_4"
+    )
 
 
 def test_vanilla_record_contains_shared_timing_fields():
@@ -628,6 +634,32 @@ def test_vanilla_generate_passes_attention_mask_to_avoid_pad_eos_ambiguity():
     assert torch.equal(model.kwargs["attention_mask"], torch.ones_like(input_ids))
 
 
+def test_vanilla_fa_generate_omits_trivial_mask():
+    from types import SimpleNamespace
+
+    from common.vanilla_inference import _generate
+
+    class FakeModel:
+        generation_config = SimpleNamespace(pad_token_id=2)
+
+        def generate(self, input_ids, **kwargs):
+            self.kwargs = kwargs
+            return input_ids
+
+    model = FakeModel()
+    input_ids = torch.tensor([[5, 6, 2]])
+
+    _generate(
+        model,
+        input_ids,
+        SimpleNamespace(
+            max_new_tokens=2, temperature=0.0, attention_backend="flash_attention_2"
+        ),
+    )
+
+    assert model.kwargs["attention_mask"] is None
+
+
 def test_vanilla_warmup_is_bounded_without_changing_benchmark_budget():
     from types import SimpleNamespace
 
@@ -756,6 +788,47 @@ def test_vanilla_decode_attention_mask_is_preallocated_and_sliced():
     assert torch.equal(mask[:, :4], torch.ones((1, 4), dtype=torch.long))
     # Slicing must be a view into one allocation, not a newly concatenated mask.
     assert mask[:, :4].untyped_storage().data_ptr() == mask.untyped_storage().data_ptr()
+
+
+def test_flash_attention_omits_trivial_all_ones_mask():
+    from common.vanilla_inference import _attention_mask_for_backend
+
+    mask = torch.ones((1, 7), dtype=torch.long)
+
+    assert _attention_mask_for_backend(mask, "flash_attention_2") is None
+    assert _attention_mask_for_backend(mask, "eager") is mask
+
+
+def test_flash_attention_keeps_nontrivial_padding_mask():
+    from common.vanilla_inference import _attention_mask_for_backend
+
+    mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.long)
+
+    assert _attention_mask_for_backend(mask, "flash_attention_2") is mask
+
+
+def test_blackwell_resolves_fa2_to_fa4_when_available():
+    from common.vanilla_inference import _resolve_flash_attention_backend
+
+    assert (
+        _resolve_flash_attention_backend(
+            "flash_attention_2",
+            compute_capability=(10, 0),
+            flash_attention_4_available=True,
+        )
+        == "flash_attention_4"
+    )
+
+
+def test_blackwell_rejects_unsupported_fa2_without_fa4():
+    from common.vanilla_inference import _resolve_flash_attention_backend
+
+    with pytest.raises(RuntimeError, match="not a supported backend"):
+        _resolve_flash_attention_backend(
+            "flash_attention_2",
+            compute_capability=(10, 0),
+            flash_attention_4_available=False,
+        )
 
 
 def test_vanilla_builds_static_cache_for_supported_transformers():

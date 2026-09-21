@@ -33,6 +33,12 @@ giữ tối đa input hợp lệ thay vì cắt về regime 3K/8K.
 đúng. Vì vậy có thể dừng rồi chạy lại cùng `data-root` mà không tạo lại phần đã
 hoàn tất.
 
+Regenerate có thể dùng vLLM 0.24.0 server farm thay cho HF local bằng
+`--regenerate-backend vllm`; worker gửi token IDs và giới hạn request/tổng token
+để vLLM continuous-batch. Hướng dẫn khởi động endpoint, mapping address theo
+GPU và chuyển an toàn sang cache SGLang nằm tại
+[`mr_dflash_vllm_regenerate.md`](mr_dflash_vllm_regenerate.md).
+
 ## 2. Phân tích và sắp xếp theo độ dài
 
 Stage `analyze` mặc định quét toàn bộ input, không còn giới hạn 1.000 dòng.
@@ -85,6 +91,12 @@ Khi length tăng trong cùng bucket hoặc chuyển sang bucket mới, batch đ�
 trước khi chạy. Sample ngắn đầu run vẫn cho phép bước nhảy lớn; khi sample dài
 dần, controller tự chuyển sang bước nhỏ hơn.
 
+Khi chọn backend vLLM, adaptive control chuyển thành token-aware concurrent
+admission ở client; batch động thực tế do vLLM 0.24.0 continuous scheduler xử
+lý. `--vllm-request-concurrency` là trần request trên mỗi server, còn
+`--vllm-max-batched-tokens` là trần prompt-plus-generation phía client. Không
+dùng đồng thời vLLM server và SGLang cache trên cùng GPU.
+
 ### Hidden cache
 
 Cache dùng token capacity của static pool SGLang/SpecForge và giới hạn:
@@ -122,9 +134,11 @@ parallel_<mode>_<split>/
 └── quarantine.jsonl
 ```
 
-Mỗi GPU nhận một lease gồm các sample được sắp xếp theo length. Parent heartbeat
-lease trong lúc worker chạy. Nếu parent/host bị kill, lease hết hạn và host mới
-có thể reclaim.
+Mỗi GPU nhận một lease gồm các sample được sắp xếp theo length. Mặc định lease
+bị giới hạn bởi `--parallel-queue-quantum-items 512`; quantum nhỏ hơn giúp GPU
+đã xử lý xong lấy việc tiếp theo thay vì bị giữ bởi một lease quá lớn. Parent
+heartbeat lease trong lúc worker chạy. Nếu parent/host bị kill, lease hết hạn và
+host mới có thể reclaim.
 
 Các nguyên tắc resume:
 
@@ -178,6 +192,12 @@ python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --sample-error-policy error \
   --resume
 ```
+
+Lệnh trên là đường HF legacy. Nếu muốn dùng vLLM cho regenerate, thay nhóm
+`--regenerate-auto-batch*` bằng `--regenerate-backend vllm` và truyền đủ
+`--vllm-server-addresses`; không truyền `--regenerate-generation-batch-size`
+cho worker vLLM. Sau khi các stage regenerate hoàn tất, dừng server farm rồi
+resume từ `validate_full_train` để SGLang/SpecForge nhận GPU sạch.
 
 Nếu source đã được chuẩn bị trong cùng `data-root`, `prepare` sẽ được reuse
 nhờ `--resume`; pipeline sẽ chuyển đến stage còn thiếu. Muốn bắt đầu từ

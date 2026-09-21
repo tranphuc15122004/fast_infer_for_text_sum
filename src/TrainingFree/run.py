@@ -18,8 +18,18 @@ from .lease_evaluation import (
     aggregate_lease_results,
     evaluate_lease_trace,
 )
+from .hierarchy_collector import collect_hierarchy_trace
+from .hierarchy_evaluation import (
+    HierarchyEvaluationConfig,
+    aggregate_hierarchy_results,
+    evaluate_hierarchy_trace,
+)
 from .policy import RecapConfig
-from .schema import validate_lease_trace_record, validate_trace_record
+from .schema import (
+    validate_hierarchy_trace_record,
+    validate_lease_trace_record,
+    validate_trace_record,
+)
 
 
 DEFAULT_INPUT = "data/representative_100/govreport_representative.jsonl"
@@ -181,9 +191,81 @@ def render_lease_report(
     return "\n".join(lines) + "\n"
 
 
+def render_hierarchy_report(
+    manifest: Mapping[str, Any],
+    aggregate: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> str:
+    """Render V3 routing metrics without claiming physical speedup."""
+
+    lines = [
+        "# RECAP-KV V3 Hierarchy report",
+        "",
+        "## Kết luận",
+        "",
+        f"Phase 1 routing gate: **{aggregate.get('status', 'INCONCLUSIVE')}**.",
+        "Full attention chỉ là offline audit reference; chưa thay đổi hoặc xóa KV thật.",
+        "",
+        "## Runtime",
+        "",
+        f"- Model: `{manifest.get('model')}`",
+        f"- Device: `{manifest.get('device')}`; CUDA: `{manifest.get('cuda_available')}`",
+        f"- Samples: requested={manifest.get('requested_samples')}, ok={manifest.get('ok_samples')}, errors={manifest.get('error_samples')}",
+        f"- Region/block: `{manifest.get('region_size')}`/`{manifest.get('block_size')}`",
+        f"- Representatives block/region: `{manifest.get('reps_per_block')}`/`{manifest.get('reps_per_region')}`",
+        f"- Mass budget: `{manifest.get('hierarchy_mass_budget')}`",
+        f"- Layer ids: `{manifest.get('hierarchy_layer_ids')}`",
+    ]
+    metrics = aggregate.get("metrics")
+    if metrics:
+        lines.extend([
+            "",
+            "## Aggregate routing metrics",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| Missed attention mass | {metrics['missed_attention_mass']:.6f} |",
+            f"| Maximum missed attention mass | {metrics['max_missed_attention_mass']:.6f} |",
+            f"| Exact expansion fraction | {metrics['exact_expansion_fraction']:.6f} |",
+            f"| Index overhead | {metrics['index_overhead']:.6f} |",
+            f"| Routing fraction | {metrics['routing_fraction']:.6f} |",
+            f"| Upper-bound violations | {metrics['upper_bound_violations']:.0f} |",
+            f"| Active QK tokens | {metrics['active_qk_tokens']:.2f} |",
+            f"| Full QK tokens | {metrics['full_qk_tokens']:.2f} |",
+            f"| Upper missed-mass bound | {metrics['upper_missed_mass_bound']:.6f} |",
+            f"| Mean routing time (ms/token) | {metrics['routing_time_ms']:.3f} |",
+        ])
+    if aggregate.get("gate"):
+        lines.extend(["", "## Phase 1 gate", "", "| Criterion | Pass |", "|---|:---:|"])
+        for name, passed in aggregate["gate"].items():
+            lines.append(f"| {name} | {'yes' if passed else 'no'} |")
+    if aggregate.get("dataset_metrics"):
+        lines.extend([
+            "",
+            "## Per-dataset metrics",
+            "",
+            "| Dataset | Missed mass | Expansion | Overhead | Violations |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for dataset, values in sorted(aggregate["dataset_metrics"].items()):
+            lines.append(
+                f"| {dataset} | {values['missed_attention_mass']:.6f} | "
+                f"{values['exact_expansion_fraction']:.6f} | "
+                f"{values['index_overhead']:.6f} | "
+                f"{values['upper_bound_violations']:.0f} |"
+            )
+    lines.extend(["", "## Per-sample status", ""])
+    for row in rows:
+        lines.append(
+            f"- `{row.get('sample_id', '?')}` / `{row.get('dataset', '?')}`: "
+            f"{row.get('status')} ({row.get('reason', '')})"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", choices=("recap", "lease"), default="recap")
+    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy"), default="recap")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--input", action="append", default=None)
     parser.add_argument("--output", required=True)
@@ -207,6 +289,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delta-cert", type=float, default=0.10)
     parser.add_argument("--min-cold-fraction", type=float, default=0.20)
     parser.add_argument("--min-lease-length", type=float, default=4.0)
+    parser.add_argument("--region-size", type=int, default=1024)
+    parser.add_argument("--reps-per-block", type=int, default=4)
+    parser.add_argument("--reps-per-region", type=int, default=4)
+    parser.add_argument("--hierarchy-mass-budget", type=float, default=0.01)
+    parser.add_argument("--max-missed-attention-mass", type=float, default=0.01)
+    parser.add_argument("--max-exact-expansion", type=float, default=0.30)
+    parser.add_argument("--max-index-overhead", type=float, default=0.10)
+    parser.add_argument("--hierarchy-layers", default="last")
     return parser
 
 
@@ -239,6 +329,12 @@ def run(args: argparse.Namespace) -> int:
         min_cold_fraction=args.min_cold_fraction,
         min_lease_length=args.min_lease_length,
     )
+    hierarchy_config = HierarchyEvaluationConfig(
+        mass_budget=args.hierarchy_mass_budget,
+        max_missed_attention_mass=args.max_missed_attention_mass,
+        max_exact_expansion=args.max_exact_expansion,
+        max_index_overhead=args.max_index_overhead,
+    )
     manifest: dict[str, Any] = {
         "schema_version": "recap.manifest.v1",
         "experiment": args.experiment,
@@ -267,6 +363,8 @@ def run(args: argparse.Namespace) -> int:
     evaluation_rows: list[dict[str, Any]] = []
     lease_trace_rows: list[dict[str, Any]] = []
     lease_evaluation_rows: list[dict[str, Any]] = []
+    hierarchy_trace_rows: list[dict[str, Any]] = []
+    hierarchy_evaluation_rows: list[dict[str, Any]] = []
     try:
         model, tokenizer, device = load_local_model(
             args.model, device=args.device, dtype=args.dtype
@@ -274,6 +372,23 @@ def run(args: argparse.Namespace) -> int:
         manifest["resolved_device"] = str(device)
         if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
             manifest["cuda_device_name"] = torch.cuda.get_device_name(device)
+        model_layers = getattr(getattr(model, "model", None), "layers", None)
+        if args.hierarchy_layers == "last":
+            hierarchy_layer_ids = [len(model_layers) - 1] if model_layers is not None else [-1]
+        elif args.hierarchy_layers == "all":
+            hierarchy_layer_ids = list(range(len(model_layers))) if model_layers is not None else None
+        else:
+            hierarchy_layer_ids = [int(value.strip()) for value in args.hierarchy_layers.split(",") if value.strip()]
+        manifest.update({
+            "region_size": int(args.region_size),
+            "reps_per_block": int(args.reps_per_block),
+            "reps_per_region": int(args.reps_per_region),
+            "hierarchy_mass_budget": float(args.hierarchy_mass_budget),
+            "max_missed_attention_mass": float(args.max_missed_attention_mass),
+            "max_exact_expansion": float(args.max_exact_expansion),
+            "max_index_overhead": float(args.max_index_overhead),
+            "hierarchy_layer_ids": hierarchy_layer_ids,
+        })
         for index, (record, source_name) in enumerate(records):
             sample_id = str(record.get("id", index))
             dataset = _record_dataset(record, source_name)
@@ -297,6 +412,27 @@ def run(args: argparse.Namespace) -> int:
                     lease_evaluation_rows.append(
                         evaluate_lease_trace(lease_trace, lease_config)
                     )
+                elif args.experiment == "hierarchy":
+                    hierarchy_trace = collect_hierarchy_trace(
+                        model,
+                        tokenizer,
+                        rendered,
+                        sample_id=sample_id,
+                        dataset=dataset,
+                        max_new_tokens=max_new_tokens,
+                        region_size=args.region_size,
+                        block_size=args.block_size,
+                        reps_per_block=args.reps_per_block,
+                        reps_per_region=args.reps_per_region,
+                        mass_budget=args.hierarchy_mass_budget,
+                        prefill_chunk_size=args.prefill_chunk_size,
+                        device=device,
+                        layer_ids=hierarchy_layer_ids,
+                    )
+                    hierarchy_trace_rows.append(validate_hierarchy_trace_record(hierarchy_trace))
+                    hierarchy_evaluation_rows.append(
+                        evaluate_hierarchy_trace(hierarchy_trace, hierarchy_config)
+                    )
                 else:
                     trace = collect_trace(
                         model,
@@ -316,6 +452,8 @@ def run(args: argparse.Namespace) -> int:
                 schema_version = (
                     "recap.lease.trace.v1"
                     if args.experiment == "lease"
+                    else "recap.hierarchy.trace.v1"
+                    if args.experiment == "hierarchy"
                     else "recap.trace.v1"
                 )
                 error_row = {
@@ -328,6 +466,14 @@ def run(args: argparse.Namespace) -> int:
                 if args.experiment == "lease":
                     lease_trace_rows.append(error_row)
                     lease_evaluation_rows.append({
+                        "status": "error",
+                        "sample_id": sample_id,
+                        "dataset": dataset,
+                        "error": error_row["error"],
+                    })
+                elif args.experiment == "hierarchy":
+                    hierarchy_trace_rows.append(error_row)
+                    hierarchy_evaluation_rows.append({
                         "status": "error",
                         "sample_id": sample_id,
                         "dataset": dataset,
@@ -351,7 +497,13 @@ def run(args: argparse.Namespace) -> int:
             "error_samples": len(records),
         })
         (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        report = render_lease_report if args.experiment == "lease" else render_report
+        report = (
+            render_lease_report
+            if args.experiment == "lease"
+            else render_hierarchy_report
+            if args.experiment == "hierarchy"
+            else render_report
+        )
         (output_dir / "report.md").write_text(report(manifest, {"status": "INCONCLUSIVE", "datasets": {}}, []), encoding="utf-8")
         return 2
 
@@ -371,6 +523,26 @@ def run(args: argparse.Namespace) -> int:
         (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         (output_dir / "lease_report.md").write_text(
             render_lease_report(manifest, aggregate, lease_evaluation_rows),
+            encoding="utf-8",
+        )
+        return 0 if manifest["ok_samples"] else 2
+
+    if args.experiment == "hierarchy":
+        aggregate = aggregate_hierarchy_results(hierarchy_evaluation_rows, hierarchy_config)
+        manifest.update({
+            "status": "ok",
+            "ok_samples": sum(row.get("status") in {"ok", "gate_fail"} for row in hierarchy_trace_rows),
+            "error_samples": sum(row.get("status") == "error" for row in hierarchy_trace_rows),
+            "inconclusive_samples": sum(row.get("status") == "inconclusive" for row in hierarchy_evaluation_rows),
+            "aggregate_status": aggregate.get("status"),
+            "elapsed_s": time.perf_counter() - started,
+        })
+        _write_jsonl(output_dir / "hierarchy_trace.jsonl", hierarchy_trace_rows)
+        _write_jsonl(output_dir / "hierarchy_metrics.jsonl", hierarchy_evaluation_rows)
+        (output_dir / "hierarchy_metrics.json").write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        (output_dir / "hierarchy_report.md").write_text(
+            render_hierarchy_report(manifest, aggregate, hierarchy_evaluation_rows),
             encoding="utf-8",
         )
         return 0 if manifest["ok_samples"] else 2

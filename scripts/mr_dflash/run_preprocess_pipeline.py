@@ -75,6 +75,16 @@ class PipelineOptions:
     overflow_policy: str = "error"
     sample_error_policy: str = "error"
     temperature: float = 0.0
+    # Regenerate có thể chạy HF local (legacy) hoặc gọi vLLM server farm.
+    regenerate_backend: str = "hf"
+    vllm_server_addresses: tuple[str, ...] = ()
+    vllm_model: Optional[str] = None
+    vllm_request_concurrency: int = 64
+    vllm_request_concurrency_start: int = 8
+    vllm_max_batched_tokens: int = 262_144
+    vllm_request_growth_factor: float = 2.0
+    vllm_request_timeout_seconds: float = 300.0
+    vllm_request_retries: int = 2
     # ``None`` means scan the complete normalized input.  A finite limit is
     # reserved for smoke/debug runs and must be explicit.
     analysis_limit: Optional[int] = None
@@ -119,6 +129,7 @@ class PipelineOptions:
     cache_startup_stagger_seconds: float = 3.0
     parallel_gpu_ids: tuple[int, ...] = ()
     parallel_scheduler: str = "shared_lease"
+    parallel_queue_quantum_items: int = 512
     progress_interval_tokens: int = 256
     # Batch inference thật trong ``model.generate``; khác với
     # regenerate_output_batch_size là batch chỉ dùng khi flush JSONL.
@@ -338,9 +349,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
             output = regenerated / f"{split}.jsonl"
             skipped_report = regenerated / f"{split}.skipped.jsonl"
             manifest = manifests / f"regeneration_{regime}_{split}.json"
+            use_vllm = options.regenerate_backend == "vllm"
+            regenerate_script = "vllm_regenerate.py" if use_vllm else "regenerate_pilot.py"
             command = [
                 python,
-                _stage_script(options, "regenerate_pilot.py"),
+                _stage_script(options, regenerate_script),
                 "--input",
                 str(normalized / f"{split}_prompts.jsonl"),
                 "--output",
@@ -357,27 +370,53 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                 str(options.temperature),
                 "--seed",
                 str(options.seed),
-                "--device",
-                options.device,
-                "--generation-batch-size",
-                str(options.regenerate_generation_batch_size),
                 *(
                     [
-                        "--auto-batch",
-                        "--auto-batch-target-vram-gb",
-                        str(options.regenerate_auto_batch_target_vram_gb),
-                        "--auto-batch-hard-vram-gb",
-                        str(options.regenerate_auto_batch_hard_vram_gb),
-                        "--auto-batch-max-size",
-                        str(options.regenerate_auto_batch_max_size),
-                        "--auto-batch-growth-factor",
-                        str(options.regenerate_auto_batch_growth_factor),
+                        "--device",
+                        options.device,
+                        "--generation-batch-size",
+                        str(options.regenerate_generation_batch_size),
+                        *(
+                            [
+                                "--auto-batch",
+                                "--auto-batch-target-vram-gb",
+                                str(options.regenerate_auto_batch_target_vram_gb),
+                                "--auto-batch-hard-vram-gb",
+                                str(options.regenerate_auto_batch_hard_vram_gb),
+                                "--auto-batch-max-size",
+                                str(options.regenerate_auto_batch_max_size),
+                                "--auto-batch-growth-factor",
+                                str(options.regenerate_auto_batch_growth_factor),
+                            ]
+                            if options.regenerate_auto_batch
+                            else []
+                        ),
                     ]
-                    if options.regenerate_auto_batch
+                    if not use_vllm
                     else []
                 ),
-                "--torch-dtype",
-                options.torch_dtype,
+                *(
+                    [
+                        "--server-address",
+                        options.vllm_server_addresses[0],
+                        "--vllm-model",
+                        options.vllm_model or options.target_model_path,
+                        "--request-concurrency",
+                        str(options.vllm_request_concurrency),
+                        "--request-concurrency-start",
+                        str(options.vllm_request_concurrency_start),
+                        "--max-batched-tokens",
+                        str(options.vllm_max_batched_tokens),
+                        "--request-growth-factor",
+                        str(options.vllm_request_growth_factor),
+                        "--request-timeout-seconds",
+                        str(options.vllm_request_timeout_seconds),
+                        "--request-retries",
+                        str(options.vllm_request_retries),
+                    ]
+                    if use_vllm
+                    else ["--torch-dtype", options.torch_dtype]
+                ),
                 *(["--preserve-full-input"] if options.full_context else []),
                 "--overflow-policy",
                 options.overflow_policy,
@@ -397,6 +436,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     "regenerate",
                     "--scheduler",
                     options.parallel_scheduler,
+                    "--queue-quantum-items",
+                    str(options.parallel_queue_quantum_items),
                     "--gpu-ids",
                     *(str(value) for value in options.parallel_gpu_ids),
                     "--input",
@@ -409,6 +450,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(resolve_parallel_work_root(regenerated / f"{split}.jsonl", "regenerate")),
                     "--target-model-path",
                     options.target_model_path,
+                    "--regenerate-backend",
+                    options.regenerate_backend,
                     "--max-length",
                     str(max_length),
                     "--max-new-tokens",
@@ -417,8 +460,14 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     str(options.temperature),
                     "--seed",
                     str(options.seed),
-                    "--generation-batch-size",
-                    str(options.regenerate_generation_batch_size),
+                    *(
+                        [
+                            "--generation-batch-size",
+                            str(options.regenerate_generation_batch_size),
+                        ]
+                        if not use_vllm
+                        else []
+                    ),
                     *(
                         [
                             "--auto-batch",
@@ -431,11 +480,36 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                             "--auto-batch-growth-factor",
                             str(options.regenerate_auto_batch_growth_factor),
                         ]
-                        if options.regenerate_auto_batch
+                        if options.regenerate_auto_batch and not use_vllm
                         else []
                     ),
-                    "--torch-dtype",
-                    options.torch_dtype,
+                    *(
+                        ["--torch-dtype", options.torch_dtype]
+                        if not use_vllm
+                        else []
+                    ),
+                    *(
+                        [
+                            "--vllm-server-addresses",
+                            *options.vllm_server_addresses,
+                            "--vllm-model",
+                            options.vllm_model or options.target_model_path,
+                            "--vllm-request-concurrency",
+                            str(options.vllm_request_concurrency),
+                            "--vllm-request-concurrency-start",
+                            str(options.vllm_request_concurrency_start),
+                            "--vllm-max-batched-tokens",
+                            str(options.vllm_max_batched_tokens),
+                            "--vllm-request-growth-factor",
+                            str(options.vllm_request_growth_factor),
+                            "--vllm-request-timeout-seconds",
+                            str(options.vllm_request_timeout_seconds),
+                            "--vllm-request-retries",
+                            str(options.vllm_request_retries),
+                        ]
+                        if use_vllm
+                        else []
+                    ),
                     "--overflow-policy",
                     options.overflow_policy,
                     "--sample-error-policy",
@@ -669,6 +743,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                     "cache",
                     "--scheduler",
                     options.parallel_scheduler,
+                    "--queue-quantum-items",
+                    str(options.parallel_queue_quantum_items),
                     "--gpu-ids",
                     *(str(value) for value in options.parallel_gpu_ids),
                     "--input",
@@ -802,6 +878,7 @@ def pipeline_config_hash(options: PipelineOptions) -> str:
         "regenerate_auto_batch_max_size",
         "regenerate_auto_batch_growth_factor",
         "parallel_gpu_ids",
+        "parallel_queue_quantum_items",
     ):
         payload_options.pop(key, None)
     payload = json.dumps(
@@ -1433,6 +1510,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--regenerate-backend",
+        choices=["hf", "vllm"],
+        default="hf",
+        help="regenerate bằng HF local hoặc vLLM server farm",
+    )
+    parser.add_argument(
+        "--vllm-server-addresses",
+        nargs="+",
+        default=[],
+        help="URL vLLM theo rank/GPU; bắt buộc khi regenerate-backend=vllm",
+    )
+    parser.add_argument("--vllm-model", default=None, help="served model id; mặc định target-model-path")
+    parser.add_argument("--vllm-request-concurrency", type=int, default=64)
+    parser.add_argument("--vllm-request-concurrency-start", type=int, default=8)
+    parser.add_argument("--vllm-max-batched-tokens", type=int, default=262144)
+    parser.add_argument("--vllm-request-growth-factor", type=float, default=2.0)
+    parser.add_argument("--vllm-request-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--vllm-request-retries", type=int, default=2)
+    parser.add_argument(
         "--analysis-limit",
         type=int,
         default=None,
@@ -1627,6 +1723,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="scheduler cho worker multi-GPU; shared_lease hỗ trợ đổi host/GPU khi resume",
     )
     parser.add_argument(
+        "--parallel-queue-quantum-items",
+        type=int,
+        default=512,
+        help="số item tối đa mỗi lease shared scheduler để giảm lệch tải giữa GPU",
+    )
+    parser.add_argument(
         "--progress-interval-tokens",
         type=int,
         default=256,
@@ -1704,6 +1806,17 @@ def main(argv=None) -> int:
         raise ValueError("cần ít nhất một --max-lengths")
     if args.max_new_tokens < 1:
         raise ValueError("max-new-tokens phải >= 1")
+    if args.regenerate_backend == "vllm":
+        if not args.vllm_server_addresses:
+            raise ValueError("regenerate-backend=vllm cần --vllm-server-addresses")
+        if args.vllm_request_concurrency < 1 or args.vllm_request_concurrency_start < 1:
+            raise ValueError("vLLM request concurrency phải >= 1")
+        if args.vllm_request_concurrency_start > args.vllm_request_concurrency:
+            raise ValueError("vllm-request-concurrency-start phải <= vllm-request-concurrency")
+        if args.vllm_max_batched_tokens < 1 or args.vllm_request_retries < 0:
+            raise ValueError("vLLM request options không hợp lệ")
+        if args.vllm_request_growth_factor <= 1.0 or args.vllm_request_timeout_seconds <= 0:
+            raise ValueError("vLLM growth/timeout không hợp lệ")
     configured_lengths = [int(args.full_context_length)] if args.full_context else [int(x) for x in args.max_lengths]
     if any(length < 1 for length in configured_lengths):
         raise ValueError("mọi context length phải >= 1")
@@ -1716,6 +1829,10 @@ def main(argv=None) -> int:
         raise ValueError("parallel-gpu-ids không được âm")
     if len(args.parallel_gpu_ids) != len(set(args.parallel_gpu_ids)):
         raise ValueError("parallel-gpu-ids không được trùng")
+    if args.parallel_queue_quantum_items < 1:
+        raise ValueError("parallel-queue-quantum-items phải >= 1")
+    if args.regenerate_backend == "vllm" and args.parallel_gpu_ids and len(args.vllm_server_addresses) < len(args.parallel_gpu_ids):
+        raise ValueError("cần ít nhất một vLLM server address cho mỗi GPU worker")
     if (
         args.progress_interval_tokens < 1
         or args.regenerate_generation_batch_size < 1
@@ -1793,6 +1910,15 @@ def main(argv=None) -> int:
         overflow_policy=str(args.overflow_policy),
         sample_error_policy=str(args.sample_error_policy),
         temperature=float(args.temperature),
+        regenerate_backend=str(args.regenerate_backend),
+        vllm_server_addresses=tuple(str(value) for value in args.vllm_server_addresses),
+        vllm_model=str(args.vllm_model) if args.vllm_model else None,
+        vllm_request_concurrency=int(args.vllm_request_concurrency),
+        vllm_request_concurrency_start=int(args.vllm_request_concurrency_start),
+        vllm_max_batched_tokens=int(args.vllm_max_batched_tokens),
+        vllm_request_growth_factor=float(args.vllm_request_growth_factor),
+        vllm_request_timeout_seconds=float(args.vllm_request_timeout_seconds),
+        vllm_request_retries=int(args.vllm_request_retries),
         analysis_limit=(int(args.analysis_limit) if args.analysis_limit is not None else None),
         device=str(args.device),
         torch_dtype=str(args.torch_dtype),
@@ -1835,6 +1961,7 @@ def main(argv=None) -> int:
         cache_startup_stagger_seconds=float(args.cache_startup_stagger_seconds),
         parallel_gpu_ids=tuple(int(value) for value in args.parallel_gpu_ids),
         parallel_scheduler=str(args.parallel_scheduler),
+        parallel_queue_quantum_items=int(args.parallel_queue_quantum_items),
         progress_interval_tokens=int(args.progress_interval_tokens),
         regenerate_generation_batch_size=int(args.regenerate_generation_batch_size),
         regenerate_auto_batch=bool(args.regenerate_auto_batch),

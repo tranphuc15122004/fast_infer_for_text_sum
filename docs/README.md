@@ -1,5 +1,13 @@
 # Baseline Inference Guide
 
+## Workboard tiến độ repo
+
+Để nắm nhanh các ý tưởng lõi, chức năng chính, mức đã triển khai/đã kiểm chứng
+và việc tiếp theo của các workstream, xem
+[`docs/project_workboard.md`](project_workboard.md). Đây là index điều hành;
+chi tiết kỹ thuật và artifact vẫn nằm trong các tài liệu nguồn được liên kết ở
+đó.
+
 Repo này là máy **code/debug**; inference thật chạy trên **server GPU riêng**.
 Trên server B200, các launcher dùng trực tiếp `python3` từ PATH; `.venv` trong
 workspace local chỉ dùng để mô phỏng dependency/API trước khi đưa code lên

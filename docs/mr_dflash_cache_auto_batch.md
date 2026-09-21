@@ -59,8 +59,10 @@ theo hint. Profile là performance-only nên đổi profile không làm mất ca
 đã hoàn tất.
 
 `shared_lease` lưu queue, lease và event log trong `work-root/shared_queue`.
-Worker nhận sample theo length tăng dần; khi process hoặc host bị dừng, lease
-hết hạn sẽ được host mới reclaim. Mỗi sample được retry tối đa 3 lần; sample
+Worker nhận sample theo length tăng dần; mặc định mỗi lease bị giới hạn bởi
+`--parallel-queue-quantum-items 512` để GPU xong shard ngắn có thể lấy việc
+tiếp theo. Khi process hoặc host bị dừng, lease hết hạn sẽ được host mới
+reclaim. Mỗi sample được retry tối đa 3 lần; sample
 vẫn lỗi ở batch 1 được ghi vào `quarantine.jsonl`. Merge cuối vẫn giữ thứ tự
 canonical của input và không ghi trùng sample.
 

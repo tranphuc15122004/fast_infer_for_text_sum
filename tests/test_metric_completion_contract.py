@@ -164,6 +164,7 @@ def test_flash_attention_does_not_use_static_cache_by_default():
     from common.vanilla_inference import _should_use_static_cache
 
     assert _should_use_static_cache("flash_attention_2") is False
+    assert _should_use_static_cache("flash_attention_4") is False
     assert _should_use_static_cache("eager") is True
 
 

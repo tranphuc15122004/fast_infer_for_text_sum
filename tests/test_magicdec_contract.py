@@ -73,6 +73,30 @@ def test_magicdec_token_id_output_rejects_temperature_sampling():
         module._canonical_next_token(engine_output, temperature=0.7)
 
 
+def test_magicdec_self_spec_warmup_has_enough_context_for_snapkv():
+    module = _load_magicdec_script()
+    input_ids = torch.tensor([[101, 202]], dtype=torch.long)
+
+    warmup_ids = module._ensure_magicdec_warmup_context(
+        input_ids, min_tokens=257, fill_token_id=2
+    )
+
+    assert warmup_ids.shape == (1, 257)
+    assert torch.equal(warmup_ids[:, :2], input_ids)
+    assert torch.equal(warmup_ids[:, 2:], torch.full((1, 255), 2))
+
+
+def test_magicdec_warmup_context_does_not_truncate_long_prompt():
+    module = _load_magicdec_script()
+    input_ids = torch.arange(300, dtype=torch.long).reshape(1, -1)
+
+    warmup_ids = module._ensure_magicdec_warmup_context(
+        input_ids, min_tokens=257, fill_token_id=2
+    )
+
+    assert warmup_ids is input_ids
+
+
 def test_magicdec_acceptance_summary_reports_mean_tau_and_draft_rate():
     module = _load_magicdec_script()
 

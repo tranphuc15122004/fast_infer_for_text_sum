@@ -537,6 +537,58 @@ def test_preprocess_pipeline_forwards_true_generation_batch_size(tmp_path: Path)
     assert stage.command[stage.command.index("--output-batch-size") + 1] == "8"
 
 
+def test_preprocess_pipeline_vllm_regenerate_uses_server_worker(tmp_path: Path) -> None:
+    from run_preprocess_pipeline import PipelineOptions, build_stage_plan
+
+    options = PipelineOptions(
+        repo_root=tmp_path,
+        data_root=tmp_path / "pilot",
+        target_model_path="/models/Qwen3-4B",
+        full_context=True,
+        full_context_length=32768,
+        regenerate_backend="vllm",
+        vllm_server_addresses=("http://127.0.0.1:8000/v1",),
+        vllm_model="qwen3-served",
+        vllm_request_concurrency=48,
+        vllm_request_concurrency_start=8,
+    )
+    stage = next(stage for stage in build_stage_plan(options) if stage.name == "regenerate_full_train")
+
+    assert stage.command[1].endswith("vllm_regenerate.py")
+    assert stage.command[stage.command.index("--server-address") + 1] == "http://127.0.0.1:8000/v1"
+    assert stage.command[stage.command.index("--vllm-model") + 1] == "qwen3-served"
+    assert stage.command[stage.command.index("--request-concurrency") + 1] == "48"
+    assert "--generation-batch-size" not in stage.command
+    assert "--auto-batch" not in stage.command
+
+
+def test_parallel_vllm_worker_maps_server_by_rank_and_uses_quantum(tmp_path: Path) -> None:
+    from parallel_stage import _build_worker_command, parse_args
+
+    args = parse_args(
+        [
+            "--mode", "regenerate",
+            "--scheduler", "shared_lease",
+            "--queue-quantum-items", "32",
+            "--gpu-ids", "0", "1",
+            "--input", str(tmp_path / "input.jsonl"),
+            "--output", str(tmp_path / "output.jsonl"),
+            "--manifest", str(tmp_path / "manifest.json"),
+            "--target-model-path", "/models/Qwen3-4B",
+            "--max-length", "32768",
+            "--regenerate-backend", "vllm",
+            "--vllm-server-addresses", "http://gpu0:8000/v1", "http://gpu1:8000/v1",
+        ]
+    )
+    command = _build_worker_command(args, tmp_path / "rank_01", 1, 2)
+
+    assert command[1].endswith("vllm_regenerate.py")
+    assert command[command.index("--server-address") + 1] == "http://gpu1:8000/v1"
+    assert "--generation-batch-size" not in command
+    assert "--torch-dtype" not in command
+    assert args.queue_quantum_items == 32
+
+
 def test_generation_budget_clips_only_response_not_full_prompt() -> None:
     from regenerate_pilot import resolve_generation_budget
 
