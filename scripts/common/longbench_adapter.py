@@ -156,6 +156,18 @@ def _module_importable(name: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _cuda_compute_capability() -> tuple[int, int] | None:
+    """Read the first CUDA device capability without failing preflight."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return tuple(int(value) for value in torch.cuda.get_device_capability(0))
+    except (RuntimeError, AssertionError, AttributeError, TypeError, ImportError):
+        return None
+
+
 def _sssd_child_env() -> dict[str, str]:
     """Environment the SSSD adapter uses for its SGLang child process."""
     env = dict(os.environ)
@@ -279,16 +291,7 @@ def preflight_baseline(
             # only produce invalid repeated-token outputs.  The inference
             # script repeats this guard because standalone launchers bypass
             # this preflight.
-            try:
-                import torch
-
-                capability = (
-                    torch.cuda.get_device_capability(0)
-                    if torch.cuda.is_available()
-                    else None
-                )
-            except (RuntimeError, AssertionError, AttributeError):
-                capability = None
+            capability = _cuda_compute_capability()
             if capability is not None and int(capability[0]) >= 10:
                 fa4_installed, fa4_reason = _module_importable("flash_attn.cute")
                 result["requirements"]["flash_attention_4"] = {

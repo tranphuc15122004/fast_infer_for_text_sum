@@ -713,7 +713,7 @@ def test_dflash_external_reference_keeps_optional_timings_null():
 def test_magicdec_preflight_requires_checkpoint_before_launch(monkeypatch):
     import common.longbench_adapter as adapter
 
-    monkeypatch.setattr(adapter.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(adapter, "_module_importable", lambda name: (True, None))
     result = adapter.preflight_baseline(
         "magicdec",
         config={"model": "meta-llama/Meta-Llama-3.1-8B-Instruct"},
@@ -747,6 +747,28 @@ def test_magicdec_preflight_rejects_unimportable_flashinfer(tmp_path, monkeypatc
 
     assert result["status"] == "missing_dependency"
     assert "flashinfer" in result["reason"]
+
+
+def test_vanilla_fa_preflight_rejects_fa2_on_blackwell(monkeypatch):
+    import common.longbench_adapter as adapter
+
+    monkeypatch.setattr(
+        adapter,
+        "_module_importable",
+        lambda name: (False, "flash_attn.cute is not installed")
+        if name == "flash_attn.cute"
+        else (True, None),
+    )
+    monkeypatch.setattr(adapter, "_cuda_compute_capability", lambda: (10, 0))
+
+    result = adapter.preflight_baseline(
+        "vanilla_fa",
+        config={"model": "meta-llama/Meta-Llama-3.1-8B-Instruct"},
+        cuda_available=True,
+    )
+
+    assert result["status"] == "unsupported_hardware"
+    assert "FA2 is unsupported" in result["reason"]
 
 
 def test_specextend_preflight_rejects_slow_attention_fallback(monkeypatch):

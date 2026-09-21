@@ -12,15 +12,17 @@ import argparse
 import concurrent.futures
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import torch
 
-from _common import read_jsonl, write_json
+from _common import prompt_messages_error, read_jsonl, write_json
 from progress import ProgressReporter, install_exception_hook
 from regenerate_pilot import (
     _append_jsonl_durable,
@@ -50,6 +52,100 @@ class VLLMRequestError(RuntimeError):
     @property
     def retryable(self) -> bool:
         return self.status is None or self.status == 408 or self.status == 429 or self.status >= 500
+
+
+def parse_vllm_metrics(payload: str) -> Dict[str, float]:
+    """Parse the vLLM Prometheus KV-cache metric without extra dependencies."""
+    usages: List[float] = []
+    for raw_line in str(payload).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        metric, separator, raw_value = line.rpartition(" ")
+        if not separator:
+            continue
+        name = metric.split("{", 1)[0].strip()
+        if name not in {
+            "vllm:gpu_cache_usage_perc",
+            "vllm:kv_cache_usage_perc",
+            "vllm:gpu_cache_usage_percentage",
+        }:
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        # Some vLLM versions expose 0..1, others expose 0..100.
+        usages.append(value / 100.0 if value > 1.0 else value)
+    return {"gpu_cache_usage": max(usages)} if usages else {}
+
+
+def metrics_url(server_address: str) -> str:
+    """Map an OpenAI-compatible ``/v1`` URL to the vLLM metrics endpoint."""
+    parsed = urlsplit(str(server_address).rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/metrics", "", ""))
+
+
+class VLLMMetricsClient:
+    """Best-effort Prometheus reader; metrics must never stop generation."""
+
+    def __init__(self, address: str, *, timeout_seconds: float = 1.0) -> None:
+        self.address = str(address)
+        self.timeout_seconds = max(0.1, float(timeout_seconds))
+        self._disabled = False
+
+    def scrape(self) -> Dict[str, float]:
+        if self._disabled:
+            return {}
+        request = urllib.request.Request(self.address, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError):
+            # A server without --enable-metrics falls back to token admission.
+            self._disabled = True
+            return {}
+        return parse_vllm_metrics(payload)
+
+
+class VLLMMetricsSampler:
+    """Capture peak KV-cache usage while a request group is in flight."""
+
+    def __init__(self, client: VLLMMetricsClient, *, interval_seconds: float = 0.5) -> None:
+        self.client = client
+        self.interval_seconds = max(0.1, float(interval_seconds))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._max_usage: Optional[float] = None
+
+    def _sample_once(self) -> None:
+        usage = self.client.scrape().get("gpu_cache_usage")
+        if usage is None:
+            return
+        with self._lock:
+            self._max_usage = usage if self._max_usage is None else max(self._max_usage, usage)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._sample_once()
+            self._stop.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        self._sample_once()
+        self._thread = threading.Thread(target=self._run, name="vllm-metrics", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> Optional[float]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2.0))
+        self._sample_once()
+        with self._lock:
+            return self._max_usage
 
 
 class VLLMCompletionClient:
@@ -133,7 +229,10 @@ class TokenAdmissionController:
         initial_size: int,
         max_size: int,
         max_batched_tokens: int,
+        initial_batched_tokens: Optional[int] = None,
         growth_factor: float = 2.0,
+        gpu_cache_target: float = 0.90,
+        gpu_cache_hard: float = 0.98,
     ) -> None:
         if initial_size < 1 or max_size < initial_size:
             raise ValueError("request concurrency không hợp lệ")
@@ -141,10 +240,20 @@ class TokenAdmissionController:
             raise ValueError("max-batched-tokens phải >= 1")
         if growth_factor <= 1.0:
             raise ValueError("growth-factor phải > 1")
+        initial_tokens = max_batched_tokens if initial_batched_tokens is None else int(initial_batched_tokens)
+        if initial_tokens < 1 or initial_tokens > max_batched_tokens:
+            raise ValueError("initial-batched-tokens không hợp lệ")
+        if not 0.0 < float(gpu_cache_target) <= 1.0:
+            raise ValueError("gpu-cache-target phải thuộc (0, 1]")
+        if not float(gpu_cache_target) <= float(gpu_cache_hard) <= 1.0:
+            raise ValueError("gpu-cache-hard phải >= target và <= 1")
         self.current_size = int(initial_size)
         self.max_size = int(max_size)
         self.max_batched_tokens = int(max_batched_tokens)
+        self.current_token_budget = initial_tokens
         self.growth_factor = float(growth_factor)
+        self.gpu_cache_target = float(gpu_cache_target)
+        self.gpu_cache_hard = float(gpu_cache_hard)
 
     @staticmethod
     def _cost(item: Dict[str, Any]) -> int:
@@ -162,7 +271,7 @@ class TokenAdmissionController:
             if len(selected) >= self.current_size:
                 break
             cost = self._cost(item)
-            if selected and total_tokens + cost > self.max_batched_tokens:
+            if selected and total_tokens + cost > self.current_token_budget:
                 break
             selected.append(item)
             total_tokens += cost
@@ -170,13 +279,38 @@ class TokenAdmissionController:
         # client budget; the server/model context is the final authority.
         return selected or items[:1]
 
-    def record_success(self, admitted: int) -> None:
-        if int(admitted) > 0:
-            grown = max(self.current_size + 1, int(self.current_size * self.growth_factor))
-            self.current_size = min(self.max_size, grown)
+    def record_success(self, admitted: int, *, cache_usage: Optional[float] = None) -> None:
+        if int(admitted) <= 0:
+            return
+        if cache_usage is not None:
+            usage = float(cache_usage)
+            if not 0.0 <= usage <= 1.0:
+                raise ValueError("cache_usage phải thuộc [0, 1]")
+            if usage >= self.gpu_cache_hard:
+                self.record_failure()
+                return
+            if usage >= self.gpu_cache_target:
+                return
+        grown = max(self.current_size + 1, int(self.current_size * self.growth_factor))
+        self.current_size = min(self.max_size, grown)
+        token_growth = max(
+            self.current_token_budget + 1,
+            int(self.current_token_budget * self.growth_factor),
+        )
+        self.current_token_budget = min(self.max_batched_tokens, token_growth)
 
     def record_failure(self) -> None:
         self.current_size = max(1, self.current_size // 2)
+        self.current_token_budget = max(1, self.current_token_budget // 2)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "request_concurrency": int(self.current_size),
+            "batched_token_budget": int(self.current_token_budget),
+            "max_batched_tokens": int(self.max_batched_tokens),
+            "gpu_cache_target": float(self.gpu_cache_target),
+            "gpu_cache_hard": float(self.gpu_cache_hard),
+        }
 
 
 def _retryable_complete(
@@ -232,7 +366,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-concurrency", type=int, default=64, help="hard cap concurrent requests per server")
     parser.add_argument("--request-concurrency-start", type=int, default=8, help="initial concurrent requests")
     parser.add_argument("--max-batched-tokens", type=int, default=262144)
+    parser.add_argument(
+        "--max-batched-tokens-start",
+        type=int,
+        default=65536,
+        help="initial client token budget; grows toward --max-batched-tokens",
+    )
     parser.add_argument("--request-growth-factor", type=float, default=2.0)
+    parser.add_argument("--metrics-address", default=None, help="optional vLLM /metrics URL")
+    parser.add_argument("--metrics-poll-interval-seconds", type=float, default=0.5)
+    parser.add_argument("--gpu-cache-target", type=float, default=0.90)
+    parser.add_argument("--gpu-cache-hard", type=float, default=0.98)
     parser.add_argument("--request-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--request-retries", type=int, default=2)
     parser.add_argument("--output-batch-size", type=int, default=16)
@@ -249,10 +393,18 @@ def main(argv=None) -> None:
         raise ValueError("request concurrency phải >= 1")
     if args.request_concurrency_start > args.request_concurrency:
         raise ValueError("request-concurrency-start phải <= request-concurrency")
-    if args.max_batched_tokens < 1 or args.request_retries < 0 or args.output_batch_size < 1:
+    if (
+        args.max_batched_tokens < 1
+        or args.max_batched_tokens_start < 1
+        or args.max_batched_tokens_start > args.max_batched_tokens
+        or args.request_retries < 0
+        or args.output_batch_size < 1
+    ):
         raise ValueError("request/batch options không hợp lệ")
     if args.temperature < 0:
         raise ValueError("temperature không được âm")
+    if args.metrics_poll_interval_seconds <= 0:
+        raise ValueError("metrics-poll-interval-seconds phải > 0")
 
     reporter = ProgressReporter(args.progress_path, interval_tokens=args.progress_interval_tokens)
     previous_hook = install_exception_hook(reporter)
@@ -278,13 +430,20 @@ def main(argv=None) -> None:
         model=args.vllm_model or args.target_model_path,
         timeout_seconds=args.request_timeout_seconds,
     )
+    metrics_client = VLLMMetricsClient(
+        args.metrics_address or metrics_url(args.server_address),
+        timeout_seconds=min(2.0, args.request_timeout_seconds),
+    )
     effective_request_concurrency = 1 if args.temperature > 0 else args.request_concurrency
     effective_request_start = 1 if args.temperature > 0 else args.request_concurrency_start
     controller = TokenAdmissionController(
         initial_size=effective_request_start,
         max_size=effective_request_concurrency,
         max_batched_tokens=args.max_batched_tokens,
+        initial_batched_tokens=args.max_batched_tokens_start,
         growth_factor=args.request_growth_factor,
+        gpu_cache_target=args.gpu_cache_target,
+        gpu_cache_hard=args.gpu_cache_hard,
     )
 
     output = Path(args.output)
@@ -381,7 +540,13 @@ def main(argv=None) -> None:
                 batch_sample_ids=[str(item["sample_id"]) for item in group],
                 prompt_tokens=max(int(item["prompt_tokens"]) for item in group),
                 generation_budget=max(int(item["generation_budget"]) for item in group),
+                **controller.snapshot(),
             )
+            metrics_sampler = VLLMMetricsSampler(
+                metrics_client,
+                interval_seconds=args.metrics_poll_interval_seconds,
+            )
+            metrics_sampler.start()
             responses: Dict[int, str] = {}
             future_map = {
                 request_executor.submit(
@@ -400,22 +565,34 @@ def main(argv=None) -> None:
                     responses[id(item)] = future.result()
                 except Exception as exc:
                     request_error = request_error or exc
+            cache_usage = metrics_sampler.stop()
             if request_error is not None:
                 exc = request_error
                 stats["request_errors"] += len(group)
                 if isinstance(exc, VLLMRequestError) and exc.retryable and len(group) > 1:
                     controller.record_failure()
-                    reporter.update("vllm_backoff", error=repr(exc), next_concurrency=controller.current_size)
+                    reporter.update(
+                        "vllm_backoff",
+                        error=repr(exc),
+                        cache_usage=cache_usage,
+                        **controller.snapshot(),
+                    )
                     continue
                 for item in group:
                     record_skip(str(item["sample_id"]), kind="error", error=f"vLLM generation lỗi: {exc!r}", prompt_tokens=item["prompt_tokens"])
                     pending.remove(item)
                 continue
-            controller.record_success(len(group))
+            controller.record_success(len(group), cache_usage=cache_usage)
             pending[:] = [item for item in pending if id(item) not in group_ids]
             for item in sorted(group, key=lambda value: int(value["row_index"])):
                 emit_result(item, responses[id(item)])
-            reporter.update("generation_batch_done", batch_size=len(group), generated_tokens=None)
+            reporter.update(
+                "generation_batch_done",
+                batch_size=len(group),
+                generated_tokens=None,
+                cache_usage=cache_usage,
+                **controller.snapshot(),
+            )
 
     selected_sample_ids = _load_sample_ids(args.sample_ids_file)
     for index, row in enumerate(read_jsonl(args.input)):
@@ -434,11 +611,10 @@ def main(argv=None) -> None:
             stats["skipped_existing"] += 1
             continue
         messages = list(row.get("conversations") or [])
-        if not messages:
-            record_skip(sample_id, kind="invalid", error="sample không có conversations")
-            continue
-        if any(str(message.get("role", "")).lower() == "assistant" for message in messages if isinstance(message, dict)):
-            record_skip(sample_id, kind="invalid", error=f"sample {sample_id!r} đã chứa assistant response; regenerate chỉ nhận prompt-only input")
+        prompt_error = prompt_messages_error(messages)
+        if prompt_error is not None:
+            error = prompt_error if prompt_error == "sample không có conversations" else f"sample {sample_id!r}: {prompt_error}"
+            record_skip(sample_id, kind="invalid", error=error)
             continue
         prompt_messages = messages
         prompt_tokens: Optional[int] = None
@@ -498,8 +674,14 @@ def main(argv=None) -> None:
             "seed": args.seed,
             "request_concurrency_max": effective_request_concurrency,
             "request_concurrency_final": controller.current_size,
+            "max_batched_tokens_start": args.max_batched_tokens_start,
+            "max_batched_tokens_final": controller.current_token_budget,
             "max_batched_tokens": args.max_batched_tokens,
             "request_growth_factor": args.request_growth_factor,
+            "metrics_address": metrics_client.address,
+            "metrics_poll_interval_seconds": args.metrics_poll_interval_seconds,
+            "gpu_cache_target": args.gpu_cache_target,
+            "gpu_cache_hard": args.gpu_cache_hard,
             "request_retries": args.request_retries,
             "output_batch_size": args.output_batch_size,
             "skipped_report": str(skipped_report),

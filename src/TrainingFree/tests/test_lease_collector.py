@@ -9,6 +9,7 @@ from src.TrainingFree.lease_collector import (
     block_log_geometry,
     compute_live_log_z,
     extract_cache_keys,
+    extract_cache_values,
     map_query_heads_to_kv,
 )
 
@@ -67,5 +68,14 @@ def test_extract_cache_keys_supports_dynamic_cache_like_layers() -> None:
     cache = SimpleNamespace(layers=[SimpleNamespace(keys=expected)])
 
     result = extract_cache_keys(cache, 0)
+
+    assert torch.equal(result, expected)
+
+
+def test_extract_cache_values_supports_dynamic_cache_like_layers() -> None:
+    expected = torch.randn(1, 2, 5, 4)
+    cache = SimpleNamespace(layers=[SimpleNamespace(values=expected)])
+
+    result = extract_cache_values(cache, 0)
 
     assert torch.equal(result, expected)

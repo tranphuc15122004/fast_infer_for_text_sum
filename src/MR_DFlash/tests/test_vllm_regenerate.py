@@ -96,6 +96,56 @@ def test_token_admission_controller_never_returns_empty_for_one_oversized_prompt
     assert controller.select([item]) == [item]
 
 
+def test_vllm_metrics_parser_reads_peak_gpu_cache_usage() -> None:
+    from vllm_regenerate import parse_vllm_metrics
+
+    payload = """
+# HELP vllm:gpu_cache_usage_perc GPU KV cache usage
+vllm:gpu_cache_usage_perc{gpu="0"} 0.72
+vllm:gpu_cache_usage_perc{gpu="1"} 0.91
+vllm:num_requests_running 8
+"""
+
+    assert parse_vllm_metrics(payload)["gpu_cache_usage"] == 0.91
+
+
+def test_token_admission_controller_grows_tokens_until_cache_target() -> None:
+    from vllm_regenerate import TokenAdmissionController
+
+    controller = TokenAdmissionController(
+        initial_size=4,
+        max_size=32,
+        max_batched_tokens=256,
+        initial_batched_tokens=64,
+        growth_factor=2.0,
+        gpu_cache_target=0.90,
+        gpu_cache_hard=0.98,
+    )
+
+    assert controller.current_token_budget == 64
+    controller.record_success(4, cache_usage=0.40)
+    assert controller.current_size == 8
+    assert controller.current_token_budget == 128
+    controller.record_success(8, cache_usage=0.92)
+    assert controller.current_size == 8
+    assert controller.current_token_budget == 128
+
+
+def test_token_admission_controller_backs_off_tokens_on_cache_pressure() -> None:
+    from vllm_regenerate import TokenAdmissionController
+
+    controller = TokenAdmissionController(
+        initial_size=16,
+        max_size=64,
+        max_batched_tokens=512,
+        initial_batched_tokens=256,
+    )
+
+    controller.record_success(16, cache_usage=0.99)
+    assert controller.current_size == 8
+    assert controller.current_token_budget == 128
+
+
 def test_retryable_vllm_error_is_retried_then_returns(monkeypatch) -> None:
     from vllm_regenerate import VLLMRequestError, _retryable_complete
 

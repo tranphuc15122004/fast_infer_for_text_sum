@@ -73,6 +73,31 @@ def extract_cache_keys(cache: Any, layer_index: int) -> Any:
     return _as_key_tensor(keys)
 
 
+def extract_cache_values(cache: Any, layer_index: int) -> Any:
+    """Extract a ``[batch, kv_heads, sequence, head_dim]`` value tensor."""
+
+    layer_index = int(layer_index)
+    if layer_index < 0:
+        raise ValueError("layer_index must be non-negative")
+    if hasattr(cache, "layers"):
+        layers = cache.layers
+        if layer_index >= len(layers):
+            raise IndexError("layer_index is outside cache layers")
+        values = getattr(layers[layer_index], "values", None)
+    elif hasattr(cache, "value_cache"):
+        values = cache.value_cache[layer_index]
+    elif isinstance(cache, (tuple, list)):
+        if layer_index >= len(cache):
+            raise IndexError("layer_index is outside tuple cache")
+        pair = cache[layer_index]
+        values = pair[1] if isinstance(pair, (tuple, list)) else getattr(pair, "values", None)
+    else:
+        values = None
+    if values is None:
+        raise TypeError("cache does not expose layer values")
+    return _as_key_tensor(values)
+
+
 def _normalize_source_span(source_start: int, source_end: int, tokens: int) -> tuple[int, int]:
     start, end = int(source_start), int(source_end)
     if start < 0 or end <= start or end > tokens:

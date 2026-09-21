@@ -7,12 +7,14 @@ from typing import Any, Mapping, Sequence
 
 from .hierarchy import SourceHierarchy, build_source_hierarchy
 from .hierarchy_routing import evaluate_routing_step, route_query
+from .concentration import head_source_concentration, head_source_oracle_metrics
 from .collector import _prefill_with_hidden
 from .lease_collector import (
     QueryCapture,
     _as_key_tensor,
     _as_query_tensor,
     extract_cache_keys,
+    extract_cache_values,
     map_query_heads_to_kv,
     source_block_attention,
 )
@@ -122,6 +124,8 @@ def collect_hierarchy_trace(
                 )
                 active_blocks: set[int] = set()
                 attention_rows: list[list[float]] = []
+                head_concentration: list[dict[str, float | int]] = []
+                head_oracle_metrics: list[dict[str, float | int]] = []
                 decisions = []
                 upper_violations = 0
                 upper_bounds: list[float] = []
@@ -141,6 +145,27 @@ def collect_hierarchy_trace(
                             block_size=block_size,
                         )
                     )
+                    concentration_rows = head_source_concentration(
+                        outputs.attentions[layer_id],
+                        source_start=rendered.source_start,
+                        source_end=rendered.source_end,
+                    )
+                    for row in concentration_rows:
+                        row["layer"] = int(layer_id)
+                    head_concentration.extend(concentration_rows)
+                    oracle_rows = head_source_oracle_metrics(
+                        outputs.attentions[layer_id],
+                        extract_cache_values(outputs.past_key_values, layer_id),
+                        source_start=rendered.source_start,
+                        source_end=rendered.source_end,
+                    )
+                    for row in oracle_rows:
+                        row["layer"] = int(layer_id)
+                        head_index = int(row["head"])
+                        row["k95_fraction"] = float(
+                            concentration_rows[head_index]["k95_fraction"]
+                        )
+                    head_oracle_metrics.extend(oracle_rows)
                     for head in range(int(query_states.shape[0])):
                         hierarchy = key_hierarchies[mapping[head]]
                         decision = route_query(
@@ -190,6 +215,8 @@ def collect_hierarchy_trace(
                     "upper_missed_mass_bound": max(upper_bounds),
                     "active_block_count": len(active_blocks),
                     "routing_time_ms": (time.perf_counter() - started) * 1000.0,
+                    "head_concentration": head_concentration,
+                    "head_oracle_metrics": head_oracle_metrics,
                 })
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 token_id = int(next_token[0, 0].item())

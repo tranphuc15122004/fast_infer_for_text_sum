@@ -23,6 +23,25 @@ def _last_message(row: Dict[str, Any], role: str) -> str:
     return ""
 
 
+def _conversation_length_hint(row: Dict[str, Any]) -> int:
+    """Estimate full prompt length when token metadata is unavailable."""
+    messages = row.get("conversations") or []
+    return len(
+        "\n".join(
+            str(message.get("content", ""))
+            for message in messages
+            if isinstance(message, dict)
+        )
+    )
+
+
+def _ends_with_user(row: Dict[str, Any]) -> bool:
+    messages = row.get("conversations") or []
+    if not messages or not isinstance(messages[-1], dict):
+        return False
+    return str(messages[-1].get("role", "")).strip().lower() == "user"
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Analyze MR-DFlash data and build length manifest")
     parser.add_argument("--input", required=True)
@@ -83,8 +102,9 @@ def main(argv=None) -> None:
             # This fallback is intentionally only a deterministic ordering
             # hint. Exact token lengths are supplied by prepare/tokenize when
             # available; the scheduler must never treat character count as a
-            # VRAM measurement.
-            length = len(_last_message(row, "user"))
+            # VRAM measurement. Include assistant history because it is part
+            # of the prompt context for multi-turn ShareGPT rows.
+            length = _conversation_length_hint(row)
         length = max(0, int(length))
         lengths.append(length)
         length_rows.append(
@@ -128,6 +148,8 @@ def main(argv=None) -> None:
         "duplicate_ids": duplicate_ids,
         "assistant_rows": assistant_rows,
         "prompt_only_rows": prompt_only_rows,
+        "assistant_history_rows": assistant_rows,
+        "prompt_ready_rows": sum(1 for row in rows if _ends_with_user(row)),
         "reference_rows": reference_rows,
         "length_metric": "source_token_length when available, otherwise source_length",
         "length_stats": {

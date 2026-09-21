@@ -3,8 +3,8 @@
 Worker [`vllm_regenerate.py`](../scripts/mr_dflash/vllm_regenerate.py) giữ
 tokenizer/chat-template local, sau đó gửi `prompt` dạng token IDs tới endpoint
 OpenAI-compatible `/v1/completions`. vLLM thực hiện continuous batching; worker
-chỉ admission-control theo số request và tổng
-`prompt_tokens + generation_budget`.
+admission-control theo số request, tổng `prompt_tokens + generation_budget` và
+peak `gpu_cache_usage_perc` lấy từ Prometheus `/metrics`.
 
 ## Mô hình triển khai
 
@@ -21,8 +21,9 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
   --served-model-name qwen3-4b \
   --host 127.0.0.1 --port 8000 \
   --dtype bfloat16 --max-model-len 32768 \
-  --gpu-memory-utilization 0.92 \
-  --max-num-seqs 64 --max-num-batched-tokens 262144
+  --gpu-memory-utilization 0.95 \
+  --max-num-seqs 128 --max-num-batched-tokens 262144 \
+  --enable-metrics
 
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL" \
   --served-model-name qwen3-4b \
@@ -52,7 +53,10 @@ PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
   --vllm-model qwen3-4b \
   --vllm-request-concurrency 64 \
   --vllm-request-concurrency-start 8 \
+  --vllm-max-batched-tokens-start 65536 \
   --vllm-max-batched-tokens 262144 \
+  --vllm-gpu-cache-target 0.90 \
+  --vllm-gpu-cache-hard 0.98 \
   --parallel-gpu-ids 0 1 2 3 \
   --parallel-scheduler shared_lease \
   --parallel-queue-quantum-items 512 \
@@ -63,11 +67,23 @@ PYTHONPATH=src python3 scripts/mr_dflash/run_preprocess_pipeline.py \
 theo quantum hữu hạn để GPU hoàn thành shard ngắn không phải chờ một shard dài
 độc quyền; output merge vẫn theo thứ tự input và kiểm tra missing/duplicate ID.
 
-`--vllm-request-concurrency-start` tăng dần tới hard cap sau các nhóm thành
-công. `--vllm-max-batched-tokens` là giới hạn admission phía client, không thay
-thế `--max-num-batched-tokens` của server. Khi gặp timeout/429/5xx, worker retry
-có backoff và giảm concurrency; lỗi không retryable tuân theo
-`--sample-error-policy`.
+`--vllm-request-concurrency-start` và
+`--vllm-max-batched-tokens-start` tăng dần sau các nhóm thành công khi KV-cache
+còn dưới target. Mặc định worker giữ target ở 90% và hard backoff ở 98%:
+
+```text
+cache_usage < 0.90  → tăng concurrency và token budget
+0.90 ≤ cache_usage < 0.98 → giữ mức hiện tại
+cache_usage ≥ 0.98 hoặc 429/5xx → giảm một nửa
+```
+
+`--vllm-max-batched-tokens` là giới hạn admission phía client, không thay thế
+`--max-num-batched-tokens` của server. Nếu server không expose `/metrics`, worker
+tự fallback sang token-aware admission, không dừng generation. Có thể truyền
+`--vllm-metrics-address` nếu endpoint metrics không nằm ở `/metrics` mặc định.
+
+Khi gặp timeout/429/5xx, worker retry có backoff và giảm concurrency/token
+budget; lỗi không retryable tuân theo `--sample-error-policy`.
 
 Với `temperature=0`, worker có thể chạy concurrent requests. Với
 `temperature>0`, worker tự hạ concurrency về 1 để giữ contract sampling gần

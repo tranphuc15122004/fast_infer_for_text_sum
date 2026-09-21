@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 
-from _common import read_jsonl, write_json, write_jsonl
+from _common import prompt_messages_error, read_jsonl, write_json, write_jsonl
 from auto_batch import AdaptiveBatchController
 from MR_DFlash.generation_batching import left_pad_prompt_ids, select_generation_group
 from progress import ProgressReporter, install_exception_hook
@@ -916,25 +916,19 @@ def main(argv=None) -> None:
             stats["skipped_existing"] += 1
             continue
         messages = list(row.get("conversations") or [])
-        if not messages:
+        prompt_error = prompt_messages_error(messages)
+        if prompt_error == "sample không có conversations":
             record_skip(
                 sample_id,
                 kind="invalid",
-                error="sample không có conversations",
+                error=prompt_error,
             )
             continue
-        if any(
-            str(message.get("role", "")).lower() == "assistant"
-            for message in messages
-            if isinstance(message, dict)
-        ):
+        if prompt_error is not None:
             record_skip(
                 sample_id,
                 kind="invalid",
-                error=(
-                    f"sample {sample_id!r} đã chứa assistant response; "
-                    "regenerate chỉ nhận prompt-only input"
-                ),
+                error=f"sample {sample_id!r}: {prompt_error}",
             )
             continue
         prompt_messages = messages

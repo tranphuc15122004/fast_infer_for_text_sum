@@ -476,7 +476,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "extra_metrics": {
             "requested_attention_backend": requested_attention_backend,
             "effective_attention_backend": effective_attention_backend
-                or "unknown",
+            or "unknown",
         },
     }
 

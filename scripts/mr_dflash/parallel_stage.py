@@ -199,12 +199,12 @@ def build_shared_queue_items(
         if length is None and isinstance(row.get("input_ids"), list):
             length = len(row["input_ids"])
         if length is None:
-            user_text = "\n".join(
+            prompt_text = "\n".join(
                 str(message.get("content", ""))
                 for message in row.get("conversations", [])
-                if isinstance(message, dict) and str(message.get("role", "")).lower() == "user"
+                if isinstance(message, dict)
             )
-            length = len(user_text)
+            length = len(prompt_text)
         items.append(WorkItem(sample_id=str(row.get("id", f"row_{index}")), index=index, length=max(0, int(length))))
     return items
 
@@ -616,9 +616,18 @@ def _build_worker_command(
                     "--request-concurrency", str(args.vllm_request_concurrency),
                     "--request-concurrency-start", str(args.vllm_request_concurrency_start),
                     "--max-batched-tokens", str(args.vllm_max_batched_tokens),
+                    "--max-batched-tokens-start", str(args.vllm_max_batched_tokens_start),
                     "--request-growth-factor", str(args.vllm_request_growth_factor),
                     "--request-timeout-seconds", str(args.vllm_request_timeout_seconds),
                     "--request-retries", str(args.vllm_request_retries),
+                    *(
+                        ["--metrics-address", args.vllm_metrics_address]
+                        if args.vllm_metrics_address
+                        else []
+                    ),
+                    "--metrics-poll-interval-seconds", str(args.vllm_metrics_poll_interval_seconds),
+                    "--gpu-cache-target", str(args.vllm_gpu_cache_target),
+                    "--gpu-cache-hard", str(args.vllm_gpu_cache_hard),
                 ]
             )
         else:
@@ -1047,9 +1056,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--vllm-request-concurrency", type=int, default=64)
     parser.add_argument("--vllm-request-concurrency-start", type=int, default=8)
     parser.add_argument("--vllm-max-batched-tokens", type=int, default=262144)
+    parser.add_argument("--vllm-max-batched-tokens-start", type=int, default=65536)
     parser.add_argument("--vllm-request-growth-factor", type=float, default=2.0)
     parser.add_argument("--vllm-request-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--vllm-request-retries", type=int, default=2)
+    parser.add_argument("--vllm-metrics-address", default=None)
+    parser.add_argument("--vllm-metrics-poll-interval-seconds", type=float, default=0.5)
+    parser.add_argument("--vllm-gpu-cache-target", type=float, default=0.90)
+    parser.add_argument("--vllm-gpu-cache-hard", type=float, default=0.98)
     parser.add_argument("--max-length", type=int, required=True)
     parser.add_argument(
         "--target-layer-ids",
@@ -1226,10 +1240,19 @@ def parse_args(argv=None) -> argparse.Namespace:
             raise ValueError("vLLM request concurrency phải >= 1")
         if args.vllm_request_concurrency_start > args.vllm_request_concurrency:
             raise ValueError("vllm-request-concurrency-start phải <= vllm-request-concurrency")
-        if args.vllm_max_batched_tokens < 1 or args.vllm_request_retries < 0:
+        if (
+            args.vllm_max_batched_tokens < 1
+            or args.vllm_max_batched_tokens_start < 1
+            or args.vllm_max_batched_tokens_start > args.vllm_max_batched_tokens
+            or args.vllm_request_retries < 0
+        ):
             raise ValueError("vLLM request options không hợp lệ")
         if args.vllm_request_growth_factor <= 1.0 or args.vllm_request_timeout_seconds <= 0:
             raise ValueError("vLLM growth/timeout không hợp lệ")
+        if args.vllm_metrics_poll_interval_seconds <= 0:
+            raise ValueError("vLLM metrics poll interval phải > 0")
+        if not 0.0 < args.vllm_gpu_cache_target <= args.vllm_gpu_cache_hard <= 1.0:
+            raise ValueError("vLLM gpu cache target/hard không hợp lệ")
     args.gpu_ids = _validate_gpu_ids(args.gpu_ids)
     if args.regenerate_backend == "vllm" and len(args.vllm_server_addresses) < len(args.gpu_ids):
         raise ValueError("cần ít nhất một vLLM server address cho mỗi GPU worker")
@@ -1324,6 +1347,11 @@ def main(argv=None) -> int:
         "vllm_request_concurrency": int(args.vllm_request_concurrency),
         "vllm_request_concurrency_start": int(args.vllm_request_concurrency_start),
         "vllm_max_batched_tokens": int(args.vllm_max_batched_tokens),
+        "vllm_max_batched_tokens_start": int(args.vllm_max_batched_tokens_start),
+        "vllm_metrics_address": args.vllm_metrics_address,
+        "vllm_metrics_poll_interval_seconds": float(args.vllm_metrics_poll_interval_seconds),
+        "vllm_gpu_cache_target": float(args.vllm_gpu_cache_target),
+        "vllm_gpu_cache_hard": float(args.vllm_gpu_cache_hard),
         "queue_quantum_items": int(args.queue_quantum_items),
         "max_length": int(args.max_length),
         "target_layer_ids": (

@@ -113,7 +113,7 @@ def test_modal_runtime_preflight_uses_the_persistent_venv():
         "/mnt/fast-infer/venv/bin/python",
         "/workspace/fast_infer_text_sum/scripts/check_shared_env.py",
         "--profile",
-        "modal-longbench",
+        "modal-longbench-core",
     ]
 
 

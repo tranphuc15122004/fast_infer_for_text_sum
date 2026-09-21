@@ -1,0 +1,129 @@
+{
+  "schema_version": "trainingfree.controlled_search.v1",
+  "date": "2026-09-21",
+  "status": "STOP_BEFORE_E43",
+  "model": "Qwen3-0.6B",
+  "device": "Modal NVIDIA A10",
+  "datasets": {
+    "gov_report": 20,
+    "multi_news": 20
+  },
+  "decode": {
+    "max_new_tokens": 32,
+    "seed": 42,
+    "layer_ids": [27],
+    "region_size": 1024,
+    "block_size": 128,
+    "reps_per_block": 4,
+    "reps_per_region": 4,
+    "routed_fractions": [0.05, 0.1, 0.2, 0.3],
+    "global_fractions": [0.1, 0.2, 0.3, 0.4]
+  },
+  "runtime": {
+    "dtype": "bfloat16",
+    "torch": "2.11.0",
+    "transformers": "5.12.1",
+    "attention_backend": "eager_decode_sdpa_prefill",
+    "prompt_thinking": false,
+    "generation": "greedy_argmax",
+    "query_heads": 16,
+    "kv_heads": 8,
+    "model_revision_or_hash_recorded": false
+  },
+  "source_length_profile": {
+    "gov_report": {"mean": 8874.1, "p50": 8854.0, "p90": 12026.1, "min": 2696, "max": 13538, "buckets": {"lt_8k": 8, "8k_16k": 12, "16k_32k": 0, "gt_32k": 0}},
+    "multi_news": {"mean": 2796.25, "p50": 2559.0, "p90": 5239.5, "min": 545, "max": 6488, "buckets": {"lt_8k": 20, "8k_16k": 0, "16k_32k": 0, "gt_32k": 0}}
+  },
+  "gates": {
+    "exact_expansion_fraction_max": 0.3,
+    "mean_missed_attention_mass_max": 0.01,
+    "p99_missed_attention_mass_max": 0.05
+  },
+  "e42_definition": {
+    "global_head_selection": "Per-dataset static set: rank heads by mean K95 over the same dev trace, then select ceil(16*global_fraction).",
+    "selection_leakage": true,
+    "routed_selection": "Per decode step and query head, exact top source positions by current attention.",
+    "expansion_metric": "E_src = mean over document, step and query head of 1 for global heads or ceil(r*source_tokens)/source_tokens for routed heads; source-only, non-source positions retained.",
+    "output_error_metric": "Relative L2 context error after retaining selected positions and renormalizing attention.",
+    "gqa_rule": "16 query heads mapped to 8 KV heads for value context."
+  },
+  "baseline_audit_reference": {
+    "record_id": "modal-trainingfree-reference-20260921",
+    "document": "docs/experiments/2026-09-21_modal_trainingfree_reference.md",
+    "methods": ["vanilla_hf", "eagle3", "dflash"],
+    "target": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "gpu": "Modal A100-SXM4-80GB",
+    "max_new_tokens": 128,
+    "direct_speedup_comparison": false,
+    "reason": "Training-Free controlled search dùng Qwen3-0.6B trên A10, output 32 tokens và metrics oracle khác E2E/throughput/ROUGE.",
+    "paired_speedup_reference": {
+      "dflash_vs_vanilla_hf": {"gov_report": 1.92, "multi_news": 2.04},
+      "eagle3_vs_vanilla_hf": {"gov_report": 1.39, "multi_news": 1.62}
+    }
+  },
+  "runs": {
+    "e41": {
+      "run_id": "e41-head-concentration-20260921",
+      "records": 40,
+      "status": "ok",
+      "datasets": {
+        "gov_report": {
+          "mean_k95_fraction": 0.24288829996621591,
+          "p95_k95_fraction": 0.4923588647739836,
+          "p99_k95_fraction": 0.61077522255193,
+          "global_head_fraction": {"0.1": 0.9511781150159745, "0.25": 0.37929313099041534, "0.5": 0.045926517571884984}
+        },
+        "multi_news": {
+          "mean_k95_fraction": 0.3846529993772528,
+          "p95_k95_fraction": 0.585393772050928,
+          "p99_k95_fraction": 0.6642407792862066,
+          "global_head_fraction": {"0.1": 0.9996966019417476, "0.25": 0.854470064724919, "0.5": 0.16423948220064724}
+        }
+      },
+      "stability": {
+        "head_id_convention": "zero_based",
+        "head_9": {
+          "gov_report": {"mean_k95_fraction": 0.51489, "prob_k95_gt_0.5": 0.55112},
+          "multi_news": {"mean_k95_fraction": 0.59888, "prob_k95_gt_0.5": 0.92718}
+        },
+        "top_head_document_jaccard": {
+          "gov_report": {"top_2": 0.93333, "top_4": 0.75368},
+          "multi_news": {"top_2": 0.58596, "top_4": 0.50707}
+        },
+        "status": "exploratory_same_dev_cohort_layer_27"
+      }
+    },
+    "e42": {
+      "run_id": "e42-oracle-hybrid-head-20260921",
+      "records": 40,
+      "observations": 19904,
+      "status": "ok",
+      "modal_volume": "fast-infer-text-sum-cache:/outputs/recap_kv_v3/e42-oracle-hybrid-head-20260921/",
+      "all_candidates_pass_on_both_datasets": false,
+      "near_frontier": {
+        "global_0.1_routed_0.1": {
+          "gov_report": {"expansion": 0.21254433870485062, "missed_mean": 0.007090306983979991, "missed_p99": 0.08750802725553537, "output_error_mean": 0.015795049921378406, "output_error_p95": 0.06448026274255185, "output_error_p99": 0.1211813397044559},
+          "multi_news": {"expansion": 0.21269657886834, "missed_mean": 0.009707851146321913, "missed_p99": 0.09954052627086626, "output_error_mean": 0.021338420577349314, "output_error_p95": 0.08514801421395417, "output_error_p99": 0.1494834476732779}
+        },
+        "global_0.1_routed_0.2": {
+          "gov_report": {"expansion": 0.30005183189467705, "missed_mean": 0.00312627667209292, "missed_p99": 0.044002181291580234, "output_error_mean": 0.007019664577067226, "output_error_p95": 0.030093007150020883, "output_error_p99": 0.061389487568161635},
+          "multi_news": {"expansion": 0.30010301291562724, "missed_mean": 0.0052959827431531235, "missed_p99": 0.05814200520515439, "output_error_mean": 0.011574721166194445, "output_error_p95": 0.046953156398699514, "output_error_p99": 0.08585028430789939}
+        },
+        "global_0.1_routed_0.3": {
+          "gov_report": {"expansion": 0.3875349542946999, "missed_mean": 0.0015524464950702824, "missed_p99": 0.02351975589990616, "output_error_mean": 0.0037130348257061107, "output_error_p95": 0.01601825598834377, "output_error_p99": 0.03394909884245595},
+          "multi_news": {"expansion": 0.3876978158583662, "missed_mean": 0.003093981914003273, "missed_p99": 0.03446212798357009, "output_error_mean": 0.0068677773156752215, "output_error_p95": 0.02793484534403706, "output_error_p99": 0.05243736901771092}
+        }
+      },
+      "document_bootstrap_95ci": {
+        "seed": 20260921,
+        "resamples": 10000,
+        "global_0.1_routed_0.2": {
+          "gov_report": {"expansion": [0.3000322549463123, 0.3000796548345409], "missed_mean": [0.0024159291860050146, 0.003998240892378232]},
+          "multi_news": {"expansion": [0.3000587940010889, 0.3001795563022116], "missed_mean": [0.004777505808597154, 0.005907593540894906]}
+        },
+        "note": "Document-weighted CI for means; P99 remains descriptive point estimate."
+      }
+    }
+  },
+  "decision": "E41 heterogeneity and exploratory persistent-head signal confirmed; E42 has meaningful oracle headroom and a near-frontier GovReport point, but no candidate satisfies all gates on both datasets. Do not promote a deployable router or physical executor; run the locked multi-layer/long-decode diagnostic before deciding whether to open E43 as a diagnostic."
+}

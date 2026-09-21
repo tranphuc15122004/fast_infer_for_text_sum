@@ -1,0 +1,102 @@
+{
+  "record_id": "modal-trainingfree-reference-20260921",
+  "created_at_utc": "2026-09-21",
+  "baseline_run": {
+    "run_id": "tf-screen-l50-20260921-core",
+    "status": "partial_success",
+    "command": "MODAL_GPU=A100-80GB modal run scripts/modal_longbench.py --mode representative --baselines 'vanilla_hf,eagle3,dflash' --datasets 'gov_report,multi_news,qmsum' --max-samples 20 --max-new-tokens 128 --warmup-runs 1 --run-id tf-screen-l50-20260921-core --allow-unsupported",
+    "config": {
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+      "eagle_model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+      "dflash_model": "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
+      "datasets": ["gov_report", "multi_news", "qmsum"],
+      "data_dir": "data/longbench_100_14k",
+      "dataset_profile_count": 100,
+      "sample_count_per_dataset": 20,
+      "max_new_tokens": 128,
+      "temperature": 0.0,
+      "warmup_runs": 1,
+      "seed": 42,
+      "timeout_seconds": 3600,
+      "max_input_tokens": 0,
+      "min_free_gb": 32.0,
+      "python": "3.12.10",
+      "torch": "2.11.0+cu130",
+      "transformers": "5.12.1",
+      "cuda": "13.0",
+      "preflight_profile": "modal-longbench-core",
+      "source_manifest_sha256": "794c688f49ed896abcfc1c27b9944037d0e52dcb7d954c3b2091356125cdb7cb"
+    },
+    "results": [
+      {"dataset": "gov_report", "method": "vanilla_hf", "n": 20, "e2e_ms": 6663.0, "tok_s": 22.26, "rouge2_f": 0.0903, "rougeL_f": 0.1400, "coverage": "complete"},
+      {"dataset": "gov_report", "method": "eagle3", "n": 20, "e2e_ms": 4802.3, "tok_s": 32.19, "rouge2_f": 0.0862, "rougeL_f": 0.1242, "coverage": "complete"},
+      {"dataset": "gov_report", "method": "dflash", "n": 20, "e2e_ms": 3465.7, "tok_s": 41.32, "rouge2_f": 0.0960, "rougeL_f": 0.1441, "coverage": "complete"},
+      {"dataset": "multi_news", "method": "vanilla_hf", "n": 20, "e2e_ms": 3037.2, "tok_s": 43.17, "rouge2_f": 0.0759, "rougeL_f": 0.1526, "coverage": "complete"},
+      {"dataset": "multi_news", "method": "eagle3", "n": 20, "e2e_ms": 1872.0, "tok_s": 73.45, "rouge2_f": 0.0573, "rougeL_f": 0.1404, "coverage": "complete"},
+      {"dataset": "multi_news", "method": "dflash", "n": 20, "e2e_ms": 1488.0, "tok_s": 95.74, "rouge2_f": 0.0791, "rougeL_f": 0.1538, "coverage": "complete"},
+      {"dataset": "qmsum", "method": "vanilla_hf", "n": 4, "e2e_ms": 6643.5, "tok_s": 20.30, "rouge2_f": 0.0915, "rougeL_f": 0.2087, "coverage": "partial_oom_from_sample_5"},
+      {"dataset": "qmsum", "method": "eagle3", "n": 5, "e2e_ms": 5967.1, "tok_s": 19.50, "rouge2_f": 0.0634, "rougeL_f": 0.1835, "coverage": "partial_oom_from_sample_6"},
+      {"dataset": "qmsum", "method": "dflash", "n": 20, "e2e_ms": 4593.4, "tok_s": 29.17, "rouge2_f": 0.0829, "rougeL_f": 0.2032, "coverage": "complete"}
+    ],
+    "artifacts": {
+      "volume": "fast-infer-text-sum-cache",
+      "path": "outputs/longbench_100_14k/tf-screen-l50-20260921-core/",
+      "manifest": "run_manifest.json",
+      "metrics_json": "metrics_summary.json",
+      "metrics_csv": "metrics_summary.csv",
+      "metrics_markdown": "metrics_summary.md"
+    }
+  },
+  "trainingfree_run": {
+    "run_id": "recap-v3-screen-20260921",
+    "experiment": "hierarchy",
+    "status": "STOP_BEFORE_PHYSICAL",
+    "config": {
+      "gpu": "NVIDIA A10G",
+      "model": "Qwen3-0.6B",
+      "datasets": ["gov_report", "multi_news", "qmsum"],
+      "samples_total": 60,
+      "max_new_tokens": 32,
+      "region_size": 1024,
+      "block_size": 128,
+      "reps_per_block": 4,
+      "reps_per_region": 4,
+      "hierarchy_mass_budget": 0.01,
+      "max_missed_attention_mass": 0.01,
+      "max_exact_expansion": 0.3,
+      "max_index_overhead": 0.1,
+      "layer_ids": [27]
+    },
+    "results": {
+      "ok_samples": 60,
+      "error_samples": 0,
+      "inconclusive_samples": 0,
+      "missed_attention_mass": 0.0,
+      "upper_bound_violations": 0,
+      "exact_expansion_fraction": 1.0,
+      "active_qk_tokens_mean": 7303.6,
+      "full_qk_tokens_mean": 7303.6,
+      "index_overhead": 0.03359049917335491,
+      "routing_fraction": 0.03613883100672566
+    },
+    "artifacts": {
+      "volume": "fast-infer-text-sum-cache",
+      "path": "outputs/recap_kv_v3/recap-v3-screen-20260921/",
+      "manifest": "manifest.json",
+      "metrics_json": "hierarchy_metrics.json",
+      "metrics_jsonl": "hierarchy_metrics.jsonl",
+      "report": "hierarchy_report.md",
+      "trace": "hierarchy_trace.jsonl"
+    }
+  },
+  "comparison_policy": {
+    "do_not_merge_trainingfree_with_baseline": "different target model",
+    "do_not_use_partial_qmsum_as_full_result": true,
+    "next_required": [
+      "rerun qmsum OOM cells with compatible memory/context policy",
+      "run Training-Free on the same target model before direct speedup claim",
+      "keep raw Modal Volume artifacts and create a new record for changed config"
+    ]
+  }
+}

@@ -13,36 +13,45 @@ from _common import (
     append_jsonl_durable,
     canonical_prompt,
     content_of,
+    normalize_role,
     read_records,
     stable_id,
 )
 from progress import ProgressReporter, install_exception_hook
 
 
-def _messages(row: Dict[str, Any]) -> List[Dict[str, str]]:
-    raw = row.get("conversations", row.get("messages", []))
+def _last_user_index(raw: Any) -> int | None:
     if not isinstance(raw, list):
-        return []
-    result: List[Dict[str, str]] = []
-    # Prompt-only semantics: keep system messages and the final user turn;
-    # original assistant answers are deliberately never used as supervision.
-    last_user = None
-    for item in raw:
+        return None
+    last_user_index = None
+    for index, item in enumerate(raw):
         if not isinstance(item, dict):
             continue
-        role = str(item.get("role", item.get("from", ""))).strip().lower()
-        if role in {"human", "user"}:
-            last_user = content_of(item)
-        elif role == "system":
-            text = content_of(item).strip()
-            if text:
-                result.append({"role": "system", "content": text})
-    # Một số record ShareGPT chỉ có system/metadata hoặc role không nằm trong
-    # schema. Đây không phải prompt hợp lệ cho target regeneration; bỏ qua
-    # record thay vì để canonical_prompt dừng toàn bộ phase prepare.
-    if not last_user or not last_user.strip():
+        if normalize_role(item.get("role", item.get("from", ""))) == "user" and content_of(item).strip():
+            last_user_index = index
+    return last_user_index
+
+
+def _messages(row: Dict[str, Any]) -> List[Dict[str, str]]:
+    raw = row.get("conversations", row.get("messages", []))
+    last_user_index = _last_user_index(raw)
+    if last_user_index is None:
         return []
-    result.append({"role": "user", "content": last_user})
+    # Prompt-only means không đưa target assistant cuối vào input, không có
+    # nghĩa là loại bỏ assistant history. Giữ toàn bộ context trước user cuối
+    # để model thấy đúng cuộc hội thoại ShareGPT; cắt mọi message sau user cuối
+    # vì đó là response đích cũ (nếu raw record có response ở cuối).
+    result: List[Dict[str, str]] = []
+    allowed_roles = {"system", "user", "assistant", "tool"}
+    for item in raw[: last_user_index + 1]:
+        if not isinstance(item, dict):
+            continue
+        role = normalize_role(item.get("role", item.get("from", "")))
+        text = content_of(item).strip()
+        if role in allowed_roles and text:
+            result.append({"role": role, "content": text})
+    if not result or result[-1]["role"] != "user":
+        return []
     return result
 
 
@@ -112,12 +121,24 @@ def main(argv=None) -> None:
             sample_id = str(raw_id) if str(raw_id).startswith("sharegpt_") else f"sharegpt_{raw_id}"
             if sample_id in existing:
                 continue
+            raw_messages = row.get("conversations", row.get("messages", []))
+            target_source_turn_index = _last_user_index(raw_messages)
+            if target_source_turn_index is None:
+                continue
+            source_length = sum(
+                len(content_of(item).strip())
+                for item in raw_messages[: target_source_turn_index + 1]
+                if isinstance(item, dict)
+            )
             yield canonical_prompt(
                 sample_id,
                 "sharegpt",
                 messages,
                 source_index=index,
-                original_turn_count=len(row.get("conversations", row.get("messages", [])) or []),
+                original_turn_count=len(raw_messages) if isinstance(raw_messages, list) else 0,
+                retained_turn_count=len(messages),
+                target_source_turn_index=target_source_turn_index,
+                source_length=source_length,
             )
             emitted += 1
 

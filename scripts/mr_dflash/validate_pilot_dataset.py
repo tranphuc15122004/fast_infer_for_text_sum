@@ -63,8 +63,6 @@ def main(argv=None) -> None:
         roles = [str(m.get("role", "")).lower() for m in conversations if isinstance(m, dict)]
         if roles[-1:] != ["assistant"]:
             raise ValueError(f"row {index}: assistant cuối bị thiếu")
-        if any(role == "assistant" for role in roles[:-1]):
-            raise ValueError(f"row {index}: có assistant trajectory cũ trước response cuối")
         assistant = str(conversations[-1].get("content", "")).strip()
         if not assistant:
             raise ValueError(f"row {index}: assistant rỗng")

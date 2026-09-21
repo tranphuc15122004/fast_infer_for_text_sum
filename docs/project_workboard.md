@@ -5,6 +5,9 @@
 > phần nào đã có code, phần nào đã test/chạy được, bằng chứng hiện tại mạnh đến
 > đâu và bước tiếp theo là gì.
 
+Benchmark reference để đối chiếu Training-Free: [Modal reference](experiments/2026-09-21_modal_trainingfree_reference.md)
+và [metadata/config JSON](experiments/2026-09-21_modal_trainingfree_reference.json).
+
 **Ngày snapshot:** 2026-09-21  
 **Commit nền:** `ffe40fc` (`cap nhat quá trình Eval`)  
 **Lưu ý trạng thái:** working tree hiện có thay đổi chưa commit ở các nhánh
@@ -37,7 +40,7 @@ Nhãn dùng trong tài liệu:
 | `B1` | Benchmark các baseline tăng tốc inference | `scripts/infer_*.py`, `scripts/run_*.sh`, `externals/`, `docs/baselines/` | **Đã có matrix, smoke và full B200 artifacts; cần chuẩn hóa diễn giải** |
 | `F1` | DFlash fine-tuning cho tóm tắt tiếng Việt | `src/Finetuning/` | **Core và synthetic pipeline đã chạy; chưa đóng real Vietnamese quality/speedup** |
 | `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Prototype/pipeline source-to-cache đã triển khai; pilot train/eval thật còn là việc chính** |
-| `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **V0/V2 có kết luận âm; V3 pilot chạy đúng nhưng gate sparsity fail; dừng trước physical KV** |
+| `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |
 | `Y1` | SyncSpec-v1 speculative decoding | `src/SyncSpec/`, `docs/baselines/syncspec.md` | **Core, test và smoke đã có; chưa có full benchmark canonical để claim** |
 | `A1` | Phân tích chẩn đoán và quyết định nghiên cứu | `src/analyze/`, `outputs/dflash_residual/`, `outputs/safe_budget_sum/`, `outputs/specextend_*` | **Nhiều thí nghiệm đã chạy; kết quả dùng để lọc giả thuyết, không tự động là baseline** |
 
@@ -180,6 +183,33 @@ method theo nơi chúng giảm chi phí:
   `lead-512` có trade-off tốt trên tập 16 mẫu, nhưng cần representative/full
   validation trước khi biến thành policy.
 
+### Screening Modal mới nhất
+
+Run `tf-screen-l50-20260921-core` đã chạy trên Modal A100 80GB với Llama 3.1
+8B Instruct, `gov_report` + `multi_news` + `qmsum`, 20 mẫu/dataset và tối đa
+128 token output. Kết quả đã được aggregate và lưu trong Modal Volume
+`fast-infer-text-sum-cache` tại
+`outputs/longbench_100_14k/tf-screen-l50-20260921-core/`.
+
+| Dataset | Method | n hợp lệ | E2E ms | tok/s | ROUGE-2 F | ROUGE-L F | Trạng thái |
+|---|---|---:|---:|---:|---:|---:|---|
+| gov_report | Vanilla HF | 20 | 6663.0 | 22.26 | 0.0903 | 0.1400 | đủ |
+| gov_report | EAGLE-3 | 20 | 4802.3 | 32.19 | 0.0862 | 0.1242 | đủ; accept 4.23 |
+| gov_report | DFlash | 20 | 3465.7 | 41.32 | 0.0960 | 0.1441 | đủ; output checks pass |
+| multi_news | Vanilla HF | 20 | 3037.2 | 43.17 | 0.0759 | 0.1526 | đủ |
+| multi_news | EAGLE-3 | 20 | 1872.0 | 73.45 | 0.0573 | 0.1404 | đủ; accept 4.25 |
+| multi_news | DFlash | 20 | 1488.0 | 95.74 | 0.0791 | 0.1538 | đủ; output checks pass |
+| qmsum | Vanilla HF | 4 | 6643.5 | 20.30 | 0.0915 | 0.2087 | OOM từ mẫu 5 |
+| qmsum | EAGLE-3 | 5 | 5967.1 | 19.50 | 0.0634 | 0.1835 | OOM từ mẫu 6 |
+| qmsum | DFlash | 20 | 4593.4 | 29.17 | 0.0829 | 0.2032 | đủ; output checks pass |
+
+Đây là screening systems/quality, chưa phải bảng claim cuối: `vanilla_fa`
+chưa chạy vì image FlashAttention source build không hoàn tất; RECAP-KV V3
+chạy riêng trên Qwen3-0.6B nên không được gộp vào các số Llama 3.1 8B. Hai ô
+qmsum bị OOM phải được giữ nguyên là thiếu coverage, không xem mean partial
+như kết quả đầy đủ. `metrics_summary.json` còn cho speedup ghép cặp với
+Vanilla HF; chỉ diễn giải speedup khi coverage pair đủ.
+
 ### Khoảng trống và giới hạn
 
 - Không phải baseline nào cũng trả cùng metric: một số kernel smoke không sinh
@@ -195,6 +225,10 @@ method theo nơi chúng giảm chi phí:
 - Hoàn chỉnh matrix baseline theo cùng model, data, output budget và reference
   semantics; ghi các ô `unsupported`, `blocked`, `aggregate-only` thay vì bỏ
   qua.
+- Chạy lại `vanilla_hf/qmsum` và `eagle3/qmsum` bằng context/memory policy
+  tương thích, hoặc chọn GPU/profile đủ VRAM; không điền số giả vào bảng.
+- Quyết định có cần build FlashAttention wheel/cache ổn định để đưa
+  `vanilla_fa` vào cùng matrix hay giữ Vanilla HF làm dense control.
 - Chạy lại các ô bị thiếu metric sau khi audit; sau đó viết báo cáo speed/
   quality theo từng nhóm phương pháp.
 - Khi thêm method mới, cập nhật cả adapter, contract test, docs baseline và
@@ -396,6 +430,28 @@ chiếu; active set chưa được dùng để mutate KV thật.
   ngưỡng; nhưng exact expansion = 1.0, active QK = full QK.
 - Kết luận đã khóa trong report là `STOP_BEFORE_PHYSICAL`.
 
+Latest Modal screening `recap-v3-screen-20260921` đã mở rộng lên 60 document
+(20 mỗi `gov_report`, `multi_news`, `qmsum`) trên A10G, target Qwen3-0.6B,
+`max_new_tokens=32`. Runtime 60/60, error 0; missed attention mass = 0,
+upper-bound violation = 0, exact expansion = 1.0, active QK = full QK,
+index overhead = 3.36%, routing fraction = 3.61%. Artifact nằm trong Modal
+Volume `fast-infer-text-sum-cache` tại
+`outputs/recap_kv_v3/recap-v3-screen-20260921/`. Run này củng cố kết luận
+audit nhưng không tạo ra số speedup/quality để ghép với bảng Llama 3.1 8B.
+
+Controlled empirical search mới nhất đã chạy E41/E42 trên 40 document
+(20 `gov_report` + 20 `multi_news`) với Qwen3-0.6B trên Modal A10. E41 cho
+thấy K95 fraction mean lần lượt 0.2429/0.3847 và head heterogeneity đủ để mở
+E42. E42 đo toàn bộ sweep global-head 10/20/30/40% × routed-source
+5/10/20/30%; không candidate nào đạt đồng thời expansion ≤30%, mean missed
+mass ≤1% và P99 missed mass ≤5% trên cả hai dataset. Cấu hình gần nhất là
+global 10% + routed 10% (expansion khoảng 21.3%) nhưng P99 missed mass còn
+8.75%/9.95%; routed 20% vượt nhẹ expansion 30% và `multi_news` vẫn P99
+5.81%. Kết luận là `STOP_BEFORE_E43`; chưa có router hay physical KV.
+Chi tiết bảng/config/artifact nằm ở
+[`docs/experiments/2026-09-21_trainingfree_controlled_search.md`](experiments/2026-09-21_trainingfree_controlled_search.md)
+và JSON đi kèm.
+
 ### Chưa đủ bằng chứng / không được diễn giải sai
 
 - Chưa có reduction thật về KV bytes, VRAM, latency hoặc throughput.
@@ -407,12 +463,13 @@ chiếu; active set chưa được dùng để mutate KV thật.
 
 ### Việc tiếp theo dự kiến
 
-- Chạy một follow-up có kiểm soát thay coverage radius toàn cục bằng bound
-  query-directional chặt hơn; giữ nguyên 40 tài liệu và các gate hiện tại.
-- Mục tiêu tối thiểu: exact expansion ≤ 30%, missed mass ≤ 1%, zero violation,
-  overhead ≤ 10%.
-- Nếu bound mới vẫn expansion gần 100%, nên dừng nhánh V3 thay vì thêm learned
-  router hoặc physical executor.
+- Không mở E43 block-score oracle, learned router hoặc physical KV executor ở
+  trạng thái hiện tại vì E42 chưa có headroom dưới gate.
+- Nếu có giả thuyết mới, phải ghi rõ thay đổi bound/gate/quality target rồi
+  chạy lại controlled search; không tune threshold trên holdout.
+- Chỉ promote một candidate khi đạt đồng thời expansion ≤30%, mean missed mass
+  ≤1%, P99 missed mass ≤5%, index overhead ≤10% và có bằng chứng quality/logit
+  fidelity tương ứng.
 
 ### Việc tiếp theo được giao
 
@@ -425,6 +482,8 @@ chiếu; active set chưa được dùng để mutate KV thật.
 - [`src/TrainingFree/plans/2026-09-20-recap-kv-v3-detailed-report.md`](../src/TrainingFree/plans/2026-09-20-recap-kv-v3-detailed-report.md)
 - [`src/TrainingFree/run.py`](../src/TrainingFree/run.py)
 - [`scripts/modal_trainingfree.py`](../scripts/modal_trainingfree.py)
+- [`docs/experiments/2026-09-21_trainingfree_controlled_search.md`](experiments/2026-09-21_trainingfree_controlled_search.md)
+- [`src/TrainingFree/plans/2026-09-21-controlled-empirical-search.md`](../src/TrainingFree/plans/2026-09-21-controlled-empirical-search.md)
 
 ---
 
@@ -581,4 +640,3 @@ Quyết định: continue | stop | defer | promote-to-benchmark
 - Taxonomy baseline: [`externals/baseline_repo_guide.md`](../externals/baseline_repo_guide.md)
 - Dữ liệu: [`data/README.md`](../data/README.md)
 - Các kế hoạch/spec chi tiết: [`docs/superpowers/`](superpowers/)
-

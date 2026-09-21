@@ -33,6 +33,17 @@ giữ tối đa input hợp lệ thay vì cắt về regime 3K/8K.
 đúng. Vì vậy có thể dừng rồi chạy lại cùng `data-root` mà không tạo lại phần đã
 hoàn tất.
 
+### Contract của prompt ShareGPT
+
+Artifact `normalized/*_prompts.jsonl` là prompt-only theo nghĩa chưa có
+assistant response đích mới; nó **không** có nghĩa là loại bỏ assistant history.
+Với ShareGPT, prepare giữ system và toàn bộ user/assistant/tool history cho đến
+user cuối cùng, rồi regenerate thêm assistant mới vào cuối. Nếu raw record đã
+có assistant sau user cuối, phần assistant sau đó bị cắt để tránh đưa đáp án
+cũ vào target generation. Metadata `original_turn_count`,
+`retained_turn_count`, `target_source_turn_index` và `source_length` dùng để
+audit việc giữ context.
+
 Regenerate có thể dùng vLLM 0.24.0 server farm thay cho HF local bằng
 `--regenerate-backend vllm`; worker gửi token IDs và giới hạn request/tổng token
 để vLLM continuous-batch. Hướng dẫn khởi động endpoint, mapping address theo
@@ -91,11 +102,15 @@ Khi length tăng trong cùng bucket hoặc chuyển sang bucket mới, batch đ�
 trước khi chạy. Sample ngắn đầu run vẫn cho phép bước nhảy lớn; khi sample dài
 dần, controller tự chuyển sang bước nhỏ hơn.
 
-Khi chọn backend vLLM, adaptive control chuyển thành token-aware concurrent
-admission ở client; batch động thực tế do vLLM 0.24.0 continuous scheduler xử
-lý. `--vllm-request-concurrency` là trần request trên mỗi server, còn
-`--vllm-max-batched-tokens` là trần prompt-plus-generation phía client. Không
-dùng đồng thời vLLM server và SGLang cache trên cùng GPU.
+Khi chọn backend vLLM, adaptive control dùng token-aware concurrent admission
+kết hợp với peak KV-cache telemetry từ Prometheus. Khi cache usage dưới target,
+worker tăng đồng thời concurrency và token budget; khi đạt target thì giữ mức;
+khi chạm hard threshold hoặc server backoff thì giảm một nửa. Batch động thực
+tế vẫn do vLLM 0.24.0 continuous scheduler xử lý. `--vllm-request-concurrency`
+là trần request trên mỗi server, còn `--vllm-max-batched-tokens` là trần
+prompt-plus-generation phía client; phía server vẫn cần cấu hình
+`--gpu-memory-utilization` và `--max-num-batched-tokens`. Không dùng đồng thời
+vLLM server và SGLang cache trên cùng GPU.
 
 ### Hidden cache
 

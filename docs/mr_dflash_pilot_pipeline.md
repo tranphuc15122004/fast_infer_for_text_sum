@@ -53,7 +53,8 @@ chung các shard target. Các stage được thực hiện theo thứ tự:
 
 Để kiểm tra toàn bộ đường đi từ prompt canonical đến feature cache mà không
 đụng vào dataset lớn, dùng script riêng sau. Input phải là JSONL prompt-only
-đã chuẩn hóa, thường là `normalized/pilot_prompts.jsonl`; script không sửa
+đã chuẩn hóa (có thể có assistant history nhưng phải kết thúc bằng user),
+thường là `normalized/pilot_prompts.jsonl`; script không sửa
 input và ghi toàn bộ artifact vào `--output-root` mới:
 
 ```bash
@@ -442,8 +443,12 @@ dữ liệu để đưa thẳng vào DataLoader. Nó chỉ ra hai source trên B
 | ShareGPT | JSON array `.json` | 64.000 | `id`, `conversations[].from/value` |
 | ArXiv | JSONL `.jsonl` | gần 200.000 | `id`, `text[]`; giữ `summary[]`, `label` làm reference/metadata |
 
-ShareGPT có role `human/gpt`. Chuẩn hóa sẽ giữ system và câu hỏi user cuối,
-loại các câu trả lời `gpt` cũ; assistant cuối sẽ được sinh lại bởi target.
+ShareGPT có role `human/gpt`. Chuẩn hóa giữ toàn bộ context hợp lệ (system,
+user, assistant/tool history) đến user cuối cùng; các message sau user cuối
+(nếu raw record đã có câu trả lời đích) bị loại. Như vậy assistant history
+được dùng làm context, còn assistant cuối sẽ được sinh lại bởi target. Metadata
+`original_turn_count`, `retained_turn_count` và `target_source_turn_index`
+cho phép kiểm tra chính xác phần nào đã được giữ.
 ArXiv có `text` là danh sách đoạn văn, nên các phần tử được nối bằng hai dòng
 trống. `summary` không đi vào loss train; nó được lưu tại
 `metadata.reference_summary` để đánh giá ROUGE sau này. `label` được giữ trong

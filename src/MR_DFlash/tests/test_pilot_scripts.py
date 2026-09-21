@@ -202,6 +202,7 @@ def test_prepare_sharegpt_accepts_json_array(tmp_path: Path) -> None:
                         {"from": "human", "value": "First question"},
                         {"from": "gpt", "value": "Old answer"},
                         {"from": "human", "value": "Final question"},
+                        {"from": "gpt", "value": "Old final answer"},
                     ],
                 }
             ]
@@ -213,11 +214,56 @@ def test_prepare_sharegpt_accepts_json_array(tmp_path: Path) -> None:
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["id"] == "sharegpt_conversation-1"
-    assert rows[0]["conversations"][-1] == {
-        "role": "user",
-        "content": "Final question",
-    }
-    assert rows[0]["metadata"]["original_turn_count"] == 3
+    assert rows[0]["conversations"] == [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "Old answer"},
+        {"role": "user", "content": "Final question"},
+    ]
+    assert rows[0]["metadata"]["original_turn_count"] == 4
+    assert rows[0]["metadata"]["retained_turn_count"] == 3
+    assert rows[0]["metadata"]["target_source_turn_index"] == 2
+
+
+def test_regeneration_accepts_assistant_history_before_final_user(tmp_path: Path) -> None:
+    from regenerate_pilot import main as regenerate_main
+
+    source = tmp_path / "prompts.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "id": "multi-turn",
+                "source": "sharegpt",
+                "conversations": [
+                    {"role": "user", "content": "First question"},
+                    {"role": "assistant", "content": "Old answer"},
+                    {"role": "user", "content": "Final question"},
+                ],
+            }
+        ],
+    )
+    responses = tmp_path / "responses.jsonl"
+    _write_jsonl(responses, [{"id": "multi-turn", "assistant": "New answer"}])
+    output = tmp_path / "regenerated.jsonl"
+
+    regenerate_main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--responses-jsonl",
+            str(responses),
+        ]
+    )
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["conversations"] == [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "Old answer"},
+        {"role": "user", "content": "Final question"},
+        {"role": "assistant", "content": "New answer"},
+    ]
 
 
 def test_prepare_sharegpt_skips_records_without_user_turn(tmp_path: Path) -> None:
@@ -551,6 +597,10 @@ def test_preprocess_pipeline_vllm_regenerate_uses_server_worker(tmp_path: Path) 
         vllm_model="qwen3-served",
         vllm_request_concurrency=48,
         vllm_request_concurrency_start=8,
+        vllm_max_batched_tokens_start=65536,
+        vllm_max_batched_tokens=262144,
+        vllm_gpu_cache_target=0.90,
+        vllm_gpu_cache_hard=0.98,
     )
     stage = next(stage for stage in build_stage_plan(options) if stage.name == "regenerate_full_train")
 
@@ -558,6 +608,8 @@ def test_preprocess_pipeline_vllm_regenerate_uses_server_worker(tmp_path: Path) 
     assert stage.command[stage.command.index("--server-address") + 1] == "http://127.0.0.1:8000/v1"
     assert stage.command[stage.command.index("--vllm-model") + 1] == "qwen3-served"
     assert stage.command[stage.command.index("--request-concurrency") + 1] == "48"
+    assert stage.command[stage.command.index("--max-batched-tokens-start") + 1] == "65536"
+    assert stage.command[stage.command.index("--gpu-cache-target") + 1] == "0.9"
     assert "--generation-batch-size" not in stage.command
     assert "--auto-batch" not in stage.command
 
@@ -584,6 +636,8 @@ def test_parallel_vllm_worker_maps_server_by_rank_and_uses_quantum(tmp_path: Pat
 
     assert command[1].endswith("vllm_regenerate.py")
     assert command[command.index("--server-address") + 1] == "http://gpu1:8000/v1"
+    assert command[command.index("--max-batched-tokens-start") + 1] == "65536"
+    assert command[command.index("--gpu-cache-hard") + 1] == "0.98"
     assert "--generation-batch-size" not in command
     assert "--torch-dtype" not in command
     assert args.queue_quantum_items == 32
@@ -804,6 +858,40 @@ def test_validate_phase_publishes_completed_sample_count(tmp_path: Path, monkeyp
     payload = read_progress(progress_path)
     assert payload["phase"] == "done"
     assert payload["completed_samples"] == 2
+
+
+def test_validate_accepts_historical_assistant_turns_before_generated_answer(
+    tmp_path: Path,
+) -> None:
+    from validate_pilot_dataset import main as validate_main
+
+    source = tmp_path / "regenerated.jsonl"
+    _write_jsonl(
+        source,
+        [
+            {
+                "id": "multi-turn",
+                "source": "sharegpt",
+                "conversations": [
+                    {"role": "user", "content": "First question"},
+                    {"role": "assistant", "content": "Old answer"},
+                    {"role": "user", "content": "Final question"},
+                    {"role": "assistant", "content": "New answer"},
+                ],
+                "metadata": {"generation_model": "/models/Qwen3-4B"},
+            }
+        ],
+    )
+
+    validate_main(
+        [
+            "--input",
+            str(source),
+            "--expected-target-model",
+            "/models/Qwen3-4B",
+            "--require-generated",
+        ]
+    )
 
 
 def test_prepare_sources_keep_one_shared_sample_counter(tmp_path: Path, monkeypatch) -> None:

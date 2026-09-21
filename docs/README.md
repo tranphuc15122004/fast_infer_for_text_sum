@@ -8,6 +8,13 @@ và việc tiếp theo của các workstream, xem
 chi tiết kỹ thuật và artifact vẫn nằm trong các tài liệu nguồn được liên kết ở
 đó.
 
+Snapshot kết quả Modal dùng làm mốc đối chiếu Training-Free:
+[`docs/experiments/2026-09-21_modal_trainingfree_reference.md`](experiments/2026-09-21_modal_trainingfree_reference.md)
+và [JSON config/result](experiments/2026-09-21_modal_trainingfree_reference.json).
+Controlled empirical search E41/E42 mới nhất:
+[`docs/experiments/2026-09-21_trainingfree_controlled_search.md`](experiments/2026-09-21_trainingfree_controlled_search.md)
+và [JSON config/result](experiments/2026-09-21_trainingfree_controlled_search.json).
+
 Repo này là máy **code/debug**; inference thật chạy trên **server GPU riêng**.
 Trên server B200, các launcher dùng trực tiếp `python3` từ PATH; `.venv` trong
 workspace local chỉ dùng để mô phỏng dependency/API trước khi đưa code lên

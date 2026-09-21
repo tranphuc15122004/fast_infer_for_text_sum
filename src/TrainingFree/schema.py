@@ -193,4 +193,35 @@ def validate_hierarchy_trace_record(record: Mapping[str, Any]) -> dict[str, Any]
                 raise ValueError(f"hierarchy {key} must be in [0, 1]")
         if int(step["active_qk_tokens"]) > int(step["full_qk_tokens"]):
             raise ValueError("active_qk_tokens must not exceed full_qk_tokens")
+        head_rows = step.get("head_concentration")
+        if head_rows is not None:
+            if not isinstance(head_rows, list) or not head_rows:
+                raise ValueError("head concentration must be a non-empty list")
+            for row in head_rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("head concentration rows must be objects")
+                try:
+                    source_width = int(row["source_tokens"])
+                    layer = int(row["layer"])
+                    head = int(row["head"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("head concentration row is invalid") from exc
+                if source_width <= 0 or layer < 0 or head < 0:
+                    raise ValueError("head concentration row indices are invalid")
+                try:
+                    source_mass = float(row["source_mass"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("head concentration source mass is invalid") from exc
+                if not math.isfinite(source_mass) or source_mass <= 0.0:
+                    raise ValueError("head concentration source mass is invalid")
+                for level in (90, 95, 99):
+                    try:
+                        count = int(row[f"k{level}"])
+                        fraction = float(row[f"k{level}_fraction"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError("head concentration row is incomplete") from exc
+                    if not 1 <= count <= source_width:
+                        raise ValueError("head concentration k-value is invalid")
+                    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+                        raise ValueError("head concentration fraction is invalid")
     return result

@@ -82,9 +82,14 @@ class PipelineOptions:
     vllm_request_concurrency: int = 64
     vllm_request_concurrency_start: int = 8
     vllm_max_batched_tokens: int = 262_144
+    vllm_max_batched_tokens_start: int = 65_536
     vllm_request_growth_factor: float = 2.0
     vllm_request_timeout_seconds: float = 300.0
     vllm_request_retries: int = 2
+    vllm_metrics_address: Optional[str] = None
+    vllm_metrics_poll_interval_seconds: float = 0.5
+    vllm_gpu_cache_target: float = 0.90
+    vllm_gpu_cache_hard: float = 0.98
     # ``None`` means scan the complete normalized input.  A finite limit is
     # reserved for smoke/debug runs and must be explicit.
     analysis_limit: Optional[int] = None
@@ -407,12 +412,25 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(options.vllm_request_concurrency_start),
                         "--max-batched-tokens",
                         str(options.vllm_max_batched_tokens),
+                        "--max-batched-tokens-start",
+                        str(options.vllm_max_batched_tokens_start),
                         "--request-growth-factor",
                         str(options.vllm_request_growth_factor),
                         "--request-timeout-seconds",
                         str(options.vllm_request_timeout_seconds),
                         "--request-retries",
                         str(options.vllm_request_retries),
+                        *(
+                            ["--metrics-address", options.vllm_metrics_address]
+                            if options.vllm_metrics_address
+                            else []
+                        ),
+                        "--metrics-poll-interval-seconds",
+                        str(options.vllm_metrics_poll_interval_seconds),
+                        "--gpu-cache-target",
+                        str(options.vllm_gpu_cache_target),
+                        "--gpu-cache-hard",
+                        str(options.vllm_gpu_cache_hard),
                     ]
                     if use_vllm
                     else ["--torch-dtype", options.torch_dtype]
@@ -500,12 +518,25 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                             str(options.vllm_request_concurrency_start),
                             "--vllm-max-batched-tokens",
                             str(options.vllm_max_batched_tokens),
+                            "--vllm-max-batched-tokens-start",
+                            str(options.vllm_max_batched_tokens_start),
                             "--vllm-request-growth-factor",
                             str(options.vllm_request_growth_factor),
                             "--vllm-request-timeout-seconds",
                             str(options.vllm_request_timeout_seconds),
                             "--vllm-request-retries",
                             str(options.vllm_request_retries),
+                            *(
+                                ["--vllm-metrics-address", options.vllm_metrics_address]
+                                if options.vllm_metrics_address
+                                else []
+                            ),
+                            "--vllm-metrics-poll-interval-seconds",
+                            str(options.vllm_metrics_poll_interval_seconds),
+                            "--vllm-gpu-cache-target",
+                            str(options.vllm_gpu_cache_target),
+                            "--vllm-gpu-cache-hard",
+                            str(options.vllm_gpu_cache_hard),
                         ]
                         if use_vllm
                         else []
@@ -1525,9 +1556,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--vllm-request-concurrency", type=int, default=64)
     parser.add_argument("--vllm-request-concurrency-start", type=int, default=8)
     parser.add_argument("--vllm-max-batched-tokens", type=int, default=262144)
+    parser.add_argument("--vllm-max-batched-tokens-start", type=int, default=65536)
     parser.add_argument("--vllm-request-growth-factor", type=float, default=2.0)
     parser.add_argument("--vllm-request-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--vllm-request-retries", type=int, default=2)
+    parser.add_argument("--vllm-metrics-address", default=None)
+    parser.add_argument("--vllm-metrics-poll-interval-seconds", type=float, default=0.5)
+    parser.add_argument("--vllm-gpu-cache-target", type=float, default=0.90)
+    parser.add_argument("--vllm-gpu-cache-hard", type=float, default=0.98)
     parser.add_argument(
         "--analysis-limit",
         type=int,
@@ -1813,10 +1849,19 @@ def main(argv=None) -> int:
             raise ValueError("vLLM request concurrency phải >= 1")
         if args.vllm_request_concurrency_start > args.vllm_request_concurrency:
             raise ValueError("vllm-request-concurrency-start phải <= vllm-request-concurrency")
-        if args.vllm_max_batched_tokens < 1 or args.vllm_request_retries < 0:
+        if (
+            args.vllm_max_batched_tokens < 1
+            or args.vllm_max_batched_tokens_start < 1
+            or args.vllm_max_batched_tokens_start > args.vllm_max_batched_tokens
+            or args.vllm_request_retries < 0
+        ):
             raise ValueError("vLLM request options không hợp lệ")
         if args.vllm_request_growth_factor <= 1.0 or args.vllm_request_timeout_seconds <= 0:
             raise ValueError("vLLM growth/timeout không hợp lệ")
+        if args.vllm_metrics_poll_interval_seconds <= 0:
+            raise ValueError("vLLM metrics poll interval phải > 0")
+        if not 0.0 < args.vllm_gpu_cache_target <= args.vllm_gpu_cache_hard <= 1.0:
+            raise ValueError("vLLM gpu cache target/hard không hợp lệ")
     configured_lengths = [int(args.full_context_length)] if args.full_context else [int(x) for x in args.max_lengths]
     if any(length < 1 for length in configured_lengths):
         raise ValueError("mọi context length phải >= 1")
@@ -1916,9 +1961,14 @@ def main(argv=None) -> int:
         vllm_request_concurrency=int(args.vllm_request_concurrency),
         vllm_request_concurrency_start=int(args.vllm_request_concurrency_start),
         vllm_max_batched_tokens=int(args.vllm_max_batched_tokens),
+        vllm_max_batched_tokens_start=int(args.vllm_max_batched_tokens_start),
         vllm_request_growth_factor=float(args.vllm_request_growth_factor),
         vllm_request_timeout_seconds=float(args.vllm_request_timeout_seconds),
         vllm_request_retries=int(args.vllm_request_retries),
+        vllm_metrics_address=(str(args.vllm_metrics_address) if args.vllm_metrics_address else None),
+        vllm_metrics_poll_interval_seconds=float(args.vllm_metrics_poll_interval_seconds),
+        vllm_gpu_cache_target=float(args.vllm_gpu_cache_target),
+        vllm_gpu_cache_hard=float(args.vllm_gpu_cache_hard),
         analysis_limit=(int(args.analysis_limit) if args.analysis_limit is not None else None),
         device=str(args.device),
         torch_dtype=str(args.torch_dtype),

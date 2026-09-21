@@ -368,7 +368,7 @@ def build_runtime_preflight_command(*, python: str | Path) -> list[str]:
         str(python),
         str(REMOTE_ROOT / "scripts" / "check_shared_env.py"),
         "--profile",
-        "modal-longbench",
+        "modal-longbench-core",
     ]
 
 

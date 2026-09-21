@@ -179,3 +179,27 @@ def canonical_prompt(sample_id: str, source: str, messages: List[Dict[str, str]]
         "conversations": messages,
         "metadata": metadata,
     }
+
+
+def prompt_messages_error(messages: Any) -> Optional[str]:
+    """Validate a prompt-only conversation with optional assistant history.
+
+    ShareGPT prompts may contain previous assistant turns as context. The
+    regenerated target is identified by the final user turn, so only a prompt
+    ending in ``user`` is valid at the regenerate boundary.
+    """
+    if not isinstance(messages, list) or not messages:
+        return "sample không có conversations"
+    roles: List[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return "conversation có message không hợp lệ"
+        role = str(message.get("role", "")).strip().lower()
+        if role not in {"system", "user", "assistant", "tool"}:
+            return f"conversation có role không hợp lệ: {role!r}"
+        if not str(message.get("content", "")).strip():
+            return f"conversation có message {role!r} rỗng"
+        roles.append(role)
+    if roles[-1] != "user":
+        return "prompt phải kết thúc bằng user message trước khi regenerate"
+    return None

@@ -94,10 +94,29 @@ PROFILE_MODULES = {
         "llmlingua",
         "pipeline.fafo.decoding",
     ),
+    # The Modal launcher performs baseline-specific checks in
+    # ``longbench_adapter.preflight_baseline``.  Keep this profile limited to
+    # imports shared by every LongBench cell so a vanilla/EAGLE/DFlash matrix
+    # does not fail before it can report which individual cell needs an
+    # optional CUDA extension.
+    "modal-longbench-core": (
+        "torch",
+        "transformers",
+        "numpy",
+        "yaml",
+        "safetensors",
+        "tqdm",
+        "accelerate",
+        "datasets",
+        "rouge_score",
+        "sentencepiece",
+        "tokenizers",
+    ),
 }
 PROFILE_OPTIONAL_MODULES = {
     "server": OPTIONAL_MODULES,
     "modal-longbench": set(),
+    "modal-longbench-core": set(),
 }
 
 
