@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,34 @@ def test_magicdec_warmup_context_does_not_truncate_long_prompt():
     )
 
     assert warmup_ids is input_ids
+
+
+def _load_snapkv_model_module(path: Path):
+    module_name = f"snapkv_model_{path.stem}_{id(path)}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get("flashinfer")
+    sys.modules["flashinfer"] = types.ModuleType("flashinfer")
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop("flashinfer", None)
+        else:
+            sys.modules["flashinfer"] = previous
+    return module
+
+
+@pytest.mark.parametrize("filename", ["model.py", "model_draft.py"])
+def test_snapkv_tail_mask_bounds_support_short_final_prefill_chunk(filename):
+    module = _load_snapkv_model_module(
+        ROOT / "externals/MagicDec/Engine/SnapKV" / filename
+    )
+
+    assert module._tail_mask_bounds(4, 7673, 128) == (4, 128)
+    assert module._tail_mask_bounds(512, 7673, 128) == (128, 128)
+    assert module._tail_mask_bounds(4, 64, 128) == (4, 64)
 
 
 def test_magicdec_acceptance_summary_reports_mean_tau_and_draft_rate():

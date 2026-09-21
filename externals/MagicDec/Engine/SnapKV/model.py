@@ -14,6 +14,20 @@ def find_multiple(n: int, k: int) -> int:
         return n
     return n + k - (n % k)
 
+
+def _tail_mask_bounds(query_len: int, key_len: int, window_size: int) -> tuple[int, int]:
+    """Return causal-mask extents for a possibly short final prefill chunk."""
+    query_len = int(query_len)
+    key_len = int(key_len)
+    window_size = int(window_size)
+    if query_len <= 0 or key_len <= 0 or window_size <= 0:
+        raise ValueError(
+            "SnapKV tail-mask dimensions must be positive: "
+            f"query_len={query_len}, key_len={key_len}, window_size={window_size}"
+        )
+    return min(query_len, window_size), min(key_len, window_size)
+
+
 @dataclass
 class ModelArgs:
     block_size: int = 2048
@@ -414,7 +428,12 @@ class Attention(nn.Module):
             end_idx = min(start_idx + chunk_size, L)
             chunk_query_states = query_states[:, :, start_idx:end_idx, :]
             attn_weights = torch.einsum('b h i d, b h j d -> b h i j', chunk_query_states, key_states)
-            attn_weights[:, :, -window_size:, -window_size:] += mask
+            mask_query_len, mask_key_len = _tail_mask_bounds(
+                attn_weights.shape[-2], attn_weights.shape[-1], window_size
+            )
+            attn_weights[:, :, -mask_query_len:, -mask_key_len:] += mask[
+                -mask_query_len:, -mask_key_len:
+            ]
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = rearrange(attn_weights, 'b h (r l) s -> b (h r) l s', r=nrepeat)
             attn_weights_sum += attn_weights[..., : -window_size].sum(dim = -2)
