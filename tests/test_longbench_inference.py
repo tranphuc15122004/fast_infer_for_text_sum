@@ -286,6 +286,76 @@ def test_vanilla_parser_exposes_distinct_attention_defaults():
     )
 
 
+def test_flash_attention4_probe_reports_broken_transitive_import(monkeypatch):
+    import common.vanilla_inference as vanilla
+
+    monkeypatch.setattr(
+        vanilla.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "flash_attn.cute" else None,
+    )
+
+    def broken_import(name):
+        if name == "flash_attn.cute":
+            raise ModuleNotFoundError(
+                "No module named 'cutlass.utils.ampere_helpers'"
+            )
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(vanilla.importlib, "import_module", broken_import)
+
+    available, reason = vanilla._probe_flash_attention_4()
+
+    assert available is False
+    assert reason is not None
+    assert "cutlass.utils.ampere_helpers" in reason
+
+
+def test_flash_attention4_compat_shim_is_in_memory_only(monkeypatch):
+    import common.vanilla_inference as vanilla
+
+    fake_cutlass_utils = type("FakeCutlassUtils", (), {})()
+    monkeypatch.setattr(
+        vanilla.importlib.util,
+        "find_spec",
+        lambda name: None
+        if name == "cutlass.utils.ampere_helpers"
+        else object(),
+    )
+    monkeypatch.setattr(
+        vanilla.importlib,
+        "import_module",
+        lambda name: fake_cutlass_utils
+        if name == "cutlass.utils"
+        else (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),
+    )
+
+    try:
+        assert vanilla._install_flash_attention_4_cutlass_compat() is True
+        shim = vanilla.sys.modules["cutlass.utils.ampere_helpers"]
+        assert shim.SMEM_CAPACITY["sm100"] == 229376
+        assert fake_cutlass_utils.ampere_helpers is shim
+    finally:
+        vanilla.sys.modules.pop("cutlass.utils.ampere_helpers", None)
+
+
+def test_longbench_preflight_applies_fa4_compat_before_import(monkeypatch):
+    import common.longbench_adapter as adapter
+    import common.vanilla_inference as vanilla
+
+    applied = []
+    monkeypatch.setattr(
+        vanilla,
+        "_install_flash_attention_4_cutlass_compat",
+        lambda: applied.append(True),
+    )
+    monkeypatch.setattr(adapter, "_module_available", lambda name: True)
+    monkeypatch.setattr(adapter.importlib, "import_module", lambda name: object())
+
+    assert adapter._module_importable("flash_attn.cute") == (True, None)
+    assert applied == [True]
+
+
 def test_vanilla_record_contains_shared_timing_fields():
     from common.benchmark_runtime import build_sample_record
 

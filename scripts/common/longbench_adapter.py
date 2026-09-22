@@ -146,6 +146,23 @@ def _module_available(name: str) -> bool:
 
 def _module_importable(name: str) -> tuple[bool, str | None]:
     """Check that a module and its native dependencies can actually import."""
+    if name == "flash_attn.cute":
+        # flash-attn-4==4.0.0b15 still imports the CUTLASS helper module that
+        # was removed from the shared CUTLASS 4.5.x package.  Apply the same
+        # process-local compatibility shim as the vanilla runner before
+        # discovery/import, otherwise the orchestrator would reject a runtime
+        # that the actual child process can use.  Keep this lazy so ordinary
+        # preflight does not import CUDA/CuTe modules.
+        try:
+            from common.vanilla_inference import (
+                _install_flash_attention_4_cutlass_compat,
+            )
+
+            _install_flash_attention_4_cutlass_compat()
+        except Exception:
+            # The real import below remains the source of truth and reports
+            # the original dependency failure if the shim cannot be applied.
+            pass
     if not _module_available(name):
         return False, f"{name} is not installed"
     try:

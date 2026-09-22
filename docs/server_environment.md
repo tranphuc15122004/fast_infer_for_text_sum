@@ -62,13 +62,37 @@ bash scripts/setup_b200_venv.sh
 `flash-attn==2.8.3.post1` hiện là source distribution trong mirror nên được
 để ngoài manifest. Vì vậy `pip install -r requirements.txt` có thể chạy trực
 tiếp trên server. Bản FA2 này chỉ dùng cho GPU Ampere/Ada/Hopper; không dùng
-cho `vanilla_fa` trên B200/Blackwell. Trên B200 phải cài runtime FA4 có
-`flash_attn.cute`; launcher sẽ tự chọn FA4 nếu module này có mặt và sẽ chặn
-trước benchmark nếu không có. Khi cần các baseline vanilla_fa trên GPU được
-FA2 hỗ trợ, DFlash hoặc SpecExtend full, chạy thêm helper; helper patch bản source
-tạm sang C++20 để khớp header Torch 2.14 và build với `MAX_JOBS=8`. Có thể đổi số job bằng
-`FLASH_ATTENTION_MAX_JOBS`. `flashinfer-jit-cache` không có trong mirror nên
-không nằm trong manifest; FlashInfer sẽ JIT vào `FLASHINFER_WORKSPACE_BASE`.
+cho `vanilla_fa` trên B200/Blackwell.
+
+Server hiện đã có `flash-attn==2.8.3.post1`, `flash-attn-4==4.0.0b15` và
+shared CUTLASS 4.5.x. FA4 beta b15 còn import
+`cutlass.utils.ampere_helpers`, trong khi CUTLASS hiện tại đã bỏ module cũ
+này. Code runner tự đăng ký một module tương thích nhỏ trong `sys.modules`
+cho đúng process benchmark; không sửa `site-packages`, không uninstall FA2,
+không cài lại package. FA2 vẫn được giữ cho các baseline/backend cần nó.
+
+Không kiểm tra FA4 bằng lệnh import trực tiếp, vì lệnh đó bỏ qua shim của
+repository. Dùng probe của runner:
+
+```bash
+export PYTHONPATH="$PWD/scripts${PYTHONPATH:+:$PYTHONPATH}"
+"$FAST_INFER_PYTHON" -c '
+from common.vanilla_inference import _probe_flash_attention_4
+ok, reason = _probe_flash_attention_4()
+if not ok:
+    raise SystemExit(reason)
+print("FA4 import: OK")
+'
+```
+
+Launcher sẽ áp dụng cùng shim trong preflight và child runner, tự chọn FA4 khi
+import probe thành công, đồng thời chặn trước benchmark nếu dependency thực sự
+bị hỏng. Khi cần các baseline vanilla_fa
+trên GPU được FA2 hỗ trợ, DFlash hoặc SpecExtend full, chạy thêm helper; helper
+patch bản source tạm sang C++20 để khớp header Torch 2.14 và build với
+`MAX_JOBS=8`. Có thể đổi số job bằng `FLASH_ATTENTION_MAX_JOBS`.
+`flashinfer-jit-cache` không có trong mirror nên không nằm trong manifest;
+FlashInfer sẽ JIT vào `FLASHINFER_WORKSPACE_BASE`.
 
 Script không xoá target đã tồn tại. Cài system packages `libnuma1` và
 `libnuma-dev` bằng image/OS package manager trước khi chạy SGLang; chúng không

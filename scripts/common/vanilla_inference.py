@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import time
+import types
 from typing import Any
 
 import torch
@@ -26,6 +29,68 @@ from common.reproducibility import seed_everything
 FLASH_ATTENTION_BACKENDS = frozenset(
     {"flash_attention_2", "flash_attention_4"}
 )
+
+
+def _install_flash_attention_4_cutlass_compat() -> bool:
+    """Install the FA4 beta compatibility module without touching site-packages.
+
+    ``flash-attn-4==4.0.0b15`` still imports the deprecated
+    ``cutlass.utils.ampere_helpers`` module.  CUTLASS 4.5.2 removed that module
+    but retained the only value used by the beta kernel: ``SMEM_CAPACITY``.
+    Register the small compatibility module in ``sys.modules`` for this
+    process only, so the server environment and the FA2 installation remain
+    unchanged.
+    """
+
+    module_name = "cutlass.utils.ampere_helpers"
+    try:
+        if importlib.util.find_spec(module_name) is not None:
+            return False
+    except Exception:
+        return False
+
+    try:
+        cutlass_utils = importlib.import_module("cutlass.utils")
+    except Exception:
+        return False
+
+    shim = types.ModuleType(module_name)
+    shim.SMEM_CAPACITY = {
+        "sm80": 163840,
+        "sm86": 102400,
+        "sm89": 102400,
+        "sm90": 232448,
+        "sm100": 229376,
+    }
+    sys.modules[module_name] = shim
+    setattr(cutlass_utils, "ampere_helpers", shim)
+    return True
+
+
+def _probe_flash_attention_4() -> tuple[bool, str | None]:
+    """Check that FA4 and its transitive CUDA/CuTe dependencies import.
+
+    ``find_spec("flash_attn.cute")`` only proves that a package directory is
+    discoverable.  FA4 loads CUTLASS/CuTe modules during import, so a stale
+    ``flash_attn.cute`` tree can be discoverable while still being unusable.
+    Keep the full exception as a preflight reason for actionable launcher
+    output.
+    """
+
+    try:
+        if importlib.util.find_spec("flash_attn.cute") is None:
+            return False, "flash_attn.cute is not installed"
+    except Exception as exc:  # discovery can import a broken parent package
+        detail = str(exc).strip().splitlines()[0] or repr(exc)
+        return False, f"{type(exc).__name__}: {detail}"
+
+    _install_flash_attention_4_cutlass_compat()
+    try:
+        importlib.import_module("flash_attn.cute")
+    except Exception as exc:
+        detail = str(exc).strip().splitlines()[0] or repr(exc)
+        return False, f"{type(exc).__name__}: {detail}"
+    return True, None
 
 
 def build_parser(default_backend: str, description: str) -> argparse.ArgumentParser:
@@ -388,12 +453,16 @@ def _load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, An
             if device.type == "cuda"
             else None
         )
-        try:
-            flash_attention_4_available = (
-                importlib.util.find_spec("flash_attn.cute") is not None
+        flash_attention_4_available, flash_attention_4_reason = (
+            _probe_flash_attention_4()
+            if requested_backend == "flash_attention_4"
+            or (
+                requested_backend == "flash_attention_2"
+                and compute_capability is not None
+                and int(compute_capability[0]) >= 10
             )
-        except ModuleNotFoundError:
-            flash_attention_4_available = False
+            else (False, None)
+        )
         try:
             args.attention_backend = _resolve_flash_attention_backend(
                 requested_backend,
@@ -402,6 +471,16 @@ def _load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, An
             )
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
+
+        if args.attention_backend == "flash_attention_4" and not flash_attention_4_available:
+            detail = f" ({flash_attention_4_reason})" if flash_attention_4_reason else ""
+            raise SystemExit(
+                "vanilla_fa requires an importable FlashAttention-4 runtime, but "
+                f"flash_attn.cute failed its import probe{detail}. The existing "
+                "flash-attn-4/CuTeDSL packages are incompatible beyond the "
+                "process-local b15 shim; do not mix an older flash_attn.cute "
+                "source tree with a newer nvidia-cutlass-dsl."
+            )
 
         try:
             if args.attention_backend == "flash_attention_4":

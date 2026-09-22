@@ -234,6 +234,10 @@ nvidia-curand==10.4.0.35
 nvidia-cusolver==12.0.4.66
 nvidia-cusparse==12.6.3.3
 nvidia-cusparselt-cu13==0.8.0
+# Shared CuTe/CUTLASS runtime used by the mirrored stack.  The installed
+# flash-attn-4==4.0.0b15 is consumed as an existing optional artifact; the
+# runner supplies its removed ampere_helpers module in-process, so do not
+# change this shared pin or reinstall FA4 just to fix that import.
 nvidia-cutlass-dsl==4.5.2
 nvidia-cutlass-dsl-libs-base==4.5.2
 nvidia-cutlass-dsl-libs-cu13==4.5.2
