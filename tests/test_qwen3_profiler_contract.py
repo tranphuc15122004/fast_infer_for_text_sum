@@ -107,7 +107,7 @@ def test_full_infer_keeps_canonical_code_and_experiment_results_together():
 
 
 def test_profile_wrapper_runs_the_canonical_full_infer_source():
-    wrapper = (ROOT / "scripts" / "run_qwen3_long_profile.sh").read_text(
+    wrapper = (ROOT / "scripts" / "runners" / "run_qwen3_long_profile.sh").read_text(
         encoding="utf-8"
     )
 

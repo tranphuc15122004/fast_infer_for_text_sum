@@ -21,7 +21,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 GPU engine smoke không cần model/checkpoint, nhưng phải chạy trên CUDA thật:
 
 ```bash
-bash scripts/run_syncspec_cuda_smoke.sh
+bash scripts/runners/run_syncspec_cuda_smoke.sh
 ```
 
 Trên máy không có CUDA, lệnh kết thúc với status `BLOCKED` có cấu trúc và mã
@@ -39,7 +39,7 @@ batch inference + vanilla-AR exactness) dùng backend synthetic deterministic:
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
   SYNCSPEC_CPU_SMOKE_DIR=/tmp/syncspec_cpu_smoke \
-  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
+  bash scripts/runners/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 Runner này giữ artifact trong thư mục `SYNCSPEC_CPU_SMOKE_DIR` và kiểm tra đủ
@@ -273,7 +273,7 @@ Smoke toàn chuỗi train trên B200 (Stage 0 → joint drafter/selector/surviva
 infer) dùng thư mục output riêng mặc định:
 
 ```bash
-bash scripts/run_syncspec_b200_train_smoke.sh
+bash scripts/runners/run_syncspec_b200_train_smoke.sh
 ```
 
 Lệnh này dùng `SYNCSPEC_TRAIN_*` trong master config; `--phase train` chỉ yêu

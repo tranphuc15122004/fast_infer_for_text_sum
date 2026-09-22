@@ -47,11 +47,11 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 Cách chung (baseline có fallback CPU):
 ```bash
-CUDA_VISIBLE_DEVICES="" DEVICE=cpu SMOKE=1 bash scripts/run_<baseline>.sh
+CUDA_VISIBLE_DEVICES="" DEVICE=cpu SMOKE=1 bash scripts/runners/run_<baseline>.sh
 ```
 
 - `llmlingua`: hỗ trợ CPU đầy đủ (`infer_llmlingua.py` tự fallback cpu khi CUDA off).
-  Đã verify: `bash scripts/run_llmlingua.sh` chạy 2 sample ~3 phút/sample (Qwen2.5-1.5B).
+  Đã verify: `bash scripts/runners/run_llmlingua.sh` chạy 2 sample ~3 phút/sample (Qwen2.5-1.5B).
 - Các baseline khác: kiểm tra script có đọc `--device`/`DEVICE` không; nếu hardcode
   `.to("cuda")` thì chưa chạy được CPU (ghi nhận và để dành cho server).
 - `CUDA_VISIBLE_DEVICES=""` quan trọng: tránh torch cu130 init CUDA với driver cũ

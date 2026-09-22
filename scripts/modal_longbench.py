@@ -59,6 +59,42 @@ DEFAULT_DATASETS = "gov_report lcc"
 DEFAULT_VOLUME_NAME = "fast-infer-text-sum-cache"
 DEFAULT_GPU = "A100-80GB"
 DEFAULT_CUDA_IMAGE = "nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04"
+SERVER_TORCH_SPEC = "torch==2.14.0+cu130"
+SERVER_TORCHVISION_SPEC = "torchvision==0.29.0+cu130"
+SERVER_FLASH_ATTN_SPEC = "flash-attn==2.8.3.post1"
+SERVER_FLASH_ATTN_4_SPEC = "flash-attn-4==4.0.0b15"
+SERVER_CUDA_SPECS = (
+    "nvidia-cublas==13.1.0.3",
+    "nvidia-cuda-cccl==13.3.3.3.1",
+    "nvidia-cuda-crt==13.3.33",
+    "nvidia-cuda-cupti==13.0.85",
+    "nvidia-cuda-nvcc==13.2.78",
+    "nvidia-cuda-nvrtc==13.0.88",
+    "nvidia-cuda-runtime==13.0.96",
+    "nvidia-cuda-tileiras==13.2.78",
+    "nvidia-cudnn-cu13==9.19.0.56",
+    "nvidia-cudnn-frontend==1.25.0",
+    "nvidia-cufft==12.0.0.61",
+    "nvidia-cufile==1.15.1.6",
+    "nvidia-curand==10.4.0.35",
+    "nvidia-cusolver==12.0.4.66",
+    "nvidia-cusparse==12.6.3.3",
+    "nvidia-cusparselt-cu13==0.8.0",
+    "nvidia-nccl-cu13==2.28.9",
+    "nvidia-nvjitlink==13.0.88",
+    "nvidia-nvshmem-cu13==3.4.5",
+    "nvidia-nvtx==13.0.85",
+    "nvidia-nvvm==13.2.78",
+)
+SERVER_CUTLASS_SPECS = (
+    "apache-tvm-ffi==0.1.9",
+    "nvidia-cutlass-dsl==4.5.2",
+    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl-libs-cu13==4.5.2",
+    "quack-kernels==0.5.0",
+    "torch_c_dlpack_ext==0.1.5",
+    "typing_extensions==4.15.0",
+)
 # There is no upstream FA2 wheel for the exact torch 2.11/cu13/cp312 tuple
 # used by the Modal image.  Keep the community wheel opt-in: source builds
 # remain the default, while CI/experiments can select an ABI-matched artifact
@@ -102,17 +138,19 @@ def _truthy(name: str) -> bool:
 def _build_image() -> modal.Image:
     """Build the portable core image and mount project code/data at runtime."""
 
-    base_name = os.environ.get("MODAL_BASE_IMAGE", "").strip()
-    if base_name:
-        image = modal.Image.from_name(base_name)
-    elif any(
+    match_server_stack = _truthy("MODAL_MATCH_SERVER_STACK")
+    cuda_build_requested = match_server_stack or any(
         _truthy(name)
         for name in (
             "MODAL_INSTALL_FLASH_ATTN",
             "MODAL_INSTALL_VLLM",
             "MODAL_INSTALL_FLASHINFER",
         )
-    ):
+    )
+    base_name = os.environ.get("MODAL_BASE_IMAGE", "").strip()
+    if base_name:
+        image = modal.Image.from_name(base_name)
+    elif cuda_build_requested:
         # The optional CUDA extensions need nvcc during image build.  The
         # minimal Debian image remains the default for vanilla_hf preflight.
         image = modal.Image.from_registry(
@@ -125,6 +163,107 @@ def _build_image() -> modal.Image:
     image = image.apt_install(
         "git", "build-essential", "libgl1", "libglib2.0-0"
     ).pip_install_from_requirements(str(ROOT / "requirements.modal.txt"))
+
+    if match_server_stack:
+        # Keep this profile explicitly aligned with the B200 server manifest.
+        # The base Modal requirements intentionally use Torch 2.11 for the
+        # general image; replace it before building the server-matched FA2
+        # extension and installing the FA4/CUTLASS artifacts.
+        image = image.env(
+            {
+                "CC": "gcc",
+                "CXX": "g++",
+                "CXXFLAGS": "-std=c++20",
+                "MAX_JOBS": os.environ.get("MODAL_FLASH_ATTN_MAX_JOBS", "2"),
+                "TORCH_CUDA_ARCH_LIST": os.environ.get(
+                    "MODAL_TORCH_CUDA_ARCH_LIST",
+                    "10.0" if GPU_TYPE.upper().startswith("B200") else "8.0",
+                ),
+                # Torch 2.14 must resolve the pinned Python NCCL library
+                # before the older libnccl shipped by the CUDA base image.
+                "LD_LIBRARY_PATH": os.pathsep.join(
+                    (
+                        "/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib",
+                        "/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib",
+                        "/usr/local/cuda/lib64",
+                        "/usr/local/lib",
+                        "/usr/local/lib/python3.12/site-packages",
+                    )
+                ),
+                "LD_PRELOAD": "/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2",
+            }
+        )
+        torch_index = os.environ.get(
+            "MODAL_TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu130"
+        )
+        image = image.pip_install(
+            SERVER_TORCH_SPEC,
+            SERVER_TORCHVISION_SPEC,
+            extra_options=f"--index-url {torch_index} --no-deps",
+        )
+        nccl_spec = os.environ.get(
+            "MODAL_NCCL_SPEC", "nvidia-nccl-cu13==2.28.9"
+        )
+        cuda_specs = tuple(
+            nccl_spec if spec.startswith("nvidia-nccl-cu13==") else spec
+            for spec in SERVER_CUDA_SPECS
+        )
+        image = image.pip_install(
+            *cuda_specs,
+            extra_options="--no-deps",
+        )
+        if _truthy("MODAL_DEBUG_SERVER_STACK"):
+            image = image.run_commands(
+                "find /usr/local/lib/python3.12/site-packages/nvidia "
+                "-name 'libnccl.so*' -print; "
+                "readelf -Ws /usr/local/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 "
+                "| grep ncclCommResume || true; "
+                "ldd /usr/local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so "
+                "| grep -E 'nccl|cuda' || true"
+            )
+        image = image.pip_install("wheel==0.45.1", "ninja==1.13.0")
+        skip_server_fa2 = _truthy("MODAL_SKIP_SERVER_FA2")
+        flash_attn_wheel = os.environ.get("MODAL_FLASH_ATTN_WHEEL", "").strip()
+        if skip_server_fa2:
+            pass
+        elif flash_attn_wheel:
+            image = image.pip_install(
+                flash_attn_wheel,
+                extra_options="--no-deps",
+            )
+        else:
+            image = image.run_commands(
+                "bash -lc 'set -euxo pipefail; "
+                "work=$(mktemp -d); "
+                "python -m pip download --no-deps --no-binary flash-attn "
+                "--dest \"$work\" "
+                + SERVER_FLASH_ATTN_SPEC
+                + "; "
+                "archive=$(find \"$work\" -maxdepth 1 -type f "
+                "\\( -name \"flash_attn-*.tar.gz\" -o -name \"flash_attn-*.zip\" \\) "
+                "| head -n1); "
+                "case \"$archive\" in "
+                "*.tar.gz) tar -xzf \"$archive\" -C \"$work\" ;; "
+                "*.zip) unzip -q \"$archive\" -d \"$work\" ;; "
+                "*) echo \"flash-attn source archive not found\" >&2; exit 1 ;; "
+                "esac; "
+                "source_dir=$(find \"$work\" -mindepth 1 -maxdepth 2 "
+                "-type f -name setup.py -printf \"%h\\n\" | head -n1); "
+                "test -n \"$source_dir\"; "
+                "sed -i \'s/-std=c++17/-std=c++20/g\' \"$source_dir/setup.py\"; "
+                "grep -q -- \"-std=c++20\" \"$source_dir/setup.py\"; "
+                "FLASH_ATTENTION_FORCE_BUILD=TRUE "
+                "MAX_JOBS=\"${MAX_JOBS:-2}\" "
+                "python -m pip install --no-build-isolation --no-deps \"$source_dir\"; "
+                "rm -rf \"$work\"'"
+            )
+        image = image.pip_install(
+            *SERVER_CUTLASS_SPECS,
+            extra_options="--no-deps",
+        ).pip_install(
+            SERVER_FLASH_ATTN_4_SPEC,
+            extra_options="--no-deps",
+        )
 
     # These are deliberately opt-in because they compile or install large,
     # CUDA-version-specific extensions.  Preflight will report the exact
@@ -156,7 +295,7 @@ def _build_image() -> modal.Image:
         ).pip_install(
             "wheel==0.45.1", "ninja==1.13.0"
         )
-    if _truthy("MODAL_INSTALL_FLASH_ATTN"):
+    if _truthy("MODAL_INSTALL_FLASH_ATTN") and not match_server_stack:
         flash_attn_wheel = os.environ.get("MODAL_FLASH_ATTN_WHEEL", "").strip()
         if flash_attn_wheel:
             image = image.pip_install(
@@ -401,6 +540,35 @@ def collect_runtime_probe(python: str | Path) -> dict[str, Any]:
     return value
 
 
+def collect_distribution_versions(python: str | Path) -> dict[str, str | None]:
+    """Read package metadata through the exact Modal benchmark interpreter."""
+
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import importlib.metadata as md, json\n"
+                "names = ('torch', 'torchvision', 'flash-attn', 'flash-attn-4', "
+                "'nvidia-cutlass-dsl')\n"
+                "def get(name):\n"
+                "    try:\n"
+                "        return md.version(name)\n"
+                "    except md.PackageNotFoundError:\n"
+                "        return None\n"
+                "print(json.dumps({name: get(name) for name in names}))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    value = json.loads(probe.stdout)
+    if not isinstance(value, dict):
+        raise RuntimeError("Modal package version probe did not return an object")
+    return {str(key): value.get(key) for key in value}
+
+
 def build_modal_provenance(
     *,
     run_id: str,
@@ -456,6 +624,16 @@ CACHE_VOLUME = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 SECRET_NAME = os.environ.get("MODAL_HF_SECRET", "").strip()
 SECRETS = [modal.Secret.from_name(SECRET_NAME, required_keys=["HF_TOKEN"])] if SECRET_NAME else []
 FUNCTION_ENV = build_function_env(SECRET_NAME)
+for _name in (
+    "MODAL_GPU",
+    "MODAL_MATCH_SERVER_STACK",
+    "MODAL_SKIP_SERVER_FA2",
+    "MODAL_NCCL_SPEC",
+    "MODAL_FLASH_ATTN_MAX_JOBS",
+    "MODAL_TORCH_CUDA_ARCH_LIST",
+):
+    if os.environ.get(_name):
+        FUNCTION_ENV[_name] = os.environ[_name]
 IMAGE = _build_image()
 app = modal.App("fast-infer-text-sum-longbench")
 
@@ -503,6 +681,7 @@ def run_benchmark(
     venv_dir = VOLUME_MOUNT / "venv"
     runtime_python = ensure_runtime_venv(venv_dir, sys.executable)
     runtime_probe = collect_runtime_probe(runtime_python)
+    runtime_probe["distributions"] = collect_distribution_versions(runtime_python)
     if runtime_probe.get("python_version", "").split(".")[:2] != ["3", "12"]:
         raise RuntimeError(
             "Modal benchmark venv must use Python 3.12: "
@@ -515,6 +694,28 @@ def run_benchmark(
         )
     if not runtime_probe.get("cuda_available"):
         raise RuntimeError("Modal benchmark requires torch.cuda.is_available()")
+    if _truthy("MODAL_MATCH_SERVER_STACK"):
+        expected_distributions = {
+            "torch": SERVER_TORCH_SPEC.split("==", 1)[1],
+            "torchvision": SERVER_TORCHVISION_SPEC.split("==", 1)[1],
+            "flash-attn-4": SERVER_FLASH_ATTN_4_SPEC.split("==", 1)[1],
+            "nvidia-cutlass-dsl": "4.5.2",
+        }
+        if not _truthy("MODAL_SKIP_SERVER_FA2"):
+            expected_distributions["flash-attn"] = SERVER_FLASH_ATTN_SPEC.split(
+                "==", 1
+            )[1]
+        actual_distributions = runtime_probe["distributions"]
+        mismatches = {
+            name: {"expected": expected, "actual": actual_distributions.get(name)}
+            for name, expected in expected_distributions.items()
+            if actual_distributions.get(name) != expected
+        }
+        if mismatches:
+            raise RuntimeError(
+                "Modal server-stack package mismatch: "
+                + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+            )
     environment = build_modal_env(
         model=model,
         eagle_model=eagle_model,

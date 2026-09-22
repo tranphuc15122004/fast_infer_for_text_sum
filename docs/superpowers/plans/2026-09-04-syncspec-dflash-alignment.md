@@ -23,7 +23,7 @@
 - Round loop, bonus commit, selector, survival and controller: `src/SyncSpec/engine.py`.
 - Native drafter: `src/SyncSpec/model.py`.
 - Trajectory/cache types and Stage 1 trainer: `src/SyncSpec/trajectory.py`, `src/SyncSpec/training.py`.
-- CLI and smoke runners: `scripts/build_syncspec_trajectories.py`, `scripts/train_syncspec.py`, `scripts/run_syncspec_cpu_smoke.sh`.
+- CLI and smoke runners: `scripts/build_syncspec_trajectories.py`, `scripts/train_syncspec.py`, `scripts/runners/run_syncspec_cpu_smoke.sh`.
 
 ### Shared invariants
 - `kd` remains the number of proposed/verified tokens in all public engine, profile, selector and output-schema APIs.

@@ -76,13 +76,19 @@ def test_repository_keeps_only_the_master_pointer_in_config_directory():
 
 
 def test_all_baseline_launchers_use_the_shared_config_loader():
-    wrappers = sorted((ROOT / "scripts").glob("run_*.sh"))
+    wrappers = sorted((ROOT / "scripts" / "runners").glob("run_*.sh"))
     for wrapper in wrappers:
-        if wrapper.name in {"run.sh", "run_b200_smoke.sh", "run_representative_100.sh"}:
-            continue
         text = wrapper.read_text(encoding="utf-8")
         assert 'source "$ROOT/scripts/common/config.sh"' in text, wrapper
         assert "config/" not in text, wrapper
+
+
+def test_scripts_root_keeps_only_primary_entrypoints():
+    assert sorted(path.name for path in (ROOT / "scripts").glob("run_*.sh")) == [
+        "run_b200_smoke.sh",
+        "run_longbench_200.sh",
+        "run_representative_100.sh",
+    ]
 
 
 def test_active_docs_describe_master_config_instead_of_deleted_per_baseline_files():

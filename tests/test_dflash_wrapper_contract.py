@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "scripts" / "run_dflash_gsm8k.sh"
+WRAPPER = ROOT / "scripts" / "runners" / "run_dflash_gsm8k.sh"
 
 
 def test_dflash_gsm8k_wrapper_exports_vendored_module_path_before_exec() -> None:

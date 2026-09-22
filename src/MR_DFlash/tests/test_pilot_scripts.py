@@ -612,6 +612,8 @@ def test_preprocess_pipeline_vllm_regenerate_uses_server_worker(tmp_path: Path) 
     assert stage.command[stage.command.index("--gpu-cache-target") + 1] == "0.9"
     assert "--generation-batch-size" not in stage.command
     assert "--auto-batch" not in stage.command
+    validate = next(stage for stage in build_stage_plan(options) if stage.name == "validate_full_train")
+    assert validate.command[validate.command.index("--expected-target-model") + 1] == "qwen3-served"
 
 
 def test_parallel_vllm_worker_maps_server_by_rank_and_uses_quantum(tmp_path: Path) -> None:

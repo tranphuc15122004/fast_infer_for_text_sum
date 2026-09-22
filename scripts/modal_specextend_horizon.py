@@ -191,7 +191,7 @@ def run_stage(
         manifest["draft_snapshot"] = draft_model
         command = [
             "bash",
-            str(REMOTE_ROOT / "scripts" / "run_specextend_horizon.sh"),
+            str(REMOTE_ROOT / "scripts" / "runners" / "run_specextend_horizon.sh"),
             str(config["level"]),
         ]
         environment = dict(os.environ)
@@ -398,7 +398,7 @@ def run_state_and_replay(
     state_log = state_root / "modal_job.log"
     state_report = state_root / "reports" / "4k_report.md"
     command = [
-        "bash", str(REMOTE_ROOT / "scripts" / "run_specextend_horizon.sh"), "4k"
+        "bash", str(REMOTE_ROOT / "scripts" / "runners" / "run_specextend_horizon.sh"), "4k"
     ]
     env = dict(os.environ)
     env.update({

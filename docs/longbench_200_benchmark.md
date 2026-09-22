@@ -300,7 +300,7 @@ script chuyên dụng (chỉ dùng `nvidia-smi`, không load model, chạy bằn
 hệ thống):
 
 ```bash
-bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
 ```
 
 Báo cáo liệt kê từng GPU vật lý (total/used/free VRAM, utilization, nhiệt độ,
@@ -309,20 +309,20 @@ tiến trình đang chiếm), đánh dấu `*` đúng GPU job sẽ dùng (theo
 chặn job khi không đủ VRAM, dùng ngưỡng `--min-free-gb`:
 
 ```bash
-bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 3 --min-free-gb 120
+bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 3 --min-free-gb 120
 # exit 0: GPU 3 đủ VRAM | exit 2: thiếu VRAM (dừng, chọn GPU khác)
-bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json /tmp/gpu_report.json  # automation
+bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json /tmp/gpu_report.json  # automation
 ```
 
 Kiểm tra với đúng ngưỡng mặc định của runner:
 
 ```bash
-bash scripts/run_gpu_check.sh \
+bash scripts/runners/run_gpu_check.sh \
   --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
   --gpu-ids 0 --min-free-gb 32
 ```
 
-File liên quan: `scripts/check_gpu_vram.py` (logic) + `scripts/run_gpu_check.sh`
+File liên quan: `scripts/check_gpu_vram.py` (logic) + `scripts/runners/run_gpu_check.sh`
 (wrapper load master profile `longbench`).
 
 Chạy một run trên GPU vật lý số 2 (hai cách tương đương):

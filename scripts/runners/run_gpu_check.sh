@@ -7,13 +7,13 @@
 # scripts/check_gpu_vram.py bằng shared interpreter 3.12.
 #
 # Usage:
-#   bash scripts/run_gpu_check.sh                         # master qua pointer
-#   bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
-#   bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 2 --min-free-gb 120
-#   bash scripts/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json gpu_report.json
+#   bash scripts/runners/run_gpu_check.sh                         # master qua pointer
+#   bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+#   bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --gpu-ids 2 --min-free-gb 120
+#   bash scripts/runners/run_gpu_check.sh --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env --json gpu_report.json
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # Optional positional/config flag override the repository's master pointer.
 if [[ "${1:-}" == "--config" ]]; then

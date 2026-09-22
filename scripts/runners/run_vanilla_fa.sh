@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ "${1:-}" == "--config" ]]; then
   export FAST_INFER_MASTER_CONFIG="${2:?--config requires a path}"
   shift 2
@@ -15,7 +15,7 @@ source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 : "${LONG_BENCH_MODEL:?LONG_BENCH_MODEL is required}"
 DATA_FILE="${LONG_BENCH_DATA_FILE:-${DATA_INPUT:-}}"
-OUTPUT_FILE="${LONG_BENCH_OUTPUT_FILE:-$ROOT/outputs/longbench_100_14k/vanilla_hf.jsonl}"
+OUTPUT_FILE="${LONG_BENCH_OUTPUT_FILE:-$ROOT/outputs/longbench_100_14k/vanilla_fa.jsonl}"
 : "${DATA_FILE:?LONG_BENCH_DATA_FILE or DATA_INPUT is required}"
 
 ARGS=(--model "$LONG_BENCH_MODEL" --data-file "$DATA_FILE"
@@ -29,4 +29,4 @@ ARGS=(--model "$LONG_BENCH_MODEL" --data-file "$DATA_FILE"
 [[ "${SMOKE:-0}" == "1" || "${LONG_BENCH_MODE:-}" == "smoke" ]] && ARGS+=(--smoke)
 cd "$ROOT"
 export PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_vanilla_hf.py" "${ARGS[@]}" "$@"
+exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_vanilla_fa.py" "${ARGS[@]}" "$@"

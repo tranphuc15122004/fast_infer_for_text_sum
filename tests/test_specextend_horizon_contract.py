@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_horizon_runner_and_decision_note_exist():
-    assert (ROOT / "scripts/run_specextend_horizon.sh").is_file()
+    assert (ROOT / "scripts/runners/run_specextend_horizon.sh").is_file()
     assert (ROOT / "docs/experiments/2026-09-13_specextend_horizon_cmr_decision.md").is_file()
 
 
@@ -17,7 +17,7 @@ def test_trace_hook_is_optional_and_runtime_only():
 
 
 def test_runner_uses_official_vicuna_pair_and_stops_on_preflight():
-    source = (ROOT / "scripts/run_specextend_horizon.sh").read_text()
+    source = (ROOT / "scripts/runners/run_specextend_horizon.sh").read_text()
     assert "vicuna_7b" in source
     assert "govreport_4K.jsonl" in source
     assert "preflight" in source

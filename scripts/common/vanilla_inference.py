@@ -69,12 +69,17 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
             setattr(cutlass_utils, "ampere_helpers", shim)
             changed = True
 
-    # FA4 b15 passes the optional third argument to nvvm.fmax positionally.
-    # CUTLASS DSL 4.5.x changed that argument to keyword-only.  Adapt the
-    # callable in this process instead of modifying either site-packages tree.
+    # FA4 b15 calls nvvm.fmax directly with the optional third argument
+    # positionally.  CUTLASS DSL 4.5.x made that argument keyword-only and
+    # also made nvvm.fmax require MLIR Values rather than CuTe scalar objects.
+    # Adapt the callable in this process instead of modifying either
+    # site-packages tree.
     try:
         nvvm = importlib.import_module("cutlass._mlir.dialects.nvvm")
         fmax = nvvm.fmax
+        cutlass = importlib.import_module("cutlass")
+        float32 = cutlass.Float32
+        mlir_ir = importlib.import_module("cutlass._mlir.ir")
         parameters = inspect.signature(fmax).parameters
         c_parameter = parameters.get("c")
         if (
@@ -84,11 +89,85 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
         ):
             @functools.wraps(fmax)
             def fmax_compat(a, b, *args, **kwargs):
-                if args:
-                    if len(args) != 1 or "c" in kwargs:
+                # FA4 b15 uses the pre-CUTLASS-4.5 signature:
+                #   nvvm.fmax(T.f32(), a, b, c=...)
+                # Newer CUTLASS infers the result type and accepts only
+                #   nvvm.fmax(a, b, c=...)
+                # Drop the explicit result type before adapting operands.
+                result_type = None
+                if isinstance(a, mlir_ir.Type):
+                    result_type = a
+                    operands = (b, *args)
+                    if len(operands) < 2:
                         return fmax(a, b, *args, **kwargs)
+                    a, b, *args = operands
+                if len(args) == 1:
+                    # FA4 b15 supplies c positionally; some generated DSL
+                    # paths also leave a keyword ``c`` behind.  The
+                    # positional value is the authoritative third operand.
                     kwargs["c"] = args[0]
-                return fmax(a, b, **kwargs)
+                    args = ()
+                if args:
+                    return fmax(a, b, *args, **kwargs)
+                loc = kwargs.get("loc")
+                ip = kwargs.get("ip")
+                c = kwargs.get("c")
+
+                def as_ir_value(value):
+                    ir_value = getattr(value, "ir_value", None)
+                    if callable(ir_value):
+                        return ir_value(loc=loc, ip=ip)
+                    try:
+                        return float32(value).ir_value(loc=loc, ip=ip)
+                    except Exception as exc:
+                        value_type = type(value)
+                        value_attrs = tuple(
+                            name
+                            for name in (
+                                "value",
+                                "type",
+                                "dtype",
+                                "shape",
+                                "__extract_mlir_values__",
+                                "__new_from_mlir_values__",
+                            )
+                            if hasattr(value, name)
+                        )
+                        raise TypeError(
+                            "FA4 nvvm.fmax operand is not directly convertible: "
+                            f"type={value_type.__module__}.{value_type.__qualname__}, "
+                            f"text={value!s}, attrs={value_attrs}"
+                        ) from exc
+
+                raw_kwargs = {
+                    "a": as_ir_value(a),
+                    "b": as_ir_value(b),
+                    "c": as_ir_value(c) if c is not None else None,
+                    "ftz": kwargs.get("ftz"),
+                    "nan": kwargs.get("nan"),
+                    "abs": kwargs.get("abs"),
+                    "loc": loc,
+                    "ip": ip,
+                }
+                raw_parameters = inspect.signature(fmax).parameters
+                first_parameter = next(iter(raw_parameters), None)
+                if first_parameter == "res":
+                    # Some CUTLASS 4.5 builds retain the old explicit-result
+                    # argument, while others infer it from a/b.
+                    if result_type is None:
+                        result_type = getattr(cutlass, "T", None)
+                        result_type = (
+                            result_type.f32()
+                            if result_type is not None
+                            else None
+                        )
+                    if result_type is None:
+                        raise TypeError(
+                            "CUTLASS nvvm.fmax requires `res`, but FA4 did not "
+                            "provide an explicit result type"
+                        )
+                    raw_kwargs["res"] = result_type
+                return fmax(**raw_kwargs)
 
             fmax_compat._fast_infer_fa4_compat = True
             nvvm.fmax = fmax_compat

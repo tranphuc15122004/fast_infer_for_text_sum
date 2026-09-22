@@ -343,10 +343,29 @@ def test_flash_attention4_compat_shim_is_in_memory_only(monkeypatch):
 def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
     import common.vanilla_inference as vanilla
 
-    def legacy_compatible_fmax(a, b, *, c=None, loc=None, ip=None):
+    class FakeFloat32:
+        def __init__(self, value):
+            self.value = value
+
+        def ir_value(self, *, loc=None, ip=None):
+            return ("ir", self.value, loc, ip)
+
+    def legacy_compatible_fmax(
+        a,
+        b,
+        *,
+        c=None,
+        ftz=None,
+        nan=None,
+        abs=None,
+        loc=None,
+        ip=None,
+    ):
         return a, b, c, loc, ip
 
     fake_nvvm = types.SimpleNamespace(fmax=legacy_compatible_fmax)
+    fake_cutlass = types.SimpleNamespace(Float32=FakeFloat32)
+    fake_mlir_ir = types.SimpleNamespace(Type=type)
     monkeypatch.setattr(
         vanilla.importlib.util,
         "find_spec",
@@ -357,11 +376,22 @@ def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
         "import_module",
         lambda name: fake_nvvm
         if name == "cutlass._mlir.dialects.nvvm"
+        else fake_cutlass
+        if name == "cutlass"
+        else fake_mlir_ir
+        if name == "cutlass._mlir.ir"
         else (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),
     )
 
     assert vanilla._install_flash_attention_4_cutlass_compat() is True
-    assert fake_nvvm.fmax(1, 2, 3, loc="loc") == (1, 2, 3, "loc", None)
+    assert fake_nvvm.fmax(1, 2, 3, loc="loc") == (
+        ("ir", 1, "loc", None),
+        ("ir", 2, "loc", None),
+        ("ir", 3, "loc", None),
+        "loc",
+        None,
+    )
+    assert fake_nvvm.fmax(1, 2, 3, c=99)[2] == ("ir", 3, None, None)
 
 
 def test_longbench_preflight_applies_fa4_compat_before_import(monkeypatch):

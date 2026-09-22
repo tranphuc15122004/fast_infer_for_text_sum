@@ -37,7 +37,7 @@ Nhãn dùng trong tài liệu:
 | ID | Workstream | Nơi chính trong repo | Trạng thái điều hành hiện tại |
 |---|---|---|---|
 | `S0` | Runtime chung và benchmark orchestration | `scripts/common/`, `config/`, `scripts/run_longbench_200.py`, `scripts/collect_metrics.py` | **Đã triển khai; đang hoàn thiện audit/final report** |
-| `B1` | Benchmark các baseline tăng tốc inference | `scripts/infer_*.py`, `scripts/run_*.sh`, `externals/`, `docs/baselines/` | **Đã có matrix, smoke và full B200 artifacts; cần chuẩn hóa diễn giải** |
+| `B1` | Benchmark các baseline tăng tốc inference | `scripts/infer_*.py`, `scripts/runners/run_*.sh`, `externals/`, `docs/baselines/` | **Đã có matrix, smoke và full B200 artifacts; cần chuẩn hóa diễn giải** |
 | `F1` | DFlash fine-tuning cho tóm tắt tiếng Việt | `src/Finetuning/` | **Core và synthetic pipeline đã chạy; chưa đóng real Vietnamese quality/speedup** |
 | `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Prototype/pipeline source-to-cache đã triển khai; pilot train/eval thật còn là việc chính** |
 | `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |

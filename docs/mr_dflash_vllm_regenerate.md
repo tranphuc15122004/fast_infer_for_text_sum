@@ -22,20 +22,26 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
   --host 127.0.0.1 --port 8000 \
   --dtype bfloat16 --max-model-len 32768 \
   --gpu-memory-utilization 0.95 \
-  --max-num-seqs 128 --max-num-batched-tokens 262144
+  --max-num-seqs 128 --max-num-batched-tokens 262144 \
+  --attention-config '{"backend":"FLASH_ATTN"}' \
+  --kv-cache-metrics
 
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL" \
   --served-model-name qwen3-4b \
   --host 127.0.0.1 --port 8001 \
   --dtype bfloat16 --max-model-len 32768 \
   --gpu-memory-utilization 0.92 \
-  --max-num-seqs 128 --max-num-batched-tokens 262144
+  --max-num-seqs 128 --max-num-batched-tokens 262144 \
+  --attention-config '{"backend":"FLASH_ATTN"}' \
+  --kv-cache-metrics
 ```
 
-Lặp lại cấu hình này cho GPU/port còn lại. Sau khi server khởi động, kiểm tra
-endpoint `/metrics`; nếu phiên bản vLLM không expose metric KV-cache, worker
-vẫn chạy bằng token-aware admission. Các server phải dùng cùng model revision,
-tokenizer và `max-model-len`; `--served-model-name` phải giống
+Lặp lại cấu hình này cho GPU/port còn lại. `--attention-config` tránh để vLLM
+tự chọn FlashInfer trong môi trường thiếu `nvrtc.h`; `--kv-cache-metrics` bật
+metric KV-cache của vLLM 0.24.0. Sau khi server khởi động, kiểm tra endpoint
+`/metrics`; nếu metric KV-cache không có, worker vẫn chạy bằng token-aware
+admission. Các server phải dùng cùng model revision, tokenizer và
+`max-model-len`; `--served-model-name` phải giống
 `--vllm-model`.
 
 ## Chạy regenerate

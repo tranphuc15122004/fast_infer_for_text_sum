@@ -570,6 +570,11 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
         for split in ("train", "val", "test"):
             regenerated_file = regenerated / f"{split}.jsonl"
             report = manifests / f"validation_{regime}_{split}.json"
+            expected_generation_model = (
+                options.vllm_model or options.target_model_path
+                if options.regenerate_backend == "vllm"
+                else options.target_model_path
+            )
             plan.append(
                 Stage(
                     name=f"validate_{regime}_{split}",
@@ -583,7 +588,7 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         "--max-length",
                         str(max_length),
                         "--expected-target-model",
-                        options.target_model_path,
+                        expected_generation_model,
                         "--require-generated",
                         "--report",
                         str(report),

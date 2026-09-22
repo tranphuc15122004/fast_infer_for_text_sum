@@ -52,12 +52,12 @@ SyncSpec-v1 có preflight riêng vì cần drafter checkpoint đã train:
 
 ```bash
 python3 scripts/check_syncspec_b200.py --strict
-bash scripts/run_syncspec_b200_smoke.sh
+bash scripts/runners/run_syncspec_b200_smoke.sh
 # Smoke Stage 0 → train joint → infer:
-bash scripts/run_syncspec_b200_train_smoke.sh
+bash scripts/runners/run_syncspec_b200_train_smoke.sh
 # Smoke toàn chuỗi CPU deterministic (dùng example master local):
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
-  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
+  bash scripts/runners/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 Mô phỏng local bằng `.venv`:
@@ -81,7 +81,7 @@ FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
 
 ## Nguyên tắc
 
-- Mỗi baseline: `scripts/infer_<b>.py` + `scripts/run_<b>.sh`; mọi launcher dùng
+- Mỗi baseline: `scripts/infer_<b>.py` + `scripts/runners/run_<b>.sh`; mọi launcher dùng
   cùng master config qua `config/master.path`, có chế độ `--smoke` và mode full; B200 smoke được điều phối bởi
   `scripts/run_b200_smoke.sh`.
 - Dữ liệu/model/cache của bạn: sửa `DATA_INPUT`, `MODEL_*`, `FI_*` trong master

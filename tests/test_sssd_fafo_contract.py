@@ -28,12 +28,12 @@ def test_vendored_repositories_are_not_nested_git_repositories():
 
 def test_dispatcher_and_launchers_register_sssd_and_fafo():
     dispatcher = (ROOT / "scripts/run.sh").read_text(encoding="utf-8")
-    assert 'sssd)       WRAPPER="scripts/run_sssd.sh"' in dispatcher
-    assert 'fafo)       WRAPPER="scripts/run_fafo.sh"' in dispatcher
+    assert 'sssd)       WRAPPER="scripts/runners/run_sssd.sh"' in dispatcher
+    assert 'fafo)       WRAPPER="scripts/runners/run_fafo.sh"' in dispatcher
     assert "sssd" in dispatcher.split("Available:", 1)[1]
     assert "fafo" in dispatcher.split("Available:", 1)[1]
     for name in ("run_sssd.sh", "run_fafo.sh"):
-        launcher = ROOT / "scripts" / name
+        launcher = ROOT / "scripts" / "runners" / name
         assert launcher.is_file()
         text = launcher.read_text(encoding="utf-8")
         assert 'source "$ROOT/scripts/common/config.sh"' in text

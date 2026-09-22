@@ -159,18 +159,18 @@ SyncSpec có thêm preflight/smoke riêng vì cần checkpoint drafter đã trai
 
 ```bash
 python3 scripts/check_syncspec_b200.py --strict
-bash scripts/run_syncspec_b200_smoke.sh
+bash scripts/runners/run_syncspec_b200_smoke.sh
 # Smoke toàn chuỗi train + infer (tạo drafter checkpoint mới):
-bash scripts/run_syncspec_b200_train_smoke.sh
+bash scripts/runners/run_syncspec_b200_train_smoke.sh
 # Smoke toàn chuỗi CPU deterministic:
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
-  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
+  bash scripts/runners/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 Mọi baseline đọc cùng một master shell-env. Pointer mặc định là
 `config/master.path`; có thể override bằng `FAST_INFER_MASTER_CONFIG`. Mẫu đầy
 đủ và tên canonical nằm ở [`docs/fast_infer_master.example.env`](fast_infer_master.example.env).
-`bash scripts/run.sh` là dispatcher gọi wrapper; production dùng `python3`, còn
+`bash scripts/run.sh` là dispatcher gọi wrapper trong `scripts/runners/`; production dùng `python3`, còn
 local simulation đặt `FAST_INFER_PYTHON` tới `.venv/bin/python`.
 
 ## Dữ liệu plug-and-play
@@ -262,7 +262,7 @@ khi card chật và retry shard OOM thay vì kill job — xem mục "Tận dụn
 mỗi shard giữ model trong process và xử lý lần lượt các dataset; dùng
 `--no-reuse-model-per-baseline` nếu cần quay về từng cell độc lập.
 Trước mỗi job, kiểm tra VRAM
-trống bằng `bash scripts/run_gpu_check.sh --config <master> [--gpu-ids N]
+trống bằng `bash scripts/runners/run_gpu_check.sh --config <master> [--gpu-ids N]
 [--min-free-gb GB]` (xem cùng mục tài liệu).
 
 ## Báo cáo kết quả semantic selection

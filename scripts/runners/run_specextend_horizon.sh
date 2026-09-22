@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Keep this experimental launcher on the same interpreter/config contract as
 # every production baseline launcher. The experiment itself does not need the
 # external master values, so it intentionally does not call a baseline config

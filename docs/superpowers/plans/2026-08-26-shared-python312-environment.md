@@ -99,22 +99,22 @@ Expected: the helper/setup assertions pass, while the complete launcher assertio
 ### Task 2: Migrate every main shell launcher
 
 **Files:**
-- Modify: `scripts/run_dflash.sh`
-- Modify: `scripts/run_dflash_gsm8k.sh`
-- Modify: `scripts/run_eagle3_qwen3.sh`
-- Modify: `scripts/run_fastkv.sh`
-- Modify: `scripts/run_flexprefill.sh`
-- Modify: `scripts/run_gemfilter.sh`
-- Modify: `scripts/run_higoe.sh`
-- Modify: `scripts/run_llmlingua.sh`
-- Modify: `scripts/run_longspec.sh`
-- Modify: `scripts/run_magicdec.sh`
-- Modify: `scripts/run_minference.sh`
-- Modify: `scripts/run_rocketkv.sh`
-- Modify: `scripts/run_semantic_selection.sh`
-- Modify: `scripts/run_specextend.sh`
-- Modify: `scripts/run_specprefill.sh`
-- Modify: `scripts/run_qwen3_long_profile.sh`
+- Modify: `scripts/runners/run_dflash.sh`
+- Modify: `scripts/runners/run_dflash_gsm8k.sh`
+- Modify: `scripts/runners/run_eagle3_qwen3.sh`
+- Modify: `scripts/runners/run_fastkv.sh`
+- Modify: `scripts/runners/run_flexprefill.sh`
+- Modify: `scripts/runners/run_gemfilter.sh`
+- Modify: `scripts/runners/run_higoe.sh`
+- Modify: `scripts/runners/run_llmlingua.sh`
+- Modify: `scripts/runners/run_longspec.sh`
+- Modify: `scripts/runners/run_magicdec.sh`
+- Modify: `scripts/runners/run_minference.sh`
+- Modify: `scripts/runners/run_rocketkv.sh`
+- Modify: `scripts/runners/run_semantic_selection.sh`
+- Modify: `scripts/runners/run_specextend.sh`
+- Modify: `scripts/runners/run_specprefill.sh`
+- Modify: `scripts/runners/run_qwen3_long_profile.sh`
 - Modify: `scripts/run_representative_100.sh`
 - Modify: `scripts/run.sh`
 

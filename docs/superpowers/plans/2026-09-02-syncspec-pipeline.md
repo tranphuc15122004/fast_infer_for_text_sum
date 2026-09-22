@@ -128,7 +128,7 @@ thêm bằng `python3 scripts/check_syncspec_b200.py` trên canonical server.
 - Add synthetic deterministic target/drafter for full CPU smoke and an offline
   Transformers backend for real model paths. Use existing `JsonlWriter` and
   repo master config conventions.
-- Add `scripts/infer_syncspec.py`, `scripts/run_syncspec.sh`, `syncspec` case
+- Add `scripts/infer_syncspec.py`, `scripts/runners/run_syncspec.sh`, `syncspec` case
   to `scripts/run.sh`, and docs `docs/baselines/syncspec.md` with canonical
   B200 environment variables and AR comparison command.
 - Test one-record CPU E2E, output schema, exact greedy equality, AR fallback,
@@ -166,7 +166,7 @@ thêm bằng `python3 scripts/check_syncspec_b200.py` trên canonical server.
   profile keys model/checkpoint/GPU/precision/kernel/context-bin/batch-bin/Kd/Kv.
 - Add `scripts/profile_syncspec.py` to produce finite profile JSON consumed by
   controller; never estimate GPU cost from CPU numbers.
-- Add `scripts/check_syncspec_b200.py` and `scripts/run_syncspec_b200_smoke.sh`
+- Add `scripts/check_syncspec_b200.py` and `scripts/runners/run_syncspec_b200_smoke.sh`
   using shared runtime/master config. Preflight must check Python 3.12, CUDA,
   B200 capability/name, offline local model files, tokenizer, target/drafter
   compatibility and writable caches. If hardware is absent, emit structured
@@ -193,12 +193,12 @@ CPU smoke:
 ```bash
 FAST_INFER_PYTHON="$PWD/.venv/bin/python" \
   SYNCSPEC_CPU_SMOKE_DIR=/tmp/syncspec_cpu_smoke \
-  bash scripts/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
+  bash scripts/runners/run_syncspec_cpu_smoke.sh docs/fast_infer_master.example.env
 ```
 
 B200 smoke (sau khi canonical mount đã sẵn sàng):
 
 ```bash
 python3 scripts/check_syncspec_b200.py --strict
-bash scripts/run_syncspec_b200_smoke.sh
+bash scripts/runners/run_syncspec_b200_smoke.sh
 ```

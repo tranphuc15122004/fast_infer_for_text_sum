@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ $# -gt 0 && "$1" != -* ]]; then
   export FAST_INFER_MASTER_CONFIG="$1"
   shift
@@ -19,7 +19,7 @@ source "$ROOT/scripts/common/runtime.sh" || exit 1
 # JSONL runs.
 case "${DFLASH_MODE:-representative}" in
   representative) ;;
-  gsm8k) exec bash "$ROOT/scripts/run_dflash_gsm8k.sh" "$@" ;;
+  gsm8k) exec bash "$ROOT/scripts/runners/run_dflash_gsm8k.sh" "$@" ;;
   *)
     echo "DFLASH_MODE must be representative or gsm8k: ${DFLASH_MODE}" >&2
     exit 2

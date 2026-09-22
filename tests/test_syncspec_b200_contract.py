@@ -312,7 +312,7 @@ def test_syncspec_b200_preflight_resolves_repo_relative_checkpoint(tmp_path: Pat
 
 
 def test_syncspec_b200_runner_is_registered_and_strict() -> None:
-    runner = (ROOT / "scripts/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
+    runner = (ROOT / "scripts/runners/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
     assert "check_syncspec_b200.py" in runner
     assert "--strict" in runner
     assert "infer_syncspec.py" in runner
@@ -322,7 +322,7 @@ def test_syncspec_b200_runner_is_registered_and_strict() -> None:
 
 
 def test_syncspec_b200_runner_uses_normalized_budget_overrides() -> None:
-    runner = (ROOT / "scripts/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
+    runner = (ROOT / "scripts/runners/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
     # config.sh resolves both SYNCSPEC_KD/KV and generic KD/KV into the latter;
     # the wrapper must branch on the normalized names or it can pass mutually
     # exclusive --budget-profiles and --kd/--kv arguments.
@@ -331,7 +331,7 @@ def test_syncspec_b200_runner_uses_normalized_budget_overrides() -> None:
 
 
 def test_syncspec_b200_train_runner_is_registered_and_strict() -> None:
-    runner = (ROOT / "scripts/run_syncspec_b200_train_smoke.sh").read_text(encoding="utf-8")
+    runner = (ROOT / "scripts/runners/run_syncspec_b200_train_smoke.sh").read_text(encoding="utf-8")
     assert "check_syncspec_b200.py" in runner
     assert "--phase train" in runner
     assert "--phase infer" in runner
@@ -349,8 +349,8 @@ def test_syncspec_b200_train_runner_is_registered_and_strict() -> None:
 
 
 def test_syncspec_b200_runners_guard_batch_sample_mismatch() -> None:
-    infer_runner = (ROOT / "scripts/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
-    train_runner = (ROOT / "scripts/run_syncspec_b200_train_smoke.sh").read_text(encoding="utf-8")
+    infer_runner = (ROOT / "scripts/runners/run_syncspec_b200_smoke.sh").read_text(encoding="utf-8")
+    train_runner = (ROOT / "scripts/runners/run_syncspec_b200_train_smoke.sh").read_text(encoding="utf-8")
     for runner in (infer_runner, train_runner):
         assert "MAX_SAMPLES" in runner
         assert "BATCH_SIZE" in runner

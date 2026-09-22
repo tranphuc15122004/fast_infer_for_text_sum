@@ -50,9 +50,9 @@ checkpoint cục bộ cho T4; Qwen3-4B không tương thích loader này và
 Llama-3.1 + EAGLE-3 cần nhiều VRAM hơn.
 
 ```bash
-bash scripts/run_specextend_horizon.sh smoke
-bash scripts/run_specextend_horizon.sh 4k
-bash scripts/run_specextend_horizon.sh 8k
+bash scripts/runners/run_specextend_horizon.sh smoke
+bash scripts/runners/run_specextend_horizon.sh 4k
+bash scripts/runners/run_specextend_horizon.sh 8k
 ```
 
 Runner kiểm tra CUDA trước khi load model. Khi bật `SPECEXTEND_TRACE_FILE`,

@@ -12,7 +12,7 @@ không dùng speculative decoding trên Tesla T4 16 GB.
 Chạy lại từ root repo:
 
 ```bash
-bash scripts/run_qwen3_long_profile.sh config/qwen3_long_profile.env
+bash scripts/runners/run_qwen3_long_profile.sh config/qwen3_long_profile.env
 ```
 
 Config mặc định dùng snapshot local của `Qwen/Qwen3-4B`, các mốc 256, 512,

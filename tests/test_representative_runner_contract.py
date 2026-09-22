@@ -82,16 +82,16 @@ def test_representative_runner_selects_t4_overrides_in_smoke_mode():
 
 
 def test_semantic_selection_adapter_files_exist():
-    assert (ROOT / "scripts/run_semantic_selection.sh").is_file()
+    assert (ROOT / "scripts/runners/run_semantic_selection.sh").is_file()
     assert (ROOT / "config/master.path").is_file()
 
 
 def test_dflash_and_longspec_have_representative_adapters():
     assert (ROOT / "scripts/infer_dflash.py").is_file()
-    assert (ROOT / "scripts/run_dflash.sh").is_file()
-    assert "fast_infer_load_config dflash" in (ROOT / "scripts/run_dflash.sh").read_text()
+    assert (ROOT / "scripts/runners/run_dflash.sh").is_file()
+    assert "fast_infer_load_config dflash" in (ROOT / "scripts/runners/run_dflash.sh").read_text()
     assert (ROOT / "scripts/infer_longspec.py").is_file()
-    assert (ROOT / "scripts/run_longspec.sh").is_file()
+    assert (ROOT / "scripts/runners/run_longspec.sh").is_file()
 
     runner = (ROOT / "scripts/run_representative_100.sh").read_text(
         encoding="utf-8"

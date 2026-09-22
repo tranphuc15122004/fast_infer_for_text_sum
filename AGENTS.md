@@ -13,8 +13,11 @@ canonical của server nằm tại [`docs/server_environment.md`](docs/server_en
 fast_infer_text_sum/
 ├── scripts/                    # script kiểm chứng từng baseline + helpers
 │   ├── infer_<baseline>.py     # mỗi baseline 1 file (--smoke + full mode)
-│   ├── run_<baseline>.sh       # wrapper dùng runtime helper chung
 │   ├── run.sh                  # dispatcher: bash scripts/run.sh <baseline>
+│   ├── run_longbench_200.sh    # entrypoint LongBench matrix
+│   ├── run_b200_smoke.sh       # entrypoint B200 smoke/preflight
+│   ├── run_representative_100.sh # entrypoint representative benchmark
+│   ├── runners/                # các wrapper run_<baseline>.sh nhỏ
 │   ├── setup_venv.sh            # tạo/cài venv Python 3.12 offline
 │   ├── check_shared_env.py      # preflight import/version, không tải model
 │   └── common/                 # helpers dùng chung
@@ -44,9 +47,10 @@ cũ. Không tạo hoặc sử dụng venv riêng cho từng baseline.
 
 ## Conventions
 
-- **1 baseline = 1 bộ file**: `scripts/infer_<b>.py` + `scripts/run_<b>.sh` +
-  `docs/baselines/<b>.md`, được nối vào `run.sh`. Tất cả launcher dùng master
-  shell-env ngoài repository qua `config/master.path`.
+- **1 baseline = 1 bộ file**: `scripts/infer_<b>.py` +
+  `scripts/runners/run_<b>.sh` + `docs/baselines/<b>.md`, được nối vào
+  `run.sh`. Tất cả launcher dùng master shell-env ngoài repository qua
+  `config/master.path`.
 - **Smoke vs full**: mặc định `--smoke` (T4-safe khi baseline hỗ trợ); full cần
   GPU lớn, kernel tương thích và model/cache thật. `SMOKE=1`/`FULL=1` trong config.
 - **Output schema**: mọi record qua `io_util.JsonlWriter`, kết thúc bằng summary.
@@ -102,7 +106,7 @@ flexprefill`.
   cài trực tiếp profile server cu130 này trên máy local.
 - Chạy script ở chế độ CPU (llmlingua có sẵn fallback CPU):
   ```bash
-  CUDA_VISIBLE_DEVICES="" DEVICE=cpu SMOKE=1 bash scripts/run_llmlingua.sh
+  CUDA_VISIBLE_DEVICES="" DEVICE=cpu SMOKE=1 bash scripts/runners/run_llmlingua.sh
   ```
 - **Bug đã sửa — đừng tái lập khi sửa script:**
   - Check Python 3.12: dùng `sys.exit(1) if cond else None`, **KHÔNG** dùng

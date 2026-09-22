@@ -65,7 +65,7 @@ def test_specextend_cli_can_explicitly_disable_hybrid_attention():
 
 
 def test_specextend_wrapper_forwards_disabled_flag():
-    wrapper = (ROOT / "scripts/run_specextend.sh").read_text(encoding="utf-8")
+    wrapper = (ROOT / "scripts/runners/run_specextend.sh").read_text(encoding="utf-8")
 
     assert "ARGS+=(--use-specextend)" in wrapper
     assert "ARGS+=(--no-use-specextend)" in wrapper

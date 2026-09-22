@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "scripts" / "run_semantic_selection.sh"
+WRAPPER = ROOT / "scripts" / "runners" / "run_semantic_selection.sh"
 
 
 def test_direct_smoke_fixture_uses_semantic_selection_document_field() -> None:
