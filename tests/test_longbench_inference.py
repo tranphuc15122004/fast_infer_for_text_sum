@@ -366,6 +366,7 @@ def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
     fake_nvvm = types.SimpleNamespace(fmax=legacy_compatible_fmax)
     fake_cutlass = types.SimpleNamespace(Float32=FakeFloat32)
     fake_mlir_ir = types.SimpleNamespace(Type=type)
+    fake_cute_arch = types.SimpleNamespace()
     monkeypatch.setattr(
         vanilla.importlib.util,
         "find_spec",
@@ -378,6 +379,8 @@ def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
         if name == "cutlass._mlir.dialects.nvvm"
         else fake_cutlass
         if name == "cutlass"
+        else fake_cute_arch
+        if name == "cutlass.cute.arch"
         else fake_mlir_ir
         if name == "cutlass._mlir.ir"
         else (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),

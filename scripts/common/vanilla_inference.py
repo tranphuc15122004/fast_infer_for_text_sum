@@ -80,6 +80,30 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
         cutlass = importlib.import_module("cutlass")
         float32 = cutlass.Float32
         mlir_ir = importlib.import_module("cutlass._mlir.ir")
+
+        # CUTLASS only re-exports these NVVM enums from ``cute.arch`` for
+        # CUDA 12.9.  FA4 b15 still imports them from that stable CuTe path,
+        # while the server's CUDA 13 package keeps the same enums under
+        # ``cutlass._mlir.dialects.nvvm``.  Re-export them in memory so the
+        # FA4 kernel can use the installed CUTLASS ABI without editing
+        # site-packages.
+        try:
+            cute_arch = importlib.import_module("cutlass.cute.arch")
+            for enum_name in (
+                "ProxyKind",
+                "SharedSpace",
+                "RoundingModeKind",
+                "ReduxKind",
+                "AtomicOpKind",
+            ):
+                if not hasattr(cute_arch, enum_name) and hasattr(nvvm, enum_name):
+                    setattr(cute_arch, enum_name, getattr(nvvm, enum_name))
+                    changed = True
+        except Exception:
+            # The fmax compatibility below remains independently useful for
+            # CUTLASS builds that already expose the CuTe enum names.
+            pass
+
         parameters = inspect.signature(fmax).parameters
         c_parameter = parameters.get("c")
         if (

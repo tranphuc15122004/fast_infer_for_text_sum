@@ -6,6 +6,15 @@
 
 set -u
 
+# This is an executable launcher, not a shell environment file.  In
+# particular, never let `.`/`source` execute its `exit` statements in the
+# operator's interactive shell.  Return from a sourced file so the parent
+# shell remains alive and give an actionable command instead.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "[b200-vllm] ERROR: không source launcher này; hãy chạy: bash ${BASH_SOURCE[0]} 1|2" >&2
+  return 2
+fi
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -27,7 +36,7 @@ Options:
 
 The launcher intentionally uses a visible stop_parallel file and visible
 output/log directories. It does not export VLLM_TMP because vLLM treats that
-name as an unknown environment variable.
+name as an unknown environment variable. Run it with bash; do not source it.
 EOF
 }
 
