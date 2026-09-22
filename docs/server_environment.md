@@ -67,9 +67,10 @@ cho `vanilla_fa` trên B200/Blackwell.
 Server hiện đã có `flash-attn==2.8.3.post1`, `flash-attn-4==4.0.0b15` và
 shared CUTLASS 4.5.x. FA4 beta b15 còn import
 `cutlass.utils.ampere_helpers`, trong khi CUTLASS hiện tại đã bỏ module cũ
-này. Code runner tự đăng ký một module tương thích nhỏ trong `sys.modules`
-cho đúng process benchmark; không sửa `site-packages`, không uninstall FA2,
-không cài lại package. FA2 vẫn được giữ cho các baseline/backend cần nó.
+này, và b15 dùng cách gọi positional cũ cho `nvvm.fmax`. Code runner tự đăng
+ký module tương thích và adapter `nvvm.fmax` trong đúng process benchmark;
+không sửa `site-packages`, không uninstall FA2, không cài lại package. FA2
+vẫn được giữ cho các baseline/backend cần nó.
 
 Không kiểm tra FA4 bằng lệnh import trực tiếp, vì lệnh đó bỏ qua shim của
 repository. Dùng probe của runner:

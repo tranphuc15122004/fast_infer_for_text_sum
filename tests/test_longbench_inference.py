@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -337,6 +338,30 @@ def test_flash_attention4_compat_shim_is_in_memory_only(monkeypatch):
         assert fake_cutlass_utils.ampere_helpers is shim
     finally:
         vanilla.sys.modules.pop("cutlass.utils.ampere_helpers", None)
+
+
+def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
+    import common.vanilla_inference as vanilla
+
+    def legacy_compatible_fmax(a, b, *, c=None, loc=None, ip=None):
+        return a, b, c, loc, ip
+
+    fake_nvvm = types.SimpleNamespace(fmax=legacy_compatible_fmax)
+    monkeypatch.setattr(
+        vanilla.importlib.util,
+        "find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setattr(
+        vanilla.importlib,
+        "import_module",
+        lambda name: fake_nvvm
+        if name == "cutlass._mlir.dialects.nvvm"
+        else (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),
+    )
+
+    assert vanilla._install_flash_attention_4_cutlass_compat() is True
+    assert fake_nvvm.fmax(1, 2, 3, loc="loc") == (1, 2, 3, "loc", None)
 
 
 def test_longbench_preflight_applies_fa4_compat_before_import(monkeypatch):

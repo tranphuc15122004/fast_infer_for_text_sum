@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -37,34 +39,66 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
     ``flash-attn-4==4.0.0b15`` still imports the deprecated
     ``cutlass.utils.ampere_helpers`` module.  CUTLASS 4.5.2 removed that module
     but retained the only value used by the beta kernel: ``SMEM_CAPACITY``.
-    Register the small compatibility module in ``sys.modules`` for this
-    process only, so the server environment and the FA2 installation remain
-    unchanged.
+    Register the small compatibility module in ``sys.modules`` and adapt the
+    legacy ``nvvm.fmax`` call convention for this process only, so the server
+    environment and the FA2 installation remain unchanged.
     """
 
+    changed = False
     module_name = "cutlass.utils.ampere_helpers"
     try:
-        if importlib.util.find_spec(module_name) is not None:
-            return False
+        missing_ampere_helpers = importlib.util.find_spec(module_name) is None
     except Exception:
-        return False
+        missing_ampere_helpers = False
 
+    if missing_ampere_helpers:
+        try:
+            cutlass_utils = importlib.import_module("cutlass.utils")
+        except Exception:
+            cutlass_utils = None
+        if cutlass_utils is not None:
+            shim = types.ModuleType(module_name)
+            shim.SMEM_CAPACITY = {
+                "sm80": 163840,
+                "sm86": 102400,
+                "sm89": 102400,
+                "sm90": 232448,
+                "sm100": 229376,
+            }
+            sys.modules[module_name] = shim
+            setattr(cutlass_utils, "ampere_helpers", shim)
+            changed = True
+
+    # FA4 b15 passes the optional third argument to nvvm.fmax positionally.
+    # CUTLASS DSL 4.5.x changed that argument to keyword-only.  Adapt the
+    # callable in this process instead of modifying either site-packages tree.
     try:
-        cutlass_utils = importlib.import_module("cutlass.utils")
-    except Exception:
-        return False
+        nvvm = importlib.import_module("cutlass._mlir.dialects.nvvm")
+        fmax = nvvm.fmax
+        parameters = inspect.signature(fmax).parameters
+        c_parameter = parameters.get("c")
+        if (
+            c_parameter is not None
+            and c_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            and not getattr(fmax, "_fast_infer_fa4_compat", False)
+        ):
+            @functools.wraps(fmax)
+            def fmax_compat(a, b, *args, **kwargs):
+                if args:
+                    if len(args) != 1 or "c" in kwargs:
+                        return fmax(a, b, *args, **kwargs)
+                    kwargs["c"] = args[0]
+                return fmax(a, b, **kwargs)
 
-    shim = types.ModuleType(module_name)
-    shim.SMEM_CAPACITY = {
-        "sm80": 163840,
-        "sm86": 102400,
-        "sm89": 102400,
-        "sm90": 232448,
-        "sm100": 229376,
-    }
-    sys.modules[module_name] = shim
-    setattr(cutlass_utils, "ampere_helpers", shim)
-    return True
+            fmax_compat._fast_infer_fa4_compat = True
+            nvvm.fmax = fmax_compat
+            changed = True
+    except Exception:
+        # The import probe below remains authoritative for unsupported or
+        # otherwise incomplete CUTLASS installations.
+        pass
+
+    return changed
 
 
 def _probe_flash_attention_4() -> tuple[bool, str | None]:

@@ -369,6 +369,9 @@ def _run_canonical(args: argparse.Namespace) -> None:
         max_seq_length=max_sequence,
         draft_budget=args.draft_budget if args.self_spec else 0,
         window_size=args.window_size,
+        draft_max_length=(
+            args.draft_budget + args.max_new_tokens if args.self_spec else None
+        ),
     )
     torch.cuda.synchronize(device)
     model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)

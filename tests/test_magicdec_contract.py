@@ -98,6 +98,25 @@ def test_magicdec_warmup_context_does_not_truncate_long_prompt():
     assert warmup_ids is input_ids
 
 
+def test_magicdec_self_spec_uses_compacted_draft_cache_positions():
+    backend_source = (
+        ROOT / "externals/MagicDec/Engine/SnapKV/backend.py"
+    ).read_text(encoding="utf-8")
+    model_source = (
+        ROOT / "externals/MagicDec/Engine/SnapKV/model.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self.draft_cachelens.fill_(self.draft_budget)" in backend_source
+    assert "self.draft_paged_kv_last_page_len.fill_(" in backend_source
+    assert "self.draft_num_pages_per_request" in backend_source
+    assert "draft_max_length=(" in (
+        ROOT / "scripts/infer_magicdec.py"
+    ).read_text(encoding="utf-8")
+    assert "pages_needed = ((self.cachelens + dec_len - 1)" in backend_source
+    assert "draft_input_pos=self.draft_cachelens" in backend_source
+    assert "draft_offsets if draft_offsets is not None else offsets" in model_source
+
+
 def _load_snapkv_model_module(path: Path):
     module_name = f"snapkv_model_{path.stem}_{id(path)}"
     spec = importlib.util.spec_from_file_location(module_name, path)
