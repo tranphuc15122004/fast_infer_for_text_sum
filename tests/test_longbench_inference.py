@@ -397,6 +397,58 @@ def test_flash_attention4_adapts_legacy_positional_nvvm_fmax(monkeypatch):
     assert fake_nvvm.fmax(1, 2, 3, c=99)[2] == ("ir", 3, None, None)
 
 
+def test_flash_attention4_exports_cuda13_enum_members_as_strings(monkeypatch):
+    import common.vanilla_inference as vanilla
+
+    class FakeEnumMember:
+        def __init__(self, name, text):
+            self.name = name
+            self.text = text
+
+        def __str__(self):
+            return self.text
+
+    class FakeEnum:
+        def __init__(self, *members):
+            self._members = members
+
+        def __iter__(self):
+            return iter(self._members)
+
+    fake_nvvm = types.SimpleNamespace(
+        ProxyKind=FakeEnum(
+            FakeEnumMember("async_shared", "async.shared"),
+        ),
+        SharedSpace=FakeEnum(
+            FakeEnumMember("shared_cta", "cta"),
+        ),
+        fmax=lambda a, b, *, c=None: (a, b, c),
+    )
+    fake_cutlass = types.SimpleNamespace(Float32=object)
+    fake_mlir_ir = types.SimpleNamespace(Type=type)
+    fake_cute_arch = types.SimpleNamespace()
+
+    monkeypatch.setattr(vanilla.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(
+        vanilla.importlib,
+        "import_module",
+        lambda name: fake_nvvm
+        if name == "cutlass._mlir.dialects.nvvm"
+        else fake_cutlass
+        if name == "cutlass"
+        else fake_cute_arch
+        if name == "cutlass.cute.arch"
+        else fake_mlir_ir
+        if name == "cutlass._mlir.ir"
+        else (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),
+    )
+
+    vanilla._install_flash_attention_4_cutlass_compat()
+
+    assert fake_cute_arch.ProxyKind.async_shared == "async.shared"
+    assert fake_cute_arch.SharedSpace.shared_cta == "cta"
+
+
 def test_longbench_preflight_applies_fa4_compat_before_import(monkeypatch):
     import common.longbench_adapter as adapter
     import common.vanilla_inference as vanilla

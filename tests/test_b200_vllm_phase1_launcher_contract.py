@@ -23,3 +23,13 @@ def test_sourcing_launcher_returns_without_killing_parent_shell() -> None:
     assert result.returncode == 0
     assert "shell-alive rc=2" in result.stdout
     assert "không source launcher này" in result.stderr
+
+
+def test_phase1_launcher_consumes_prepared_data_without_building_it() -> None:
+    text = LAUNCHER.read_text(encoding="utf-8")
+
+    assert '"$PROJECT_ROOT/scripts/mr_dflash/prepare_server_data.py"' not in text
+    assert '"$PROJECT_ROOT/scripts/mr_dflash/build_pilot_dataset.py"' not in text
+    assert 'PREPARED_ROOT="${PREPARED_ROOT:-' in text
+    assert "--from-stage regenerate_full_train" in text
+    assert "normalized/${split}_prompts.jsonl" in text

@@ -15,6 +15,54 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 2
 fi
 
+# ======================= CẤU HÌNH THƯỜNG DÙNG ==============================
+# Chỉnh các biến ở block này trước khi chạy. Các biến bên dưới block là
+# advanced/runtime và thường không cần thay đổi.
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/../outputs}"
+
+GPU_ID="${GPU_ID:-0}"                                      # GPU dùng cho vLLM/cache
+TARGET_MODEL="${TARGET_MODEL:-/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B}"
+VLLM_PORT="${VLLM_PORT:-38147}"                            # port loopback của vLLM
+RUN_ROOT="${RUN_ROOT:-$OUTPUT_ROOT/mr_dflash_phase1_20k_sharegpt_30k_arxiv_vllm_b200}"
+PREPARED_ROOT="${PREPARED_ROOT:-$PROJECT_ROOT/../data/mr_dflash_phase1_20k_sharegpt_30k_arxiv}"
+
+# --------------------------- Phase 1 ---------------------------------------
+# Context/output:
+#   PHASE1_CONTEXT_LENGTH = tổng prompt + output tối đa của model.
+#   PHASE1_MAX_NEW_TOKENS = output tối đa mỗi sample; không phải batch size.
+PHASE1_CONTEXT_LENGTH="${PHASE1_CONTEXT_LENGTH:-32768}"
+PHASE1_MAX_NEW_TOKENS="${PHASE1_MAX_NEW_TOKENS:-2048}"
+
+# GPU/batch:
+#   VLLM_GPU_MEMORY_UTILIZATION = phần VRAM vLLM được phép dùng; 0.95 ~= 171 GiB.
+#   VLLM_BATCH_SIZE             = số request/sample tối đa.
+#   VLLM_BATCH_TOKENS           = tổng prompt + generation token; nút VRAM chính.
+#   VLLM_BATCH_START_*           = mức khởi động; mặc định bằng max => batch cố định.
+# Công thức gần đúng: batch_tokens = batch_size × (prompt_tokens + output_tokens).
+# Nếu OOM, giảm VLLM_BATCH_TOKENS: 524288 -> 393216 -> 262144.
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
+VLLM_BATCH_SIZE="${VLLM_BATCH_SIZE:-64}"
+VLLM_BATCH_TOKENS="${VLLM_BATCH_TOKENS:-524288}"
+VLLM_BATCH_START_SIZE="${VLLM_BATCH_START_SIZE:-$VLLM_BATCH_SIZE}"
+VLLM_BATCH_START_TOKENS="${VLLM_BATCH_START_TOKENS:-$VLLM_BATCH_TOKENS}"
+
+# Admission control/telemetry:
+# target/hard là KV-cache target và ngưỡng backoff; growth/timeout/retries
+# chỉ ảnh hưởng khi request lỗi hoặc khi start < max.
+VLLM_GPU_CACHE_TARGET="${VLLM_GPU_CACHE_TARGET:-0.90}"
+VLLM_GPU_CACHE_HARD="${VLLM_GPU_CACHE_HARD:-0.95}"
+VLLM_REQUEST_GROWTH_FACTOR="${VLLM_REQUEST_GROWTH_FACTOR:-2.0}"
+VLLM_REQUEST_TIMEOUT_SECONDS="${VLLM_REQUEST_TIMEOUT_SECONDS:-600}"
+VLLM_REQUEST_RETRIES="${VLLM_REQUEST_RETRIES:-2}"
+VLLM_METRICS_POLL_INTERVAL_SECONDS="${VLLM_METRICS_POLL_INTERVAL_SECONDS:-0.5}"
+
+# Hidden-cache phase (chạy sau khi vLLM đã dừng):
+CACHE_BATCH_SIZE_3K="${CACHE_BATCH_SIZE_3K:-4}"
+CACHE_BATCH_SIZE_LONG_CONTEXT="${CACHE_BATCH_SIZE_LONG_CONTEXT:-2}"
+CACHE_IO_THREADS="${CACHE_IO_THREADS:-2}"
+CACHE_IO_QUEUE_SIZE="${CACHE_IO_QUEUE_SIZE:-4}"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -36,7 +84,9 @@ Options:
 
 The launcher intentionally uses a visible stop_parallel file and visible
 output/log directories. It does not export VLLM_TMP because vLLM treats that
-name as an unknown environment variable. Run it with bash; do not source it.
+name as an unknown environment variable. For the B200 180 GiB profile, only
+VLLM_BATCH_SIZE and VLLM_BATCH_TOKENS are intended as batch overrides. Run it
+with bash; do not source it.
 EOF
 }
 
@@ -60,14 +110,9 @@ case "$MODE" in
   *) die "mode phải là 1 hoặc 2, nhận được: $MODE" ;;
 esac
 
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/../outputs}"
-RUN_ROOT="${RUN_ROOT:-$OUTPUT_ROOT/mr_dflash_phase1_20k_sharegpt_30k_arxiv_vllm_b200}"
-PREPARED_ROOT="${PREPARED_ROOT:-$PROJECT_ROOT/../data/mr_dflash_phase1_20k_sharegpt_30k_arxiv}"
-TARGET_MODEL="${TARGET_MODEL:-/workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B}"
+
+# ============================ ADVANCED =====================================
 RUNTIME_TMP="${RUNTIME_TMP:-$PROJECT_ROOT/../vllm_tmp}"
-VLLM_PORT="${VLLM_PORT:-38147}"
-GPU_ID="${GPU_ID:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
 
@@ -181,6 +226,10 @@ start_server() {
 
   : > "$VLLM_LOG"
   echo "[b200-vllm] starting vLLM on GPU=$GPU_ID port=$VLLM_PORT"
+  # --max-model-len là trần context của model; không có nghĩa mọi sample
+  # đều dùng 32K token. --gpu-memory-utilization=0.98 cho khoảng 176 GiB/180
+  # GiB và chừa headroom cho CUDA/kernel. max-num-batched-tokens là giới hạn
+  # VRAM chính của scheduler.
   nohup env \
     CUDA_VISIBLE_DEVICES="$GPU_ID" \
     TMPDIR="$TMPDIR" \
@@ -198,10 +247,10 @@ start_server() {
     --host 127.0.0.1 \
     --port "$VLLM_PORT" \
     --dtype bfloat16 \
-    --max-model-len 32768 \
-    --gpu-memory-utilization 0.95 \
-    --max-num-seqs 128 \
-    --max-num-batched-tokens 262144 \
+    --max-model-len "$PHASE1_CONTEXT_LENGTH" \
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
+    --max-num-seqs "$VLLM_BATCH_SIZE" \
+    --max-num-batched-tokens "$VLLM_BATCH_TOKENS" \
     --attention-config '{"backend":"FLASH_ATTN"}' \
     --kernel-config '{"enable_flashinfer_autotune":false}' \
     --enforce-eager \
@@ -245,6 +294,10 @@ stop_server() {
 }
 
 prepare_phase1_root() {
+  # Dataset contract: analysis and prepare/build are explicit commands run
+  # before this launcher.  Phase 1 chỉ nhận normalized artifacts đã được duyệt;
+  # tuyệt đối không gọi prepare_server_data.py/build_pilot_dataset.py ở đây,
+  # để vLLM regenerate/cache không âm thầm random-sample hoặc đổi split.
   mkdir -p "$RUN_ROOT"
   if [[ ! -e "$RUN_ROOT/normalized" ]]; then
     [[ -d "$PREPARED_ROOT/normalized" ]] || die "thiếu prepare root: $PREPARED_ROOT/normalized"
@@ -268,41 +321,48 @@ run_phase1() {
     --sharegpt-count 20000
     --arxiv-count 30000
     --full-context
-    --full-context-length 32768
+    --full-context-length "$PHASE1_CONTEXT_LENGTH"
     --cache-splits train val
     --target-layer-ids 1 9 17 25 33
     --supervision-mode last_assistant
     --seed 42
-    --max-new-tokens 2048
+    # Số token output tối đa mỗi sample; đây là giới hạn generation riêng,
+    # không phải batch size. Tổng prompt + output vẫn không vượt context.
+    --max-new-tokens "$PHASE1_MAX_NEW_TOKENS"
     --overflow-policy error
     --sample-error-policy error
     --temperature 0.0
     --regenerate-backend vllm
     --vllm-server-addresses "$SERVER_ADDRESS"
     --vllm-model qwen3-4b
-    --vllm-request-concurrency 128
-    --vllm-request-concurrency-start 8
-    --vllm-max-batched-tokens 262144
-    --vllm-max-batched-tokens-start 65536
-    --vllm-request-growth-factor 2.0
-    --vllm-request-timeout-seconds 600
-    --vllm-request-retries 2
+    # Các tham số dưới đây mirror batch server; start=max nên không ramp-up.
+    --vllm-request-concurrency "$VLLM_BATCH_SIZE"
+    --vllm-request-concurrency-start "$VLLM_BATCH_START_SIZE"
+    --vllm-max-batched-tokens "$VLLM_BATCH_TOKENS"
+    --vllm-max-batched-tokens-start "$VLLM_BATCH_START_TOKENS"
+    # Chỉ dùng khi có lỗi: client vẫn backoff/retry để tránh làm chết server.
+    --vllm-request-growth-factor "$VLLM_REQUEST_GROWTH_FACTOR"
+    --vllm-request-timeout-seconds "$VLLM_REQUEST_TIMEOUT_SECONDS"
+    --vllm-request-retries "$VLLM_REQUEST_RETRIES"
     --vllm-metrics-address "http://127.0.0.1:${VLLM_PORT}/metrics"
-    --vllm-metrics-poll-interval-seconds 0.5
-    --vllm-gpu-cache-target 0.85
-    --vllm-gpu-cache-hard 0.95
+    --vllm-metrics-poll-interval-seconds "$VLLM_METRICS_POLL_INTERVAL_SECONDS"
+    # KV-cache target/hard: mức target để theo dõi và hard limit để backoff.
+    --vllm-gpu-cache-target "$VLLM_GPU_CACHE_TARGET"
+    --vllm-gpu-cache-hard "$VLLM_GPU_CACHE_HARD"
     --device cuda
     --torch-dtype bfloat16
-    --cache-batch-size-3k 4
-    --cache-batch-size-long-context 1
+    # Các batch dưới đây thuộc phase hidden-cache sau khi vLLM đã dừng,
+    # không phải batch generation của vLLM.
+    --cache-batch-size-3k "$CACHE_BATCH_SIZE_3K"
+    --cache-batch-size-long-context "$CACHE_BATCH_SIZE_LONG_CONTEXT"
     --cache-bucket-buffer-3k 16
     --cache-bucket-buffer-long-context 8
     --cache-shard-size-3k 64
     --cache-shard-size-long-context 32
     --cache-attention-backend sdpa
     --cache-backend hf
-    --cache-io-threads 2
-    --cache-io-queue-size 4
+    --cache-io-threads "$CACHE_IO_THREADS"
+    --cache-io-queue-size "$CACHE_IO_QUEUE_SIZE"
     --parallel-gpu-ids "$GPU_ID"
     --parallel-scheduler shared_lease
     --parallel-queue-quantum-items 512

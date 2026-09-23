@@ -36,6 +36,26 @@ normalized/val_prompts.jsonl
 normalized/test_prompts.jsonl
 ```
 
+## Quét phân phối raw dataset trước khi build
+
+Trước khi quyết định số lượng, split hoặc rule lọc, chạy analyzer độc lập. Nó
+duyệt tuần tự toàn bộ raw ShareGPT rồi ArXiv, không random-sample, không gọi
+vLLM và không tạo `train/val/test`:
+
+```bash
+python3 scripts/mr_dflash/analyze_phase1_dataset.py \
+  --sharegpt-source /workspace/storage-shared/nlp/tungdd11/tungdecoder/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --arxiv-source /workspace/storage-shared/nlp/dungdx4/datasets/arxiv/train.label.jsonl \
+  --output-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_phase1_raw_analysis \
+  --tokenizer /workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B \
+  --local-files-only
+```
+
+Kết quả gồm `summary.json`, `records.jsonl`, `issues.jsonl` và bốn hình PNG
+trong `figures/`. `--max-records N` chỉ dành cho smoke test; bỏ option này khi
+quét thật. Sau khi duyệt report, chạy prepare/build riêng theo rule đã chọn,
+rồi truyền `--prepared-root` của artifact đó cho launcher Phase 1.
+
 ## Chuẩn bị môi trường
 
 ```bash

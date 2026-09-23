@@ -84,9 +84,10 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
         # CUTLASS only re-exports these NVVM enums from ``cute.arch`` for
         # CUDA 12.9.  FA4 b15 still imports them from that stable CuTe path,
         # while the server's CUDA 13 package keeps the same enums under
-        # ``cutlass._mlir.dialects.nvvm``.  Re-export them in memory so the
-        # FA4 kernel can use the installed CUTLASS ABI without editing
-        # site-packages.
+        # ``cutlass._mlir.dialects.nvvm``.  The CUDA 13 CuTe wrappers also
+        # require string literals (for example ``"async.shared"``) rather
+        # than enum instances.  Expose a small string-member namespace in
+        # memory so FA4 can use the old member names with the new ABI.
         try:
             cute_arch = importlib.import_module("cutlass.cute.arch")
             for enum_name in (
@@ -97,7 +98,15 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
                 "AtomicOpKind",
             ):
                 if not hasattr(cute_arch, enum_name) and hasattr(nvvm, enum_name):
-                    setattr(cute_arch, enum_name, getattr(nvvm, enum_name))
+                    enum_class = getattr(nvvm, enum_name)
+                    string_members = {
+                        member.name: str(member) for member in enum_class
+                    }
+                    setattr(
+                        cute_arch,
+                        enum_name,
+                        types.SimpleNamespace(**string_members),
+                    )
                     changed = True
         except Exception:
             # The fmax compatibility below remains independently useful for

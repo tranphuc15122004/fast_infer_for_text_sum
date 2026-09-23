@@ -6,11 +6,24 @@ cache hidden states của target model. Phase này chưa train drafter.
 
 ## 1. Luồng xử lý
 
+Phần phân tích raw dataset là một bước độc lập trước pipeline dưới đây. Chạy
+`scripts/mr_dflash/analyze_phase1_dataset.py` để quét đủ ShareGPT và ArXiv theo
+thứ tự input, không random-sample; report gồm thống kê, duplicate/schema issues
+và các PNG trong `figures/`. Analyzer không tạo split và không chạy vLLM.
+
+Sau khi duyệt report, mới chạy `prepare_server_data.py`/`build_pilot_dataset.py`
+với rule sampling/split được quyết định rõ ràng. Launcher B200 chỉ nhận
+`PREPARED_ROOT/normalized/{train,val,test}_prompts.jsonl`, bắt đầu từ
+`regenerate_full_train`, nên không còn build dữ liệu ngầm.
+
 ```text
-ShareGPT + ArXiv
+raw ShareGPT + ArXiv
       │
       ▼
-prepare: normalized/*.jsonl + split manifests
+analyze-only: summary.json + records/issues + figures
+      │
+      ▼
+user-approved prepare/build: normalized/*.jsonl + split manifests
       │
       ▼
 analyze: length statistics + length_manifest.jsonl
