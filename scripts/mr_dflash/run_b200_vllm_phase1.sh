@@ -33,6 +33,9 @@ PREPARED_ROOT="${PREPARED_ROOT:-$PROJECT_ROOT/../data/mr_dflash_phase1_20k_share
 #   PHASE1_MAX_NEW_TOKENS = output tối đa mỗi sample; không phải batch size.
 PHASE1_CONTEXT_LENGTH="${PHASE1_CONTEXT_LENGTH:-32768}"
 PHASE1_MAX_NEW_TOKENS="${PHASE1_MAX_NEW_TOKENS:-2048}"
+# Hẹn giờ dừng mềm cho mode 2. 0 = chạy đến khi hoàn tất; ví dụ 240 = 4 giờ.
+# Khi hết giờ, pipeline dừng ở boundary an toàn và lần chạy sau sẽ --resume.
+PHASE1_AUTO_PAUSE_MINUTES="${PHASE1_AUTO_PAUSE_MINUTES:-0}"
 
 # GPU/batch:
 #   VLLM_GPU_MEMORY_UTILIZATION = phần VRAM vLLM được phép dùng; 0.95 ~= 171 GiB.
@@ -80,13 +83,15 @@ Options:
   --target-model PATH   Local Qwen3-4B model path.
   --port PORT           vLLM loopback port; default 38147.
   --gpu-id ID           Physical GPU id; default 0.
+  --auto-pause-minutes N  Graceful pause after N minutes; 0 disables it.
   -h, --help            Show this help.
 
 The launcher intentionally uses a visible stop_parallel file and visible
 output/log directories. It does not export VLLM_TMP because vLLM treats that
 name as an unknown environment variable. For the B200 180 GiB profile, only
 VLLM_BATCH_SIZE and VLLM_BATCH_TOKENS are intended as batch overrides. Run it
-with bash; do not source it.
+with bash; do not source it. PHASE1_AUTO_PAUSE_MINUTES can stop mode 2
+gracefully so the same command can resume later.
 EOF
 }
 
@@ -146,6 +151,11 @@ while [[ $# -gt 0 ]]; do
       GPU_ID="$2"
       shift 2
       ;;
+    --auto-pause-minutes)
+      [[ $# -ge 2 ]] || die "--auto-pause-minutes cần số nguyên"
+      PHASE1_AUTO_PAUSE_MINUTES="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -155,6 +165,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+[[ "$PHASE1_AUTO_PAUSE_MINUTES" =~ ^[0-9]+$ ]] \
+  || die "PHASE1_AUTO_PAUSE_MINUTES phải là số nguyên >= 0"
 
 export PROJECT_ROOT OUTPUT_ROOT RUN_ROOT PREPARED_ROOT TARGET_MODEL RUNTIME_TMP VLLM_PORT GPU_ID
 export TMPDIR="$RUNTIME_TMP"
@@ -310,6 +323,29 @@ prepare_phase1_root() {
   done
 }
 
+PAUSE_TIMER_PID=""
+
+start_pause_timer() {
+  [[ "$PHASE1_AUTO_PAUSE_MINUTES" -gt 0 ]] || return 0
+  rm -f "$STOP_FILE"
+  local seconds=$((PHASE1_AUTO_PAUSE_MINUTES * 60))
+  (
+    sleep "$seconds"
+    printf '[b200-vllm] auto-pause reached after %s minutes; requesting graceful stop\n' \
+      "$PHASE1_AUTO_PAUSE_MINUTES" >&2
+    touch "$STOP_FILE"
+  ) &
+  PAUSE_TIMER_PID=$!
+  echo "[b200-vllm] auto-pause enabled: ${PHASE1_AUTO_PAUSE_MINUTES} minutes (pid=$PAUSE_TIMER_PID)"
+}
+
+stop_pause_timer() {
+  [[ -n "$PAUSE_TIMER_PID" ]] || return 0
+  kill "$PAUSE_TIMER_PID" 2>/dev/null || true
+  wait "$PAUSE_TIMER_PID" 2>/dev/null || true
+  PAUSE_TIMER_PID=""
+}
+
 run_phase1() {
   prepare_phase1_root
   local common_args=(
@@ -369,6 +405,7 @@ run_phase1() {
     --progress-interval-tokens 256
     --regenerate-output-batch-size 1
     --worker-stall-timeout-seconds 0
+    --worker-stop-file "$STOP_FILE"
     --local-files-only
     --resume
   )
@@ -382,6 +419,13 @@ run_phase1() {
   if [[ $regenerate_rc -ne 0 ]]; then
     echo "[b200-vllm] regenerate failed rc=$regenerate_rc; keeping log/output for resume" >&2
     return "$regenerate_rc"
+  fi
+
+  if [[ -e "$STOP_FILE" ]]; then
+    echo "[b200-vllm] auto-pause requested after regeneration; stopping before cache"
+    stop_server
+    SERVER_MANAGED=0
+    return 0
   fi
 
   stop_server
@@ -417,9 +461,18 @@ cleanup_mode2() {
   # Uninstall the EXIT/INT/TERM trap before exiting; otherwise exit from the
   # cleanup function can re-enter the same trap on some bash versions.
   trap - EXIT INT TERM
+  stop_pause_timer
   stop_server
   exit "$rc"
 }
 trap cleanup_mode2 EXIT INT TERM
 
+rm -f "$STOP_FILE"
+start_pause_timer
 run_phase1
+PHASE1_RC=$?
+stop_pause_timer
+if [[ -e "$STOP_FILE" ]]; then
+  echo "[b200-vllm] phase 1 paused by timer; rerun the same command to resume"
+fi
+exit "$PHASE1_RC"

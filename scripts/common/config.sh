@@ -275,6 +275,19 @@ fast_infer__load_dflash() {
   fast_infer_default_from SMOKE_MAX_NEW_TOKENS DFLASH_SMOKE_NEW_TOKENS
 }
 
+fast_infer__load_domino() {
+  fast_infer_default_from TARGET_MODEL DOMINO_TARGET_MODEL MODEL_TARGET
+  fast_infer_default_from DRAFT_MODEL DOMINO_DRAFT_MODEL MODEL_DOMINO
+  fast_infer_default_from DATA_FILE DOMINO_DATA_FILE DATA_INPUT
+  fast_infer_default_from MAX_SAMPLES DOMINO_MAX_SAMPLES RUN_SAMPLES
+  fast_infer_default_from MAX_NEW_TOKENS DOMINO_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from MAX_INPUT_TOKENS DOMINO_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS
+  fast_infer_default_from TEMPERATURE DOMINO_TEMPERATURE RUN_TEMPERATURE
+  fast_infer_default_from OUTPUT_FILE DOMINO_OUTPUT_FILE
+  fast_infer_default_from BLOCK_SIZE DOMINO_BLOCK_SIZE
+  fast_infer_default_from ATTENTION_BACKEND DOMINO_ATTENTION_BACKEND
+}
+
 fast_infer__load_sssd() {
   fast_infer_default_from MODEL SSSD_MODEL MODEL_TARGET
   fast_infer_default_from DATA_FILE SSSD_DATA_FILE DATA_INPUT
@@ -509,6 +522,7 @@ fast_infer_load_config() {
   case "$baseline" in
     longbench) fast_infer__load_longbench ;;
     dflash) fast_infer__load_dflash ;;
+    domino) fast_infer__load_domino ;;
     fafo) fast_infer__load_fafo ;;
     eagle3) fast_infer__load_eagle3 ;;
     fastkv) fast_infer__load_fastkv ;;

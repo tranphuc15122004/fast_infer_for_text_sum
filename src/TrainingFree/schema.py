@@ -10,6 +10,7 @@ from typing import Any, Mapping
 TRACE_SCHEMA_VERSION = "recap.trace.v1"
 LEASE_TRACE_SCHEMA_VERSION = "recap.lease.trace.v1"
 HIERARCHY_TRACE_SCHEMA_VERSION = "recap.hierarchy.trace.v1"
+TEMPORAL_TRACE_SCHEMA_VERSION = "recap.e43.temporal.trace.v1"
 
 
 def _vector(value: Any, name: str) -> list[float]:
@@ -193,6 +194,35 @@ def validate_hierarchy_trace_record(record: Mapping[str, Any]) -> dict[str, Any]
                 raise ValueError(f"hierarchy {key} must be in [0, 1]")
         if int(step["active_qk_tokens"]) > int(step["full_qk_tokens"]):
             raise ValueError("active_qk_tokens must not exceed full_qk_tokens")
+        temporal = step.get("temporal")
+        if temporal is not None:
+            if not isinstance(temporal, Mapping):
+                raise ValueError("temporal metrics must be an object")
+            for group_name in ("gqa_oracle", "lag", "adaptive_lag", "recurrent"):
+                group = temporal.get(group_name, {})
+                if not isinstance(group, Mapping):
+                    raise ValueError(f"temporal {group_name} must be an object")
+                for config_name, metrics in group.items():
+                    if not isinstance(config_name, str) or not isinstance(metrics, Mapping):
+                        raise ValueError("temporal metric rows must be named objects")
+                    for key in (
+                        "mean_missed_mass",
+                        "p99_missed_mass",
+                        "gqa_missed_mass",
+                        "gqa_p99_missed_mass",
+                        "source_cost_ratio",
+                        "working_source_cost_ratio",
+                    ):
+                        if key not in metrics:
+                            continue
+                        try:
+                            metric = float(metrics[key])
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(f"temporal metric {key} must be finite") from exc
+                        if not math.isfinite(metric):
+                            raise ValueError(f"temporal metric {key} must be finite")
+                    if "refresh" in metrics and not isinstance(metrics["refresh"], bool):
+                        raise ValueError("temporal refresh must be boolean")
         head_rows = step.get("head_concentration")
         if head_rows is not None:
             if not isinstance(head_rows, list) or not head_rows:
@@ -224,4 +254,52 @@ def validate_hierarchy_trace_record(record: Mapping[str, Any]) -> dict[str, Any]
                         raise ValueError("head concentration k-value is invalid")
                     if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
                         raise ValueError("head concentration fraction is invalid")
+    return result
+
+
+def validate_temporal_trace_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate compact E43 temporal-support audit traces."""
+
+    result = copy.deepcopy(dict(record))
+    if result.get("schema_version") != TEMPORAL_TRACE_SCHEMA_VERSION:
+        raise ValueError("invalid temporal trace schema_version")
+    if result.get("status") != "ok":
+        if not result.get("sample_id") or not result.get("error"):
+            raise ValueError("error temporal rows require sample_id and error")
+        return result
+    if not result.get("sample_id"):
+        raise ValueError("temporal trace requires sample_id")
+    try:
+        source_tokens = int(result.get("source_tokens", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("temporal source_tokens must be positive") from exc
+    if source_tokens <= 0:
+        raise ValueError("temporal source_tokens must be positive")
+    steps = result.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("temporal trace steps must be a non-empty list")
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            raise ValueError("each temporal step must be an object")
+        try:
+            if int(step["step"]) < 0:
+                raise ValueError("step must be non-negative")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"temporal step {index} index is invalid") from exc
+        temporal = step.get("temporal", step)
+        if not isinstance(temporal, Mapping):
+            raise ValueError("temporal metrics must be an object")
+        for group_name in ("gqa_oracle", "lag", "adaptive_lag", "recurrent"):
+            group = temporal.get(group_name, {})
+            if not isinstance(group, Mapping):
+                raise ValueError(f"temporal {group_name} must be an object")
+            for config_name, metrics in group.items():
+                if not isinstance(config_name, str) or not isinstance(metrics, Mapping):
+                    raise ValueError("temporal metric rows must be named objects")
+                for key, value in metrics.items():
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                        continue
+                    raise ValueError(f"temporal metric {key} must be finite")
     return result

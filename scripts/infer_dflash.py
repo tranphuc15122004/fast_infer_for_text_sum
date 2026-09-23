@@ -20,6 +20,12 @@ from common import io_util, metrics, rouge, verify
 from common.data_loader import load_records
 from common.input_utils import truncate_input_ids
 from common.paths import ROOT
+from common.paired_reference import (
+    attach_reference_timing,
+    load_reference_sidecar,
+    prompt_hash,
+)
+from common.qwen3_paired import build_run_config, prepare_input_ids
 from common.reproducibility import seed_everything
 
 
@@ -146,11 +152,13 @@ def _format_prompt(tokenizer, sample: dict) -> str:
 
 
 def _run_generation(dflash_generate, draft, target, input_ids, *, max_new_tokens,
-                    temperature, block_size):
+                    temperature, block_size, fixed_output=False):
     torch.cuda.synchronize()
     start = time.perf_counter()
     eos_id = target.config.eos_token_id
-    stop_token_ids = eos_id if isinstance(eos_id, list) else [eos_id]
+    stop_token_ids = [-1] if fixed_output else (
+        eos_id if isinstance(eos_id, list) else [eos_id]
+    )
     result = dflash_generate(
         draft,
         target=target,
@@ -180,6 +188,10 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--fixed-output-tokens", type=int, default=None,
+        help="disable EOS stopping and generate exactly this many tokens",
+    )
     parser.add_argument("--max-input-tokens", type=int, default=0,
                         help="truncate each prompt to this many tokens before "
                              "generation (0 = no limit; use on T4 smoke runs)")
@@ -195,6 +207,11 @@ def main() -> None:
         action="store_true",
         help="run only speculative decoding; attach an external Vanilla reference later",
     )
+    parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
+    parser.add_argument("--run-config-hash", default=None)
+    parser.add_argument("--reference-file", default=None)
+    parser.add_argument("--reference-baseline", default="vanilla_hf")
+    parser.add_argument("--reference-run-id", default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -202,6 +219,12 @@ def main() -> None:
     if args.smoke:
         args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 32)
+        if args.fixed_output_tokens is not None:
+            args.fixed_output_tokens = min(args.fixed_output_tokens, 32)
+    if args.fixed_output_tokens is not None:
+        if args.fixed_output_tokens <= 0:
+            raise SystemExit("--fixed-output-tokens must be positive")
+        args.max_new_tokens = args.fixed_output_tokens
 
     dtype, attn_impl = _dtype_and_attention()
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -247,17 +270,36 @@ def main() -> None:
         prompts = [{"id": "prompt", "prompt": args.prompt, "reference": None}]
 
     block_size = args.block_size or int(draft.block_size)
+    reference_records = (
+        load_reference_sidecar(Path(args.reference_file))
+        if args.reference_file
+        else None
+    )
     writer = io_util.JsonlWriter(Path(args.output))
     checks: list[tuple[bool, str]] = []
 
     for sample in prompts:
         prompt = _format_prompt(tokenizer, sample)
         encoded = tokenizer(prompt, return_tensors="pt")
-        input_ids = encoded.input_ids.to(device)
-        if args.max_input_tokens and args.max_input_tokens > 0 \
-                and input_ids.shape[1] > args.max_input_tokens:
-            input_ids = truncate_input_ids(input_ids, args.max_input_tokens).contiguous()
-        input_len = int(input_ids.shape[1])
+        prepared = prepare_input_ids(
+            encoded.input_ids, max(args.max_input_tokens, 0)
+        )
+        input_ids = prepared.input_ids.to(device).contiguous()
+        input_len = prepared.input_tokens
+        dataset = sample.get("raw", {}).get("dataset", Path(args.data_file).stem
+                                              if args.data_file else "prompt")
+        run_config_hash = args.run_config_hash
+        if run_config_hash is None:
+            run_config_hash = build_run_config(
+                dataset=dataset,
+                target_model=args.target_model,
+                input_cap=max(args.max_input_tokens, 0),
+                output_tokens=args.max_new_tokens,
+                seed=args.seed,
+                dtype=str(dtype),
+                attention_backend="paired",
+                temperature=args.temperature,
+            )["run_config_hash"]
 
         if args.skip_reference:
             baseline, baseline_elapsed = None, None
@@ -268,6 +310,7 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 block_size=1,
+                fixed_output=args.fixed_output_tokens is not None,
             )
         seed_everything(args.seed)
         torch.cuda.reset_peak_memory_stats(device)
@@ -276,6 +319,7 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             block_size=block_size,
+            fixed_output=args.fixed_output_tokens is not None,
         )
 
         output_ids = result.output_ids[0, input_len:]
@@ -306,15 +350,26 @@ def main() -> None:
 
         record = {
             "method": "dflash",
-            "dataset": "data-file" if args.data_file else "prompt",
+            "dataset": dataset,
             "task_type": sample.get("raw", {}).get("task_type"),
             "model": args.target_model,
             "draft_model": args.draft_model,
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "dtype": str(dtype),
+            "attention_backend": attn_impl,
             "input_tokens": input_len,
+            "original_input_tokens": prepared.original_input_tokens,
+            "input_truncated": prepared.input_truncated,
             "retained_tokens": input_len,
             "output_tokens": n_tok,
             "baseline_output_tokens": baseline_n_tok,
             "batch_size": 1,
+            "status": "success",
+            "run_id": args.run_id,
+            "prompt_hash": prompt_hash(prepared.input_ids),
+            "run_config_hash": run_config_hash,
+            "speed_output_tokens": args.fixed_output_tokens,
             "selector_latency_ms": None,
             "ttft_ms": round(prefill_ms, 3),
             "prefill_ms": round(prefill_ms, 3),
@@ -363,6 +418,29 @@ def main() -> None:
                 and baseline_n_tok == n_tok
             ),
         }
+        if reference_records is not None:
+            reference_key = (
+                str(record["dataset"]),
+                str(record["sample_id"]),
+                str(record["prompt_hash"]),
+                str(record["run_config_hash"]),
+            )
+            reference = reference_records.get(reference_key)
+            if reference is None:
+                reference = {
+                    "dataset": record["dataset"],
+                    "sample_id": record["sample_id"],
+                    "prompt_hash": record["prompt_hash"],
+                    "run_config_hash": record["run_config_hash"],
+                    "status": "missing",
+                }
+            record = attach_reference_timing(
+                record,
+                reference,
+                reference_baseline=args.reference_baseline,
+                reference_run_id=args.reference_run_id,
+                expected_output_tokens=args.fixed_output_tokens,
+            )
         if record["task_type"] == "code_completion":
             metrics.add_code_completion(record, text, sample.get("reference"))
         else:

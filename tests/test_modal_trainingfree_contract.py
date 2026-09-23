@@ -134,3 +134,28 @@ def test_modal_hierarchy_config_is_forwarded() -> None:
     assert command[command.index("--block-size") + 1] == "64"
     assert command[command.index("--reps-per-block") + 1] == "8"
     assert command[command.index("--reps-per-region") + 1] == "8"
+
+
+def test_modal_temporal_experiment_and_sweep_are_forwarded() -> None:
+    runner = load_runner()
+
+    command = runner.build_runner_command(
+        target_model="/opt/models/Qwen3-0.6B",
+        inputs=["data/longbench_100_14k/gov_report.jsonl"],
+        output_dir=Path("/mnt/fast-in/outputs/recap_kv_e43/smoke"),
+        max_samples=1,
+        max_new_tokens=32,
+        smoke=True,
+        python="/mnt/fast-in/venv/bin/python",
+        experiment="temporal",
+        temporal_lags="1,2,4,8,16",
+        temporal_budgets="0.1,0.2,0.3,0.4",
+        temporal_alphas="1.0,1.25,1.5",
+        temporal_refresh_intervals="2,4,8,16",
+        temporal_block_sizes="16,32,64",
+    )
+
+    assert command[command.index("--experiment") + 1] == "temporal"
+    assert command[command.index("--temporal-lags") + 1] == "1,2,4,8,16"
+    assert command[command.index("--temporal-block-sizes") + 1] == "16,32,64"
+    assert runner.output_root_for_experiment("temporal").as_posix().endswith("recap_kv_e43")

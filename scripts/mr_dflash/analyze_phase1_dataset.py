@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -397,8 +398,8 @@ def _write_figures(
 
     structure = figures / "conversation_structure.png"
     def draw_structure(plt):
-        if share_turns:
-            plt.hist(share_turns, bins=max(1, min(20, max(share_turns) - min(share_turns) + 1)), alpha=0.65, label="ShareGPT turns", color=palette["sharegpt"])
+        if sharegpt_turns:
+            plt.hist(sharegpt_turns, bins=max(1, min(20, max(sharegpt_turns) - min(sharegpt_turns) + 1)), alpha=0.65, label="ShareGPT turns", color=palette["sharegpt"])
         if arxiv_docs:
             plt.twinx().hist(arxiv_docs, bins=30, histtype="step", linewidth=2, label="ArXiv chars", color=palette["arxiv"])
         plt.xlabel("Turn count (ShareGPT) / document length (ArXiv)")
@@ -415,12 +416,31 @@ def _write_figures(
     )}
 
 
+def _log_scan_progress(
+    event: str,
+    source: str,
+    entries: int,
+    records: int,
+    parse_errors: int,
+    started_at: float,
+) -> None:
+    elapsed = max(time.monotonic() - started_at, 1e-9)
+    print(
+        f"[analysis] {event} source={source} entries={entries} records={records} "
+        f"parse_errors={parse_errors} elapsed={elapsed:.1f}s rate={entries / elapsed:.2f}/s",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def analyze_dataset(
     sharegpt_source: str | Path,
     arxiv_source: str | Path,
     output_root: str | Path,
     tokenizer: Any = None,
     max_records: int | None = None,
+    progress_interval_records: int = 1000,
+    progress_interval_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Quét đủ hai raw source theo thứ tự, không random sampling.
 
@@ -428,6 +448,16 @@ def analyze_dataset(
     Nó đếm JSON object đã đọc, không đếm dòng trống hay lỗi parse không tạo
     được object.
     """
+
+    if progress_interval_records < 1:
+        raise ValueError("progress_interval_records phải >= 1")
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds phải > 0")
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm có trong requirements server
+        tqdm = None
+    scan_started = time.monotonic()
 
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
@@ -447,8 +477,27 @@ def analyze_dataset(
 
     with records_path.open("w", encoding="utf-8") as record_handle, issues_path.open("w", encoding="utf-8") as issue_handle:
         for source, path in (("sharegpt", sharegpt_source), ("arxiv", arxiv_source)):
-            for audit in analyze_source(path, source, tokenizer):
+            source_started = time.monotonic()
+            source_entries = 0
+            source_parse_errors = 0
+            last_progress_at = source_started
+            print(f"[analysis] START source={source} path={path}", file=sys.stderr, flush=True)
+            progress_iterator = analyze_source(path, source, tokenizer)
+            if tqdm is not None:
+                progress_iterator = tqdm(
+                    progress_iterator,
+                    total=None,
+                    desc=f"scan {source}",
+                    unit="records",
+                    mininterval=0.5,
+                    disable=False,
+                    dynamic_ncols=True,
+                    file=sys.stderr,
+                )
+            for audit in progress_iterator:
+                source_entries += 1
                 if audit["kind"] == "parse_error":
+                    source_parse_errors += 1
                     issue = {
                         "kind": "malformed_json",
                         "source": source,
@@ -457,6 +506,16 @@ def analyze_dataset(
                     }
                     issues.append(issue)
                     issue_handle.write(json.dumps(issue, ensure_ascii=False, sort_keys=True) + "\n")
+                    now = time.monotonic()
+                    if (
+                        source_entries % progress_interval_records == 0
+                        or now - last_progress_at >= progress_interval_seconds
+                    ):
+                        _log_scan_progress(
+                            "PROGRESS", source, source_entries, source_counts[source]["scanned"],
+                            source_parse_errors, source_started,
+                        )
+                        last_progress_at = now
                     continue
 
                 scanned_rows += 1
@@ -489,8 +548,24 @@ def analyze_dataset(
                     sharegpt_turns.append(int(audit["turn_count"]))
                 if audit.get("source") == "arxiv" and audit.get("char_length") is not None:
                     arxiv_docs.append(int(audit["char_length"]))
+                now = time.monotonic()
+                if (
+                    source_entries % progress_interval_records == 0
+                    or now - last_progress_at >= progress_interval_seconds
+                ):
+                    _log_scan_progress(
+                        "PROGRESS", source, source_entries, source_counts[source]["scanned"],
+                        source_parse_errors, source_started,
+                    )
+                    last_progress_at = now
                 if max_records is not None and scanned_rows >= max_records:
                     break
+            if tqdm is not None:
+                progress_iterator.close()
+            _log_scan_progress(
+                "DONE", source, source_entries, source_counts[source]["scanned"],
+                source_parse_errors, source_started,
+            )
             if max_records is not None and scanned_rows >= max_records:
                 break
 
@@ -527,6 +602,13 @@ def analyze_dataset(
         arxiv_docs,
     )
     _write_json(output / "summary.json", summary)
+    total_elapsed = time.monotonic() - scan_started
+    print(
+        f"[analysis] COMPLETE records={scanned_rows} elapsed={total_elapsed:.1f}s "
+        f"summary={output / 'summary.json'}",
+        file=sys.stderr,
+        flush=True,
+    )
     return summary
 
 
@@ -546,6 +628,18 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--tokenizer", default=None, help="Tokenizer local; không truy cập internet")
     parser.add_argument("--max-records", type=int, default=None, help="Chỉ dùng smoke test; bỏ trống để quét toàn bộ")
     parser.add_argument(
+        "--progress-interval-records",
+        type=int,
+        default=1000,
+        help="In log tiến trình sau mỗi N record/event (mặc định: 1000)",
+    )
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=30.0,
+        help="In log tiến trình ít nhất mỗi N giây khi có record hoàn tất (mặc định: 30)",
+    )
+    parser.add_argument(
         "--local-files-only",
         action="store_true",
         help="Giữ contract offline; tokenizer luôn được load local-only",
@@ -554,12 +648,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     for path in (args.sharegpt_source, args.arxiv_source):
         if not path.is_file():
             parser.error(f"Không tìm thấy raw source: {path}")
+    if args.progress_interval_records < 1:
+        parser.error("--progress-interval-records phải >= 1")
+    if args.progress_interval_seconds <= 0:
+        parser.error("--progress-interval-seconds phải > 0")
+    if args.tokenizer:
+        print(f"[analysis] LOADING tokenizer={args.tokenizer}", file=sys.stderr, flush=True)
+    tokenizer = _load_tokenizer(args.tokenizer)
+    if args.tokenizer:
+        print("[analysis] tokenizer ready; starting dataset scan", file=sys.stderr, flush=True)
     summary = analyze_dataset(
         sharegpt_source=args.sharegpt_source,
         arxiv_source=args.arxiv_source,
         output_root=args.output_root,
-        tokenizer=_load_tokenizer(args.tokenizer),
+        tokenizer=tokenizer,
         max_records=args.max_records,
+        progress_interval_records=args.progress_interval_records,
+        progress_interval_seconds=args.progress_interval_seconds,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

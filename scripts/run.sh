@@ -19,6 +19,7 @@ case "$BASELINE" in
   vanilla_fa)   WRAPPER="scripts/runners/run_vanilla_fa.sh" ;;
   eagle3)      WRAPPER="scripts/runners/run_eagle3_qwen3.sh" ;;
   dflash)      WRAPPER="scripts/runners/run_dflash.sh" ;;
+  domino)      WRAPPER="scripts/runners/run_domino.sh" ;;
   sssd)       WRAPPER="scripts/runners/run_sssd.sh" ;;
   fafo)       WRAPPER="scripts/runners/run_fafo.sh" ;;
   llmlingua)   WRAPPER="scripts/runners/run_llmlingua.sh" ;;
@@ -36,7 +37,7 @@ case "$BASELINE" in
   syncspec)        WRAPPER="scripts/runners/run_syncspec.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
+    echo "Available: longbench_200 vanilla_hf vanilla_fa eagle3 dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
     exit 1
     ;;
 esac

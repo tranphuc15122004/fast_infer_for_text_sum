@@ -33,3 +33,14 @@ def test_phase1_launcher_consumes_prepared_data_without_building_it() -> None:
     assert 'PREPARED_ROOT="${PREPARED_ROOT:-' in text
     assert "--from-stage regenerate_full_train" in text
     assert "normalized/${split}_prompts.jsonl" in text
+
+
+def test_phase1_launcher_has_resumable_graceful_auto_pause() -> None:
+    text = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'PHASE1_AUTO_PAUSE_MINUTES="${PHASE1_AUTO_PAUSE_MINUTES:-0}"' in text
+    assert "--auto-pause-minutes" in text
+    assert "start_pause_timer" in text
+    assert "touch \"$STOP_FILE\"" in text
+    assert "--worker-stop-file \"$STOP_FILE\"" in text
+    assert 'exit "$PHASE1_RC"' in text

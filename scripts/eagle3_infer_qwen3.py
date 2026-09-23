@@ -39,6 +39,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from common import metrics, rouge  # noqa: E402
 from common.input_utils import truncate_input_ids  # noqa: E402
+from common.paired_reference import (  # noqa: E402
+    attach_reference_timing,
+    load_reference_sidecar,
+    prompt_hash,
+)
+from common.qwen3_paired import build_run_config, prepare_input_ids  # noqa: E402
 from common.reproducibility import seed_everything  # noqa: E402
 
 
@@ -61,6 +67,19 @@ def build_eagle_messages(prompt: str) -> list[dict[str, str]]:
         {"role": "system", "content": EAGLE_LLAMA3_SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
+
+
+def resolve_dtype(name: str) -> torch.dtype:
+    aliases = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    try:
+        return aliases[name.lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported EAGLE dtype: {name}") from exc
 
 
 def resolve_eagle_tree_config(
@@ -99,18 +118,27 @@ def load_questions(question_file: Path, begin: int, end: int) -> list[dict]:
     selected = rows[begin:end]
     if not selected:
         raise ValueError(f"No question in range [{begin}, {end}) from {question_file}")
-    return selected
+    normalized = []
+    for index, row in enumerate(selected, start=begin):
+        if "turns" in row:
+            normalized.append(row)
+            continue
+        prompt = row.get("prompt") or row.get("question") or row.get("text")
+        if prompt is None:
+            raise ValueError(f"Question {index} has no prompt/turns field")
+        normalized.append({
+            **row,
+            "question_id": row.get("id", index),
+            "turns": [str(prompt)],
+            "answer": row.get("reference_output") or row.get("reference") or row.get("answer"),
+        })
+    return normalized
 
 
 def build_input_ids(tokenizer, prompt: str, device) -> torch.Tensor:
-    return tokenizer.apply_chat_template(
-        build_eagle_messages(prompt),
-        tokenize=True,
-        add_generation_prompt=True,
-        enable_thinking=False,
-        return_tensors="pt",
-        return_dict=False,
-    ).to(device)
+    # The paired matrix hashes this exact sequence and feeds it to every
+    # baseline.  Do not add an EAGLE-specific system prompt/chat wrapper.
+    return tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
 
 def timed_generate(
@@ -122,6 +150,7 @@ def timed_generate(
     spec: bool,
     is_llama3: bool = True,
     include_phase_timings: bool = False,
+    stop_on_eos: bool = True,
 ) -> tuple:
     """Run EAGLE (spec=True) or naive (spec=False) decoding.
 
@@ -142,6 +171,7 @@ def timed_generate(
             return_stats=True,
             return_phase_timings=include_phase_timings,
             is_llama3=is_llama3,
+            stop_on_eos=stop_on_eos,
         )
         if include_phase_timings:
             output_ids, _, idx, elapsed, acceptance_lengths, phase_timings = results
@@ -159,6 +189,7 @@ def timed_generate(
             return_stats=True,
             return_phase_timings=include_phase_timings,
             is_llama3=is_llama3,
+            stop_on_eos=stop_on_eos,
         )
         if include_phase_timings:
             output_ids, new_tokens, idx, elapsed, phase_timings = results
@@ -257,6 +288,8 @@ def main() -> None:
     parser.add_argument("--question-end", type=int, default=1)
     parser.add_argument("--num-choices", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--fixed-output-tokens", type=int, default=None,
+                        help="disable EOS stopping and generate exactly this many tokens")
     parser.add_argument("--max-input-tokens", type=int, default=0,
                         help="truncate each prompt to this many tokens before "
                              "KV cache sizing (0 = no limit; use on T4 smoke runs)")
@@ -264,6 +297,7 @@ def main() -> None:
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--dtype", default="bfloat16", choices=("float16", "bfloat16"))
     parser.add_argument(
         "--seed",
         type=int,
@@ -271,6 +305,12 @@ def main() -> None:
     )
     parser.add_argument("--skip-naive", action="store_true",
                         help="Skip the naive autoregressive baseline (no speedup reported)")
+    parser.add_argument("--dataset-name", default=None)
+    parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
+    parser.add_argument("--run-config-hash", default=None)
+    parser.add_argument("--reference-file", default=None)
+    parser.add_argument("--reference-baseline", default="vanilla_hf")
+    parser.add_argument("--reference-run-id", default=None)
     parser.add_argument("--check-target-parity", action="store_true",
                         help="compare EaModel target logits with stock Transformers once")
     parser.add_argument("--smoke", action="store_true",
@@ -282,6 +322,12 @@ def main() -> None:
     if args.smoke:
         args.question_end = min(args.question_end, args.question_begin + 1)
         args.max_new_tokens = min(args.max_new_tokens, 32)
+        if args.fixed_output_tokens is not None:
+            args.fixed_output_tokens = min(args.fixed_output_tokens, 32)
+    if args.fixed_output_tokens is not None:
+        if args.fixed_output_tokens <= 0:
+            raise SystemExit("--fixed-output-tokens must be positive")
+        args.max_new_tokens = args.fixed_output_tokens
 
     tree_config = resolve_eagle_tree_config(
         total_token=args.total_token,
@@ -312,15 +358,21 @@ def main() -> None:
     print(f"Loaded {len(questions)} questions "
           f"[{args.question_begin}, {args.question_end}), "
           f"{args.num_choices} choice(s) each")
+    reference_records = (
+        load_reference_sidecar(Path(args.reference_file))
+        if args.reference_file
+        else None
+    )
 
     model_load_start = time.perf_counter()
+    compute_dtype = resolve_dtype(args.dtype)
     model = EaModel.from_pretrained(
         base_model_path=args.base_model,
         ea_model_path=args.eagle_model,
         total_token=args.total_token,
         depth=args.depth,
         top_k=args.top_k,
-        torch_dtype=torch.float16,
+        torch_dtype=compute_dtype,
         # Transformers 5's meta-device loader reports a clean state-dict
         # audit for this vendored EAGLE class but leaves its parameters at
         # initialization values.  Materialize the custom target normally so
@@ -362,7 +414,7 @@ def main() -> None:
         print("Checking vendored EAGLE target logits against stock Transformers ...")
         reference_target = AutoModelForCausalLM.from_pretrained(
             args.base_model,
-            dtype=torch.float16,
+            dtype=compute_dtype,
             attn_implementation="eager",
             low_cpu_mem_usage=True,
         ).to("cuda").eval()
@@ -382,11 +434,15 @@ def main() -> None:
     print("Tokenizing prompts ...")
     prompts = [q["turns"][0] for q in questions]
     all_input_ids = [build_input_ids(tokenizer, p, "cuda") for p in prompts]
+    prepared_inputs = [
+        prepare_input_ids(t, max(args.max_input_tokens, 0)) for t in all_input_ids
+    ]
+    all_input_ids = [prepared.input_ids.contiguous() for prepared in prepared_inputs]
     if args.max_input_tokens and args.max_input_tokens > 0:
         # Cap long prompts (e.g. govreport) so the EAGLE KV cache and eager
         # attention fit a T4 16GB in smoke runs.
         all_input_ids = [
-            truncate_input_ids(t, args.max_input_tokens).contiguous()
+            t.contiguous()
             for t in all_input_ids
         ]
     max_input_len = max(t.shape[1] for t in all_input_ids)
@@ -452,6 +508,7 @@ def main() -> None:
                         args.max_new_tokens, args.total_token, spec=True,
                         is_llama3=True,
                         include_phase_timings=True,
+                        stop_on_eos=args.fixed_output_tokens is None,
                     )
                     answer = decode_answer(tokenizer, out_ids, input_len)
 
@@ -469,6 +526,7 @@ def main() -> None:
                             args.max_new_tokens, args.total_token, spec=False,
                             is_llama3=True,
                             include_phase_timings=True,
+                            stop_on_eos=args.fixed_output_tokens is None,
                         )
                     else:
                         naive_tokens, naive_time, naive_phases = None, None, {}
@@ -487,6 +545,9 @@ def main() -> None:
                     naive_tok_s, speedup = None, None
 
                 record = {
+                    "method": "eagle3",
+                    "dataset": args.dataset_name or question.get("dataset") or "question-file",
+                    "sample_id": qid,
                     "question_id": qid,
                     "choice": choice,
                     "question": prompt,
@@ -495,6 +556,7 @@ def main() -> None:
                     "reference_output": question.get("answer") or question.get("reference"),
                     "task_type": question.get("task_type"),
                     "status": "success",
+                    "run_id": args.run_id,
                     "new_tokens": new_tokens,
                     "tree_steps": tree_steps,
                     "accept_length": round(accept_length, 4),
@@ -510,9 +572,30 @@ def main() -> None:
                                 if speedup is not None else None),
                     "base_model": args.base_model,
                     "eagle_model": args.eagle_model,
+                    "model": args.base_model,
+                    "max_new_tokens": args.max_new_tokens,
+                    "temperature": args.temperature,
+                    "dtype": args.dtype,
+                    "attention_backend": "eagle_native",
                     "model_load_ms": model_load_ms,
                     "retained_tokens": input_len,
+                    "original_input_tokens": prepared_inputs[qi].original_input_tokens,
+                    "input_truncated": prepared_inputs[qi].input_truncated,
+                    "speed_output_tokens": args.fixed_output_tokens,
+                    "prompt_hash": prompt_hash(prepared_inputs[qi].input_ids),
+                    "run_config_hash": args.run_config_hash,
                 }
+                if record["run_config_hash"] is None:
+                    record["run_config_hash"] = build_run_config(
+                        dataset=record["dataset"],
+                        target_model=args.base_model,
+                        input_cap=max(args.max_input_tokens, 0),
+                        output_tokens=args.max_new_tokens,
+                        seed=args.seed,
+                        dtype=args.dtype,
+                        attention_backend="paired",
+                        temperature=args.temperature,
+                    )["run_config_hash"]
                 record.update(
                     build_eagle_timing_fields(
                         input_tokens=input_len,
@@ -544,6 +627,23 @@ def main() -> None:
                 )
                 record["eagle_phase_timings"] = eagle_phases
                 record["naive_phase_timings"] = naive_phases
+                if reference_records is not None:
+                    key = (
+                        str(record["dataset"]), str(record["sample_id"]),
+                        str(record["prompt_hash"]), str(record["run_config_hash"]),
+                    )
+                    reference = reference_records.get(key) or {
+                        "dataset": record["dataset"], "sample_id": record["sample_id"],
+                        "prompt_hash": record["prompt_hash"],
+                        "run_config_hash": record["run_config_hash"],
+                        "status": "missing",
+                    }
+                    record = attach_reference_timing(
+                        record, reference,
+                        reference_baseline=args.reference_baseline,
+                        reference_run_id=args.reference_run_id,
+                        expected_output_tokens=args.fixed_output_tokens,
+                    )
                 reference = question.get("reference") or question.get("answer")
                 if record["task_type"] == "code_completion":
                     metrics.add_code_completion(record, answer, reference)

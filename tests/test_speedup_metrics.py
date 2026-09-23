@@ -135,6 +135,69 @@ def test_compute_group_preserves_external_speedup_scope():
     assert group["external_reference_baselines"] == ["vanilla_fa"]
 
 
+def test_nested_collector_excludes_reference_sidecars_from_method_rows(tmp_path):
+    run_root = tmp_path / "run"
+    method_dir = run_root / "dflash"
+    reference_dir = run_root / "references"
+    method_dir.mkdir(parents=True)
+    reference_dir.mkdir(parents=True)
+    row = {
+        "method": "vanilla_hf",
+        "dataset": "gov_report",
+        "sample_id": "s1",
+        "status": "success",
+        "e2e_ms": 100.0,
+    }
+    (method_dir / "gov_report.jsonl").write_text(
+        __import__("json").dumps({**row, "method": "dflash"}) + "\n",
+        encoding="utf-8",
+    )
+    (reference_dir / "gov_report.jsonl").write_text(
+        __import__("json").dumps(row) + "\n", encoding="utf-8"
+    )
+
+    files = collect_metrics.load_output_files(run_root, ["gov_report"])
+
+    assert [(stem, len(rows)) for stem, _dataset, rows in files] == [
+        ("dflash_gov_report", 1)
+    ]
+
+
+def test_speed_summary_includes_decode_only_token_throughput():
+    summary = metrics.aggregate_speed(
+        [{"decode_throughput_tok_s": 10.0}, {"decode_throughput_tok_s": 20.0}]
+    )
+
+    assert summary["decode_throughput_tok_s"]["mean"] == 15.0
+
+
+def test_markdown_has_combined_paired_main_results_table(tmp_path):
+    group = {
+        "num_records": 2,
+        "speed": {
+            "decode_throughput_tok_s": {"mean": 50.0},
+            "prefill_ms": {"mean": 11.0},
+            "decode_ms": {"mean": 22.0},
+        },
+        "speculative": {"avg_accept_length": {"mean": 3.0}},
+        "speedup": {"esr": 1.5, "dsr": 2.0},
+    }
+    result = {
+        "outputs_dir": "outputs",
+        "datasets": ["gov_report"],
+        "metrics": {"gov_report": {"dflash": group}},
+        "overall": {"dflash": group},
+    }
+    path = tmp_path / "summary.md"
+
+    collect_metrics.write_markdown(path, result, ["gov_report"])
+
+    report = path.read_text(encoding="utf-8")
+    assert "Bảng kết quả chính (paired online)" in report
+    assert "decode tok/s" in report
+    assert "| dflash | 2 | 3.00 | 50.00 | 11.00 | 22.00 | 1.50 | 2.00 |" in report
+
+
 def test_normalize_record_maps_native_eagle_and_gemfilter_pairs():
     eagle = collect_metrics.normalize_record(
         {

@@ -22,6 +22,7 @@ BASELINE_MEASUREMENT_SCOPE = {
     "magicdec": "full_e2e",
     "eagle3": "full_e2e",
     "dflash": "full_e2e",
+    "domino": "full_e2e",
     "specextend": "full_e2e",
     "fafo": "e2e_only",
 }
@@ -110,7 +111,7 @@ _CODE_QUALITY_FIELDS = (
     "code_exact_match",
     "code_edit_similarity",
 )
-_SPECULATIVE_BASELINES = {"magicdec", "eagle3", "dflash", "specextend"}
+_SPECULATIVE_BASELINES = {"magicdec", "eagle3", "dflash", "domino", "specextend"}
 _DERIVED_ISSUES = {
     "speedup_invalid",
     "missing_tpot_ms",

@@ -19,6 +19,7 @@ from .lease_evaluation import (
     evaluate_lease_trace,
 )
 from .hierarchy_collector import collect_hierarchy_trace
+from .temporal_collector import collect_temporal_trace
 from .hierarchy_evaluation import (
     HierarchyEvaluationConfig,
     aggregate_hierarchy_results,
@@ -28,8 +29,10 @@ from .policy import RecapConfig
 from .schema import (
     validate_hierarchy_trace_record,
     validate_lease_trace_record,
+    validate_temporal_trace_record,
     validate_trace_record,
 )
+from .temporal import TemporalConfig
 
 
 DEFAULT_INPUT = "data/representative_100/govreport_representative.jsonl"
@@ -263,9 +266,28 @@ def render_hierarchy_report(
     return "\n".join(lines) + "\n"
 
 
+def render_temporal_trace_report(manifest: Mapping[str, Any]) -> str:
+    """Render the collector handoff; E43 aggregation is done by its analyzer."""
+
+    return "\n".join(
+        [
+            "# E43 Temporal Support Reuse trace",
+            "",
+            "Trace collection completed without changing model KV execution.",
+            "Run `scripts/analyze_trainingfree_e43.py` on `temporal_trace.jsonl` to aggregate the sweep.",
+            "",
+            f"- Model: `{manifest.get('model')}`",
+            f"- Device: `{manifest.get('device')}`; CUDA: `{manifest.get('cuda_available')}`",
+            f"- Samples: requested={manifest.get('requested_samples')}, ok={manifest.get('ok_samples')}, errors={manifest.get('error_samples')}",
+            f"- Layer ids: `{manifest.get('hierarchy_layer_ids')}`",
+            f"- Temporal config: `{manifest.get('temporal_config')}`",
+        ]
+    ) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy"), default="recap")
+    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy", "temporal"), default="recap")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--input", action="append", default=None)
     parser.add_argument("--output", required=True)
@@ -297,6 +319,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-exact-expansion", type=float, default=0.30)
     parser.add_argument("--max-index-overhead", type=float, default=0.10)
     parser.add_argument("--hierarchy-layers", default="last")
+    parser.add_argument("--temporal-lags", default="1,2,4,8,16")
+    parser.add_argument("--temporal-budgets", default="0.1,0.2,0.3,0.4")
+    parser.add_argument("--temporal-alphas", default="1.0,1.25,1.5")
+    parser.add_argument("--temporal-refresh-intervals", default="2,4,8,16")
+    parser.add_argument("--temporal-block-sizes", default="16,32,64")
+    parser.add_argument("--temporal-mass-level", type=float, default=0.95)
     return parser
 
 
@@ -335,6 +363,18 @@ def run(args: argparse.Namespace) -> int:
         max_exact_expansion=args.max_exact_expansion,
         max_index_overhead=args.max_index_overhead,
     )
+    temporal_config = TemporalConfig(
+        lags=tuple(int(value.strip()) for value in args.temporal_lags.split(",") if value.strip()),
+        budgets=tuple(float(value.strip()) for value in args.temporal_budgets.split(",") if value.strip()),
+        alphas=tuple(float(value.strip()) for value in args.temporal_alphas.split(",") if value.strip()),
+        refresh_intervals=tuple(
+            int(value.strip()) for value in args.temporal_refresh_intervals.split(",") if value.strip()
+        ),
+        block_sizes=tuple(
+            int(value.strip()) for value in args.temporal_block_sizes.split(",") if value.strip()
+        ),
+        mass_level=args.temporal_mass_level,
+    )
     manifest: dict[str, Any] = {
         "schema_version": "recap.manifest.v1",
         "experiment": args.experiment,
@@ -365,6 +405,7 @@ def run(args: argparse.Namespace) -> int:
     lease_evaluation_rows: list[dict[str, Any]] = []
     hierarchy_trace_rows: list[dict[str, Any]] = []
     hierarchy_evaluation_rows: list[dict[str, Any]] = []
+    temporal_trace_rows: list[dict[str, Any]] = []
     try:
         model, tokenizer, device = load_local_model(
             args.model, device=args.device, dtype=args.dtype
@@ -389,6 +430,8 @@ def run(args: argparse.Namespace) -> int:
             "max_index_overhead": float(args.max_index_overhead),
             "hierarchy_layer_ids": hierarchy_layer_ids,
         })
+        if args.experiment == "temporal":
+            manifest["temporal_config"] = asdict(temporal_config)
         for index, (record, source_name) in enumerate(records):
             sample_id = str(record.get("id", index))
             dataset = _record_dataset(record, source_name)
@@ -433,6 +476,20 @@ def run(args: argparse.Namespace) -> int:
                     hierarchy_evaluation_rows.append(
                         evaluate_hierarchy_trace(hierarchy_trace, hierarchy_config)
                     )
+                elif args.experiment == "temporal":
+                    temporal_trace = collect_temporal_trace(
+                        model,
+                        tokenizer,
+                        rendered,
+                        sample_id=sample_id,
+                        dataset=dataset,
+                        max_new_tokens=max_new_tokens,
+                        prefill_chunk_size=args.prefill_chunk_size,
+                        device=device,
+                        layer_ids=hierarchy_layer_ids,
+                        temporal_config=temporal_config,
+                    )
+                    temporal_trace_rows.append(validate_temporal_trace_record(temporal_trace))
                 else:
                     trace = collect_trace(
                         model,
@@ -454,6 +511,8 @@ def run(args: argparse.Namespace) -> int:
                     if args.experiment == "lease"
                     else "recap.hierarchy.trace.v1"
                     if args.experiment == "hierarchy"
+                    else "recap.e43.temporal.trace.v1"
+                    if args.experiment == "temporal"
                     else "recap.trace.v1"
                 )
                 error_row = {
@@ -479,6 +538,8 @@ def run(args: argparse.Namespace) -> int:
                         "dataset": dataset,
                         "error": error_row["error"],
                     })
+                elif args.experiment == "temporal":
+                    temporal_trace_rows.append(error_row)
                 else:
                     trace_rows.append(error_row)
                     evaluation_rows.append({
@@ -502,6 +563,8 @@ def run(args: argparse.Namespace) -> int:
             if args.experiment == "lease"
             else render_hierarchy_report
             if args.experiment == "hierarchy"
+            else render_temporal_trace_report
+            if args.experiment == "temporal"
             else render_report
         )
         (output_dir / "report.md").write_text(report(manifest, {"status": "INCONCLUSIVE", "datasets": {}}, []), encoding="utf-8")
@@ -544,6 +607,22 @@ def run(args: argparse.Namespace) -> int:
         (output_dir / "hierarchy_report.md").write_text(
             render_hierarchy_report(manifest, aggregate, hierarchy_evaluation_rows),
             encoding="utf-8",
+        )
+        return 0 if manifest["ok_samples"] else 2
+
+    if args.experiment == "temporal":
+        manifest.update({
+            "status": "ok",
+            "ok_samples": sum(row.get("status") == "ok" for row in temporal_trace_rows),
+            "error_samples": sum(row.get("status") == "error" for row in temporal_trace_rows),
+            "inconclusive_samples": 0,
+            "aggregate_status": "TRACE_READY",
+            "elapsed_s": time.perf_counter() - started,
+        })
+        _write_jsonl(output_dir / "temporal_trace.jsonl", temporal_trace_rows)
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        (output_dir / "temporal_report.md").write_text(
+            render_temporal_trace_report(manifest), encoding="utf-8"
         )
         return 0 if manifest["ok_samples"] else 2
 

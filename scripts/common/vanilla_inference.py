@@ -24,6 +24,12 @@ from common.benchmark_runtime import (
 )
 from common.data_loader import load_records
 from common.input_utils import truncate_input_ids
+from common.paired_reference import (
+    attach_reference_timing,
+    load_reference_sidecar,
+    prompt_hash,
+)
+from common.qwen3_paired import build_run_config, prepare_input_ids
 from common.quality_guard import is_degenerate_output
 from common.reproducibility import seed_everything
 
@@ -249,6 +255,12 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     parser.add_argument("--data-file", default=os.environ.get("LONG_BENCH_DATA_FILE"))
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--fixed-output-tokens",
+        type=int,
+        default=None,
+        help="disable EOS stopping and generate exactly this many tokens",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--seed", type=int, default=int(os.environ.get("LONG_BENCH_SEED", "42"))
@@ -274,6 +286,10 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
         default=os.environ.get("LONG_BENCH_ATTENTION_BACKEND", default_backend),
     )
     parser.add_argument("--run-id", default=os.environ.get("LONG_BENCH_RUN_ID"))
+    parser.add_argument("--run-config-hash", default=None)
+    parser.add_argument("--reference-file", default=None)
+    parser.add_argument("--reference-baseline", default="vanilla_hf")
+    parser.add_argument("--reference-run-id", default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--output", required=True)
     return parser
@@ -307,6 +323,8 @@ def _generate(model: Any, input_ids: torch.Tensor, args: argparse.Namespace) -> 
         "return_dict_in_generate": False,
         "pad_token_id": model.generation_config.pad_token_id,
     }
+    if getattr(args, "fixed_output_tokens", None) is not None:
+        kwargs["eos_token_id"] = None
     if args.temperature > 0:
         kwargs["temperature"] = args.temperature
     attention_mask = _attention_mask_for_backend(
@@ -481,8 +499,9 @@ def _timed_generate(
         torch.cuda.synchronize(device)
     request_start = time.perf_counter()
     input_length = int(input_ids.shape[1])
+    output_budget = int(getattr(args, "fixed_output_tokens", None) or args.max_new_tokens)
     attention_mask = _build_decode_attention_mask(
-        input_ids, max_new_tokens=args.max_new_tokens
+        input_ids, max_new_tokens=output_budget
     )
     try:
         model_dtype = next(model.parameters()).dtype
@@ -491,7 +510,7 @@ def _timed_generate(
     if _should_use_static_cache(getattr(args, "attention_backend", None)):
         static_cache, cache_backend = _build_static_cache(
             model,
-            max_cache_len=input_length + int(args.max_new_tokens),
+            max_cache_len=input_length + output_budget,
             device=device,
             dtype=model_dtype,
         )
@@ -522,8 +541,9 @@ def _timed_generate(
         eos_id = tokenizer.eos_token_id
 
         decode_start = time.perf_counter()
-        if not _is_eos(next_token, eos_id):
-            for _ in range(max(args.max_new_tokens - 1, 0)):
+        stop_on_eos = getattr(args, "fixed_output_tokens", None) is None
+        if not stop_on_eos or not _is_eos(next_token, eos_id):
+            for _ in range(max(output_budget - 1, 0)):
                 current_length = input_length + len(generated)
                 step = model(
                     input_ids=next_token,
@@ -540,7 +560,7 @@ def _timed_generate(
                     past = static_cache
                 next_token = _next_token(step.logits, args.temperature)
                 generated.append(next_token)
-                if _is_eos(next_token, eos_id):
+                if stop_on_eos and _is_eos(next_token, eos_id):
                     break
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -662,6 +682,8 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     if args.smoke:
         args.max_samples = 1
         args.max_new_tokens = min(args.max_new_tokens, 8)
+        if args.fixed_output_tokens is not None:
+            args.fixed_output_tokens = min(args.fixed_output_tokens, 32)
         if args.max_input_tokens is None:
             args.max_input_tokens = 4096
     elif args.max_input_tokens is None:
@@ -672,6 +694,11 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         raise SystemExit("--max-samples must be positive")
     if args.max_new_tokens <= 0:
         raise SystemExit("--max-new-tokens must be positive")
+    if args.fixed_output_tokens is not None:
+        if args.fixed_output_tokens <= 0:
+            raise SystemExit("--fixed-output-tokens must be positive")
+        # Keep the public max_new_tokens and the manual-loop budget aligned.
+        args.max_new_tokens = args.fixed_output_tokens
 
     seed_everything(args.seed)
     device = torch.device(args.device)
@@ -696,6 +723,7 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         "seed": args.seed,
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
+        "speed_output_tokens": args.fixed_output_tokens,
         "warmup_runs": args.warmup_runs,
         "batch_size": 1,
         "extra_metrics": {
@@ -704,6 +732,12 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             or "unknown",
         },
     }
+
+    reference_records = (
+        load_reference_sidecar(Path(args.reference_file))
+        if args.reference_file
+        else None
+    )
 
     with torch.inference_mode():
         seed_everything(args.seed)
@@ -718,12 +752,32 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     successful = 0
     for sample in records:
         seed_everything(args.seed)
-        input_ids = _prompt_batch(
-            tokenizer,
-            sample["prompt"],
-            max_input_tokens=max(args.max_input_tokens, 0),
-        ).to(device)
-        input_tokens = int(input_ids.shape[1])
+        encoded = tokenizer(sample["prompt"], return_tensors="pt")
+        prepared = prepare_input_ids(
+            encoded.input_ids, max(args.max_input_tokens, 0)
+        )
+        input_ids = prepared.input_ids.to(device)
+        input_tokens = prepared.input_tokens
+        sample_dataset = sample.get("raw", {}).get("dataset", data_name)
+        sample_run_config_hash = args.run_config_hash
+        if sample_run_config_hash is None:
+            sample_run_config_hash = build_run_config(
+                dataset=sample_dataset,
+                target_model=str(args.model),
+                input_cap=max(args.max_input_tokens, 0),
+                output_tokens=args.max_new_tokens,
+                seed=args.seed,
+                dtype=args.dtype,
+                attention_backend="paired",
+                temperature=args.temperature,
+            )["run_config_hash"]
+        sample_config = {
+            **config,
+            "original_input_tokens": prepared.original_input_tokens,
+            "input_truncated": prepared.input_truncated,
+            "prompt_hash": prompt_hash(prepared.input_ids),
+            "run_config_hash": sample_run_config_hash,
+        }
         with torch.inference_mode():
             output_ids, timing = _timed_generate(
                 model, input_ids, tokenizer, args, device
@@ -739,14 +793,14 @@ def run(args: argparse.Namespace, *, method: str) -> int:
         timing["model_load_ms"] = model_load_ms
         record = build_sample_record(
             method=method,
-            dataset=sample.get("raw", {}).get("dataset", data_name),
+            dataset=sample_dataset,
             sample_id=sample["id"],
             model=str(args.model),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             timing=timing,
             config={
-                **config,
+                **sample_config,
                 "extra_metrics": {
                     **dict(config.get("extra_metrics", {}) or {}),
                     "kv_cache_backend": timing.get("kv_cache_backend"),
@@ -776,6 +830,37 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             )
         record["run_id"] = args.run_id
         record["task_type"] = task_type
+        if reference_records is not None:
+            reference_key = (
+                record["dataset"],
+                str(record["sample_id"]),
+                str(record["prompt_hash"]),
+                str(record["run_config_hash"]),
+            )
+            reference = reference_records.get(reference_key)
+            if reference is None:
+                record = attach_reference_timing(
+                    record,
+                    {
+                        "dataset": record["dataset"],
+                        "sample_id": record["sample_id"],
+                        "prompt_hash": record["prompt_hash"],
+                        "run_config_hash": record["run_config_hash"],
+                        "status": "missing",
+                    },
+                    reference_baseline=args.reference_baseline,
+                    reference_run_id=args.reference_run_id,
+                    expected_output_tokens=args.fixed_output_tokens,
+                )
+                record["speedup_invalid_reason"] = "missing_reference"
+            else:
+                record = attach_reference_timing(
+                    record,
+                    reference,
+                    reference_baseline=args.reference_baseline,
+                    reference_run_id=args.reference_run_id,
+                    expected_output_tokens=args.fixed_output_tokens,
+                )
         writer.add(record)
         successful += 1
         print(

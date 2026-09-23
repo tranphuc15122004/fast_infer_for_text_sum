@@ -43,18 +43,56 @@ duyệt tuần tự toàn bộ raw ShareGPT rồi ArXiv, không random-sample, k
 vLLM và không tạo `train/val/test`:
 
 ```bash
+OUTPUT_ROOT=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_phase1_raw_analysis
+mkdir -p "$OUTPUT_ROOT"
+set -o pipefail
 python3 scripts/mr_dflash/analyze_phase1_dataset.py \
   --sharegpt-source /workspace/storage-shared/nlp/tungdd11/tungdecoder/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
   --arxiv-source /workspace/storage-shared/nlp/dungdx4/datasets/arxiv/train.label.jsonl \
-  --output-root /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/mr_dflash_phase1_raw_analysis \
+  --output-root "$OUTPUT_ROOT" \
   --tokenizer /workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B \
-  --local-files-only
+  --progress-interval-records 500 \
+  --progress-interval-seconds 15 \
+  --local-files-only \
+  2>&1 | tee "$OUTPUT_ROOT/analysis.log"
 ```
+
+Analyzer hiển thị progress bar riêng cho từng nguồn. Vì không đếm trước tổng
+record, thanh báo số đã quét, thời gian và tốc độ thay vì phần trăm/ETA. Log
+`START`, `PROGRESS`, `DONE` hiện trực tiếp và được lưu ở `analysis.log`.
+Giảm hai interval để log dày hơn. `Ctrl+C` dừng tiến trình; chạy lại sẽ quét
+từ đầu và ghi đè `records.jsonl` cùng `issues.jsonl` trong output root.
 
 Kết quả gồm `summary.json`, `records.jsonl`, `issues.jsonl` và bốn hình PNG
 trong `figures/`. `--max-records N` chỉ dành cho smoke test; bỏ option này khi
 quét thật. Sau khi duyệt report, chạy prepare/build riêng theo rule đã chọn,
 rồi truyền `--prepared-root` của artifact đó cho launcher Phase 1.
+
+## Hẹn giờ tạm dừng an toàn
+
+Mode `2` hỗ trợ dừng mềm sau một số phút. Khi đến hạn, launcher gửi stop
+signal cho pipeline, dừng trước khi chuyển sang hidden-cache, rồi shutdown
+vLLM sạch. Artifact đã ghi vẫn dùng được với `--resume`.
+
+Mặc định không giới hạn thời gian:
+
+```bash
+PHASE1_AUTO_PAUSE_MINUTES=0 \
+  bash scripts/mr_dflash/run_b200_vllm_phase1.sh 2 \
+  --prepared-root /path/to/prepared_dataset
+```
+
+Ví dụ dừng sau 4 giờ:
+
+```bash
+bash scripts/mr_dflash/run_b200_vllm_phase1.sh 2 \
+  --prepared-root /path/to/prepared_dataset \
+  --auto-pause-minutes 240
+```
+
+Chạy lại đúng lệnh sau khi server rảnh; launcher tự xóa stop signal cũ và
+pipeline tiếp tục từ artifact đã hoàn thành. Không dùng `SIGSTOP` hoặc kill
+cứng vì process có thể tiếp tục giữ VRAM B200.
 
 ## Chuẩn bị môi trường
 

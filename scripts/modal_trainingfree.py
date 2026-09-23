@@ -25,6 +25,7 @@ REMOTE_ROOT = Path("/workspace/fast_infer_text_sum")
 VOLUME_MOUNT = Path("/mnt/fast-in")
 REMOTE_OUTPUT_ROOT_V2 = VOLUME_MOUNT / "outputs" / "recap_kv_v2"
 REMOTE_OUTPUT_ROOT_V3 = VOLUME_MOUNT / "outputs" / "recap_kv_v3"
+REMOTE_OUTPUT_ROOT_E43 = VOLUME_MOUNT / "outputs" / "recap_kv_e43"
 REMOTE_TARGET_MODEL = Path("/opt/models/Qwen3-0.6B")
 LOCAL_TARGET_MODEL = Path(
     os.environ.get("MODAL_RECAP_TARGET_LOCAL", "/home/tuantb/models/Qwen3-0.6B")
@@ -113,6 +114,12 @@ def build_runner_command(
     reps_per_region: int = 4,
     hierarchy_mass_budget: float = 0.01,
     hierarchy_layers: str = "last",
+    temporal_lags: str = "1,2,4,8,16",
+    temporal_budgets: str = "0.1,0.2,0.3,0.4",
+    temporal_alphas: str = "1.0,1.25,1.5",
+    temporal_refresh_intervals: str = "2,4,8,16",
+    temporal_block_sizes: str = "16,32,64",
+    temporal_mass_level: float = 0.95,
 ) -> list[str]:
     command = [
         python,
@@ -144,6 +151,18 @@ def build_runner_command(
         str(hierarchy_mass_budget),
         "--hierarchy-layers",
         hierarchy_layers,
+        "--temporal-lags",
+        temporal_lags,
+        "--temporal-budgets",
+        temporal_budgets,
+        "--temporal-alphas",
+        temporal_alphas,
+        "--temporal-refresh-intervals",
+        temporal_refresh_intervals,
+        "--temporal-block-sizes",
+        temporal_block_sizes,
+        "--temporal-mass-level",
+        str(temporal_mass_level),
     ]
     for input_path in inputs:
         command.extend(("--input", input_path))
@@ -168,6 +187,8 @@ def _new_run_id(mode: str) -> str:
 
 
 def output_root_for_experiment(experiment: str) -> Path:
+    if experiment == "temporal":
+        return REMOTE_OUTPUT_ROOT_E43
     if experiment == "hierarchy":
         return REMOTE_OUTPUT_ROOT_V3
     if experiment in {"recap", "lease"}:
@@ -196,6 +217,12 @@ def run_recap(
     reps_per_region: int = 4,
     hierarchy_mass_budget: float = 0.01,
     hierarchy_layers: str = "last",
+    temporal_lags: str = "1,2,4,8,16",
+    temporal_budgets: str = "0.1,0.2,0.3,0.4",
+    temporal_alphas: str = "1.0,1.25,1.5",
+    temporal_refresh_intervals: str = "2,4,8,16",
+    temporal_block_sizes: str = "16,32,64",
+    temporal_mass_level: float = 0.95,
 ) -> dict[str, object]:
     sample_limit, token_limit, smoke = resolve_options(mode, max_samples, max_new_tokens)
     selected_run_id = run_id or _new_run_id(mode)
@@ -216,6 +243,12 @@ def run_recap(
         reps_per_region=reps_per_region,
         hierarchy_mass_budget=hierarchy_mass_budget,
         hierarchy_layers=hierarchy_layers,
+        temporal_lags=temporal_lags,
+        temporal_budgets=temporal_budgets,
+        temporal_alphas=temporal_alphas,
+        temporal_refresh_intervals=temporal_refresh_intervals,
+        temporal_block_sizes=temporal_block_sizes,
+        temporal_mass_level=temporal_mass_level,
     )
     environment = dict(os.environ)
     environment.update(
@@ -257,7 +290,7 @@ def build_parser():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "pilot"), default="smoke")
-    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy"), default="lease")
+    parser.add_argument("--experiment", choices=("recap", "lease", "hierarchy", "temporal"), default="lease")
     parser.add_argument("--target-model", default=str(REMOTE_TARGET_MODEL))
     parser.add_argument("--inputs", default="")
     parser.add_argument("--max-samples", type=int, default=None)
@@ -269,6 +302,12 @@ def build_parser():
     parser.add_argument("--reps-per-region", type=int, default=4)
     parser.add_argument("--hierarchy-mass-budget", type=float, default=0.01)
     parser.add_argument("--hierarchy-layers", default="last")
+    parser.add_argument("--temporal-lags", default="1,2,4,8,16")
+    parser.add_argument("--temporal-budgets", default="0.1,0.2,0.3,0.4")
+    parser.add_argument("--temporal-alphas", default="1.0,1.25,1.5")
+    parser.add_argument("--temporal-refresh-intervals", default="2,4,8,16")
+    parser.add_argument("--temporal-block-sizes", default="16,32,64")
+    parser.add_argument("--temporal-mass-level", type=float, default=0.95)
     return parser
 
 
@@ -287,6 +326,12 @@ def main(
     reps_per_region: int = 4,
     hierarchy_mass_budget: float = 0.01,
     hierarchy_layers: str = "last",
+    temporal_lags: str = "1,2,4,8,16",
+    temporal_budgets: str = "0.1,0.2,0.3,0.4",
+    temporal_alphas: str = "1.0,1.25,1.5",
+    temporal_refresh_intervals: str = "2,4,8,16",
+    temporal_block_sizes: str = "16,32,64",
+    temporal_mass_level: float = 0.95,
 ) -> None:
     _, _, smoke = resolve_options(mode, max_samples, max_new_tokens)
     selected_inputs = tuple(
@@ -306,6 +351,12 @@ def main(
         reps_per_region=reps_per_region,
         hierarchy_mass_budget=hierarchy_mass_budget,
         hierarchy_layers=hierarchy_layers,
+        temporal_lags=temporal_lags,
+        temporal_budgets=temporal_budgets,
+        temporal_alphas=temporal_alphas,
+        temporal_refresh_intervals=temporal_refresh_intervals,
+        temporal_block_sizes=temporal_block_sizes,
+        temporal_mass_level=temporal_mass_level,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result.get("returncode", 1) != 0:

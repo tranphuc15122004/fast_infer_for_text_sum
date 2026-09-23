@@ -330,6 +330,7 @@ class EaModel(nn.Module):
             is_llama3=False,
             return_stats=False,
             return_phase_timings=False,
+            stop_on_eos=True,
 
     ):
         if is_llama3:
@@ -452,11 +453,11 @@ class EaModel(nn.Module):
             )
             _finish_cuda_phase(phase_events, "draft_events", draft_start)
 
-            if is_llama3:
+            if stop_on_eos and is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
                     break
 
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            if stop_on_eos and self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
             if new_token > max_new_tokens:
                 break
@@ -544,6 +545,7 @@ class EaModel(nn.Module):
             is_llama3=False,
             return_stats=False,
             return_phase_timings=False,
+            stop_on_eos=True,
 
     ):
         if is_llama3:
@@ -610,11 +612,11 @@ class EaModel(nn.Module):
             input_ids = torch.cat([input_ids, input_id], dim=-1)
             new_token += 1
 
-            if is_llama3:
+            if stop_on_eos and is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
                     break
 
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            if stop_on_eos and self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
             if new_token > max_new_tokens:
                 break
