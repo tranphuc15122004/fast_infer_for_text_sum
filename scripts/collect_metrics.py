@@ -12,7 +12,7 @@ Output: metrics_summary.json (đầy đủ) + metrics_summary.csv (bảng rộng
 Metric tốc độ (mean/median/p90/std của từng key schema §13):
   input_tokens, retained_tokens, output_tokens, selector_latency_ms, ttft_ms,
   tpot_ms, prefill_ms, decode_ms, e2e_ms, pipeline_e2e_ms,
-  throughput_tok_s, qps, peak_memory_gb
+  throughput_tok_s, decode_throughput_tok_s, qps, peak_memory_gb
   + retained_ratio, compression_ratio (suy ra) + key speculative (nếu có).
 
 Paired speedup (ratio of means, dense/reference divided by method):
@@ -237,6 +237,20 @@ def _split_names(value: str | None) -> list[str]:
     return value.replace(",", " ").split()
 
 
+def select_datasets(
+    datasets: list[str], index: dict[str, dict], requested: str | None
+) -> tuple[list[str], dict[str, dict]]:
+    """Restrict a report to a named subset, failing on missing datasets."""
+
+    names = _split_names(requested)
+    if not names:
+        return datasets, index
+    missing = [name for name in names if name not in index]
+    if missing:
+        raise ValueError(f"datasets not found in data directory: {', '.join(missing)}")
+    return names, {name: index[name] for name in names}
+
+
 def normalize_record(record: dict, fallback_method: str) -> dict:
     """Map non-schema semantic-selection fields to the shared metric schema."""
     out = dict(record)
@@ -351,9 +365,13 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
     for r in records:
         rid = record_id(r)
         data_entry = data_index.get(rid, {}) if rid else {}
-        task_type = data_entry.get("task_type") or r.get("task_type")
+        task_type = r.get("task_type") or data_entry.get("task_type")
         code_group = code_group or task_type == "code_completion"
-        ref = data_entry.get("reference") or r.get("reference")
+        ref = (
+            r.get("reference_output")
+            or r.get("reference")
+            or data_entry.get("reference")
+        )
         if not ref:
             continue
         joined += 1
@@ -378,6 +396,12 @@ def compute_group(records: list[dict], data_index: dict) -> dict:
         group["speed"] = speed
     if spec:
         group["speculative"] = spec
+    output_parity = metrics.aggregate_output_parity(records)
+    if output_parity:
+        group["output_parity"] = output_parity
+    weighted_throughput = metrics.aggregate_weighted_throughput(records)
+    if weighted_throughput:
+        group["weighted_throughput"] = weighted_throughput
     speedup = metrics.aggregate_speedup(records)
     speedup_coverage = metrics.speedup_pair_coverage(records)
     if speedup or any(item["available"] for item in speedup_coverage.values()):
@@ -422,11 +446,14 @@ def load_output_files(outputs_dir: Path, datasets: list[str]) -> list[tuple[str,
             # New orchestrator layout:
             # outputs/<run_id>/<baseline>/<dataset>.jsonl.  Conversion inputs
             # and logs are deliberately excluded.
+            excluded_dirs = {"inputs", "logs", "references", "controls"}
             files = sorted(
                 path
                 for path in outputs_dir.rglob("*.jsonl")
-                if path.parent.name not in {"inputs", "logs"}
-                and path.stem in datasets
+                if path.stem in datasets
+                and not excluded_dirs.intersection(
+                    path.relative_to(outputs_dir).parts[:-1]
+                )
             )
     else:
         files = [outputs_dir]
@@ -454,6 +481,8 @@ def main() -> None:
                              "(hoặc 1 file jsonl)")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                         help="thư mục canonical JSONL (để join reference)")
+    parser.add_argument("--datasets", default="",
+                        help="chỉ tổng hợp danh sách dataset được phân tách bằng dấu phẩy")
     parser.add_argument("--out", type=Path, default=None,
                         help="đường dẫn metrics_summary.json "
                              "(mặc định <outputs-dir>/metrics_summary.json)")
@@ -487,6 +516,10 @@ def main() -> None:
         raise SystemExit(f"data dir not found: {data_dir}")
 
     datasets, data_index = load_data_index(data_dir)
+    try:
+        datasets, data_index = select_datasets(datasets, data_index, args.datasets)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(f"Datasets in {data_dir}: {datasets}")
 
     if args.strict:
@@ -616,10 +649,24 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
             if label not in seen:
                 seen.add(label)
                 col_meta.append(("semantic", key, "mean"))
+        for key in group.get("output_parity", {}):
+            label = f"output_parity_{key}"
+            if label not in seen:
+                seen.add(label)
+                col_meta.append(("output_parity", key, "value"))
+        for key in group.get("weighted_throughput", {}):
+            label = f"weighted_{key}"
+            if label not in seen:
+                seen.add(label)
+                col_meta.append(("weighted_throughput", key, "value"))
 
     def column_name(section: str, key: str, stat: str) -> str:
         if section == "speedup_coverage":
             return f"{key}_pair_ratio"
+        if section == "output_parity":
+            return f"output_parity_{key}"
+        if section == "weighted_throughput":
+            return f"weighted_{key}"
         return f"{key}_{stat}"
 
     header = ["dataset", "method", "num_records", "num_reference_joined"] + [
@@ -639,6 +686,12 @@ def write_csv(path: Path, result: dict, datasets: list[str]) -> None:
             elif section == "speedup_coverage":
                 coverage = group.get("speedup_coverage", {}).get(key, {})
                 v = coverage.get("ratio") if isinstance(coverage, dict) else None
+                row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+            elif section == "output_parity":
+                v = group.get("output_parity", {}).get(key)
+                row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+            elif section == "weighted_throughput":
+                v = group.get("weighted_throughput", {}).get(key)
                 row.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
             else:
                 agg = group.get(section, {}).get(key)
@@ -665,6 +718,7 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
         f"- Outputs: {result['outputs_dir']}",
         f"- Datasets: {', '.join(datasets)}",
         "- Speed: mean/median/p90/std theo schema §13 (metrics_summary.json có đầy đủ).",
+        "- Decode tok/s ở bảng chính là tổng output tokens chia tổng decode time; phân bố tok/s từng mẫu vẫn nằm trong metrics_summary.json/CSV.",
         "- Speedup: ratio của mean timing dense/reference chia cho mean timing method (chỉ khi có cặp ghép).",
         "- Semantic: ROUGE-1/2/L P/R/F, ROUGE-Lsum, BLEU-1..4, length ratio (mean).",
         "",
@@ -673,6 +727,38 @@ def write_markdown(path: Path, result: dict, datasets: list[str]) -> None:
     def add_tables(md: list[str], label: str, groups: dict) -> None:
         md.append(f"## {label}")
         md.append("")
+        md.append("### Bảng kết quả chính (paired online)")
+        md.append("")
+        md.append("| method | n | τ (mean accept length) | decode tok/s | prefill ms | decode ms | ESR | DSR |")
+        md.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for method, group in sorted(groups.items()):
+            sp = group.get("speed", {})
+            spec = group.get("speculative", {})
+            su = group.get("speedup", {})
+            weighted = group.get("weighted_throughput", {})
+            md.append(
+                f"| {method} | {group.get('num_records', 0)} "
+                f"| {_fmt(spec.get('avg_accept_length'))} "
+                f"| {_fmt(weighted.get('decode_tok_s', sp.get('decode_throughput_tok_s')))} "
+                f"| {_fmt(sp.get('prefill_ms'))} | {_fmt(sp.get('decode_ms'))} "
+                f"| {_fmt(su.get('esr'))} | {_fmt(su.get('dsr'))} |"
+            )
+        md.append("")
+        if any(group.get("output_parity") for group in groups.values()):
+            md.append("### Exact token agreement so với Vanilla HF (không phải điều kiện speedup)")
+            md.append("")
+            md.append("| method | n | fixed-K exact | fixed-K token ratio | quality-prefix exact | quality-prefix token ratio |")
+            md.append("|---|---:|---:|---:|---:|---:|")
+            for method, group in sorted(groups.items()):
+                parity = group.get("output_parity", {})
+                md.append(
+                    f"| {method} | {parity.get('samples', 0)} "
+                    f"| {_fmt(parity.get('fixed_continuation_exact_match_rate'))} "
+                    f"| {_fmt(parity.get('fixed_continuation_token_match_ratio'))} "
+                    f"| {_fmt(parity.get('quality_prefix_exact_match_rate'))} "
+                    f"| {_fmt(parity.get('quality_prefix_token_match_ratio'))} |"
+                )
+            md.append("")
         md.append("### Tốc độ (mean)")
         md.append("")
         md.append("| method | n | input | ret% | out | sel_ms | prefill | decode | ttft | tpot | e2e | pipeline | tok/s | qps | mem |")

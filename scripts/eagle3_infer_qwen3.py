@@ -44,7 +44,12 @@ from common.paired_reference import (  # noqa: E402
     load_reference_sidecar,
     prompt_hash,
 )
-from common.qwen3_paired import build_run_config, prepare_input_ids  # noqa: E402
+from common.qwen3_paired import (  # noqa: E402
+    build_run_config,
+    capture_generation_output,
+    model_provenance,
+    prepare_input_ids,
+)
 from common.reproducibility import seed_everything  # noqa: E402
 
 
@@ -510,7 +515,14 @@ def main() -> None:
                         include_phase_timings=True,
                         stop_on_eos=args.fixed_output_tokens is None,
                     )
-                    answer = decode_answer(tokenizer, out_ids, input_len)
+                    generation_artifact = capture_generation_output(
+                        tokenizer,
+                        out_ids[0, input_len:],
+                        expected_output_tokens=args.fixed_output_tokens,
+                    )
+                    answer = generation_artifact["quality_text"]
+                    if args.fixed_output_tokens is None:
+                        answer = answer.strip()  # Keep legacy natural-EOS formatting.
 
                     if not args.skip_naive:
                         seed_everything(sample_seed)
@@ -604,6 +616,17 @@ def main() -> None:
                         decode_ms=eagle_phases.get("decode_ms", eagle_time * 1000.0),
                         e2e_ms=eagle_phases.get("e2e_ms"),
                     )
+                )
+                record.update(generation_artifact)
+                record.update(
+                    model_provenance(
+                        model.base_model,
+                        tokenizer,
+                        draft_model=getattr(model, "ea_layer", None),
+                    )
+                )
+                record["tau_scope"] = (
+                    "fixed_budget" if args.fixed_output_tokens is not None else None
                 )
                 record["peak_memory_gb"] = eagle_phases.get("peak_memory_gb")
                 record["device"] = "cuda:0"

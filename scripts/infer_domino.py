@@ -15,7 +15,12 @@ from common import io_util, metrics, rouge, verify
 from common.benchmark_runtime import build_sample_record, runtime_metadata
 from common.data_loader import load_records
 from common.paired_reference import attach_reference_timing, load_reference_sidecar, prompt_hash
-from common.qwen3_paired import build_run_config, prepare_input_ids
+from common.qwen3_paired import (
+    build_run_config,
+    capture_generation_output,
+    model_provenance,
+    prepare_input_ids,
+)
 from common.reproducibility import seed_everything
 
 
@@ -190,7 +195,14 @@ def main() -> int:
                 use_bias=args.use_bias,
             )
         output_ids = result.output_ids[0, result.num_input_tokens:]
-        text = tokenizer.decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+        generation_artifact = capture_generation_output(
+            tokenizer,
+            output_ids,
+            expected_output_tokens=args.fixed_output_tokens,
+        )
+        text = generation_artifact["quality_text"]
+        if args.fixed_output_tokens is None:
+            text = text.strip()  # Preserve the legacy natural-EOS output contract.
         output_tokens = int(result.num_output_tokens)
         prefill_ms = float(result.time_to_first_token) * 1000.0
         decode_ms = float(result.time_per_output_token) * output_tokens * 1000.0
@@ -246,6 +258,9 @@ def main() -> int:
         record["acceptance_lengths"] = acceptance
         record["avg_accept_length"] = tau
         record["block_size"] = block_size
+        record.update(generation_artifact)
+        record.update(model_provenance(target, tokenizer, draft_model=draft))
+        record["tau_scope"] = "fixed_budget" if args.fixed_output_tokens else None
         if reference_records is not None:
             key = (str(record["dataset"]), str(record["sample_id"]), str(record["prompt_hash"]), str(record["run_config_hash"]))
             reference = reference_records.get(key) or {

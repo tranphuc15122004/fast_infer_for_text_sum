@@ -140,6 +140,31 @@ def test_online_speedup_pair_does_not_require_matching_generated_text():
     assert record["dsr"] == pytest.approx(2.0)
 
 
+def test_online_pair_records_output_parity_separately_from_speedup_validity():
+    reference = _reference_record(
+        generated_token_ids=[10, 11, 99, 12],
+        first_eos_index=2,
+        quality_output_tokens=2,
+    )
+    method = _method_record(
+        generated_token_ids=[10, 12, 99, 13],
+        first_eos_index=2,
+        quality_output_tokens=2,
+    )
+
+    record = attach_reference_timing(
+        method,
+        reference,
+        expected_output_tokens=1024,
+    )
+
+    assert record["speedup_valid"] is True
+    assert record["fixed_continuation_exact_match"] is False
+    assert record["fixed_continuation_first_divergence_index"] == 1
+    assert record["quality_prefix_exact_match"] is False
+    assert record["quality_prefix_token_match_ratio"] == pytest.approx(0.5)
+
+
 def test_attach_reference_rejects_prompt_or_fixed_budget_mismatch():
     record = attach_reference_timing(
         _method_record(prompt_hash=prompt_hash([9, 9, 9]), output_tokens=512),
@@ -152,6 +177,18 @@ def test_attach_reference_rejects_prompt_or_fixed_budget_mismatch():
     assert record["dsr"] is None
     assert "prompt_hash" in record["speedup_invalid_reason"]
     assert "output_tokens" in record["speedup_invalid_reason"]
+
+
+def test_attach_reference_rejects_checkpoint_revision_mismatch():
+    record = attach_reference_timing(
+        _method_record(target_model_revision="target-rev"),
+        _reference_record(target_model_revision="different-target-rev"),
+        expected_output_tokens=1024,
+    )
+
+    assert record["speedup_valid"] is False
+    assert record["esr"] is None
+    assert "target_model_revision" in record["speedup_invalid_reason"]
 
 
 def test_attach_reference_rejects_non_batch_one_pair():

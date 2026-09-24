@@ -21,30 +21,28 @@ lệch output length hoặc khác reference.
 MagicDec và SpecExtend nằm ngoài phạm vi matrix Qwen3-4B này; không xóa code
 hoặc artifact cũ của chúng.
 
-**Thiết kế đánh giá:** Có hai profile độc lập:
-
-1. `speed_fixed_budget`: đo tốc độ với batch size 1 và đúng `K=1024` output
-   token ở full run (`K=32` ở smoke). Generation phải chạy đủ `K` token; nếu
-   một adapter dừng sớm theo EOS và không thể tắt stop condition thì record
-   không được dùng cho ESR/DSR chính thức.
-2. `quality_natural_eos`: giữ generation tự nhiên với trần 2048 token để đo
-   text, ROUGE/code quality và `tau`; không dùng output length khác nhau để
-   claim decoder speedup.
+**Thiết kế đánh giá:** Chỉ có một lượt generation fixed-K cho mỗi method:
+`K=1024` ở full run (`K=32` ở smoke), batch size 1 và tắt EOS stopping. Lưu
+nguyên continuation token IDs; từ đó xác định EOS đầu tiên và tạo
+`quality_text` bằng cách giải mã phần trước EOS. Như vậy speed và quality
+được thu trong cùng một lượt, không cần chạy natural-EOS profile thứ hai.
 
 Reference Vanilla HF chạy trước theo từng sample và ghi sidecar. Baseline
 đọc sidecar đó, join bằng `dataset + sample_id + prompt_hash + run_config_hash`
-và ghi ESR/DSR ngay trong record. Raw timing vẫn phải được lưu để audit và
-tính lại độc lập.
+và ghi ESR/DSR ngay trong record. ESR/DSR ghép theo input/config và fixed-K,
+không yêu cầu các method sinh cùng chuỗi token; exact/token agreement được ghi
+riêng làm correctness audit và không làm điều kiện speedup. Raw token IDs và
+timing được lưu để audit/offline recompute mà không chạy model lại.
 
 **Giới hạn input/output:** Phân tích `data/longbench_100_14k/` hiện có 500
 sample cho thấy input token đã được chuẩn hóa nằm trong khoảng 165–13.904
 token; p50 toàn bộ là 5.497,5, p90 là 12.351,3, p95 là 13.025,4 và p99 là
 13.489,1. Vì vậy full run khóa `MAX_INPUT_TOKENS=14000` sau khi áp dụng
-chính xác Qwen3 chat template; không loại bỏ các sample hiện tại và không
-truncate âm thầm. Smoke dùng cùng input cap. Nếu tokenizer Qwen3 sau chat
-template phát hiện record vượt cap, runner phải áp dụng cùng một quy tắc
-truncation deterministic cho mọi baseline và ghi `input_truncated=true`,
-`original_input_tokens` vào record.
+tokenize prompt canonical đang có; không loại bỏ sample hiện tại và không
+truncate âm thầm. Smoke dùng cùng input cap. Mỗi adapter tokenizes cùng prompt
+bằng tokenizer snapshot đã khóa, áp dụng chung truncation deterministic và
+ghi `input_truncated=true`, `original_input_tokens`, `prompt_hash`; runner
+strict-join các hash trước khi công nhận speedup.
 
 Phân bố theo dataset hiện tại:
 
@@ -56,11 +54,11 @@ Phân bố theo dataset hiện tại:
 | `lcc` | 1.004 | 2.261,0 | 5.539,3 | 12.229 |
 | `repobench-p` | 2.735 | 6.898,5 | 12.732,3 | 13.774 |
 
-Speed profile khóa `SPEED_OUTPUT_TOKENS=1024` ở full run và 32 ở smoke. Mọi
-method phải sinh đủ đúng số token này, không dừng tại EOS trong profile speed;
-method không hỗ trợ fixed-length generation bị loại khỏi bảng ESR/DSR. Quality
-profile có thể dùng natural EOS với trần 2048 token, nhưng output length của
-profile này không được dùng để so sánh decoder speed.
+Fixed-K run khóa `SPEED_OUTPUT_TOKENS=1024` ở full và 32 ở smoke. Mọi method
+phải sinh đủ đúng số token; record đồng thời giữ `generated_token_ids`,
+`first_eos_index`, `quality_output_tokens`, `quality_text` và
+`full_output_text`. Chất lượng được đo trên phần text trước EOS; tốc độ dùng
+đúng toàn bộ fixed-K continuation.
 
 **Kiến trúc:** Dùng `benchmark_runtime.py` làm schema/timing core, thêm một
 reference sidecar contract dùng chung, rồi nối Domino vào registry/LongBench
@@ -79,6 +77,10 @@ dataset, sample_id, prompt_hash, run_config_hash
 model, target_model_revision, batch_size, device, dtype, attention_backend
 input_tokens, output_tokens, max_new_tokens
 original_input_tokens, input_truncated, speed_output_tokens
+generated_token_ids, generated_token_count, first_eos_index
+quality_output_tokens, quality_text, full_output_text, fixed_budget_reached
+fixed_continuation_exact_match, quality_prefix_exact_match
+fixed_continuation_token_match_ratio, fixed_continuation_first_divergence_index
 prefill_ms, decode_ms, e2e_ms
 throughput_tok_s, decode_throughput_tok_s, tpot_ms
 temperature, warmup_runs, measurement_scope
@@ -122,12 +124,12 @@ Vanilla FA ghi `null`, không ghi `0`.
 ### Fairness rules
 
 - Target duy nhất: local snapshot `Qwen3-4B`; không bật thinking mode.
-- Cùng tokenizer, chat template, prompt file, sample IDs, seed, temperature,
+- Cùng tokenizer, prompt file, sample IDs, seed, temperature,
   dtype, `MAX_INPUT_TOKENS=14000`, output budget và warmup.
-- Input IDs phải được tokenize một lần bằng Qwen3 tokenizer; reference và
-  baseline dùng cùng input IDs hoặc cùng `prompt_hash` sau truncation.
-- Speed profile phải có `output_tokens == SPEED_OUTPUT_TOKENS`; EOS sớm là
-  `fixed_budget_failed`, không được biến thành speedup hợp lệ.
+- Reference và baseline dùng cùng prompt source/tokenizer snapshot; prompt hash
+  sau truncation phải khớp chính xác trong paired join.
+- Fixed-K run phải có `output_tokens == SPEED_OUTPUT_TOKENS`; EOS sớm không
+  dừng generation mà chỉ đánh dấu prefix chất lượng.
 - Batch size luôn bằng 1; process startup và model loading không nằm trong
   sample timing.
 - Có `torch.cuda.synchronize()` trước và sau vùng đo.
@@ -157,12 +159,13 @@ Vanilla FA ghi `null`, không ghi `0`.
 ```text
 outputs/Benchmark_results/qwen3_4b_paired_online/<run-id>/
 ├── run_manifest.json
-├── reference/vanilla_hf/<dataset>.jsonl
-├── control/vanilla_fa/<dataset>.jsonl
-├── methods/{dflash,domino,eagle3}/<dataset>.jsonl
-├── audits/<baseline>_<dataset>.metrics.json
-├── summaries/metrics_summary.json
-└── logs/
+├── inputs/source/<dataset>.jsonl
+├── inputs/<dataset>.eagle.jsonl
+├── vanilla_hf/<dataset>.jsonl
+├── vanilla_fa/<dataset>.jsonl
+├── {dflash,domino,eagle3}/<dataset>.jsonl
+├── references/<dataset>.jsonl
+└── metrics_summary.{json,csv,md}
 ```
 
 Không ghi đè `outputs/Benchmark_results/ketqua_benchmark/` hoặc report Llama
@@ -186,11 +189,12 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
 - Thêm `SPEED_OUTPUT_TOKENS=1024` cho full và `32` cho smoke; giá trị phải
   được ghi vào manifest, không lấy ngầm từ config cũ 2048.
 - Thêm `MAX_INPUT_TOKENS=14000` cho cả smoke/full và lưu phân tích input
-  distribution vào manifest; không dùng `14k` như tên thư mục mà bỏ qua số
-  token thực tế sau chat template.
+  distribution/hash của từng JSONL vào manifest; không dùng `14k` như tên
+  thư mục mà bỏ qua số token thực tế sau tokenize/truncation.
 - Khóa danh sách baseline mới; DSpark không được tự động xuất hiện trong run.
-- Sinh `run_config_hash` từ target revision, tokenizer, dataset manifest,
-  budget, seed, dtype, backend và timing profile.
+- Sinh `run_config_hash` từ target path, dataset SHA-256, budget, seed, dtype,
+  backend và workload; strict pairing đồng thời đối chiếu target/tokenizer
+  revision thực tế được ghi trong output rows.
 
 **Tests:**
 
@@ -199,8 +203,8 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
   `enable_thinking == False`.
 - `MAX_INPUT_TOKENS == 14000`, `SPEED_OUTPUT_TOKENS == 1024` ở full profile;
   smoke dùng 32 output token.
-- Data preflight xác nhận 500/500 sample hiện tại không bị loại; nếu có
-  truncation sau Qwen3 chat template, mọi baseline nhận cùng prompt hash.
+- Data preflight xác nhận sample count theo từng JSONL; nếu có truncation,
+  mọi baseline phải có cùng prompt hash sau cap.
 - Không chấp nhận trộn target Llama hoặc output directory cũ.
 
 ## Task 2: Implement paired reference sidecar và online ESR/DSR
@@ -217,7 +221,7 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
 
 - Implement sidecar writer/reader keyed by dataset, sample ID, prompt hash và
   run config hash.
-- Implement strict join: khác prompt, budget, model revision, batch size hoặc
+- Implement strict join: khác prompt, budget, target/tokenizer revision, batch size hoặc
   config hash phải trả `speedup_valid=False` với reason cụ thể.
 - Derive per-record `decode_throughput_tok_s`, `tpot_ms`, `esr`, `dsr` sau khi
   method timing hoàn tất nhưng trước khi append JSONL; đây là “online” metric.
@@ -251,8 +255,8 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
   sidecar.
 - Vanilla FA chạy cùng input/config như control; nếu FlashAttention không
   tương thích thì fail rõ ràng, không fallback.
-- Speed reference phải tắt EOS hoặc dùng generation loop tiếp tục đến đủ
-  `SPEED_OUTPUT_TOKENS`; natural-EOS chỉ chạy ở quality profile.
+- Speed reference tắt EOS và sinh đủ `SPEED_OUTPUT_TOKENS`; quality text được
+  tạo offline từ token IDs trước EOS, không thực hiện generation thứ hai.
 - Tách model-load timing khỏi sample E2E.
 - Kiểm tra target token parity giữa Vanilla HF và Vanilla FA ở deterministic
   speed smoke; mismatch phải được ghi audit trước khi dùng Vanilla FA làm
@@ -307,7 +311,7 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
 
 - Giữ EAGLE3 là baseline experimental; chỉ cho phép full speed record nếu
   target parity smoke pass.
-- Dùng đúng Qwen3 tokenizer/chat template và `enable_thinking=False`.
+- Dùng đúng Qwen3 tokenizer, cùng prompt canonical và `enable_thinking=False`.
 - Nhận cùng tokenized input và fixed output budget từ paired runner; không tự
   tokenize lại bằng prompt contract khác.
 - Ghi token IDs hoặc hash của generated continuation để so với Vanilla HF;
@@ -339,8 +343,8 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
 - DFlash dùng target `Qwen3-4B` và draft `Qwen3-4B-DFlash-b16`.
 - Chạy theo thứ tự: manifest/data validation → Vanilla HF reference → Vanilla
   FA control → DFlash/Domino/EAGLE3.
-- Reference và method đều nhận `MAX_INPUT_TOKENS=14000`; speed profile dùng
-  đúng 1024 output token, quality profile mới cho phép EOS tự nhiên.
+- Reference và method đều nhận `MAX_INPUT_TOKENS=14000` và fixed budget; cùng
+  record token IDs dùng cho cả tốc độ và chất lượng.
 - Mỗi child process chỉ dùng batch 1; không chạy reference và method đồng thời
   trên cùng GPU.
 - Truyền `reference_sidecar`, `reference_run_id`, `run_config_hash` xuống mọi
@@ -361,8 +365,8 @@ hiện tại cho đến khi run mới đạt toàn bộ acceptance criteria.
 - 5 dataset × 100 sample.
 - 8 B200 data-parallel nếu manifest server xác nhận cùng runtime; từng request
   vẫn batch 1.
-- Chạy speed profile trước. Chỉ chạy quality natural-EOS sau khi speed smoke
-  đạt acceptance.
+- Chạy một fixed-K smoke cho toàn matrix; cùng record raw token IDs phục vụ cả
+  speed và quality, không chạy thêm quality natural-EOS pass.
 
 ## Task 7: Audit, aggregate và cập nhật report
 
@@ -417,8 +421,8 @@ Method | tau | Decode tok/s | Prefill ms | Decode ms | ESR vs Vanilla HF | DSR v
 5. Chạy EAGLE3 parity smoke; fail thì loại EAGLE3 khỏi full ranking.
 6. Chạy integration smoke đủ matrix.
 7. Chỉ khi smoke pass mới chạy full 5×100 speed profile.
-8. Audit full artifact; chỉ khi acceptance criteria đạt mới chạy quality profile
-   và cập nhật report chính.
+8. Audit full artifact; nếu acceptance criteria đạt thì cập nhật report chính
+   trực tiếp từ artifact này, không chạy lại model để lấy quality output.
 
 Không chạy full GPU hoặc tuyên bố speedup trong paper trước khi stop gates trên
 đạt. Kế hoạch này không thay thế kết quả cũ; nó tạo một benchmark Qwen3-4B

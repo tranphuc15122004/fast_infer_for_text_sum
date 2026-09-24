@@ -29,7 +29,12 @@ from common.paired_reference import (
     load_reference_sidecar,
     prompt_hash,
 )
-from common.qwen3_paired import build_run_config, prepare_input_ids
+from common.qwen3_paired import (
+    build_run_config,
+    capture_generation_output,
+    model_provenance,
+    prepare_input_ids,
+)
 from common.quality_guard import is_degenerate_output
 from common.reproducibility import seed_everything
 
@@ -784,11 +789,12 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             )
         new_ids = output_ids[0, input_tokens:]
         output_tokens = int(new_ids.shape[0])
-        text = tokenizer.decode(
+        generation_artifact = capture_generation_output(
+            tokenizer,
             new_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
+            expected_output_tokens=args.fixed_output_tokens,
         )
+        text = generation_artifact["quality_text"]
         task_type = sample.get("raw", {}).get("task_type") or sample.get("task_type")
         timing["model_load_ms"] = model_load_ms
         record = build_sample_record(
@@ -816,6 +822,9 @@ def run(args: argparse.Namespace, *, method: str) -> int:
             "degenerate_repetition": is_degenerate_output(text),
             "action": "annotate_only",
         }
+        record.update(generation_artifact)
+        record.update(model_provenance(model, tokenizer))
+        record["tau_scope"] = "fixed_budget" if args.fixed_output_tokens else None
         if task_type == "code_completion":
             metrics.add_code_completion(record, text, sample.get("reference"))
         else:
@@ -861,6 +870,16 @@ def run(args: argparse.Namespace, *, method: str) -> int:
                     reference_run_id=args.reference_run_id,
                     expected_output_tokens=args.fixed_output_tokens,
                 )
+        elif method == "vanilla_hf" and args.fixed_output_tokens is not None:
+            # Mark the in-run dense reference row explicitly as the unity
+            # speedup anchor used by the paired main table.
+            record = attach_reference_timing(
+                record,
+                record,
+                reference_baseline="vanilla_hf",
+                reference_run_id=args.run_id,
+                expected_output_tokens=args.fixed_output_tokens,
+            )
         writer.add(record)
         successful += 1
         print(

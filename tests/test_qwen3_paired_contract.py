@@ -20,6 +20,10 @@ from common.qwen3_paired import (  # noqa: E402
     prepare_input_ids,
     profile_defaults,
 )
+from run_qwen3_4b_paired import (  # noqa: E402
+    snapshot_dataset,
+    validate_paired_records,
+)
 from common.vanilla_inference import build_parser as build_vanilla_parser  # noqa: E402
 from common.vanilla_inference import _timed_generate  # noqa: E402
 
@@ -76,6 +80,107 @@ def test_input_distribution_reports_per_dataset_and_global_percentiles(tmp_path)
     assert distribution["datasets"]["gov_report"]["count"] == 3
     assert distribution["datasets"]["gov_report"]["max"] == 300
     assert distribution["global"]["p50"] == pytest.approx(200.0)
+
+
+def test_paired_record_validator_requires_raw_fixed_budget_and_online_speedups():
+    row = {
+        "status": "success",
+        "batch_size": 1,
+        "sample_id": "s1",
+        "prompt_hash": "prompt",
+        "run_config_hash": "config",
+        "output_tokens": 4,
+        "speed_output_tokens": 4,
+        "dense_output_tokens": 4,
+        "measurement_scope": "full_e2e",
+        "prefill_ms": 10.0,
+        "decode_ms": 5.0,
+        "e2e_ms": 20.0,
+        "throughput_tok_s": 200.0,
+        "decode_throughput_tok_s": 800.0,
+        "dense_prefill_ms": 8.0,
+        "dense_decode_ms": 4.0,
+        "dense_e2e_ms": 24.0,
+        "method_decode_tok_s": 800.0,
+        "dense_decode_tok_s": 1000.0,
+        "generated_token_ids": [1, 2, 3, 4],
+        "fixed_budget_reached": True,
+        "quality_text": "answer",
+        "full_output_text": "answer",
+        "quality_output_tokens": 4,
+        "acceptance_lengths": [3, 2],
+        "avg_accept_length": 2.5,
+        "tau_scope": "fixed_budget",
+        "reference_baseline": "vanilla_hf",
+        "reference_run_id": "run-1",
+        "speedup_scope": "qwen3_4b_batch1_fixed_budget",
+        "output_parity_available": True,
+        "fixed_continuation_exact_match": True,
+        "quality_prefix_exact_match": True,
+        "speedup_valid": True,
+        "esr": 1.2,
+        "dsr": 0.8,
+    }
+
+    assert validate_paired_records([row], baseline="dflash", expected_samples=1, output_tokens=4) == []
+    errors = validate_paired_records(
+        [{**row, "speedup_valid": False, "output_tokens": 3}],
+        baseline="dflash",
+        expected_samples=1,
+        output_tokens=4,
+    )
+    assert any("output_tokens" in error for error in errors)
+    assert any("speedup_valid" in error for error in errors)
+
+
+def test_paired_record_validator_rejects_missing_main_timing_phases():
+    row = {
+        "status": "success",
+        "batch_size": 1,
+        "sample_id": "s1",
+        "output_tokens": 2,
+        "speed_output_tokens": 2,
+        "generated_token_ids": [1, 2],
+        "fixed_budget_reached": True,
+        "quality_text": "answer",
+        "full_output_text": "answer",
+        "quality_output_tokens": 2,
+        "output_parity_available": True,
+        "fixed_continuation_exact_match": True,
+        "quality_prefix_exact_match": True,
+        "prompt_hash": "prompt",
+        "run_config_hash": "config",
+        "reference_baseline": "vanilla_hf",
+        "reference_run_id": "run-1",
+        "speedup_scope": "qwen3_4b_batch1_fixed_budget",
+        "speedup_valid": True,
+        "esr": 1.0,
+        "dsr": 1.0,
+    }
+
+    errors = validate_paired_records(
+        [row], baseline="vanilla_fa", expected_samples=1, output_tokens=2
+    )
+
+    assert any("measurement_scope" in error for error in errors)
+    assert any("prefill_ms" in error for error in errors)
+    assert any("dense_prefill_ms" in error for error in errors)
+
+
+def test_dataset_snapshot_freezes_exact_selected_source_rows(tmp_path):
+    source = tmp_path / "gov_report.jsonl"
+    snapshot = tmp_path / "inputs" / "gov_report.source.jsonl"
+    raw_lines = [
+        '{"id":"a","prompt":"first"}',
+        '{"id":"b","prompt":"second"}',
+        '{"id":"c","prompt":"not selected"}',
+    ]
+    source.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+    count = snapshot_dataset(source, snapshot, max_samples=2)
+
+    assert count == 2
+    assert snapshot.read_text(encoding="utf-8").splitlines() == raw_lines[:2]
 
 
 def test_vanilla_parser_exposes_fixed_output_and_pairing_arguments():

@@ -40,6 +40,7 @@ SPEED_KEYS = [
     "e2e_ms",
     "pipeline_e2e_ms",
     "throughput_tok_s",
+    "decode_throughput_tok_s",
     "qps",
     "peak_memory_gb",
 ]
@@ -344,6 +345,40 @@ def aggregate_speed(
     return out
 
 
+def aggregate_weighted_throughput(records: Sequence[Mapping]) -> dict:
+    """Compute total generated tokens divided by total recorded wall time."""
+
+    successful = [
+        record
+        for record in records
+        if record.get("status", "success") == "success"
+        and record.get("scope") != "aggregate"
+        and record.get("type") != "summary"
+    ]
+    result: dict[str, float | int] = {}
+    for name, timing_key, tokens_key in (
+        ("decode_tok_s", "decode_ms", "output_tokens"),
+        ("e2e_tok_s", "e2e_ms", "output_tokens"),
+    ):
+        pairs: list[tuple[float, float]] = []
+        for record in successful:
+            try:
+                tokens = float(record.get(tokens_key) or 0)
+                elapsed_ms = float(record.get(timing_key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tokens > 0 and elapsed_ms > 0:
+                pairs.append((tokens, elapsed_ms))
+        if not pairs:
+            continue
+        total_tokens = sum(tokens for tokens, _ in pairs)
+        total_ms = sum(elapsed for _, elapsed in pairs)
+        result[name] = round(total_tokens * 1000.0 / total_ms, 4)
+        result[f"{name}_tokens"] = int(total_tokens)
+        result[f"{name}_time_ms"] = round(total_ms, 4)
+    return result
+
+
 def _acceptance_length_from_record(record: Mapping) -> Optional[float]:
     """Read one sample's mean accepted length from supported trace formats.
 
@@ -411,6 +446,45 @@ def aggregate_speculative(records: Sequence[Mapping]) -> dict:
                 values.append(value)
         out["avg_accept_length"] = agg_numeric(values) or {}
     return out
+
+
+def aggregate_output_parity(records: Sequence[Mapping]) -> dict:
+    """Summarize exact generated-token agreement without gating speedups."""
+
+    available = [
+        record
+        for record in records
+        if record.get("status", "success") == "success"
+        and record.get("output_parity_available") is True
+    ]
+    if not available:
+        return {}
+
+    def mean_field(key: str) -> float | None:
+        values = [
+            float(record[key])
+            for record in available
+            if isinstance(record.get(key), (int, float))
+        ]
+        return round(mean(values), 4) if values else None
+
+    def bool_rate(key: str) -> float | None:
+        values = [record[key] for record in available if isinstance(record.get(key), bool)]
+        return round(sum(values) / len(values), 4) if values else None
+
+    return {
+        "samples": len(available),
+        "fixed_continuation_exact_match_rate": bool_rate(
+            "fixed_continuation_exact_match"
+        ),
+        "fixed_continuation_token_match_ratio": mean_field(
+            "fixed_continuation_token_match_ratio"
+        ),
+        "quality_prefix_exact_match_rate": bool_rate("quality_prefix_exact_match"),
+        "quality_prefix_token_match_ratio": mean_field(
+            "quality_prefix_token_match_ratio"
+        ),
+    }
 
 
 def _first_positive(record: Mapping, keys: Sequence[str]) -> Optional[float]:

@@ -25,7 +25,12 @@ from common.paired_reference import (
     load_reference_sidecar,
     prompt_hash,
 )
-from common.qwen3_paired import build_run_config, prepare_input_ids
+from common.qwen3_paired import (
+    build_run_config,
+    capture_generation_output,
+    model_provenance,
+    prepare_input_ids,
+)
 from common.reproducibility import seed_everything
 
 
@@ -326,11 +331,14 @@ def main() -> None:
         baseline_ids = (
             baseline.output_ids[0, input_len:] if baseline is not None else None
         )
-        text = tokenizer.decode(
+        generation_artifact = capture_generation_output(
+            tokenizer,
             output_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
+            expected_output_tokens=args.fixed_output_tokens,
+        )
+        text = generation_artifact["quality_text"]
+        if args.fixed_output_tokens is None:
+            text = text.strip()  # Preserve the legacy natural-EOS output contract.
         baseline_text = None
         if baseline_ids is not None:
             baseline_text = tokenizer.decode(
@@ -418,6 +426,9 @@ def main() -> None:
                 and baseline_n_tok == n_tok
             ),
         }
+        record.update(generation_artifact)
+        record.update(model_provenance(target, tokenizer, draft_model=draft))
+        record["tau_scope"] = "fixed_budget" if args.fixed_output_tokens else None
         if reference_records is not None:
             reference_key = (
                 str(record["dataset"]),

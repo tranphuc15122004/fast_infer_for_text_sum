@@ -154,6 +154,14 @@ def _pair_mismatch(
     for field in ("dataset", "sample_id", "prompt_hash", "run_config_hash"):
         if str(record.get(field)) != str(reference.get(field)):
             mismatches.append(field)
+    for field in (
+        "target_model_revision",
+        "tokenizer_revision",
+        "tokenizer_name_or_path",
+    ):
+        reference_value = reference.get(field)
+        if reference_value is not None and record.get(field) != reference_value:
+            mismatches.append(field)
     if record.get("batch_size") != 1 or reference.get("batch_size") != 1:
         mismatches.append("batch_size")
     if expected_output_tokens is not None:
@@ -163,6 +171,71 @@ def _pair_mismatch(
         if int(reference.get("output_tokens") or 0) != expected:
             mismatches.append("dense_output_tokens")
     return list(dict.fromkeys(mismatches))
+
+
+def _visible_continuation(record: Mapping[str, Any], token_ids: list[int]) -> list[int]:
+    count = record.get("quality_output_tokens")
+    if isinstance(count, int) and 0 <= count <= len(token_ids):
+        return token_ids[:count]
+    eos_ids = record.get("eos_token_id")
+    eos_set = (
+        {int(value) for value in eos_ids}
+        if isinstance(eos_ids, (list, tuple, set))
+        else ({int(eos_ids)} if isinstance(eos_ids, int) else set())
+    )
+    eos_position = next(
+        (index for index, token in enumerate(token_ids) if token in eos_set), None
+    )
+    return token_ids[:eos_position] if eos_position is not None else token_ids
+
+
+def _token_parity_fields(
+    record: Mapping[str, Any], reference: Mapping[str, Any]
+) -> dict[str, Any]:
+    method_ids = record.get("generated_token_ids")
+    reference_ids = reference.get("generated_token_ids")
+    fields = {
+        "fixed_continuation_exact_match": None,
+        "fixed_continuation_token_match_ratio": None,
+        "fixed_continuation_first_divergence_index": None,
+        "quality_prefix_exact_match": None,
+        "quality_prefix_token_match_ratio": None,
+        "output_parity_available": False,
+    }
+    if not isinstance(method_ids, list) or not isinstance(reference_ids, list):
+        return fields
+    method_tokens = [int(token) for token in method_ids]
+    reference_tokens = [int(token) for token in reference_ids]
+
+    def compare(left: list[int], right: list[int]) -> tuple[bool, float, int | None]:
+        matches = sum(a == b for a, b in zip(left, right))
+        denominator = max(len(left), len(right), 1)
+        divergence = next(
+            (index for index, (a, b) in enumerate(zip(left, right)) if a != b),
+            None,
+        )
+        if divergence is None and len(left) != len(right):
+            divergence = min(len(left), len(right))
+        return left == right, matches / denominator, divergence
+
+    fixed_exact, fixed_ratio, fixed_divergence = compare(
+        method_tokens, reference_tokens
+    )
+    quality_exact, quality_ratio, _ = compare(
+        _visible_continuation(record, method_tokens),
+        _visible_continuation(reference, reference_tokens),
+    )
+    fields.update(
+        {
+            "fixed_continuation_exact_match": fixed_exact,
+            "fixed_continuation_token_match_ratio": fixed_ratio,
+            "fixed_continuation_first_divergence_index": fixed_divergence,
+            "quality_prefix_exact_match": quality_exact,
+            "quality_prefix_token_match_ratio": quality_ratio,
+            "output_parity_available": True,
+        }
+    )
+    return fields
 
 
 def attach_reference_timing(
@@ -185,6 +258,7 @@ def attach_reference_timing(
     result["reference_run_id"] = reference_run_id or reference.get("run_id")
     result["speedup_scope"] = speedup_scope
     result["dense_output_tokens"] = reference.get("output_tokens")
+    result.update(_token_parity_fields(result, reference))
     for field in REFERENCE_TIMING_FIELDS:
         result[f"dense_{field}"] = reference.get(field)
 

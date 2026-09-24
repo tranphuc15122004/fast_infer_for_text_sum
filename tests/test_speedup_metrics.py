@@ -171,6 +171,120 @@ def test_speed_summary_includes_decode_only_token_throughput():
     assert summary["decode_throughput_tok_s"]["mean"] == 15.0
 
 
+def test_weighted_decode_throughput_is_total_tokens_over_total_decode_time():
+    result = metrics.aggregate_weighted_throughput(
+        [
+            {"status": "success", "output_tokens": 4, "decode_ms": 100.0, "e2e_ms": 120.0},
+            {"status": "success", "output_tokens": 4, "decode_ms": 300.0, "e2e_ms": 320.0},
+        ]
+    )
+
+    assert result["decode_tok_s"] == pytest.approx(20.0)
+    assert result["e2e_tok_s"] == pytest.approx(8 / 0.44, abs=1e-3)
+
+
+def test_compute_group_exposes_weighted_decode_throughput_for_main_table(tmp_path):
+    group = collect_metrics.compute_group(
+        [
+            {"status": "success", "output_tokens": 4, "decode_ms": 100.0, "e2e_ms": 120.0},
+            {"status": "success", "output_tokens": 4, "decode_ms": 300.0, "e2e_ms": 320.0},
+        ],
+        {},
+    )
+
+    assert group["weighted_throughput"]["decode_tok_s"] == pytest.approx(20.0)
+    result = {
+        "outputs_dir": "outputs",
+        "datasets": ["gov_report"],
+        "metrics": {"gov_report": {"dflash": group}},
+        "overall": {"dflash": group},
+    }
+    path = tmp_path / "weighted-throughput-test.csv"
+    collect_metrics.write_csv(path, result, ["gov_report"])
+    assert "weighted_decode_tok_s" in path.read_text()
+
+
+def test_collector_can_scope_report_to_selected_datasets():
+    datasets, index = collect_metrics.select_datasets(
+        ["gov_report", "qmsum"],
+        {"gov_report": {"a": {}}, "qmsum": {"b": {}}},
+        "qmsum",
+    )
+
+    assert datasets == ["qmsum"]
+    assert list(index) == ["qmsum"]
+
+
+def test_overall_quality_prefers_each_record_reference_when_ids_overlap():
+    rows = [
+        {
+            "dataset": "gov_report",
+            "sample_id": "same-id",
+            "status": "success",
+            "task_type": "summarization",
+            "text": "alpha",
+            "reference_output": "alpha",
+        },
+        {
+            "dataset": "qmsum",
+            "sample_id": "same-id",
+            "status": "success",
+            "task_type": "summarization",
+            "text": "beta",
+            "reference_output": "beta",
+        },
+    ]
+
+    group = collect_metrics.compute_group(
+        rows,
+        {"same-id": {"reference": "wrong collided reference"}},
+    )
+
+    assert group["semantic"]["rouge1_f"] == 1.0
+
+
+def test_compute_group_aggregates_online_token_parity_separately_from_speedup(tmp_path):
+    group = collect_metrics.compute_group(
+        [
+            {
+                "status": "success",
+                "speedup_valid": True,
+                "output_parity_available": True,
+                "fixed_continuation_exact_match": True,
+                "fixed_continuation_token_match_ratio": 1.0,
+                "quality_prefix_exact_match": True,
+                "quality_prefix_token_match_ratio": 1.0,
+            },
+            {
+                "status": "success",
+                "speedup_valid": True,
+                "output_parity_available": True,
+                "fixed_continuation_exact_match": False,
+                "fixed_continuation_token_match_ratio": 0.75,
+                "quality_prefix_exact_match": False,
+                "quality_prefix_token_match_ratio": 0.5,
+            },
+        ],
+        {},
+    )
+
+    assert group["output_parity"]["samples"] == 2
+    assert group["output_parity"]["fixed_continuation_exact_match_rate"] == 0.5
+    assert group["output_parity"]["quality_prefix_token_match_ratio"] == 0.75
+    result = {
+        "outputs_dir": "outputs",
+        "datasets": ["gov_report"],
+        "metrics": {"gov_report": {"dflash": group}},
+        "overall": {"dflash": group},
+    }
+    csv_path = tmp_path / "output_parity_metrics.csv"
+    md_path = tmp_path / "output_parity_metrics.md"
+    collect_metrics.write_csv(csv_path, result, ["gov_report"])
+    collect_metrics.write_markdown(md_path, result, ["gov_report"])
+    assert "output_parity_fixed_continuation_exact_match_rate" in csv_path.read_text()
+    assert "Exact token agreement so với Vanilla HF" in md_path.read_text()
+
+
 def test_markdown_has_combined_paired_main_results_table(tmp_path):
     group = {
         "num_records": 2,
@@ -179,6 +293,7 @@ def test_markdown_has_combined_paired_main_results_table(tmp_path):
             "prefill_ms": {"mean": 11.0},
             "decode_ms": {"mean": 22.0},
         },
+        "weighted_throughput": {"decode_tok_s": 50.0},
         "speculative": {"avg_accept_length": {"mean": 3.0}},
         "speedup": {"esr": 1.5, "dsr": 2.0},
     }
