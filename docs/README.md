@@ -62,6 +62,9 @@ trận DFlash-2L/MR-2S/DFlash-5L nằm tại
 Runbook Phase 1 source-to-cache mới với adaptive batch, shared lease và resume
 khác host nằm tại
 [`docs/mr_dflash_phase1_pipeline_v2.md`](mr_dflash_phase1_pipeline_v2.md).
+Builder dataset 50k ShareGPT/ArXiv, preview toàn bộ độ dài prompt và quota cố định
+trước khi build nằm tại
+[`docs/mr_dflash_balanced_dataset.md`](mr_dflash_balanced_dataset.md).
 Profile VRAM và lệnh chạy dành cho B200 100 GB nằm tại
 [`docs/mr_dflash_b200_profile.md`](mr_dflash_b200_profile.md).
 

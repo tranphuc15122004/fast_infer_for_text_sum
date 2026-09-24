@@ -67,6 +67,10 @@ Kết quả gồm `summary.json`, `records.jsonl`, `issues.jsonl` và bốn hìn
 trong `figures/`. `--max-records N` chỉ dành cho smoke test; bỏ option này khi
 quét thật. Sau khi duyệt report, chạy prepare/build riêng theo rule đã chọn,
 rồi truyền `--prepared-root` của artifact đó cho launcher Phase 1.
+Với kế hoạch 25k ShareGPT + 25k ArXiv chia đều năm bin, dùng
+[`docs/mr_dflash_balanced_dataset.md`](../../docs/mr_dflash_balanced_dataset.md)
+để chạy preview quota trước; builder không tạo split ở preview và chỉ build khi
+truyền `--confirm-build` sau khi đã xem report.
 
 ## Hẹn giờ tạm dừng an toàn
 
