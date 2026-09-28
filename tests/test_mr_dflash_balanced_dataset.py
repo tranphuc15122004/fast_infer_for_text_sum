@@ -47,6 +47,15 @@ def test_default_length_bins_are_five_two_kibibyte_intervals() -> None:
     assert length_bin(10241) is None
 
 
+def test_default_quota_is_short_heavy_and_supports_exact_splits() -> None:
+    from build_balanced_dataset import BIN_TARGETS, SOURCE_TARGETS
+
+    assert SOURCE_TARGETS == {"sharegpt": 16_660, "arxiv": 33_340}
+    assert BIN_TARGETS == {0: 14_000, 1: 9_000, 2: 9_000, 3: 9_000, 4: 9_000}
+    assert sum(SOURCE_TARGETS.values()) == 50_000
+    assert sum(BIN_TARGETS.values()) == 50_000
+
+
 def test_prompt_length_counts_rendered_chat_template_and_generation_prefix() -> None:
     from build_balanced_dataset import prompt_token_counts
 
@@ -66,8 +75,8 @@ def test_quota_plan_meets_source_and_bin_totals_without_forcing_half_each_bin() 
     from build_balanced_dataset import BIN_TARGETS, SOURCE_TARGETS, plan_source_bin_quotas
 
     available = {
-        "sharegpt": {0: 8000, 1: 4000, 2: 7000, 3: 5000, 4: 6000},
-        "arxiv": {0: 4000, 1: 9000, 2: 6000, 3: 5000, 4: 4000},
+        "sharegpt": {0: 90_127, 1: 2_497, 2: 130, 3: 24, 4: 21},
+        "arxiv": {0: 12_071, 1: 30_349, 2: 41_842, 3: 33_781, 4: 24_361},
     }
     plan = plan_source_bin_quotas(available)
 
@@ -86,11 +95,13 @@ def test_quota_plan_meets_source_and_bin_totals_without_forcing_half_each_bin() 
     val = _allocate_five_percent(quotas)
     test = _allocate_five_percent(quotas, val)
     for source in SOURCE_TARGETS:
-        assert sum(val[source].values()) == 1250
-        assert sum(test[source].values()) == 1250
+        expected = SOURCE_TARGETS[source] // 20
+        assert sum(val[source].values()) == expected
+        assert sum(test[source].values()) == expected
     for bucket in BIN_TARGETS:
-        assert sum(val[source][bucket] for source in SOURCE_TARGETS) == 500
-        assert sum(test[source][bucket] for source in SOURCE_TARGETS) == 500
+        expected = BIN_TARGETS[bucket] // 20
+        assert sum(val[source][bucket] for source in SOURCE_TARGETS) == expected
+        assert sum(test[source][bucket] for source in SOURCE_TARGETS) == expected
 
 
 def test_quota_plan_reports_shortage_instead_of_changing_targets() -> None:
@@ -105,8 +116,8 @@ def test_quota_plan_reports_shortage_instead_of_changing_targets() -> None:
 
     assert plan["feasible"] is False
     assert plan["source_shortages"]["sharegpt"] == 0
-    assert plan["bin_shortages"][3] == 5000
-    assert plan["bin_shortages"][4] == 5000
+    assert plan["bin_shortages"][3] == 4000
+    assert plan["bin_shortages"][4] == 4000
     assert plan["source_bin_quotas"] == {}
 
 
@@ -224,17 +235,23 @@ def test_preview_scans_every_normalized_row_and_writes_reports_only(
     }
 
     def fake_prepare(script_name, _input_path, output_path, *, resume):
+        if resume and output_path.exists():
+            return
         rows = normalized[script_name]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
 
+    tokenizer_instances = []
+
     class FakeAutoTokenizer:
         @staticmethod
         def from_pretrained(_name, **kwargs):
             assert kwargs == {"local_files_only": True, "use_fast": True}
-            return TinyTokenizer()
+            tokenizer = TinyTokenizer()
+            tokenizer_instances.append(tokenizer)
+            return tokenizer
 
     monkeypatch.setattr(builder, "_prepare_source", fake_prepare)
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=FakeAutoTokenizer))
@@ -258,6 +275,30 @@ def test_preview_scans_every_normalized_row_and_writes_reports_only(
     assert (output / "reports" / "length_distribution.png").stat().st_size > 0
     assert (output / "manifests" / "preview_manifest.json").is_file()
     assert not (output / "normalized" / "train_prompts.jsonl").exists()
+
+    # Simulate the old cache format, which stored quota targets alongside raw
+    # source/tokenizer identity. Changing quotas must still reuse its scan cache.
+    preview = json.loads((output / "manifests" / "preview_manifest.json").read_text())
+    source_identity = output / ".build_work" / "source" / "source_identity.json"
+    source_identity.write_text(json.dumps(preview["identity"]), encoding="utf-8")
+
+    # Updating quotas must reuse normalized/token-length caches. The previous
+    # implementation incorrectly treated quota changes as source changes.
+    monkeypatch.setattr(builder, "SOURCE_TARGETS", {"sharegpt": 20_000, "arxiv": 30_000})
+    monkeypatch.setattr(builder, "BIN_TARGETS", {0: 18_000, 1: 8_000, 2: 8_000, 3: 8_000, 4: 8_000})
+    assert builder.main(
+        [
+            "--sharegpt-source", str(share_raw),
+            "--arxiv-source", str(arxiv_raw),
+            "--tokenizer", "qwen3-local",
+            "--output-root", str(output),
+            "--batch-size", "2",
+            "--resume",
+            "--preview-only",
+        ]
+    ) == 0
+    assert tokenizer_instances[-1].calls == 0
+
     with pytest.raises(ValueError, match="quota không khả thi"):
         builder.main(
             [

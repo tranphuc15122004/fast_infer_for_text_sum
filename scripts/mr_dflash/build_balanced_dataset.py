@@ -33,16 +33,16 @@ DEFAULT_ARXIV_SOURCE = (
 )
 DEFAULT_OUTPUT_ROOT = (
     "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/"
-    "mr_dflash_phase1_50k_50_50_10k"
+    "mr_dflash_phase1_50k_33_67_14k_9k"
 )
-DEFAULT_SHAREGPT_COUNT = 25_000
-DEFAULT_ARXIV_COUNT = 25_000
+DEFAULT_SHAREGPT_COUNT = 16_660
+DEFAULT_ARXIV_COUNT = 33_340
 DEFAULT_MAX_PROMPT_TOKENS = 10 * 1_024
 BIN_WIDTH = 2 * 1_024
 SOURCES = ("sharegpt", "arxiv")
 SPLITS = ("train", "val", "test")
 SOURCE_TARGETS = {"sharegpt": DEFAULT_SHAREGPT_COUNT, "arxiv": DEFAULT_ARXIV_COUNT}
-BIN_TARGETS = {index: 10_000 for index in range(5)}
+BIN_TARGETS = {0: 14_000, 1: 9_000, 2: 9_000, 3: 9_000, 4: 9_000}
 
 
 def _length_edges(max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS) -> tuple[int, ...]:
@@ -131,7 +131,7 @@ def plan_source_bin_quotas(
         return plan
 
     # Begin near each bin's observed source composition, then adjust by the
-    # smallest squared-error step until the global 25k/25k margin is exact.
+    # smallest squared-error step until the global source margins are exact.
     share_quotas = {
         bucket: min(upper[bucket], max(lower[bucket], round(ideal[bucket])))
         for bucket in BIN_TARGETS
@@ -968,6 +968,14 @@ def _preview_identity(
         ],
     }
 
+def _source_cache_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Identity for normalized/token-length caches, independent of sampling quotas."""
+    return {
+        key: identity[key]
+        for key in ("schema_version", "inputs", "tokenizer", "seed", "max_prompt_tokens")
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Preview rồi build dataset MR-DFlash 50k theo quota source và độ dài"
@@ -1059,9 +1067,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     (work / "source").mkdir(parents=True, exist_ok=True)
     (work / "lengths").mkdir(parents=True, exist_ok=True)
     source_identity_path = work / "source" / "source_identity.json"
+    source_cache_identity = _source_cache_identity(identity)
     if args.resume and source_identity_path.exists():
         previous_identity = json.loads(source_identity_path.read_text(encoding="utf-8"))
-        if previous_identity != identity:
+        if _source_cache_identity(previous_identity) != source_cache_identity:
             raise ValueError(
                 "raw source/tokenizer/seed đã đổi so với cache; dùng output-root mới"
             )
@@ -1071,7 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise ValueError(f"thiếu source identity trong {work / 'source'}; dùng output-root mới")
     else:
-        write_json(source_identity_path, identity)
+        write_json(source_identity_path, source_cache_identity)
     normalized_paths = {
         "sharegpt": work / "source" / "sharegpt_prompts.jsonl",
         "arxiv": work / "source" / "arxiv_prompts.jsonl",
