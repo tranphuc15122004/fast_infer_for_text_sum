@@ -22,6 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import torch
 
+from MR_DFlash.data import has_consecutive_supervised_tokens, render_conversation
 from _common import prompt_messages_error, read_jsonl, write_json
 from progress import ProgressReporter, install_exception_hook
 from regenerate_pilot import (
@@ -468,6 +469,7 @@ def main(argv=None) -> None:
         "skipped_invalid": 0,
         "skipped_overflow": 0,
         "skipped_errors": 0,
+        "skipped_short_targets": 0,
         "clipped_outputs": 0,
         "request_errors": 0,
     }
@@ -497,13 +499,43 @@ def main(argv=None) -> None:
             assistant,
             args.max_length,
         )
+        sample_id = str(item["sample_id"])
         if not assistant:
-            record_skip(str(item["sample_id"]), kind="invalid", error="response rỗng", prompt_tokens=item.get("prompt_tokens"))
+            record_skip(sample_id, kind="invalid", error="response rỗng", prompt_tokens=item.get("prompt_tokens"))
+            return
+        conversations = item["prompt_messages"] + [{"role": "assistant", "content": assistant}]
+        _, assistant_mask = render_conversation(
+            conversations,
+            tokenizer,
+            args.max_length,
+            supervision_mode="last_assistant",
+        )
+        if not has_consecutive_supervised_tokens(assistant_mask):
+            _append_jsonl_durable(
+                skipped_report,
+                [{
+                    "id": sample_id,
+                    "kind": "too_short_target",
+                    "error": "assistant target không có hai token supervise liên tiếp",
+                    "prompt_tokens": item.get("prompt_tokens"),
+                    "max_length": int(args.max_length),
+                    "requested_max_new_tokens": int(args.max_new_tokens),
+                    "supervised_tokens": int(sum(assistant_mask)),
+                }],
+            )
+            existing.add(sample_id)
+            stats["skipped_short_targets"] += 1
+            reporter.update(
+                "sample_done",
+                sample_id=sample_id,
+                completed_samples=len(existing),
+                skipped_short_targets=stats["skipped_short_targets"],
+            )
             return
         row = item["row"]
         final_row = {
             **row,
-            "conversations": item["prompt_messages"] + [{"role": "assistant", "content": assistant}],
+            "conversations": conversations,
             "metadata": {
                 **(row.get("metadata") or {}),
                 "generation_model": args.vllm_model or args.target_model_path,
@@ -692,7 +724,18 @@ def main(argv=None) -> None:
         },
     )
     print(f"[vllm_regenerate] {stats}")
-    reporter.update("done", completed_samples=len(existing), written=stats["written"], skipped=stats["skipped_invalid"] + stats["skipped_overflow"] + stats["skipped_errors"], input_rows=stats["input_rows"])
+    reporter.update(
+        "done",
+        completed_samples=len(existing),
+        written=stats["written"],
+        skipped=(
+            stats["skipped_invalid"]
+            + stats["skipped_overflow"]
+            + stats["skipped_errors"]
+            + stats["skipped_short_targets"]
+        ),
+        input_rows=stats["input_rows"],
+    )
     sys.excepthook = previous_hook
 
 
