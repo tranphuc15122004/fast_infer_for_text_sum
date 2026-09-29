@@ -108,7 +108,10 @@ def _load_status_ids(path: Path) -> set[str]:
     raw = path.read_text(encoding="utf-8")
     if not raw:
         return set()
-    lines = raw.splitlines()
+    # JSONL records are separated by CR/LF. ``str.splitlines()`` also splits
+    # on Unicode separators such as U+2028/U+2029, which are valid characters
+    # inside JSON strings and made valid generated rows look corrupted.
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     has_terminal_newline = raw.endswith(("\n", "\r"))
     ids: set[str] = set()
     valid_lines: list[str] = []

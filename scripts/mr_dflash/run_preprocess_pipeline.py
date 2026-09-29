@@ -1012,9 +1012,21 @@ def _reusable_success(stage: Stage, options: PipelineOptions, config_hash: str) 
         return False
     old_hash = payload.get("config_hash")
     if old_hash != config_hash:
-        raise RuntimeError(
-            f"stage {stage.name} đã có success marker với config_hash khác; "
-            "dùng --no-resume hoặc data-root mới để tránh trộn artifact"
+        # The pipeline hash covers options for every stage. A change to an
+        # unrelated stage (for example cache tuning) must not invalidate a
+        # completed artifact when this stage's actual command is unchanged.
+        # Keep the guard strict whenever this stage's command differs.
+        old_command = payload.get("command")
+        current_command = [str(value) for value in stage.command]
+        if old_command != current_command:
+            raise RuntimeError(
+                f"stage {stage.name} đã có success marker nhưng config_hash "
+                "và command của stage hiện tại đều khác; cần kiểm tra cấu hình "
+                "trước khi resume"
+            )
+        print(
+            f"[pipeline] REUSE {stage.name}: config_hash toàn pipeline đã đổi, "
+            "nhưng command của stage không đổi"
         )
     try:
         _check_artifacts(stage)
