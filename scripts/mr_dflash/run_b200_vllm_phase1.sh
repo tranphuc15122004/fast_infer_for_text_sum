@@ -428,6 +428,21 @@ run_phase1() {
     return 0
   fi
 
+  # A regeneration stage can account for worker failures by writing quarantine
+  # rows and still exit successfully. Do not cache an incomplete train/val set.
+  local split quarantine_file quarantine_count
+  for split in train val test; do
+    quarantine_file="$RUN_ROOT/regenerated_full/parallel_regenerate_${split}/quarantine.jsonl"
+    if [[ -s "$quarantine_file" ]]; then
+      quarantine_count="$(wc -l < "$quarantine_file" | tr -d '[:space:]')"
+      echo "[b200-vllm] ERROR: ${split} regeneration still has ${quarantine_count} quarantined sample(s): $quarantine_file" >&2
+      echo "[b200-vllm] cache is blocked; preserve shards, requeue quarantined IDs, then resume mode 2" >&2
+      stop_server
+      SERVER_MANAGED=0
+      return 1
+    fi
+  done
+
   stop_server
   SERVER_MANAGED=0
   echo "[b200-vllm] vLLM stopped; phase 1 cache can use the GPU"
