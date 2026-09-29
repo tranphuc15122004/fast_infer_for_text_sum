@@ -80,25 +80,17 @@ def main() -> int:
     plan_path = work_root / "parallel_plan.json"
     quarantine_path = work_root / "quarantine.jsonl"
 
-    for path in (canonical_output, canonical_skipped, canonical_manifest, plan_path, quarantine_path):
+    for path in (canonical_output, canonical_skipped, canonical_manifest, plan_path):
         if not path.is_file():
             raise FileNotFoundError(f"Thiếu artifact bắt buộc: {path}")
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     queue_root = Path(plan["queue_root"]).resolve()
     queue_meta = queue_root / "meta.json"
-    if not queue_meta.is_file():
-        raise FileNotFoundError(f"Thiếu shared queue metadata: {queue_meta}")
-    meta = json.loads(queue_meta.read_text(encoding="utf-8"))
-    if not str(meta.get("stage", "")).startswith("regenerate:"):
-        raise ValueError(f"Queue không phải regeneration queue: {meta.get('stage')!r}")
-
-    quarantine_records = read_jsonl(quarantine_path)
-    quarantine_ids = {
-        str(row.get("sample_id", "")) for row in quarantine_records if row.get("sample_id")
-    }
-    if not quarantine_ids:
-        raise ValueError("quarantine.jsonl không có sample_id để requeue")
+    queue_snapshot: dict[str, int] | None = None
+    queue_available = queue_meta.is_file()
+    if queue_root.exists() and not queue_available:
+        raise FileNotFoundError(f"Shared queue tồn tại nhưng thiếu metadata: {queue_meta}")
 
     canonical_rows = read_jsonl(canonical_output)
     canonical_skips = read_jsonl(canonical_skipped)
@@ -111,11 +103,60 @@ def main() -> int:
         for row in canonical_skips
         if row.get("kind") == "quarantine" and row.get("id")
     }
-    if canonical_quarantine_ids != quarantine_ids:
-        raise ValueError(
-            "Danh sách quarantine trong canonical skipped và work-root không khớp: "
-            f"canonical={len(canonical_quarantine_ids)}, queue={len(quarantine_ids)}"
+
+    # The standalone quarantine.jsonl is published only after the coordinator
+    # finishes its worker loop. If it crashed and the queue was also removed,
+    # the canonical + rank quarantine records are the remaining durable source.
+    if queue_available:
+        meta = json.loads(queue_meta.read_text(encoding="utf-8"))
+        if not str(meta.get("stage", "")).startswith("regenerate:"):
+            raise ValueError(f"Queue không phải regeneration queue: {meta.get('stage')!r}")
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from shared_scheduler import SharedLeaseQueue
+
+        queue = SharedLeaseQueue(
+            queue_root,
+            stage=str(meta["stage"]),
+            config_hash=str(meta["config_hash"]),
+            max_attempts=int(meta.get("max_attempts", 3)),
         )
+        queue_snapshot = queue.snapshot()
+        quarantine_records = queue.quarantine_records()
+        quarantine_ids = {
+            str(row.get("sample_id", "")) for row in quarantine_records if row.get("sample_id")
+        }
+        if not quarantine_ids:
+            raise ValueError(
+                "Shared queue không còn sample quarantine; kiểm tra events.jsonl và canonical artifacts"
+            )
+        if int(queue_snapshot.get("quarantined", -1)) != len(quarantine_ids):
+            raise ValueError(
+                "Snapshot và danh sách quarantine của shared queue không khớp: "
+                f"snapshot={queue_snapshot.get('quarantined')}, records={len(quarantine_ids)}"
+            )
+        if canonical_quarantine_ids != quarantine_ids:
+            raise ValueError(
+                "Danh sách quarantine trong canonical skipped và shared queue không khớp: "
+                f"canonical={len(canonical_quarantine_ids)}, queue={len(quarantine_ids)}"
+            )
+    else:
+        quarantine_ids = canonical_quarantine_ids
+        if not quarantine_ids:
+            raise ValueError(
+                "Không có shared queue và canonical train.skipped.jsonl không chứa quarantine IDs"
+            )
+        print("shared queue: absent; rebuilding it from durable worker artifacts on resume")
+
+    if quarantine_path.is_file():
+        published_records = read_jsonl(quarantine_path)
+        published_ids = {
+            str(row.get("sample_id", "")) for row in published_records if row.get("sample_id")
+        }
+        if published_ids != quarantine_ids:
+            raise ValueError(
+                "quarantine.jsonl đã publish nhưng không khớp nguồn quarantine: "
+                f"artifact={len(published_ids)}, source={len(quarantine_ids)}"
+            )
     short_rows = [row for row in canonical_skips if row.get("kind") == "too_short_target"]
     short_ids = ids(short_rows)
     if short_ids & canonical_output_ids:
@@ -148,10 +189,15 @@ def main() -> int:
             elif sample_id:
                 non_quarantine_skip_ids.add(sample_id)
 
-    if rank_quarantine_ids != quarantine_ids:
+    if queue_available and rank_quarantine_ids != quarantine_ids:
         raise ValueError(
-            "Quarantine ID trong worker shard và quarantine.jsonl không khớp: "
+            "Quarantine ID trong worker shard và shared queue không khớp: "
             f"shard={len(rank_quarantine_ids)}, queue={len(quarantine_ids)}"
+        )
+    if not queue_available and rank_quarantine_ids - quarantine_ids:
+        raise ValueError(
+            "Worker shard có quarantine ID không có trong canonical skipped: "
+            f"{sorted(rank_quarantine_ids - quarantine_ids)[:5]}"
         )
     if short_ids - (output_ids | non_quarantine_skip_ids):
         raise ValueError("Có too_short_target canonical không tìm thấy trong worker shards")
@@ -168,6 +214,7 @@ def main() -> int:
 
     print(f"run_root: {run_root}")
     print(f"queue_root: {queue_root}")
+    print(f"queue status: {queue_snapshot if queue_snapshot is not None else 'absent; will rebuild'}")
     print(f"quarantined IDs: {len(quarantine_ids)}")
     print(f"already durable in output/skip: {len(quarantine_ids) - len(pending_ids)}")
     print(f"will be pending on fresh queue: {len(pending_ids)}")
@@ -180,7 +227,9 @@ def main() -> int:
     backup = run_root / f"recovery_backup_requeue_{stamp}"
     backup.mkdir()
 
-    to_backup = [canonical_output, canonical_skipped, canonical_manifest, plan_path, quarantine_path]
+    to_backup = [canonical_output, canonical_skipped, canonical_manifest, plan_path]
+    if quarantine_path.is_file():
+        to_backup.append(quarantine_path)
     for rank_root in rank_roots:
         to_backup.extend((rank_root / "output.jsonl", rank_root / "skipped.jsonl"))
     status_path = work_root / "status.json"
@@ -198,8 +247,9 @@ def main() -> int:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
 
-    queue_backup = backup / "old_shared_queue"
-    shutil.move(str(queue_root), str(queue_backup))
+    if queue_root.exists():
+        queue_backup = backup / "old_shared_queue"
+        shutil.move(str(queue_root), str(queue_backup))
 
     for rank_root, (output_rows, skipped_rows) in loaded.items():
         output_rows = [row for row in output_rows if str(row.get("id", "")) not in short_ids]
@@ -216,7 +266,7 @@ def main() -> int:
         marker.unlink(missing_ok=True)
 
     print(f"Recovery backup: {backup}")
-    print("Quarantine skip records removed from worker shards; old queue backed up.")
+    print("Quarantine skip records removed from worker shards; existing queue backed up when present.")
     print("Short-target skips preserved in worker shards; train regeneration success marker cleared.")
     print("Run the normal B200 Phase 1 mode-2 launcher with the same RUN_ROOT to retry and merge.")
     return 0
