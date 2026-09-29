@@ -401,7 +401,7 @@ run_phase1() {
     --cache-io-queue-size "$CACHE_IO_QUEUE_SIZE"
     --parallel-gpu-ids "$GPU_ID"
     --parallel-scheduler shared_lease
-    --parallel-queue-quantum-items 512
+    --parallel-queue-quantum-items 50000
     --progress-interval-tokens 256
     --regenerate-output-batch-size 1
     --worker-stall-timeout-seconds 0
@@ -443,13 +443,15 @@ run_phase1() {
 SERVER_MANAGED=0
 if [[ "$MODE" == "1" ]]; then
   if start_server; then
-    echo "[b200-vllm] mode 1 completed; vLLM remains running"
+    echo "[b200-vllm] mode 1 completed; vLLM remains running; run-root=$RUN_ROOT; server-log=$VLLM_LOG"
     exit 0
   fi
+  echo "[b200-vllm] mode 1 failed to start vLLM; run-root=$RUN_ROOT; inspect=$VLLM_LOG" >&2
   exit 1
 fi
 
 if ! start_server; then
+  echo "[b200-vllm] mode 2 failed to start vLLM; run-root=$RUN_ROOT; inspect=$VLLM_LOG" >&2
   exit 1
 fi
 
@@ -472,7 +474,12 @@ start_pause_timer
 run_phase1
 PHASE1_RC=$?
 stop_pause_timer
-if [[ -e "$STOP_FILE" ]]; then
-  echo "[b200-vllm] phase 1 paused by timer; rerun the same command to resume"
+if [[ "$PHASE1_RC" -ne 0 ]]; then
+  echo "[b200-vllm] phase 1 failed rc=$PHASE1_RC; partial outputs and logs are at $RUN_ROOT" >&2
+elif [[ -e "$STOP_FILE" ]]; then
+  echo "[b200-vllm] phase 1 paused by timer; rerun the same command to resume; partial outputs are at $RUN_ROOT"
+else
+  echo "[b200-vllm] phase 1 completed successfully; output root: $RUN_ROOT"
+  echo "[b200-vllm] vLLM log: $VLLM_LOG"
 fi
 exit "$PHASE1_RC"

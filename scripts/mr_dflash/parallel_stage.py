@@ -1024,7 +1024,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help="thư mục queue chung; mặc định là work-root/shared_queue",
     )
-    parser.add_argument("--queue-lease-ttl-seconds", type=float, default=300.0)
+    parser.add_argument("--queue-lease-ttl-seconds", type=float, default=3600.0)
     parser.add_argument("--queue-lock-ttl-seconds", type=float, default=600.0)
     parser.add_argument("--queue-max-attempts", type=int, default=3)
     parser.add_argument(
@@ -1511,11 +1511,18 @@ def main(argv=None) -> int:
                         done_ids = durable_worker_ids(args, work_root, rank)
                         done_ids &= {item.sample_id for item in lease.items}
                         if done_ids:
-                            queue.complete(
-                                lease.lease_id,
-                                sample_ids=done_ids,
-                                artifacts={sample_id: str(_worker_root(work_root, rank)) for sample_id in done_ids},
-                            )
+                            try:
+                                queue.complete(
+                                    lease.lease_id,
+                                    sample_ids=done_ids,
+                                    artifacts={sample_id: str(_worker_root(work_root, rank)) for sample_id in done_ids},
+                                )
+                            except RuntimeError as complete_error:
+                                # Expired leases cannot be committed, but their
+                                # durable rows remain in worker output and will
+                                # be skipped when the queue reassigns them.
+                                if not str(complete_error).startswith("lease không còn hợp lệ:"):
+                                    raise
                         try:
                             retry_result = queue.retry(lease.lease_id, error=repr(worker_error))
                             if retry_result == "quarantined":

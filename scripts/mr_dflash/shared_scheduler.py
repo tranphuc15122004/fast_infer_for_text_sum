@@ -64,7 +64,7 @@ class SharedLeaseQueue:
         *,
         stage: str,
         config_hash: str,
-        lease_ttl_seconds: float = 300.0,
+        lease_ttl_seconds: float = 3600.0,
         max_attempts: int = 3,
         lock_ttl_seconds: float = 600.0,
         now_fn: Optional[Callable[[], float]] = None,
@@ -84,6 +84,7 @@ class SharedLeaseQueue:
         self.lock_ttl_seconds = float(lock_ttl_seconds)
         self.lock_timeout_seconds = float(lock_timeout_seconds)
         self._now = now_fn or time.time
+        self._lease_expiries: dict[str, float] = {}
         self._items_path = self.root / "items.jsonl"
         self._meta_path = self.root / "meta.json"
         self._events_path = self.root / "events.jsonl"
@@ -162,6 +163,7 @@ class SharedLeaseQueue:
                     "timestamp": now,
                 }
             )
+            self._lease_expiries[lease_id] = expires_at
             return QueueLease(
                 lease_id=lease_id,
                 worker_id=str(worker_id),
@@ -170,25 +172,33 @@ class SharedLeaseQueue:
             )
 
     def heartbeat(self, lease_id: str) -> float:
-        """Extend a live lease and return its new expiry timestamp."""
+        """Extend a live lease when it approaches its renewal window."""
+        lease_id = str(lease_id)
+        now = float(self._now())
+        cached_expiry = self._lease_expiries.get(lease_id)
+        renew_window = max(1.0, self.lease_ttl_seconds / 3.0)
+        if cached_expiry is not None and now < cached_expiry - renew_window:
+            return cached_expiry
         with self._mutex():
             states = self._replay(self._read_items())
             lease_items = [
                 state
                 for state in states.values()
-                if state.get("status") == "leased" and state.get("lease_id") == str(lease_id)
+                if state.get("status") == "leased" and state.get("lease_id") == lease_id
             ]
-            if not lease_items or any(float(state["expires_at"]) <= float(self._now()) for state in lease_items):
+            now = float(self._now())
+            if not lease_items or any(float(state["expires_at"]) <= now for state in lease_items):
                 raise RuntimeError(f"lease không còn hợp lệ: {lease_id}")
-            expires_at = float(self._now()) + self.lease_ttl_seconds
+            expires_at = now + self.lease_ttl_seconds
             self._append_event(
                 {
                     "event": "heartbeat",
-                    "lease_id": str(lease_id),
+                    "lease_id": lease_id,
                     "expires_at": expires_at,
-                    "timestamp": float(self._now()),
+                    "timestamp": now,
                 }
             )
+            self._lease_expiries[lease_id] = expires_at
             return expires_at
 
     def complete(
