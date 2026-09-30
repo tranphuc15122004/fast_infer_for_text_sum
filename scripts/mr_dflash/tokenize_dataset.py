@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 
 import torch
 
-from _common import read_jsonl
+from _common import read_jsonl, write_jsonl
 from progress import ProgressReporter, install_exception_hook
 
 
@@ -38,6 +38,12 @@ def main(argv=None) -> None:
         "--resume",
         action="store_true",
         help="giữ các shard đã ghi và bỏ qua sample id đã tokenize",
+    )
+    parser.add_argument(
+        "--invalid-sample-policy",
+        choices=("error", "skip"),
+        default="error",
+        help="skip sample lỗi khi render/quá dài; ghi ID/lý do vào output/skipped.jsonl",
     )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args(argv)
@@ -68,6 +74,7 @@ def main(argv=None) -> None:
     samples: List[Dict[str, Any]] = []
     shards: List[Dict[str, Any]] = []
     existing_ids = set()
+    skipped_by_id: Dict[str, Dict[str, Any]] = {}
     total = 0
     processed_samples = 0
     existing_shards = sorted(root.glob("shard_*.pt"))
@@ -77,6 +84,12 @@ def main(argv=None) -> None:
             f"tokenized output đã tồn tại: {root}; dùng --resume hoặc thư mục mới"
         )
     if args.resume:
+        skipped_path = root / "skipped.jsonl"
+        if skipped_path.is_file():
+            for row in read_jsonl(skipped_path):
+                sample_id = str(row.get("id", ""))
+                if sample_id:
+                    skipped_by_id[sample_id] = row
         if manifest_path.exists():
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -137,6 +150,7 @@ def main(argv=None) -> None:
             break
         sample_id = str(row.get("id", row_index))
         if sample_id in existing_ids:
+            skipped_by_id.pop(sample_id, None)
             processed_samples += 1
             reporter.update(
                 "sample_done",
@@ -146,24 +160,63 @@ def main(argv=None) -> None:
             )
             continue
         conversations = row.get("conversations") or []
-        input_ids, loss_mask = render_conversation(
-            conversations,
-            tokenizer,
-            10**9,
-            supervision_mode=args.supervision_mode,
-        )
-        if len(input_ids) > args.max_length:
-            raise ValueError(
-                f"sample {row.get('id', row_index)!r} dài {len(input_ids)} > "
-                f"max_length={args.max_length}; regenerate với prompt budget nhỏ hơn"
+        try:
+            input_ids, loss_mask = render_conversation(
+                conversations,
+                tokenizer,
+                10**9,
+                supervision_mode=args.supervision_mode,
             )
-        if len(input_ids) < 3 or not has_consecutive_supervised_tokens(loss_mask):
+        except (TypeError, ValueError, IndexError, KeyError) as exc:
+            if args.invalid_sample_policy == "error":
+                raise
+            skipped_by_id[sample_id] = {
+                "id": sample_id,
+                "row_index": int(row_index + 1),
+                "kind": "tokenization_error",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
             processed_samples += 1
             reporter.update(
                 "sample_done",
                 completed_samples=processed_samples,
                 sample_id=sample_id,
                 status="skipped",
+                skip_reason="tokenization_error",
+            )
+            continue
+
+        invalid_reason = None
+        if len(input_ids) > args.max_length:
+            invalid_reason = "tokenized_length_exceeds_max_length"
+        elif len(input_ids) < 3:
+            invalid_reason = "tokenized_sequence_too_short"
+        elif not has_consecutive_supervised_tokens(loss_mask):
+            invalid_reason = "no_consecutive_supervised_target_tokens"
+        if invalid_reason:
+            if (
+                args.invalid_sample_policy == "error"
+                and invalid_reason == "tokenized_length_exceeds_max_length"
+            ):
+                raise ValueError(
+                    f"sample {row.get('id', row_index)!r} dài {len(input_ids)} > "
+                    f"max_length={args.max_length}; regenerate với prompt budget nhỏ hơn"
+                )
+            skipped_by_id[sample_id] = {
+                "id": sample_id,
+                "row_index": int(row_index + 1),
+                "kind": "invalid_training_sample",
+                "reason": invalid_reason,
+                "tokenized_length": int(len(input_ids)),
+                "supervised_tokens": int(sum(loss_mask)),
+            }
+            processed_samples += 1
+            reporter.update(
+                "sample_done",
+                completed_samples=processed_samples,
+                sample_id=sample_id,
+                status="skipped",
+                skip_reason=invalid_reason,
             )
             continue
         ids = torch.tensor(input_ids, dtype=torch.long)
@@ -175,6 +228,7 @@ def main(argv=None) -> None:
             "length": int(ids.numel()),
         })
         existing_ids.add(sample_id)
+        skipped_by_id.pop(sample_id, None)
         total += 1
         processed_samples += 1
         reporter.update(
@@ -186,6 +240,7 @@ def main(argv=None) -> None:
         if len(samples) >= args.shard_size:
             flush()
     flush()
+    write_jsonl(root / "skipped.jsonl", skipped_by_id.values())
     manifest_payload = write_tokenized_manifest(
         root,
         shards=shards,
@@ -212,6 +267,7 @@ def main(argv=None) -> None:
         "done",
         completed_samples=processed_samples,
         written_samples=total,
+        skipped_samples=len(skipped_by_id),
         shards=len(shards),
     )
     sys.excepthook = previous_hook

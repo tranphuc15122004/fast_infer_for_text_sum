@@ -590,6 +590,8 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         "--expected-target-model",
                         expected_generation_model,
                         "--require-generated",
+                        "--invalid-sample-policy",
+                        "skip",
                         "--report",
                         str(report),
                         *(_local_files_args(options)),
@@ -620,12 +622,14 @@ def build_stage_plan(options: PipelineOptions) -> list[Stage]:
                         str(max_length),
                         "--supervision-mode",
                         options.supervision_mode,
+                        "--invalid-sample-policy",
+                        "skip",
                         "--feature-layer-ids",
                         *(str(layer) for layer in options.target_layer_ids),
                         *(_local_files_args(options)),
                         *(_resume_args(options)),
                     ],
-                    artifacts=(output_manifest, provenance),
+                    artifacts=(output_manifest, provenance, output_dir / "skipped.jsonl"),
                     kind="tokenized",
                 )
             )
@@ -1011,19 +1015,23 @@ def _reusable_success(stage: Stage, options: PipelineOptions, config_hash: str) 
     except (OSError, json.JSONDecodeError):
         return False
     old_hash = payload.get("config_hash")
-    if old_hash != config_hash:
-        # The pipeline hash covers options for every stage. A change to an
-        # unrelated stage (for example cache tuning) must not invalidate a
-        # completed artifact when this stage's actual command is unchanged.
-        # Keep the guard strict whenever this stage's command differs.
-        old_command = payload.get("command")
-        current_command = [str(value) for value in stage.command]
-        if old_command != current_command:
+    old_command = payload.get("command")
+    current_command = [str(value) for value in stage.command]
+    if old_command != current_command:
+        if old_hash != config_hash:
             raise RuntimeError(
                 f"stage {stage.name} đã có success marker nhưng config_hash "
                 "và command của stage hiện tại đều khác; cần kiểm tra cấu hình "
                 "trước khi resume"
             )
+        print(
+            f"[pipeline] RERUN {stage.name}: command của stage đã đổi "
+            "(ví dụ policy validation/tokenization)"
+        )
+        return False
+    if old_hash != config_hash:
+        # A change to unrelated pipeline options must not invalidate an
+        # artifact when this stage's command is unchanged.
         print(
             f"[pipeline] REUSE {stage.name}: config_hash toàn pipeline đã đổi, "
             "nhưng command của stage không đổi"
