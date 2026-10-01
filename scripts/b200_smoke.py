@@ -115,6 +115,17 @@ def _run_env_values(
                 "ATTN_IMPLEMENTATION": "flash_attention_2",
             }
         )
+    elif baseline == "domino":
+        values.update(
+            {
+                "TARGET_MODEL": target,
+                "DRAFT_MODEL": env.get("MODEL_DOMINO_DRAFT")
+                or env.get("B200_DOMINO_MODEL")
+                or env.get("MODEL_DOMINO", ""),
+                "DATA_FILE": data_file,
+                "ATTENTION_BACKEND": env.get("DOMINO_ATTENTION_BACKEND", "sdpa"),
+            }
+        )
     elif baseline == "llmlingua":
         values.update(
             {

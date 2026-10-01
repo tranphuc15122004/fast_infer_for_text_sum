@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINES = (
     "eagle3",
     "dflash",
+    "domino",
     "llmlingua",
     "fastkv",
     "rocketkv",
@@ -40,6 +41,7 @@ BASELINES = (
 GPU_ONLY = {
     "eagle3",
     "dflash",
+    "domino",
     "specprefill",
     "minference",
     "magicdec",
@@ -52,6 +54,7 @@ GPU_ONLY = {
 BASELINE_IMPORTS = {
     "eagle3": ("torch", "transformers", "eagle.model.ea_model"),
     "dflash": ("torch", "transformers", "dflash", "flash_attn"),
+    "domino": ("torch", "transformers", "dflash"),
     "llmlingua": ("torch", "transformers", "llmlingua"),
     "fastkv": ("torch", "transformers"),
     "rocketkv": ("torch", "triton"),
@@ -70,6 +73,7 @@ BASELINE_IMPORTS = {
 ASSET_ENV = {
     "eagle3": ("BASE_MODEL", "EAGLE_MODEL", "DATA_FILE"),
     "dflash": ("TARGET_MODEL", "DRAFT_MODEL", "DATA_FILE"),
+    "domino": ("TARGET_MODEL", "DRAFT_MODEL", "DATA_FILE"),
     "llmlingua": ("COMPRESSOR_MODEL", "TARGET_MODEL", "DOC_FILE"),
     "fastkv": ("MODEL", "DATA_FILE"),
     "gemfilter": ("MODEL", "DATA_FILE"),
@@ -88,6 +92,11 @@ PROFILE_ASSET_ENV = {
     "dflash": {
         "TARGET_MODEL": "B200_TARGET_MODEL",
         "DRAFT_MODEL": "B200_DFLASH_MODEL",
+        "DATA_FILE": "B200_DATA_FILE",
+    },
+    "domino": {
+        "TARGET_MODEL": "B200_TARGET_MODEL",
+        "DRAFT_MODEL": "B200_DOMINO_MODEL",
         "DATA_FILE": "B200_DATA_FILE",
     },
     "llmlingua": {

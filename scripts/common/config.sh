@@ -260,11 +260,11 @@ fast_infer__load_longbench() {
 }
 
 fast_infer__load_vllm_all() {
-  fast_infer_default_from VLLM_TARGET_MODEL MODEL_TARGET LONG_BENCH_MODEL
-  fast_infer_default_from VLLM_EAGLE3_MODEL MODEL_EAGLE_DRAFT EAGLE_MODEL
-  fast_infer_default_from VLLM_DFLASH_MODEL MODEL_DFLASH_DRAFT
-  fast_infer_default_from VLLM_DOMINO_MODEL MODEL_DOMINO_DRAFT
-  fast_infer_default_from VLLM_DSPARK_MODEL MODEL_DSPARK_DRAFT
+  fast_infer_default_from VLLM_TARGET_MODEL MODEL_TARGET LONG_BENCH_MODEL B200_TARGET_MODEL
+  fast_infer_default_from VLLM_EAGLE3_MODEL MODEL_EAGLE_DRAFT EAGLE_MODEL B200_EAGLE_MODEL
+  fast_infer_default_from VLLM_DFLASH_MODEL MODEL_DFLASH_DRAFT B200_DFLASH_MODEL
+  fast_infer_default_from VLLM_DOMINO_MODEL MODEL_DOMINO_DRAFT MODEL_DOMINO DOMINO_DRAFT_MODEL B200_DOMINO_MODEL
+  fast_infer_default_from VLLM_DSPARK_MODEL MODEL_DSPARK_DRAFT MODEL_DSPARK DSPARK_DRAFT_MODEL B200_DSPARK_MODEL
   fast_infer_default_from VLLM_DATA_FILE LONG_BENCH_DATA_FILE DATA_INPUT
   fast_infer_default_from VLLM_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS LONG_BENCH_MAX_NEW_TOKENS
   fast_infer_default_from VLLM_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS LONG_BENCH_MAX_INPUT_TOKENS
@@ -275,7 +275,7 @@ fast_infer__load_vllm_all() {
 
 fast_infer__load_dflash() {
   fast_infer_default_from TARGET_MODEL MODEL_TARGET
-  fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT
+  fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT B200_DFLASH_MODEL
   fast_infer_default_from DATA_FILE DFLASH_DATA_FILE DATA_INPUT
   fast_infer_default_from MAX_SAMPLES DFLASH_MAX_SAMPLES RUN_SAMPLES
   fast_infer_default_from MAX_NEW_TOKENS DFLASH_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
@@ -290,8 +290,8 @@ fast_infer__load_dflash() {
 }
 
 fast_infer__load_domino() {
-  fast_infer_default_from TARGET_MODEL DOMINO_TARGET_MODEL MODEL_TARGET
-  fast_infer_default_from DRAFT_MODEL DOMINO_DRAFT_MODEL MODEL_DOMINO
+  fast_infer_default_from TARGET_MODEL DOMINO_TARGET_MODEL MODEL_TARGET B200_TARGET_MODEL
+  fast_infer_default_from DRAFT_MODEL DOMINO_DRAFT_MODEL MODEL_DOMINO_DRAFT MODEL_DOMINO B200_DOMINO_MODEL
   fast_infer_default_from DATA_FILE DOMINO_DATA_FILE DATA_INPUT
   fast_infer_default_from MAX_SAMPLES DOMINO_MAX_SAMPLES RUN_SAMPLES
   fast_infer_default_from MAX_NEW_TOKENS DOMINO_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
