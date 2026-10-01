@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: fast-infer-vllm-plugin
+Version: 0.1.0
+Summary: In-tree vLLM plugin for Domino compatibility in fast_infer_text_sum.

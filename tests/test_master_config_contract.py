@@ -88,6 +88,7 @@ def test_scripts_root_keeps_only_primary_entrypoints():
         "run_b200_smoke.sh",
         "run_longbench_200.sh",
         "run_representative_100.sh",
+        "run_vllm_all.sh",
     ]
 
 

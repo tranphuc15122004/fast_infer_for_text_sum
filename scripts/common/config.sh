@@ -259,6 +259,20 @@ fast_infer__load_longbench() {
   fast_infer_default LONG_BENCH_MAGICDEC_MODEL_NAME "${MODEL_TARGET:-}"
 }
 
+fast_infer__load_vllm_all() {
+  fast_infer_default_from VLLM_TARGET_MODEL MODEL_TARGET LONG_BENCH_MODEL
+  fast_infer_default_from VLLM_EAGLE3_MODEL MODEL_EAGLE_DRAFT EAGLE_MODEL
+  fast_infer_default_from VLLM_DFLASH_MODEL MODEL_DFLASH_DRAFT
+  fast_infer_default_from VLLM_DOMINO_MODEL MODEL_DOMINO_DRAFT
+  fast_infer_default_from VLLM_DSPARK_MODEL MODEL_DSPARK_DRAFT
+  fast_infer_default_from VLLM_DATA_FILE LONG_BENCH_DATA_FILE DATA_INPUT
+  fast_infer_default_from VLLM_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS LONG_BENCH_MAX_NEW_TOKENS
+  fast_infer_default_from VLLM_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS LONG_BENCH_MAX_INPUT_TOKENS
+  fast_infer_default_from VLLM_MAX_MODEL_LEN LONG_BENCH_MAX_MODEL_LEN
+  fast_infer_default_from VLLM_DTYPE LONG_BENCH_DTYPE
+  fast_infer_default_from VLLM_SEED LONG_BENCH_SEED RUN_SEED
+}
+
 fast_infer__load_dflash() {
   fast_infer_default_from TARGET_MODEL MODEL_TARGET
   fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT
@@ -540,6 +554,7 @@ fast_infer_load_config() {
     specextend) fast_infer__load_specextend ;;
     specprefill) fast_infer__load_specprefill ;;
     syncspec) fast_infer__load_syncspec ;;
+    vllm_all) fast_infer__load_vllm_all ;;
     *)
       echo "fast-infer: unsupported baseline in master config loader: $baseline" >&2
       return 1
