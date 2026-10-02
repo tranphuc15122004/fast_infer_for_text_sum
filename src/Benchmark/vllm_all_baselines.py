@@ -1373,6 +1373,17 @@ def _evaluate(args: argparse.Namespace) -> int:
 
     parity = _annotate_parity(records)
     metric_summary = _method_metrics(records, methods)
+
+    # Per-dataset breakdown
+    dataset_names = sorted({r.get("dataset") for r in records if r.get("dataset")})
+    per_dataset_metrics: dict[str, Any] = {}
+    per_dataset_parity: dict[str, Any] = {}
+    if len(dataset_names) > 1:
+        for ds in dataset_names:
+            ds_records = [r for r in records if r.get("dataset") == ds]
+            per_dataset_metrics[ds] = _method_metrics(ds_records, methods)
+            per_dataset_parity[ds] = _annotate_parity(ds_records)
+
     execution_complete = len(records) == len(methods) * len(samples)
     correctness_pass = all(
         parity[method]["compared_samples"] == len(samples)
@@ -1436,6 +1447,8 @@ def _evaluate(args: argparse.Namespace) -> int:
         "quality_pass": quality_pass,
         "parity": parity,
         "method_metrics": metric_summary,
+        "per_dataset_metrics": per_dataset_metrics,
+        "per_dataset_parity": per_dataset_parity,
         "model_configs": model_configs,
         "metric_definitions": {
             "tpot_ms": "(last_token_ts - first_token_ts) / (output_tokens - 1)",
@@ -1479,23 +1492,15 @@ def _evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _write_markdown_report(path: Path, summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
-    lines = [
-        f"# Báo cáo eval vLLM đồng bộ — {summary['run_id']}",
-        "",
-        f"- Trạng thái chạy: {summary['status']}",
-        f"- GPU: {summary['gpu']}",
-        f"- vLLM: {summary['vllm_version']}; PyTorch: {summary['torch_version']}",
-        f"- Số mẫu chung: {summary['sample_count']}",
-        f"- Parity greedy toàn bộ: {summary['correctness_pass']}",
-        "",
+def _render_markdown_table(lines: list[str], method_metrics: dict[str, Any], parity_dict: dict[str, Any]) -> None:
+    lines.extend([
         "| Method | Sinh thành công | Hợp lệ theo guard | Lặp | ROUGE-L | TPOT (ms/token) | DSR | ESR | Acceptance (%) | Accept length | Token khớp vanilla | LCS với vanilla |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for method, metrics in summary["method_metrics"].items():
-        parity = summary["parity"][method]
+    ])
+    for method, metrics in method_metrics.items():
+        parity = parity_dict.get(method) or {}
         paired = metrics.get("paired_speed_metrics") or {}
-        exact = f"{parity['exact_matches']}/{parity['compared_samples']}"
+        exact = f"{parity.get('exact_matches', 0)}/{parity.get('compared_samples', 0)}"
         overlap = parity.get("token_lcs_overlap")
 
         def fmt(value: Any) -> str:
@@ -1510,6 +1515,32 @@ def _write_markdown_report(path: Path, summary: dict[str, Any], records: list[di
             f"{fmt(metrics.get('mean_acceptance_rate_percent'))} | "
             f"{fmt(metrics.get('mean_avg_accept_length'))} | {exact} | {overlap_text} |"
         )
+
+
+def _write_markdown_report(path: Path, summary: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    lines = [
+        f"# Báo cáo eval vLLM đồng bộ — {summary['run_id']}",
+        "",
+        f"- Trạng thái chạy: {summary['status']}",
+        f"- GPU: {summary['gpu']}",
+        f"- vLLM: {summary['vllm_version']}; PyTorch: {summary['torch_version']}",
+        f"- Số mẫu chung: {summary['sample_count']}",
+        f"- Parity greedy toàn bộ: {summary['correctness_pass']}",
+        "",
+    ]
+    per_ds = summary.get("per_dataset_metrics") or {}
+    per_parity = summary.get("per_dataset_parity") or {}
+    if per_ds:
+        lines.append("## 1. Tổng quan chung toàn bộ Benchmark (Overall Macro Summary)\n")
+    _render_markdown_table(lines, summary["method_metrics"], summary["parity"])
+
+    if per_ds:
+        lines.append("\n## 2. Chi tiết theo từng Dataset riêng biệt\n")
+        for ds, ds_metrics in per_ds.items():
+            lines.append(f"### Dataset: `{ds}`\n")
+            _render_markdown_table(lines, ds_metrics, per_parity.get(ds, {}))
+            lines.append("")
+
     lines.extend(
         [
             "",

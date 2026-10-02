@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -37,6 +37,7 @@ def validate_feature_cache(
     supervision_mode: str = "last_assistant",
     expected_target_model: Optional[str] = None,
     expected_feature_layer_ids: Optional[Sequence[int]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, Any]:
     """Kiểm tra coverage, tensor shape/finite và optional token parity."""
     from MR_DFlash.data import build_sample
@@ -126,6 +127,10 @@ def validate_feature_cache(
                     raise ValueError(f"sample {sample_id!r} input_ids/loss_mask lệch regenerated JSONL")
             checked_ids.append(sample_id)
             checked_offsets += length
+            if progress_callback is not None and (
+                len(checked_ids) % 1000 == 0 or len(checked_ids) == len(expected_ids)
+            ):
+                progress_callback(len(checked_ids), len(expected_ids))
         checked_shards += 1
     if set(checked_ids) != expected_ids or len(checked_ids) != len(manifest_ids):
         raise ValueError("coverage thực tế của shard không khớp manifest/input")
@@ -177,4 +182,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
