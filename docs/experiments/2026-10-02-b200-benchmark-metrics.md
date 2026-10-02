@@ -1,6 +1,6 @@
 # Tổng hợp metric benchmark B200: DSpark, DFlash, Eagle3, Domino
 
-> Báo cáo tổng hợp từ hai thư mục run đã cung cấp. Số liệu gốc được đọc từ `run_report.json`, `events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl` và `report_vi.md`; bảng latency theo dataset và percentile được tính lại từ event log. Các metric không có dữ liệu trong artifact được ghi rõ là thiếu, không nội suy.
+> Báo cáo tổng hợp từ hai thư mục run đã cung cấp. Số liệu gốc được đọc từ `run_report.json`, `events.jsonl`, `samples.jsonl`, `excluded_samples.jsonl`, `report_vi.md` và `console.log`; bảng latency theo dataset và percentile được tính lại từ event log. Acceptance length theo dataset được ước lượng từ cửa sổ metric trong console log và được đánh dấu riêng vì không có số đo theo từng request.
 
 ## 1. Kết luận nhanh
 
@@ -205,7 +205,21 @@ Các hệ số dưới đây tính lại từ `request_finished` event, ghép c�
 | GPU1 | eagle3 | draft_tree_nodes | 446 | 218016 | 488.83 | 0 | — | — | — | — |
 | GPU1 | domino | draft_tokens | 446 | 421584 | 945.26 | 0 | — | — | — | — |
 
-Các trường acceptance rate / acceptance percent / average accept length / accepted draft tokens đều null (valid count = 0) cho mọi speculative method. Chỉ có tổng proposal được quan sát. `draft_proposal_units` của Eagle3 là `draft_tree_nodes`; các method khác ghi `draft_tokens`, nên tổng proposal units không so sánh trực tiếp giữa họ method.
+Trong metric có cấu trúc của `run_report.json` và các event `request_finished`, acceptance rate / acceptance percent / average accept length / accepted draft tokens đều null (valid count = 0). `console.log` lại có các dòng `SpecDecoding metrics` với acceptance length, draft acceptance rate và token counters được gom theo cửa sổ runtime; bảng kế tiếp khai thác acceptance length từ các dòng này. Chỉ có tổng proposal per-request trong report là trực tiếp quan sát được. `draft_proposal_units` của Eagle3 là `draft_tree_nodes`; các method khác ghi `draft_tokens`, nên tổng proposal units không so sánh trực tiếp giữa họ method.
+
+### Acceptance length theo dataset (ước lượng từ console log)
+
+`Mean acceptance length` bên dưới là giá trị rolling do vLLM in ra, không phải mean tính trên từng request. Để gán log vào dataset, mỗi dòng được ghép với các `request_finished` của method trong khoảng 10 giây trước thời điểm log; nếu khoảng này chứa nhiều dataset, dòng được gán cho dataset có nhiều request hoàn tất nhất trong khoảng đó. Giá trị trong ô là trung bình số học các cửa sổ được gán như vậy, làm tròn 2 chữ số. Ký hiệu `thuần/tổng` cho biết số cửa sổ chỉ có request của dataset đó trên tổng số cửa sổ được gán vào dataset; các cửa sổ hỗn hợp vẫn góp vào giá trị, nên đây là ước lượng để tham khảo, không phải thống kê dataset chính xác.
+
+| Dataset | GPU0 DSpark | GPU0 DFlash | GPU1 Eagle3 | GPU1 Domino |
+|---|---:|---:|---:|---:|
+| gov_report | 3.06 (1/1) | 2.12 (1/2) | 2.25 (2/2) | 1.08 (3/3) |
+| qmsum | 2.56 (1/1) | 1.82 (1/1) | 2.02 (1/2) | 1.06 (1/3) |
+| multi_news | 3.07 (0/2) | 2.52 (0/2) | 2.05 (1/2) | 1.09 (3/3) |
+| lcc | 3.29 (0/1) | 2.82 (0/1) | 2.08 (1/2) | 1.05 (2/4) |
+| repobench-p | 3.11 (1/1) | 2.42 (1/1) | 2.04 (1/2) | 1.05 (2/2) |
+
+Các cửa sổ dùng ở đây nằm trong thời gian infer đo chính thức; đã loại log trước request đầu tiên và cửa sổ đầu nếu kết thúc trong 10 giây đầu kể từ request đầu của method để giảm khả năng trộn warmup vào kết quả. Mỗi method chạy 446 request trên cùng 5 dataset. Với `vanilla_vllm`, acceptance length không áp dụng vì không có draft model. Nguồn để audit từng cửa sổ là `console.log`; event log cung cấp timestamp/sample để xác định dataset, nhưng không lưu lại acceptance length theo request.
 
 ## 5. Thời gian khởi tạo và thực thi
 
@@ -253,9 +267,9 @@ Hai run ghi `CUDA_VISIBLE_DEVICES` riêng (`0` và `1`), còn `nvidia-smi` snaps
 | Output guard | repetition_flags | Số output bị gắn cờ lặp. | 0 cho mọi method. |
 | Speculative | speculative_metrics_available_samples | Số request có trace/metadata speculative. | 446 cho mỗi speculative method. |
 | Speculative | proposed_draft_tokens_observed | Tổng đơn vị proposal draft theo report. | Có tổng; đơn vị Eagle3 khác các method còn lại. |
-| Speculative | acceptance_rate, acceptance_rate_percent | Tỷ lệ proposal draft được chấp nhận. | Không có giá trị hợp lệ: count=0, các mean null. |
-| Speculative | avg_accept_length | Độ dài trung bình accepted draft sequence. | Null cho mọi speculative method. |
-| Speculative | accepted_draft_tokens_observed | Tổng token draft được chấp nhận. | Null cho mọi speculative method. |
+| Speculative | acceptance_rate, acceptance_rate_percent | Tỷ lệ proposal draft được chấp nhận. | Null theo request trong JSON; `console.log` có `Avg Draft acceptance rate` theo cửa sổ runtime, không tách chính xác theo dataset. |
+| Speculative | avg_accept_length | Độ dài trung bình accepted draft sequence. | Null theo request trong JSON; console log có `Mean acceptance length` rolling. Mục 4 có ước lượng theo dataset, không phải mean chính xác trên request. |
+| Speculative | accepted_draft_tokens_observed | Tổng token draft được chấp nhận. | Null theo request trong JSON; `console.log` in `Accepted` token counter theo cửa sổ, không tái dựng được tổng chính xác cho từng dataset. |
 | Runtime | load_ms | Thời gian load engine/model từng method. | Có trong model config; liệt kê mục 5. |
 | Runtime | evaluation_runtime_ms | Thời gian evaluation tổng thể theo run report. | Có trong cả hai run. |
 | GPU memory | allocated/reserved/peak bytes | Counters lấy từ CUDA/PyTorch context trong log. | Toàn bộ bằng 0; không dùng làm VRAM peak. |
@@ -282,13 +296,13 @@ Hai run ghi `CUDA_VISIBLE_DEVICES` riêng (`0` và `1`), còn `nvidia-smi` snaps
 3. **ROUGE gộp sai họ task:** `lcc` và `repobench-p` là code completion; cần metric exact/edit similarity riêng. Artifact không lưu metric task-aware theo dataset.
 4. **Generation cap 64 token:** hạn chế khả năng đánh giá summary dài và có thể ảnh hưởng latency/proposal rate.
 5. **Parity fingerprint trùng bất thường:** DFlash, Eagle3, Domino có cùng trạng thái match và LCS cho từng sample. Cần kiểm tra kết quả gốc và liên kết method trước khi tin metric chất lượng/parity.
-6. **Speculative acceptance thiếu:** proposal count có, nhưng acceptance rate, accepted token count và accept length đều null; không thể kết luận hiệu quả draft/acceptance.
+6. **Acceptance chỉ có ở độ hạt cửa sổ:** event/JSON không có acceptance per-request. Console log có rolling acceptance length, acceptance rate và accepted-token counters; bảng theo dataset ở mục 4 là ước lượng gán cửa sổ, không đủ để kết luận chính xác hiệu quả draft trên từng dataset.
 7. **VRAM counter không hợp lệ:** counters theo request ghi 0 bytes dù snapshot `nvidia-smi` cho thấy khoảng 161–165 GiB đang dùng trong các thời điểm chạy. Không so sánh peak memory theo method từ artifact này.
 8. **Không có nhiều seed:** cấu hình ghi seed=42; chỉ có một run cho mỗi nhóm method. Báo cáo không cung cấp sai số/CI giữa nhiều seed.
 
 ## 11. Khuyến nghị bước tiếp theo
 
-Trước khi dùng kết quả để xếp hạng baseline, khôi phục `results.jsonl` gốc từ hai đường dẫn artifact trong report và chạy integrity audit theo `(run_id, method, sample_id)`: đối chiếu generation token IDs, parity từng mẫu và task type; tính lại ROUGE riêng trên `gov_report/multi_news/qmsum`, exact match/edit similarity riêng trên `lcc/repobench-p`. Sau đó quyết định rõ xử lý 54 mẫu quá dài (mở rộng ngữ cảnh hay quy tắc truncation chuẩn) rồi chạy lại full matrix với metric acceptance và VRAM đã được kiểm tra.
+Trước khi dùng kết quả để xếp hạng baseline, khôi phục `results.jsonl` gốc từ hai đường dẫn artifact trong report và chạy integrity audit theo `(run_id, method, sample_id)`: đối chiếu generation token IDs, parity từng mẫu và task type; tính lại ROUGE riêng trên `gov_report/multi_news/qmsum`, exact match/edit similarity riêng trên `lcc/repobench-p`. Sau đó quyết định rõ xử lý 54 mẫu quá dài (mở rộng ngữ cảnh hay quy tắc truncation chuẩn) rồi chạy lại full matrix có lưu acceptance per-request và VRAM counters đã được kiểm tra.
 
 ## 12. Artifact nguồn
 
@@ -296,29 +310,29 @@ Trước khi dùng kết quả để xếp hạng baseline, khôi phục `result
 
 | Artifact | Đường dẫn trong workspace | Vai trò |
 |---|---|---|
-| Báo cáo run | `b200-gpu0-dspark-dflash/report_vi.md` | Bảng tổng hợp ngắn gốc. |
-| Run report JSON | `b200-gpu0-dspark-dflash/run_report.json` | Config, method metrics, parity từng sample, model/runtime metadata. |
-| Event log | `b200-gpu0-dspark-dflash/events.jsonl` | Request timings, guard flags, speculative counters, runtime events. |
-| Sample manifest | `b200-gpu0-dspark-dflash/samples.jsonl` | Prompt/input metadata, references, IDs; không có generated output. |
-| Excluded samples | `b200-gpu0-dspark-dflash/excluded_samples.jsonl` | 54 mẫu bị loại và lý do/input length. |
-| Console log | `b200-gpu0-dspark-dflash/console.log` | Stdout summary của run. |
-| Progress | `b200-gpu0-dspark-dflash/progress.json` | Trạng thái/record count của run. |
+| Báo cáo run | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/report_vi.md` | Bảng tổng hợp ngắn gốc. |
+| Run report JSON | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/run_report.json` | Config, method metrics, parity từng sample, model/runtime metadata. |
+| Event log | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/events.jsonl` | Request timings, guard flags, speculative counters, runtime events. |
+| Sample manifest | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/samples.jsonl` | Prompt/input metadata, references, IDs; không có generated output. |
+| Excluded samples | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/excluded_samples.jsonl` | 54 mẫu bị loại và lý do/input length. |
+| Console log | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/console.log` | Stdout và rolling speculative metrics, gồm acceptance length theo cửa sổ. |
+| Progress | `outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/progress.json` | Trạng thái/record count của run. |
 
-Link nhanh: [b200-gpu0-dspark-dflash/report_vi.md](../../b200-gpu0-dspark-dflash/report_vi.md), [b200-gpu0-dspark-dflash/run_report.json](../../b200-gpu0-dspark-dflash/run_report.json), [b200-gpu0-dspark-dflash/events.jsonl](../../b200-gpu0-dspark-dflash/events.jsonl)
+Link nhanh: [report_vi.md](../../outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/report_vi.md), [run_report.json](../../outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/run_report.json), [events.jsonl](../../outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/events.jsonl), [console.log](../../outputs/Benchmark_VLLM_full/b200-gpu0-dspark-dflash/console.log)
 
 ### GPU1 — `b200-gpu1-eagle3-domino`
 
 | Artifact | Đường dẫn trong workspace | Vai trò |
 |---|---|---|
-| Báo cáo run | `b200-gpu1-eagle3-domino/report_vi.md` | Bảng tổng hợp ngắn gốc. |
-| Run report JSON | `b200-gpu1-eagle3-domino/run_report.json` | Config, method metrics, parity từng sample, model/runtime metadata. |
-| Event log | `b200-gpu1-eagle3-domino/events.jsonl` | Request timings, guard flags, speculative counters, runtime events. |
-| Sample manifest | `b200-gpu1-eagle3-domino/samples.jsonl` | Prompt/input metadata, references, IDs; không có generated output. |
-| Excluded samples | `b200-gpu1-eagle3-domino/excluded_samples.jsonl` | 54 mẫu bị loại và lý do/input length. |
-| Console log | `b200-gpu1-eagle3-domino/console.log` | Stdout summary của run. |
-| Progress | `b200-gpu1-eagle3-domino/progress.json` | Trạng thái/record count của run. |
+| Báo cáo run | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/report_vi.md` | Bảng tổng hợp ngắn gốc. |
+| Run report JSON | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/run_report.json` | Config, method metrics, parity từng sample, model/runtime metadata. |
+| Event log | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/events.jsonl` | Request timings, guard flags, speculative counters, runtime events. |
+| Sample manifest | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/samples.jsonl` | Prompt/input metadata, references, IDs; không có generated output. |
+| Excluded samples | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/excluded_samples.jsonl` | 54 mẫu bị loại và lý do/input length. |
+| Console log | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/console.log` | Stdout và rolling speculative metrics, gồm acceptance length theo cửa sổ. |
+| Progress | `outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/progress.json` | Trạng thái/record count của run. |
 
-Link nhanh: [b200-gpu1-eagle3-domino/report_vi.md](../../b200-gpu1-eagle3-domino/report_vi.md), [b200-gpu1-eagle3-domino/run_report.json](../../b200-gpu1-eagle3-domino/run_report.json), [b200-gpu1-eagle3-domino/events.jsonl](../../b200-gpu1-eagle3-domino/events.jsonl)
+Link nhanh: [report_vi.md](../../outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/report_vi.md), [run_report.json](../../outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/run_report.json), [events.jsonl](../../outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/events.jsonl), [console.log](../../outputs/Benchmark_VLLM_full/b200-gpu1-eagle3-domino/console.log)
 
 ---
 Báo cáo này phân biệt số liệu được ghi trong run report, metric tính lại từ event log và metric hiện không thể audit do thiếu raw results. Không xem `execution_pass=true` là bằng chứng baseline thắng về quality hoặc correctness.
