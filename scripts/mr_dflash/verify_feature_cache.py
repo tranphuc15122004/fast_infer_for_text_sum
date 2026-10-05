@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import torch
 
@@ -38,12 +38,22 @@ def validate_feature_cache(
     expected_target_model: Optional[str] = None,
     expected_feature_layer_ids: Optional[Sequence[int]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    input_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    resume_shards: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    shard_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """Kiểm tra coverage, tensor shape/finite và optional token parity."""
+    """Kiểm tra coverage, tensor shape/finite và optional token parity.
+
+    ``resume_shards`` chứa receipts của shard đã audit thành công. Receipt chỉ
+    được dùng lại nếu kích thước, thời gian sửa/đổi metadata và inode của shard
+    vẫn giống lần audit trước.
+    ``shard_callback`` được gọi ngay sau mỗi shard để caller ghi checkpoint.
+    """
     from MR_DFlash.data import build_sample
 
     cache_root, manifest = _load_manifest(Path(cache_path))
-    input_rows = list(read_jsonl(data_path))
+    if input_rows is None:
+        input_rows = list(read_jsonl(data_path))
     expected_rows: Dict[str, Dict[str, Any]] = {}
     for row in input_rows:
         sample_id = str(row.get("id", ""))
@@ -67,9 +77,11 @@ def validate_feature_cache(
     if missing or extra:
         raise ValueError(f"cache coverage lệch: missing={missing[:5]}, extra={extra[:5]}")
 
-    checked_ids: list[str] = []
+    checked_ids: set[str] = set()
     checked_offsets = 0
     checked_shards = 0
+    loaded_shards = 0
+    resumed_shards = 0
     manifest_shards = manifest.get("shards")
     if not isinstance(manifest_shards, list) or not manifest_shards:
         raise ValueError("manifest không có shards")
@@ -80,12 +92,58 @@ def validate_feature_cache(
         shard_path = cache_root / str(descriptor["path"])
         if not shard_path.is_file():
             raise FileNotFoundError(f"cache thiếu shard: {shard_path}")
+        shard_key = str(descriptor["path"])
+        stat = shard_path.stat()
+        fingerprint = {
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
+            "inode": int(stat.st_ino),
+        }
+        descriptor_ids = [str(value) for value in descriptor.get("ids", [])]
+        descriptor_lengths = [int(value) for value in descriptor.get("lengths", [])]
+        receipt = (resume_shards or {}).get(shard_key)
+        if not isinstance(receipt, Mapping):
+            receipt = None
+        receipt_ids = descriptor_ids
+        can_resume = bool(
+            receipt
+            and descriptor_ids
+            and receipt.get("fingerprint") == fingerprint
+            and receipt_ids
+            and int(receipt.get("num_samples", -1)) == len(receipt_ids)
+            and int(receipt.get("checked_offsets", -1)) >= len(receipt_ids)
+        )
+        if descriptor_ids and receipt_ids != descriptor_ids:
+            can_resume = False
+        if can_resume:
+            if int(descriptor.get("count", -1)) != len(receipt_ids):
+                can_resume = False
+            elif descriptor_lengths and len(descriptor_lengths) != len(receipt_ids):
+                can_resume = False
+            elif descriptor_lengths and int(receipt.get("checked_offsets", -1)) != sum(descriptor_lengths):
+                can_resume = False
+            elif any(sample_id not in expected_rows for sample_id in receipt_ids):
+                can_resume = False
+            elif any(sample_id in checked_ids for sample_id in receipt_ids):
+                raise ValueError(f"manifest/checkpoint có ID trùng giữa shard: {shard_key}")
+        if can_resume:
+            checked_ids.update(receipt_ids)
+            checked_offsets += int(receipt["checked_offsets"])
+            checked_shards += 1
+            resumed_shards += 1
+            if progress_callback is not None and (
+                len(checked_ids) % 1000 == 0 or len(checked_ids) == len(expected_ids)
+            ):
+                progress_callback(len(checked_ids), len(expected_ids))
+            continue
+
         payload = torch.load(shard_path, map_location="cpu", weights_only=False)
         samples = payload.get("samples") if isinstance(payload, dict) else payload
         if not isinstance(samples, list):
             raise ValueError(f"shard không có list samples: {shard_path}")
-        descriptor_ids = [str(value) for value in descriptor.get("ids", [])]
-        descriptor_lengths = [int(value) for value in descriptor.get("lengths", [])]
+        shard_sample_ids: list[str] = []
+        shard_offsets = 0
         if int(descriptor.get("count", -1)) != len(samples):
             raise ValueError(f"count shard lệch: {shard_path}")
         if descriptor_ids and descriptor_ids != [str(sample.get("id", "")) for sample in samples]:
@@ -110,7 +168,7 @@ def validate_feature_cache(
                 raise ValueError(f"sample {sample_id!r} hidden shape không khớp: {tuple(hidden.shape)}")
             if int(hidden.shape[1]) != int(manifest.get("feature_width", -1)):
                 raise ValueError(f"sample {sample_id!r} hidden width không khớp manifest")
-            if not torch.isfinite(hidden.float()).all().item():
+            if not torch.isfinite(hidden).all().item():
                 raise ValueError(f"sample {sample_id!r} hidden có NaN/Inf")
             if tokenizer is not None:
                 expected = build_sample(
@@ -125,14 +183,28 @@ def validate_feature_cache(
                 expected_mask_tensor = torch.as_tensor(expected["loss_mask"], dtype=torch.float32)
                 if not torch.equal(input_ids, expected_ids_tensor) or not torch.equal(loss_mask, expected_mask_tensor):
                     raise ValueError(f"sample {sample_id!r} input_ids/loss_mask lệch regenerated JSONL")
-            checked_ids.append(sample_id)
+            checked_ids.add(sample_id)
+            shard_sample_ids.append(sample_id)
+            shard_offsets += length
             checked_offsets += length
             if progress_callback is not None and (
                 len(checked_ids) % 1000 == 0 or len(checked_ids) == len(expected_ids)
             ):
                 progress_callback(len(checked_ids), len(expected_ids))
         checked_shards += 1
-    if set(checked_ids) != expected_ids or len(checked_ids) != len(manifest_ids):
+        loaded_shards += 1
+        if shard_callback is not None:
+            shard_callback(
+                shard_key,
+                {
+                    "fingerprint": fingerprint,
+                    "num_samples": len(shard_sample_ids),
+                    "checked_offsets": shard_offsets,
+                },
+            )
+        del payload
+        del samples
+    if checked_ids != expected_ids or len(checked_ids) != len(manifest_ids):
         raise ValueError("coverage thực tế của shard không khớp manifest/input")
     return {
         "schema_version": "mr_dflash_feature_cache_audit_v1",
@@ -141,6 +213,8 @@ def validate_feature_cache(
         "cache_path": str(cache_path),
         "num_samples": len(checked_ids),
         "num_shards": checked_shards,
+        "loaded_shards": loaded_shards,
+        "resumed_shards": resumed_shards,
         "checked_offsets": checked_offsets,
         "token_parity_checked": tokenizer is not None,
         "feature_layer_ids": [int(value) for value in manifest.get("feature_layer_ids", [])],

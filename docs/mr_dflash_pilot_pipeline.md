@@ -344,6 +344,24 @@ Audit phải báo `valid=True`, đủ sample và `checked_offsets` bằng tổng
 tokenized của các sample. Tùy chọn `--tokenizer` còn kiểm tra token/mask; nếu
 chỉ cần kiểm tra shard nhanh có thể bỏ tùy chọn này.
 
+Audit chất lượng regenerated và hidden cache chạy preflight metadata trước khi
+đọc shard; với run vLLM, script tự lấy tên served model từ
+`pipeline_plan.json`. Checkpoint mặc định nằm cạnh report, lưu receipt từng
+shard và kết quả từng hidden sample. Khi bị ngắt, chạy lại cùng lệnh để resume;
+receipt chỉ được dùng nếu fingerprint file đầu vào, manifest và shard còn
+khớp. Có thể tách integrity scan khỏi GPU hidden recompute:
+
+```bash
+RUN_ROOT=/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_run
+CUDA_VISIBLE_DEVICES=0 python3 scripts/mr_dflash/audit_regenerated_cache_quality.py \
+  --run-root "$RUN_ROOT" --device cuda:0 --hidden-samples-per-split 32 \
+  --skip-hidden-recompute
+
+# Tiếp tục cùng audit; integrity scan đã có checkpoint nên chỉ kiểm tra phần còn thiếu.
+CUDA_VISIBLE_DEVICES=0 python3 scripts/mr_dflash/audit_regenerated_cache_quality.py \
+  --run-root "$RUN_ROOT" --device cuda:0 --hidden-samples-per-split 32
+```
+
 Trước khi chạy thật, in toàn bộ command mà không đọc source/model:
 
 ```bash
