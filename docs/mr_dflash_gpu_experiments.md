@@ -28,6 +28,33 @@ riêng. Agent không tự chọn GPU hay chiếm GPU của job khác; người c
 - DDP CPU world-size 2 cũng đã pass bằng `torchrun`; đây chỉ là validation
   process-group/sharding/checkpoint, không thay thế GPU smoke.
 
+## Cập nhật tiến độ B200 — 2026-10-05
+
+Theo xác nhận của người vận hành, hai lượt **fine-tune** và **GrowMTP loss
+from scratch** đã chạy xong. Đường dẫn checkpoint, config dump, metrics và log
+train chưa được đưa vào workspace, nên trạng thái này chỉ xác nhận job đã kết
+thúc; chưa ghi nhận loss cuối, số bước hoặc kết quả chất lượng.
+
+Audit feature cache của run
+`/workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z`
+đã hoàn tất quét shard/tensor/token parity cho 44.979 train và 2.498 val. Hai
+mẫu val không có supervised token liên tiếp đã được loại khỏi bản input riêng
+dùng audit; dữ liệu gốc giữ nguyên. Phần hidden recompute kết thúc **fail**:
+32/32 mẫu train và 32/32 mẫu val không đạt `allclose`. Cosine thấp nhất trong
+report khoảng 0,966; sai số tuyệt đối lớn nhất vượt 6.000.
+
+Manifest và command cache cùng khai báo target path Qwen3-4B, layers
+`[1,9,17,25,33]`, BF16, HF backbone và SDPA. Tuy nhiên `target_revision=None`
+và manifest không có fingerprint weights tại thời điểm cache được tạo. Vì vậy
+chưa xác định được hidden mismatch đến từ model snapshot hay khác biệt ở đường
+capture/runtime. Hai lượt train được ghi nhận là đã chạy xong, nhưng audit này
+chưa xác nhận cache hidden tương đương model snapshot đang được load hiện tại.
+
+Việc cần làm tiếp theo: lưu checkpoint/config/metrics/log của hai lượt train;
+đối chiếu thời điểm và snapshot weights với cache; sau khi xử lý parity, chạy
+exactness, acceptance, quality và paired cost evaluation. Không dùng kết quả
+hiện tại để claim cache parity hoặc speedup.
+
 ## Điều kiện cấp job
 
 Trước mỗi run, người thực hiện phải xác nhận GPU không thuộc job khác và thay

@@ -8,7 +8,7 @@
 Benchmark reference để đối chiếu Training-Free: [Modal reference](experiments/2026-09-21_modal_trainingfree_reference.md)
 và [metadata/config JSON](experiments/2026-09-21_modal_trainingfree_reference.json).
 
-**Ngày snapshot:** 2026-09-21  
+**Ngày snapshot:** 2026-10-05  
 **Commit nền:** `ffe40fc` (`cap nhat quá trình Eval`)  
 **Lưu ý trạng thái:** working tree hiện có thay đổi chưa commit ở các nhánh
 `MR_DFlash`, `TrainingFree` và các tài liệu/runtime liên quan. Những phần này
@@ -39,7 +39,7 @@ Nhãn dùng trong tài liệu:
 | `S0` | Runtime chung và benchmark orchestration | `scripts/common/`, `config/`, `scripts/run_longbench_200.py`, `scripts/collect_metrics.py` | **Đã triển khai; đang hoàn thiện audit/final report** |
 | `B1` | Benchmark các baseline tăng tốc inference | `scripts/infer_*.py`, `scripts/runners/run_*.sh`, `externals/`, `docs/baselines/` | **Đã có matrix, smoke và full B200 artifacts; cần chuẩn hóa diễn giải** |
 | `F1` | DFlash fine-tuning cho tóm tắt tiếng Việt | `src/Finetuning/` | **Core và synthetic pipeline đã chạy; chưa đóng real Vietnamese quality/speedup** |
-| `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Prototype/pipeline source-to-cache đã triển khai; pilot train/eval thật còn là việc chính** |
+| `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Fine-tune và GrowMTP loss from scratch trên B200 đã chạy xong theo báo cáo; audit hidden cache và đánh giá chất lượng/acceptance còn mở** |
 | `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |
 | `Y1` | SyncSpec-v1 speculative decoding | `src/SyncSpec/`, `docs/baselines/syncspec.md` | **Core, test và smoke đã có; chưa có full benchmark canonical để claim** |
 | `A1` | Phân tích chẩn đoán và quyết định nghiên cứu | `src/analyze/`, `outputs/dflash_residual/`, `outputs/safe_budget_sum/`, `outputs/specextend_*` | **Nhiều thí nghiệm đã chạy; kết quả dùng để lọc giả thuyết, không tự động là baseline** |
@@ -356,6 +356,16 @@ loss và ngân sách tham số hay không.
   test GPU được guard theo hardware.
 - Pipeline Phase 1 source-to-cache có runbook đầy đủ cho B200, gồm dry-run,
   resume, adaptive batch, parallel worker và fairness check.
+- Theo xác nhận ngày 2026-10-05, hai lượt fine-tune và GrowMTP loss from
+  scratch đã chạy xong trên B200. Workspace hiện chưa có đường dẫn checkpoint,
+  metrics hoặc log train để ghi nhận số bước, loss cuối và cấu hình thực tế.
+- Audit run 50K tại `mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z`
+  đã quét train 44.979 mẫu và val 2.498 mẫu sau khi loại hai sample không đủ
+  supervised tokens. Tuy nhiên cả 32/32 mẫu hidden được recompute ở mỗi split
+  đều fail `allclose`; summary kết thúc `status=fail`. Manifest khớp path/layer/
+  dtype/backend được khai báo, nhưng `target_revision=None` và không có
+  fingerprint weights lịch sử, nên chưa xác nhận cache được tạo từ đúng snapshot
+  model hiện tại.
 - Có tài liệu/protocol cho pilot train/eval, nhưng trong artifact hiện thấy
   chưa có một output MR-DFlash final được đóng cùng report speed/quality để
   gọi là benchmark result hoàn chỉnh.
@@ -369,14 +379,15 @@ loss và ngân sách tham số hay không.
 
 ### Việc tiếp theo dự kiến
 
-1. Chạy/hoàn tất preprocess và cache Qwen3-4B theo cùng feature contract cho
-   DFlash-2L, MR-DFlash-2S và DFlash-5L.
-2. Train pilot cùng seed/data/loss, ghi trainable params, peak VRAM,
-   step time, tokens/s và checkpoint provenance.
-3. Evaluate với target full-prefix verifier, exactness-check và summary report;
-   chỉ sau đó mới đưa vào benchmark inference.
-4. Nếu Qwen3 pilot có tín hiệu, lặp lại ma trận Llama 3.1 8B theo config đã
-   khóa, không trộn feature cache khác target/layer.
+1. Ghi đường dẫn checkpoint, config, seed, số optimizer steps, loss cuối,
+   metrics và log cho hai lượt train đã hoàn tất.
+2. Xác minh nguyên nhân hidden parity fail giữa cache và model snapshot. Chưa
+   dùng kết quả train để kết luận cho tới khi biết cache được tạo bằng weights
+   và runtime nào.
+3. Chạy exactness, acceptance, quality và paired cost evaluation cho các
+   checkpoint; chỉ sau đó mới đưa vào benchmark inference.
+4. Nếu cần tạo lại cache bằng target snapshot đã xác định, đánh giá tác động
+   đến hai checkpoint hiện có trước khi quyết định retrain.
 
 ### Việc tiếp theo được giao
 
@@ -388,6 +399,7 @@ loss và ngân sách tham số hay không.
 - [`docs/mr_dflash.md`](mr_dflash.md)
 - [`docs/mr_dflash_pilot_pipeline.md`](mr_dflash_pilot_pipeline.md)
 - [`docs/mr_dflash_phase1_pipeline_v2.md`](mr_dflash_phase1_pipeline_v2.md)
+- [`docs/mr_dflash_gpu_experiments.md`](mr_dflash_gpu_experiments.md)
 - [`docs/mr_dflash_b200_profile.md`](mr_dflash_b200_profile.md)
 - [`docs/mr_dflash_vllm_regenerate.md`](mr_dflash_vllm_regenerate.md)
 
