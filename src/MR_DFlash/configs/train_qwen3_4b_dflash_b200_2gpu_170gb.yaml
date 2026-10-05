@@ -1,0 +1,56 @@
+run_id: qwen3-4b-dflash-paper-50k-2gpu-b200
+output_dir: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/dflash_qwen3_4b_paper_2gpu
+
+model:
+  target_model_path: /workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B
+  architecture: dflash
+  draft_num_hidden_layers: 5
+  draft_intermediate_size: 9728
+  block_size: 16
+  mask_token_id: 151669
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  draft_init_layer_ids: [1, 9, 17, 25, 33]
+  init_draft_from_target: false
+  draft_checkpoint_path: null
+  torch_dtype: bfloat16
+
+data:
+  feature_mode: offline
+  train_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/regenerated_full/train.jsonl
+  eval_data_path: /tmp/val_filtered.jsonl
+  tokenized_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/tokenized_full/train
+  eval_tokenized_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/tokenized_full/val
+  hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/target_features_qwen3_4b_full/train
+  eval_hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/target_features_qwen3_4b_full/val
+  supervision_mode: last_assistant
+  max_length: 16384
+  cache_dir: ./cache
+  num_samples: null
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: null
+  # Batch 14 trên context 16K tận dụng ~155-168 GB VRAM của card B200 180GB
+  batch_size: 14
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  indexer_train_mode: schedule
+  indexer_dense_steps: 1000
+  save_interval: 2500
+  log_interval: 20
+  eval_interval: 1000
+  dp_world_size: 1
+  seed: 42
