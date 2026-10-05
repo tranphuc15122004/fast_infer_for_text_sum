@@ -135,6 +135,7 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "metrics.jsonl"
         self.best_eval_loss = float("inf")
+        self._pbar = None
 
         if resume_from:
             self._resume(resume_from)
@@ -280,140 +281,172 @@ class Trainer:
         ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
         batches = self._iter_batches(self.dataset, shuffle=True)
         summary: Dict[str, object] = {}
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = None
 
-        for batch in batches:
-            if self.global_step >= self.total_steps:
-                break
-            batch = self._prepare_batch(batch)
-            if window_micros == 0:
-                step_start_wall = time.perf_counter()
-            out: StepOutput = self.strategy.forward_loss(batch, ctx)
-            scalar = out.loss
-            acc_num, acc_den = out.ratio_metrics.get(
-                "acc", (torch.zeros(()), torch.zeros(()))
+        if self.dist.is_main and tqdm is not None:
+            self._pbar = tqdm(
+                total=self.total_steps,
+                initial=self.global_step,
+                desc="[train]",
+                dynamic_ncols=True,
+                unit="step",
+                leave=True,
             )
-            loss_for_backward = scalar / acc_steps
-            loss_for_backward.backward()
-            self.micro += 1
-            window_loss += float(scalar.detach())
-            window_acc_num += float(torch.as_tensor(acc_num).float().sum())
-            window_acc_den += float(torch.as_tensor(acc_den).float().sum())
-            for name, pair in out.ratio_metrics.items():
-                if name == "acc":
-                    continue
-                numerator, denominator = pair
-                if name not in window_extra:
-                    window_extra[name] = [
-                        torch.zeros_like(torch.as_tensor(numerator, device=self.device).detach(), dtype=torch.float64),
-                        torch.zeros_like(torch.as_tensor(denominator, device=self.device).detach(), dtype=torch.float64),
-                    ]
-                window_extra[name][0] += torch.as_tensor(numerator, device=self.device).detach().double()
-                window_extra[name][1] += torch.as_tensor(denominator, device=self.device).detach().double()
-            window_micros += 1
-            window_tokens += int(batch.tensors["input_ids"].numel())
+        else:
+            self._pbar = None
 
-            stepped = self.micro % acc_steps == 0
-            if stepped:
-                # Thứ tự chuẩn: optimizer.step() rồi scheduler.step() (torch
-                # cảnh báo nếu ngược). Logged lr là giá trị cho step kế tiếp.
-                if tcfg.max_grad_norm is not None and tcfg.max_grad_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), tcfg.max_grad_norm
-                    )
-                else:
-                    grad_norm = torch.tensor(float("nan"))
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.global_step += 1
-                ctx = StepContext(
-                    global_step=self.global_step, total_steps=self.total_steps
-                )
-                if self.device.type == "cuda":
-                    # CUDA kernels are asynchronous; synchronize only at the
-                    # measurement boundary so pilot timing is meaningful.
-                    torch.cuda.synchronize(self.device)
-                step_started_at = step_start_wall or time.perf_counter()
-                step_time_s = time.perf_counter() - step_started_at
-
-                # DDP gradient đã được average, nên log cũng cần aggregate
-                # để rank 0 phản ánh global batch thay vì local batch.
-                metric_totals = torch.tensor(
-                    [window_loss, window_acc_num, window_acc_den, window_tokens],
-                    device=self.device,
-                    dtype=torch.float64,
-                )
-                all_reduce_sum(metric_totals)
-                global_micros = max(1, window_micros * self.dist.world_size)
-                global_acc_den = float(metric_totals[2].item())
-                metrics = {
-                    "global_step": self.global_step,
-                    "loss": float(metric_totals[0].item()) / global_micros,
-                    "acc": (
-                        float(metric_totals[1].item()) / global_acc_den
-                        if global_acc_den > 0
-                        else float("nan")
-                    ),
-                    "lr": current_lr(self.optimizer),
-                    "grad_norm": float(grad_norm.detach()),
-                    "trainable_parameter_count": self.trainable_parameter_count,
-                    "tokens_per_step": int(round(metric_totals[3].item())),
-                    "step_time_s": round(max(step_time_s, 1e-9), 4),
-                    "tokens_per_second": round(
-                        float(metric_totals[3].item()) / max(step_time_s, 1e-9), 2
-                    ),
-                    "elapsed_s": round(time.time() - start_wall, 2),
-                }
-                if self.device.type == "cuda":
-                    metrics.update(
-                        {
-                            "peak_memory_allocated_mb": round(
-                                torch.cuda.max_memory_allocated(self.device)
-                                / (1024 * 1024),
-                                2,
-                            ),
-                            "peak_memory_reserved_mb": round(
-                                torch.cuda.max_memory_reserved(self.device)
-                                / (1024 * 1024),
-                                2,
-                            ),
-                        }
-                    )
-                    torch.cuda.reset_peak_memory_stats(self.device)
-                for name, (numerator, denominator) in window_extra.items():
-                    totals = torch.stack([numerator, denominator], dim=0)
-                    all_reduce_sum(totals)
-                    ratios = totals[0] / totals[1].clamp_min(1e-12)
-                    if name == "acc_pos":
-                        prefix = "acc_at"
-                    elif name == "accept_ge":
-                        prefix = "accept_ge"
-                    else:
-                        prefix = name
-                    ratio_values = ratios.detach().cpu().tolist()
-                    if not isinstance(ratio_values, list):
-                        ratio_values = [ratio_values]
-                    for offset, value in enumerate(ratio_values, 1):
-                        metrics[f"{prefix}_{offset}"] = float(value)
-                self._log(metrics)
-                window_loss = 0.0
-                window_acc_num = 0.0
-                window_acc_den = 0.0
-                window_micros = 0
-                window_tokens = 0
-                window_extra = {}
-                step_start_wall = None
-
-                if save_every and self.global_step % save_every == 0:
-                    self._save_checkpoint(f"step_{self.global_step}")
-                if (
-                    eval_dataset is not None
-                    and tcfg.eval_interval > 0
-                    and self.global_step % tcfg.eval_interval == 0
-                ):
-                    self.evaluate(eval_dataset)
+        try:
+            for batch in batches:
                 if self.global_step >= self.total_steps:
                     break
+                batch = self._prepare_batch(batch)
+                if window_micros == 0:
+                    step_start_wall = time.perf_counter()
+                out: StepOutput = self.strategy.forward_loss(batch, ctx)
+                scalar = out.loss
+                acc_num, acc_den = out.ratio_metrics.get(
+                    "acc", (torch.zeros(()), torch.zeros(()))
+                )
+                loss_for_backward = scalar / acc_steps
+                loss_for_backward.backward()
+                self.micro += 1
+                window_loss += float(scalar.detach())
+                window_acc_num += float(torch.as_tensor(acc_num).float().sum())
+                window_acc_den += float(torch.as_tensor(acc_den).float().sum())
+                for name, pair in out.ratio_metrics.items():
+                    if name == "acc":
+                        continue
+                    numerator, denominator = pair
+                    if name not in window_extra:
+                        window_extra[name] = [
+                            torch.zeros_like(torch.as_tensor(numerator, device=self.device).detach(), dtype=torch.float64),
+                            torch.zeros_like(torch.as_tensor(denominator, device=self.device).detach(), dtype=torch.float64),
+                        ]
+                    window_extra[name][0] += torch.as_tensor(numerator, device=self.device).detach().double()
+                    window_extra[name][1] += torch.as_tensor(denominator, device=self.device).detach().double()
+                window_micros += 1
+                window_tokens += int(batch.tensors["input_ids"].numel())
+
+                stepped = self.micro % acc_steps == 0
+                if stepped:
+                    # Thứ tự chuẩn: optimizer.step() rồi scheduler.step() (torch
+                    # cảnh báo nếu ngược). Logged lr là giá trị cho step kế tiếp.
+                    if tcfg.max_grad_norm is not None and tcfg.max_grad_norm > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), tcfg.max_grad_norm
+                        )
+                    else:
+                        grad_norm = torch.tensor(float("nan"))
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.global_step += 1
+                    ctx = StepContext(
+                        global_step=self.global_step, total_steps=self.total_steps
+                    )
+                    if self.device.type == "cuda":
+                        # CUDA kernels are asynchronous; synchronize only at the
+                        # measurement boundary so pilot timing is meaningful.
+                        torch.cuda.synchronize(self.device)
+                    step_started_at = step_start_wall or time.perf_counter()
+                    step_time_s = time.perf_counter() - step_started_at
+
+                    # DDP gradient đã được average, nên log cũng cần aggregate
+                    # để rank 0 phản ánh global batch thay vì local batch.
+                    metric_totals = torch.tensor(
+                        [window_loss, window_acc_num, window_acc_den, window_tokens],
+                        device=self.device,
+                        dtype=torch.float64,
+                    )
+                    all_reduce_sum(metric_totals)
+                    global_micros = max(1, window_micros * self.dist.world_size)
+                    global_acc_den = float(metric_totals[2].item())
+                    metrics = {
+                        "global_step": self.global_step,
+                        "loss": float(metric_totals[0].item()) / global_micros,
+                        "acc": (
+                            float(metric_totals[1].item()) / global_acc_den
+                            if global_acc_den > 0
+                            else float("nan")
+                        ),
+                        "lr": current_lr(self.optimizer),
+                        "grad_norm": float(grad_norm.detach()),
+                        "trainable_parameter_count": self.trainable_parameter_count,
+                        "tokens_per_step": int(round(metric_totals[3].item())),
+                        "step_time_s": round(max(step_time_s, 1e-9), 4),
+                        "tokens_per_second": round(
+                            float(metric_totals[3].item()) / max(step_time_s, 1e-9), 2
+                        ),
+                        "elapsed_s": round(time.time() - start_wall, 2),
+                    }
+                    if self.device.type == "cuda":
+                        metrics.update(
+                            {
+                                "peak_memory_allocated_mb": round(
+                                    torch.cuda.max_memory_allocated(self.device)
+                                    / (1024 * 1024),
+                                    2,
+                                ),
+                                "peak_memory_reserved_mb": round(
+                                    torch.cuda.max_memory_reserved(self.device)
+                                    / (1024 * 1024),
+                                    2,
+                                ),
+                            }
+                        )
+                        torch.cuda.reset_peak_memory_stats(self.device)
+                    for name, (numerator, denominator) in window_extra.items():
+                        totals = torch.stack([numerator, denominator], dim=0)
+                        all_reduce_sum(totals)
+                        ratios = totals[0] / totals[1].clamp_min(1e-12)
+                        if name == "acc_pos":
+                            prefix = "acc_at"
+                        elif name == "accept_ge":
+                            prefix = "accept_ge"
+                        else:
+                            prefix = name
+                        ratio_values = ratios.detach().cpu().tolist()
+                        if not isinstance(ratio_values, list):
+                            ratio_values = [ratio_values]
+                        for offset, value in enumerate(ratio_values, 1):
+                            metrics[f"{prefix}_{offset}"] = float(value)
+                    self._log(metrics)
+                    if self._pbar is not None:
+                        self._pbar.update(1)
+                        postfix = {
+                            "loss": f"{metrics['loss']:.4f}",
+                            "acc": f"{metrics['acc']:.3f}",
+                            "lr": f"{metrics['lr']:.2e}",
+                        }
+                        if "tokens_per_second" in metrics:
+                            postfix["tok/s"] = f"{metrics['tokens_per_second']:.0f}"
+                        self._pbar.set_postfix(postfix)
+
+                    window_loss = 0.0
+                    window_acc_num = 0.0
+                    window_acc_den = 0.0
+                    window_micros = 0
+                    window_tokens = 0
+                    window_extra = {}
+                    step_start_wall = None
+
+                    if save_every and self.global_step % save_every == 0:
+                        self._save_checkpoint(f"step_{self.global_step}")
+                    if (
+                        eval_dataset is not None
+                        and tcfg.eval_interval > 0
+                        and self.global_step % tcfg.eval_interval == 0
+                    ):
+                        self.evaluate(eval_dataset)
+                    if self.global_step >= self.total_steps:
+                        break
+        finally:
+            if self._pbar is not None:
+                self._pbar.close()
+                self._pbar = None
 
         # Dừng với accumulation lẻ → cảnh báo (bình thường khi max_steps cắt sớm).
         if self.micro % acc_steps != 0:
@@ -508,10 +541,14 @@ class Trainer:
                 json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            print(
+            msg = (
                 f"[eval] step={self.global_step} loss={result['eval_loss']:.4f} "
                 f"acc={result['eval_acc']:.4f}"
             )
+            if self._pbar is not None:
+                self._pbar.write(msg)
+            else:
+                print(msg, flush=True)
         current_eval_loss = float(result["eval_loss"])
         if current_eval_loss < self.best_eval_loss:
             self.best_eval_loss = current_eval_loss
@@ -549,7 +586,11 @@ class Trainer:
             self._draft_state_dict(),
             config_yaml=self.run_cfg.dump_yaml(),
         )
-        print(f"[trainer] đã lưu checkpoint tại {path} (step {self.global_step})")
+        msg = f"[trainer] đã lưu checkpoint tại {path} (step {self.global_step})"
+        if self._pbar is not None:
+            self._pbar.write(msg)
+        else:
+            print(msg, flush=True)
         barrier()
         return path
 
@@ -559,12 +600,27 @@ class Trainer:
         line = json.dumps(metrics, ensure_ascii=False, sort_keys=True)
         with open(self.metrics_path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-        if self.global_step % self.run_cfg.training.log_interval == 0:
-            print(
-                f"[train] step={metrics['global_step']} loss={metrics['loss']:.4f} "
-                f"acc={metrics['acc']:.4f} lr={metrics['lr']:.2e} "
-                f"gn={metrics['grad_norm']:.3f}"
+        log_interval = max(1, self.run_cfg.training.log_interval)
+        if (
+            self.global_step == 1
+            or self.global_step % log_interval == 0
+            or self.global_step >= self.total_steps
+        ):
+            mem_info = ""
+            if "peak_memory_allocated_mb" in metrics:
+                mem_info = f" | vram={metrics['peak_memory_allocated_mb']:.0f}MB"
+            pct = (self.global_step / self.total_steps * 100) if self.total_steps > 0 else 0.0
+            msg = (
+                f"[train] step={self.global_step}/{self.total_steps} ({pct:.1f}%) | "
+                f"loss={metrics['loss']:.4f} | acc={metrics['acc']:.4f} | "
+                f"lr={metrics['lr']:.2e} | gn={metrics['grad_norm']:.3f} | "
+                f"tok/s={metrics.get('tokens_per_second', 0):.0f} | "
+                f"step_time={metrics.get('step_time_s', 0):.2f}s{mem_info}"
             )
+            if self._pbar is not None:
+                self._pbar.write(msg)
+            else:
+                print(msg, flush=True)
 
 
 __all__ = ["Trainer"]
