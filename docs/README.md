@@ -56,6 +56,28 @@ Xem [bối cảnh MR-DFlash](mr_dflash.md) và
 [`src/MR_DFlash/README.md`](../src/MR_DFlash/README.md). Nó chưa có launcher
 benchmark inference hay kết quả riêng.
 
+Tài liệu nền cho paper về chọn/nén context của DFlash: tổng hợp thực nghiệm,
+insight, mẫu số attention, liên hệ Training-Free/MASW, giới hạn bằng chứng và
+các phép kiểm chứng còn cần thực hiện:
+[hồ sơ phân tích nghiên cứu](experiments/2026-10-06_dflash_context_memory_paper_analysis.md).
+
+Thăm dò attention của DFlash trên một instance GovReport, bốn mức 3K/5K/8K/16K
+và tám lượt draft/mức trên Modal L40S:
+[báo cáo và histogram/heatmap](experiments/2026-10-06_dflash_attention_probe_results.md).
+Mở rộng lên 10 instance, sinh tới EOS/512 token và khảo sát toàn bộ mass trên
+prompt, output đã sinh, anchor và mask của draft block:
+[protocol và kết quả](experiments/2026-10-06_dflash_attention_10_instances_full_mass.md).
+Phân tích phục vụ module nén context KV, chỉ số chính trên 100% mass và
+chẩn đoán cache sau khi loại 16 key của draft block; phương pháp luôn giữ block:
+[insight, số đo và hình bổ sung](experiments/2026-10-06_dflash_full_context_compression_analysis.md).
+So sánh phân phối attention DFlash với target ở layer thấp/giữa/cao, cùng
+phân tích overlap Top-K trên cùng các lượt draft:
+[báo cáo và hình](experiments/2026-10-06_dflash_target_attention_comparison.md).
+Đo đúng parent query của target tạo anchor ở lượt trước và đối chiếu với
+attention DFlash ở lượt kế tiếp, gồm histogram toàn mass và bonus/correction
+alignment:
+[báo cáo parent-to-next-draft](experiments/2026-10-06_dflash_parent_attention_next_draft.md).
+
 Quy trình pilot train/eval với target feature online, tokenized shard và ma
 trận DFlash-2L/MR-2S/DFlash-5L nằm tại
 [`docs/mr_dflash_pilot_pipeline.md`](mr_dflash_pilot_pipeline.md).
