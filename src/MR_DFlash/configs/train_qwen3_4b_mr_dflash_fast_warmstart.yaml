@@ -1,0 +1,67 @@
+run_id: qwen3-4b-mr-dflash-fast-warmstart-4gpu-b200
+output_dir: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_fast_warmstart_4gpu
+
+model:
+  target_model_path: /workspace/storage-shared/nlp/dungdx4/BERT/Qwen3-4B
+  architecture: mr_dflash
+  draft_num_hidden_layers: 1
+  draft_intermediate_size: 9728
+  block_size: 16
+  mask_token_id: 151669
+  feature_layer_ids: [1, 9, 17, 25, 33]
+  draft_init_layer_ids: [18]
+  mr_stage_init_layer_ids: [17, 18]
+  mr_num_stages: 2
+  hca_compression_ratio: 128
+  csa_compression_ratio: 4
+  memory_local_window: 128
+  csa_top_k: 64
+  indexer_dim: null
+  indexer_num_heads: 1
+  init_draft_from_target: false
+  # Khởi tạo warm-start kế thừa từ checkpoint DFlash 2000 steps đã học tốt
+  draft_checkpoint_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/dflash_paper_4gpu/checkpoint_best_eval.pt
+  torch_dtype: bfloat16
+
+data:
+  feature_mode: offline
+  train_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/regenerated_full/train.jsonl
+  eval_data_path: /tmp/val_filtered.jsonl
+  tokenized_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/tokenized_full/train
+  eval_tokenized_data_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/tokenized_full/val
+  hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/target_features_qwen3_4b_full/train
+  eval_hidden_states_path: /workspace/storage-shared/nlp/dungdx4/phuc_projects/outputs/mr_dflash_phase1_50k_50_50_10k_b200_gpu0_ctx16k_out1k_20260928T132928Z/target_features_qwen3_4b_full/val
+  supervision_mode: last_assistant
+  max_length: 16384
+  cache_dir: ./cache
+  num_samples: null
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  strategy: mr_dflash
+  num_epochs: 1
+  # Chạy 500 steps warm-start adaptation (~1 - 1.2 giờ trên 4 GPU B200)
+  max_steps: 500
+  batch_size: 8
+  accumulation_steps: 1
+  # Giảm LR xuống 0.0002 cho warm-start fine-tuning để tránh sốc trọng số đã học
+  learning_rate: 0.0002
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  # Giảm số anchors xuống 256 để giảm 50% tính toán Attention, tăng tốc độ step
+  num_anchors: 256
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  loss_type: dflash
+  indexer_train_mode: schedule
+  indexer_dense_steps: 100
+  save_interval: 250
+  log_interval: 10
+  eval_interval: 250
+  dp_world_size: 1
+  seed: 42
