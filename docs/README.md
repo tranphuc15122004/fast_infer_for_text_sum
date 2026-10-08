@@ -25,6 +25,15 @@ Nếu chạy benchmark trên Modal thay vì server B200, dùng
 cache/output Volume riêng; không dùng trực tiếp master-env chứa path
 `/workspace/storage-shared/...` của server.
 
+## Context-Adaptive DFlash training-free
+
+Bộ tài liệu triển khai mới nằm tại
+[TrainingFree README](../src/TrainingFree/README.md): đặc tả A/B/C, tích hợp
+KV/positions/verifier, protocol calibration/dev/test theo source document,
+schema/timing, runbook và task implementation. Trạng thái hiện tại là
+**đặc tả để triển khai**, chưa có executor/launcher hoặc kết quả riêng của
+phương pháp. Xem [baseline guide dự kiến](baselines/context_adaptive_dflash.md).
+
 ## Nội dung
 
 - **Chung** — chuẩn bị venv Python 3.12 offline, định dạng dữ liệu, lệnh chạy
@@ -60,6 +69,12 @@ Tài liệu nền cho paper về chọn/nén context của DFlash: tổng hợp 
 insight, mẫu số attention, liên hệ Training-Free/MASW, giới hạn bằng chứng và
 các phép kiểm chứng còn cần thực hiện:
 [hồ sơ phân tích nghiên cứu](experiments/2026-10-06_dflash_context_memory_paper_analysis.md).
+
+Hướng AMR-DFlash acceptance-first cập nhật ngày 08/10/2026:
+[proposal và paper story](../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md)
+và [bộ tài liệu triển khai](../src/ARMdflash/AMR_DFlash_Implementation/README.md).
+Bộ này gồm đặc tả, data/train contract, protocol, kế hoạch và checklist; hiện
+chưa có implementation hoặc kết quả AMR.
 
 Đề xuất cơ chế điều phối context tận dụng DFlash đã train: giữ block 16,
 chọn key bằng attention của chính drafter, tái sử dụng và dense refresh:

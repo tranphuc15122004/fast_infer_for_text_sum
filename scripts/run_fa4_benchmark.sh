@@ -18,7 +18,32 @@ export MODEL_DOMINO_DRAFT="${LONG_BENCH_DOMINO_MODEL:-${MODEL_DOMINO_DRAFT:-${MO
 export MODEL_DSPARK_DRAFT="${LONG_BENCH_DSPARK_MODEL:-${MODEL_DSPARK_DRAFT:-${MODEL_DSPARK:-}}}"
 
 DATA_DIR="${FA4_DATA_DIR:-${LONG_BENCH_DATA_DIR:-data/longbench_100_14k}}"
-[[ "$DATA_DIR" = /* ]] || DATA_DIR="$ROOT/$DATA_DIR"
+if [[ "$DATA_DIR" != /* ]]; then
+  if [[ -d "$ROOT/$DATA_DIR" ]]; then
+    DATA_DIR="$ROOT/$DATA_DIR"
+  elif [[ "$DATA_DIR" == *"eval_100"* ]]; then
+    if [[ -d "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/eval_100" ]]; then
+      DATA_DIR="/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/eval_100"
+    elif [[ -d "$ROOT/data/eval_100" ]]; then
+      DATA_DIR="$ROOT/data/eval_100"
+    elif [[ -d "$ROOT/datasets/eval_100" ]]; then
+      DATA_DIR="$ROOT/datasets/eval_100"
+    elif [[ -d "/home/tuantb/fast_infer_text_sum_Viet/datasets/eval_100" ]]; then
+      DATA_DIR="/home/tuantb/fast_infer_text_sum_Viet/datasets/eval_100"
+    fi
+  else
+    DATA_DIR="$ROOT/$DATA_DIR"
+  fi
+elif [[ ! -d "$DATA_DIR" && "$DATA_DIR" == *"eval_100"* ]]; then
+  if [[ -d "/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/eval_100" ]]; then
+    DATA_DIR="/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/eval_100"
+  elif [[ -d "$ROOT/data/eval_100" ]]; then
+    DATA_DIR="$ROOT/data/eval_100"
+  elif [[ -d "/home/tuantb/fast_infer_text_sum_Viet/datasets/eval_100" ]]; then
+    DATA_DIR="/home/tuantb/fast_infer_text_sum_Viet/datasets/eval_100"
+  fi
+fi
+
 OUTPUT_DIR="${FA4_OUTPUT_ROOT:-$ROOT/outputs/fa4_native_benchmark}"
 [[ "$OUTPUT_DIR" = /* ]] || OUTPUT_DIR="$ROOT/$OUTPUT_DIR"
 export FA4_EXECUTION_BACKEND=server

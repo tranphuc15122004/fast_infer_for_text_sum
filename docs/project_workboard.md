@@ -41,6 +41,7 @@ Nhãn dùng trong tài liệu:
 | `F1` | DFlash fine-tuning cho tóm tắt tiếng Việt | `src/Finetuning/` | **Core và synthetic pipeline đã chạy; chưa đóng real Vietnamese quality/speedup** |
 | `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Fine-tune và GrowMTP loss from scratch trên B200 đã chạy xong theo báo cáo; audit hidden cache và đánh giá chất lượng/acceptance còn mở** |
 | `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |
+| `T2` | Context-Adaptive DFlash training-free | `src/TrainingFree/docs/context_adaptive_dflash/` | **Đặc tả và protocol đã có; executor/launcher và G0–G6 đang pending** |
 | `Y1` | SyncSpec-v1 speculative decoding | `src/SyncSpec/`, `docs/baselines/syncspec.md` | **Core, test và smoke đã có; chưa có full benchmark canonical để claim** |
 | `A1` | Phân tích chẩn đoán và quyết định nghiên cứu | `src/analyze/`, `outputs/dflash_residual/`, `outputs/safe_budget_sum/`, `outputs/specextend_*` | **Nhiều thí nghiệm đã chạy; kết quả dùng để lọc giả thuyết, không tự động là baseline** |
 
@@ -498,6 +499,32 @@ và JSON đi kèm.
 - [`src/TrainingFree/plans/2026-09-21-controlled-empirical-search.md`](../src/TrainingFree/plans/2026-09-21-controlled-empirical-search.md)
 
 ---
+
+## `T2` — Context-Adaptive DFlash training-free
+
+### Ý tưởng và phạm vi
+
+Cùng thích nghi draft-context budget và số speculative tokens trên pretrained
+DFlash, dùng source relevance/uncertainty/acceptance và cost model. Target luôn
+full context và exact verification; không cập nhật model weights.
+
+### Trạng thái hiện tại
+
+Ngày 2026-10-08 đã hoàn thiện [bộ tài liệu canonical](../src/TrainingFree/README.md):
+algorithm, cache/verifier contracts, measurement schema, source-group split,
+calibration/dev/test protocol, paper story, runbook và implementation plan.
+Code `TrainingFree.run/policy` hiện có vẫn là RECAP-KV. Chưa có executor mới,
+launcher hoặc benchmark Context-Adaptive DFlash; G0–G6 đều pending.
+
+### Việc tiếp theo và nguồn sự thật
+
+Thực hiện [Task1–9](../src/TrainingFree/plans/2026-10-08-context-adaptive-dflash-implementation.md):
+config/source metadata → full DFlash parity → verifier/signals → selection →
+controller/refresh → evaluator/launcher → GPU correctness và locked experiments.
+Chỉ công bố speedup khi có completed paired artifacts, overhead đầy đủ và CI.
+
+Nhánh này có scope riêng với T1; các gate RECAP-KV trước đó không tự chuyển thành
+gate đã pass hoặc kết quả của Context-Adaptive DFlash.
 
 ## `Y1` — SyncSpec-v1: synchronized lossless speculative decoding
 

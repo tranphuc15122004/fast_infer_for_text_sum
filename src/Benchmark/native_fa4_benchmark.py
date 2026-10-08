@@ -18,12 +18,63 @@ SERVER_MODE = True
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REMOTE_ROOT = PROJECT_ROOT
 REMOTE_SRC = PROJECT_ROOT / "src"
-DATASETS = ("gov_report", "qmsum", "multi_news", "lcc", "repobench-p")
+LONGBENCH_DATASETS = ("gov_report", "qmsum", "multi_news", "lcc", "repobench-p")
+VIETNAMESE_DATASETS = ("vietnews", "wikilingua", "vims", "vlsp")
+DATASETS = LONGBENCH_DATASETS + VIETNAMESE_DATASETS
 DATA_ROOT = Path(os.environ.get("FA4_DATA_DIR", PROJECT_ROOT / "data" / "longbench_100_14k")).expanduser()
 if not DATA_ROOT.is_absolute():
     DATA_ROOT = PROJECT_ROOT / DATA_ROOT
+
+
+def resolve_dataset_file(data_root: Path, dataset: str) -> Path:
+    """Resolve jsonl file path for dataset, supporting both LongBench and Vietnamese formats."""
+    f1 = data_root / f"{dataset}.jsonl"
+    if f1.is_file():
+        return f1
+    f2 = data_root / f"{dataset}_100.jsonl"
+    if f2.is_file():
+        return f2
+    manifest_path = data_root / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if "datasets" in m and dataset in m["datasets"]:
+                eval_file = m["datasets"][dataset].get("eval_file")
+                if eval_file:
+                    f3 = data_root / Path(eval_file).name
+                    if f3.is_file():
+                        return f3
+        except Exception:
+            pass
+    return f1
+
+
+def detect_default_datasets(data_root: Path) -> tuple[str, ...]:
+    """Auto-detect whether data_root contains Vietnamese eval_100 or LongBench datasets."""
+    manifest_path = data_root / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if "datasets" in m:
+                found_vn = [d for d in VIETNAMESE_DATASETS if d in m["datasets"]]
+                if found_vn:
+                    return tuple(found_vn)
+                found_lb = [d for d in LONGBENCH_DATASETS if d in m["datasets"]]
+                if found_lb:
+                    return tuple(found_lb)
+        except Exception:
+            pass
+    vn_files = [d for d in VIETNAMESE_DATASETS if resolve_dataset_file(data_root, d).is_file()]
+    if vn_files:
+        return tuple(vn_files)
+    lb_files = [d for d in LONGBENCH_DATASETS if resolve_dataset_file(data_root, d).is_file()]
+    if lb_files:
+        return tuple(lb_files)
+    return LONGBENCH_DATASETS
+
+
 LOCAL_DATA_FILES = {
-    name: DATA_ROOT / f"{name}.jsonl"
+    name: resolve_dataset_file(DATA_ROOT, name)
     for name in DATASETS
 }
 REMOTE_DATA_FILES = dict(LOCAL_DATA_FILES)
@@ -339,17 +390,19 @@ def _prepare_samples(
     datasets: tuple[str, ...],
     samples_per_dataset: int,
     max_input_tokens: int,
+    data_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from Benchmark.common.benchmark_data import read_jsonl, render_prompt
     from Benchmark.common.fa4_benchmark import select_length_spread
     from Benchmark.common.input_utils import truncate_input_ids
     from Benchmark.common.prompt_format import format_chat_prompt
 
+    root = data_root or DATA_ROOT
     selected: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
     for dataset in datasets:
         candidates: list[dict[str, Any]] = []
-        data_path = REMOTE_DATA_FILES[dataset]
+        data_path = resolve_dataset_file(root, dataset)
         dataset_sha256 = hashlib.sha256(data_path.read_bytes()).hexdigest()
         for row in read_jsonl(data_path):
             prompt = format_chat_prompt(tokenizer, render_prompt(row))
@@ -1145,24 +1198,65 @@ def _safe_mean(values: list[float]) -> float | None:
     return round(statistics.mean(values), 4) if values else None
 
 
-def _validate_longbench_data(datasets: tuple[str, ...]) -> dict[str, Any]:
-    """Verify selected canonical LongBench files against their manifest."""
+def _validate_longbench_data(datasets: tuple[str, ...], data_root: Path | None = None) -> dict[str, Any]:
+    """Verify selected canonical LongBench or Vietnamese eval_100 files against manifest."""
     from Benchmark.common.benchmark_data import read_jsonl
 
-    manifest_path = DATA_ROOT / "manifest.json"
+    root = data_root or DATA_ROOT
+    manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"LongBench manifest not found: {manifest_path}")
+        raise FileNotFoundError(f"Dataset manifest not found: {manifest_path}")
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
-    if manifest.get("schema_version") != "longbench-canonical-v1":
+
+    checked: dict[str, Any] = {}
+    schema_version = manifest.get("schema_version")
+
+    # Vietnamese eval_100 manifest
+    if "datasets" in manifest and isinstance(manifest["datasets"], dict) and any(d in manifest["datasets"] for d in VIETNAMESE_DATASETS):
+        vn_manifest_datasets = manifest["datasets"]
+        for dataset in datasets:
+            path = resolve_dataset_file(root, dataset)
+            if not path.is_file():
+                raise FileNotFoundError(f"Vietnamese dataset not found: {path}")
+            rows = read_jsonl(path)
+            meta = vn_manifest_datasets.get(dataset, {})
+            expected_count = int(meta.get("eval_records") or manifest.get("config", {}).get("samples_per_dataset", 100))
+            if expected_count <= 0 or len(rows) != expected_count:
+                raise ValueError(
+                    f"{dataset} sample count differs from manifest: "
+                    f"expected={expected_count}, actual={len(rows)}"
+                )
+            if any(str(row.get("dataset", "")) != dataset for row in rows):
+                raise ValueError(f"{dataset} file contains a row for another dataset")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            expected_hash = meta.get("eval_sha256")
+            if expected_hash and digest != expected_hash:
+                raise ValueError(
+                    f"{dataset} file SHA-256 differs from manifest: "
+                    f"expected={expected_hash}, actual={digest}"
+                )
+            checked[dataset] = {
+                "path": str(path.resolve()),
+                "sample_count": len(rows),
+                "sha256": digest,
+            }
+        return {
+            "data_dir": str(root.resolve()),
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "schema_version": schema_version or "vietnamese-eval_100-v1",
+            "datasets": checked,
+        }
+
+    # Canonical LongBench manifest
+    if schema_version != "longbench-canonical-v1":
         raise ValueError(
-            f"Unexpected LongBench schema version: {manifest.get('schema_version')!r}"
+            f"Unexpected dataset schema version: {schema_version!r}"
         )
     expected_counts = manifest.get("selected_counts", {})
     expected_hashes = manifest.get("file_sha256", {})
-    checked: dict[str, Any] = {}
     for dataset in datasets:
-        path = REMOTE_DATA_FILES[dataset]
+        path = resolve_dataset_file(root, dataset)
         if not path.is_file():
             raise FileNotFoundError(f"LongBench dataset not found: {path}")
         rows = read_jsonl(path)
@@ -1183,7 +1277,7 @@ def _validate_longbench_data(datasets: tuple[str, ...]) -> dict[str, Any]:
             "sha256": digest,
         }
     return {
-        "data_dir": str(DATA_ROOT.resolve()),
+        "data_dir": str(root.resolve()),
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "schema_version": manifest["schema_version"],
         "datasets": checked,
@@ -1209,6 +1303,8 @@ def run_flashattn_benchmark(
     verifier_audit: bool = False,
     preflight_only: bool = False,
     debug_cuda_launch_blocking: bool = False,
+    data_dir: Path | str | None = None,
+    output_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Benchmark selected datasets/methods with paired batch-one requests."""
     import gc
@@ -1252,6 +1348,14 @@ def run_flashattn_benchmark(
     from Benchmark.common.quality_guard import is_degenerate_output
     from Benchmark.common.rouge import add_rouge, aggregate_rouge
 
+    active_data_root = Path(data_dir).expanduser() if data_dir else DATA_ROOT
+    if not active_data_root.is_absolute():
+        active_data_root = PROJECT_ROOT / active_data_root
+
+    active_output_root = Path(output_dir).expanduser() if output_dir else REMOTE_OUTPUT_ROOT
+    if not active_output_root.is_absolute():
+        active_output_root = PROJECT_ROOT / active_output_root
+
     if not torch.cuda.is_available():
         raise RuntimeError("Benchmark process did not expose a CUDA GPU")
     if torch.cuda.get_device_capability(0)[0] < 10:
@@ -1266,7 +1370,10 @@ def run_flashattn_benchmark(
         raise ValueError("checkpoint-interval must be positive")
     if resume and not run_id:
         raise ValueError("resume requires an explicit run-id")
-    selected_datasets = parse_selection(datasets, DATASETS, "dataset")
+    if datasets == "all":
+        selected_datasets = detect_default_datasets(active_data_root)
+    else:
+        selected_datasets = parse_selection(datasets, DATASETS, "dataset")
     selected_methods = resolve_flashattn_methods(methods)
     sample_limit = resolve_sample_limit(mode, samples_per_dataset, available=100)
     if not run_id:
@@ -1288,7 +1395,7 @@ def run_flashattn_benchmark(
         allow_installed_vllm=SERVER_MODE,
     )
     runtime["fa4_tree_mask_gpu_probe"] = _fa4_tree_mask_gpu_probe(torch)
-    runtime["dataset_validation"] = _validate_longbench_data(selected_datasets)
+    runtime["dataset_validation"] = _validate_longbench_data(selected_datasets, data_root=active_data_root)
 
     if preflight_only:
         return {
@@ -1319,6 +1426,7 @@ def run_flashattn_benchmark(
         datasets=selected_datasets,
         samples_per_dataset=sample_limit,
         max_input_tokens=max_input_tokens,
+        data_root=active_data_root,
     )
     runtime["selected_samples"] = [
         {
@@ -1384,7 +1492,7 @@ def run_flashattn_benchmark(
     method_configs: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     gpu_context_lost = False
-    remote_run_dir = REMOTE_OUTPUT_ROOT / run_id
+    remote_run_dir = active_output_root / run_id
     remote_run_dir.mkdir(parents=True, exist_ok=True)
     partial_path = remote_run_dir / "results.partial.jsonl"
     warmup_path = remote_run_dir / "warmup.jsonl"

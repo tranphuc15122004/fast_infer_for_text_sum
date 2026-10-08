@@ -116,6 +116,8 @@ def runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "verifier_audit": args.verifier_audit,
         "preflight_only": args.preflight_only,
         "debug_cuda_launch_blocking": args.debug_cuda_launch_blocking,
+        "data_dir": str(args.data_dir),
+        "output_dir": str(args.output_dir),
     }
 
 

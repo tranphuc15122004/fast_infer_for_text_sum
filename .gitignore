@@ -50,6 +50,8 @@ externals/EAGLE/eagle/data/mt_bench/reference_answer/
 # Large, regenerable datasets (prepare_data.py tải từ HuggingFace; xem data/README.md)
 data/raw/
 data/normalized/
+data/eval_100
+datasets/
 
 # IDE
 .vscode/
