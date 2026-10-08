@@ -62,4 +62,4 @@ Phương pháp đề xuất sử dụng source relevance, uncertainty có sẵn 
 
 Nếu A có lợi nhưng B không vượt best fixed, giữ selective context finding và giảm adaptive-length claim. Nếu A/B đều có lợi nhưng joint không vượt independent, không claim lợi ích từ phối hợp. Nếu interaction có nhưng controller không khai thác được, báo empirical finding và phần policy còn hạn chế. Nếu speedup chỉ có trên fixed-token stress run, giới hạn claim vào regime đó.
 
-Khi viết abstract kết quả cuối, chỉ bổ sung số đo có completed artifacts, paired CI và gate report. Proposal này không dùng động từ khẳng định đã đạt speedup, generalization hoặc memory saving cho executor chưa triển khai.
+Khi viết abstract kết quả cuối, chỉ bổ sung số đo có completed artifacts, paired CI và gate report. Executor đã có code nhưng chưa qua GPU parity/benchmark; paper story này không khẳng định đã đạt speedup, generalization hoặc memory saving.

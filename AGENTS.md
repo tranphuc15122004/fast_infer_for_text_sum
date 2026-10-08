@@ -82,7 +82,8 @@ bash scripts/run_longbench_200.sh --config <master> --mode full \
 
 Baseline khả dụng: `eagle3 dflash llmlingua fastkv rocketkv gemfilter
 specprefill minference magicdec longspec specextend higoe semantic_selection
-flexprefill`.
+flexprefill context_adaptive_dflash` (Context-Adaptive DFlash đang ở trạng thái
+experimental; chưa xác nhận parity hoặc benchmark trên GPU).
 
 ## Gotchas
 

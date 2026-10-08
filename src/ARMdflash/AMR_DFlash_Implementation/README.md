@@ -1,6 +1,6 @@
 # Bộ tài liệu triển khai AMR-DFlash
 
-Ngày: **08/10/2026**. Trạng thái: **đặc tả và kế hoạch; chưa triển khai AMR, chưa chạy training/GPU benchmark**.
+Ngày: **08/10/2026**. Trạng thái: **V0 code và launcher đã triển khai; CPU contract tests pass; model thật/B200 training và benchmark chưa chạy**.
 
 Nguồn quyết định nghiên cứu là [proposal AMR-DFlash ngày 08/10](../AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md). Bộ này chuyển proposal thành hợp đồng triển khai có thể kiểm tra; các lựa chọn V0 là cấu hình khởi đầu cho pilot, không phải kết quả khoa học.
 
@@ -9,7 +9,7 @@ Nguồn quyết định nghiên cứu là [proposal AMR-DFlash ngày 08/10](../A
 | Tài liệu | Dùng khi nào |
 |---|---|
 | [Đặc tả kỹ thuật](../../../docs/superpowers/specs/2026-10-08-amr-dflash-design.md) | Xây module, quyết định memory interface, vị trí và verifier |
-| [Dữ liệu và huấn luyện](data_training_contract.md) | Capture state, tạo nhãn, train và resume |
+| [Dữ liệu và huấn luyện](data_training_contract.md) | Capture state, tạo nhãn, train và artifact hiện có |
 | [Giao thức thực nghiệm](experiment_protocol.md) | Chọn cohort, chạy pilot, đo cost và đánh giá giả thuyết |
 | [Kế hoạch triển khai](../../../docs/superpowers/plans/2026-10-08-amr-dflash-implementation.md) | Thực hiện từng task với đầu vào, đầu ra và kiểm thử cụ thể |
 | [Checklist nghiệm thu](acceptance_checklist.md) | Xác định milestone đã đạt và claim được phép |
@@ -18,18 +18,20 @@ Nguồn quyết định nghiên cứu là [proposal AMR-DFlash ngày 08/10](../A
 
 - Acceptance-first: accepted prefix là cơ chế; committed tokens/s và E2E là kết quả cuối.
 - Giữ pretrained DFlash **5 layer**, **16 live positions = 1 anchor + 15 proposals**.
-- Thêm local exact memory, selector học theo state, compressor bổ trợ và gate theo cost.
-- Target và DFlash frozen ban đầu; attention warm-up không bắt buộc.
-- Full integrated pilot sớm; selector/compressor/gate/reuse có thể tắt độc lập.
+- Thêm local exact memory, selector học theo state, compressor bổ trợ và gate ngưỡng context.
+- Target và DFlash frozen; attention warm-up không bắt buộc.
+- V0 có dense/selection/compressor/hybrid ablation và gate override. Memory reuse policy chưa triển khai.
 - Target giữ full context. V0 triển khai **greedy**; sampling chỉ được mở sau khi có verifier đúng phân phối.
 
 ## Nơi triển khai dự kiến
 
-Core mới: `src/AMR_DFlash/`. Đây là đường dẫn **sẽ tạo ở giai đoạn code**, không phải package đã tồn tại. Không chuyển kiến trúc HCA/CSA hai stage cũ thành AMR bằng cách đổi tên.
+Core mới nằm ở `src/AMR_DFlash/`. Không chuyển kiến trúc HCA/CSA hai stage cũ thành AMR bằng cách đổi tên.
 
-Entrypoint dự kiến: `scripts/amr_dflash/` cho pipeline nghiên cứu; `scripts/infer_amr_dflash.py` + `scripts/runners/run_amr_dflash.sh` + `docs/baselines/amr_dflash.md` cho benchmark khi integration đạt gate.
+Entrypoint pipeline là `scripts/amr_dflash/cli.py`; baseline được dispatch qua `scripts/infer_amr_dflash.py`, `scripts/runners/run_amr_dflash.sh` và `bash scripts/run.sh amr_dflash`. Preflight kiểm tra local assets và B200 capability mà không load model weights.
 
 Artifact sinh ra nằm ở `outputs/amr_dflash/<run_id>/`, checkpoint ở `checkpoints/amr_dflash/<run_id>/`. Không commit tensors, outputs hoặc checkpoint. Launcher dùng master-env qua `config/master.path`; cấu hình YAML chỉ chứa hyperparameter và tên biến môi trường, không tạo master config thứ hai.
+
+V0 có `dense`, `selection`, `compressor` và `amr` modes; capture target trajectory, tạo support candidates, target-verifier labels/preferences, train selector/compressor, fixed-state evaluation và rollout inference. Các acceptance/evidence gates trong checklist vẫn mở cho model thật, GPU, train-time validation cadence, cost calibration và holdout results.
 
 ## Ranh giới với code đã có
 
@@ -43,6 +45,4 @@ Artifact sinh ra nằm ở `outputs/amr_dflash/<run_id>/`, checkpoint ở `check
 
 ## Trình tự thực hiện
 
-`T1–T3` khóa backbone và sparse interface; `T4–T6` tạo state/preference và selector; `T7–T8` thêm compressor và evaluator; `T9` tích hợp train; `T10–T12` hoàn thiện cached execution, launcher và pilot/ablation.
-
-Tất cả task bắt đầu ở trạng thái chưa thực hiện. CPU smoke kiểm tra semantics/gradient; chỉ server GPU mới xác nhận acceptance trên checkpoint thật và latency vật lý. Thông tin runtime: [hồ sơ server](../../../docs/server_environment.md), [CPU workflow](../../../docs/cpu_dev_workflow.md).
+`T1–T11` có hiện thực V0 rút gọn nhưng nhiều acceptance gate vẫn mở; `T12` pilot/ablation và mọi GPU experiment chưa thực hiện. CPU tests kiểm tra semantics/gradient trên tiny synthetic Qwen3; chỉ server GPU mới xác nhận checkpoint thật, fit, latency vật lý và quality. Thông tin runtime: [hồ sơ server](../../../docs/server_environment.md), [CPU workflow](../../../docs/cpu_dev_workflow.md).

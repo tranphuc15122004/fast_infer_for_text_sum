@@ -1,28 +1,28 @@
 # Hợp đồng artifact và đo lường
 
-Ngày: **2026-10-08**. [Thiết kế](design.md), [protocol](experiment_protocol.md). Schema mới là contract để triển khai, không sửa schema trace RECAP-KV.
+Ngày: **2026-10-08**. Executor ghi artifact theo contract này; chưa có measured result/G0–G6 report. [Thiết kế](design.md), [protocol](experiment_protocol.md). Schema mới không sửa schema trace RECAP-KV.
 
 ## 1. Run layout và provenance
 
 ```text
 outputs/context_adaptive_dflash/<run_id>/
-  manifest.json
+  prepare_manifest.json
   split_manifest.json
+  calibration/{run_manifest.json,calibration.json,action_observations.jsonl}
   locked_config.json
-  calibration.json
-  requests.jsonl
-  rounds.jsonl
-  outputs_token_ids.jsonl
-  comparison.json
-  report.md
-  logs/
+  {smoke,dev,test}/<variant>/<online|frozen>/
+    manifest.json
+    rep_N/{requests.jsonl,rounds.jsonl,output_token_ids.jsonl}
+  {dev,test}/<online|frozen>/{comparison.json,report.md}
 ```
 
 `run_id` duy nhất; writer hiện có append, nên runner phải từ chối output đã tồn tại trừ resume hợp lệ. Resume chỉ tiếp tục request chưa hoàn tất, kiểm tra config/model/data hashes, không append summary vào giữa stream. Partial artifacts/error rows không được báo như completed run.
 
-Manifest bắt buộc: `schema_version=cadflash.manifest.v1`, run/time/code commit và dirty state; target/draft/tokenizer config/weight fingerprint, prompt template hash, data file SHA256, source group IDs/split hash, runtime versions, GPU name/capability, actual attention backend, dtype, kernel/graph settings, seed, sampling/stopping, selector/layer/refresh, budgets/gammas/length mode, timing/online-update mode, calibration signature/hash, model-load and warmup scope. Không dump HF token hoặc toàn bộ master-env vào manifest.
+Mỗi phase/variant/mode có `schema_version=cadflash.manifest.v1`, run/time/code commit+dirty, SHA-256 từng file code được dùng và model asset (weights/config/tokenizer), data file SHA256, split hash/counts, runtime/GPU/backend/dtype, config, action settings, sampling/stopping, seed, repetitions/warmups và calibration hash/signature. Không dump HF token hoặc toàn bộ master-env vào manifest. `implementation_sha256` và asset content hashes tham gia calibration/resume signature.
 
-Hash model assets một lần trước request timing. Timestamp/model load không thuộc run compatibility signature; checkpoint, runtime, dataset/prompt/sampling và cost-model signature phải khớp để dùng calibration. Chi phí hashing/setup không được giả thành steady-state inference.
+Ghi riêng `target_signature`, `draft_signature`, `tokenizer_signature`, `statistics_update_mode` và `cost_update_mode`. `model_signature` là signature của target + tokenizer để AR có thể pair với draft variants; draft-based controls phải cùng `draft_signature`. Config/cell ID phải phân biệt frozen và online tables; không gộp hai mode như repetitions của cùng policy.
+
+Hash model assets một lần trước request timing; manifest in tiến độ vì snapshot lớn có thể cần thời gian đọc. Timestamp/model load không thuộc request E2E; checkpoint, code, runtime, dataset/prompt/sampling và calibration signature phải khớp để reuse priors. Chi phí hashing/setup không được giả thành steady-state inference.
 
 ## 2. Calibration và locked configuration
 
@@ -32,14 +32,15 @@ Hash model assets một lần trước request timing. Timestamp/model load khô
 |---|---|
 | `entropy_cutpoints` | 3 floats finite, nondecreasing, signal temperature/vocabulary đi cùng signature |
 | `prefix_priors` | Key selector/B/gamma/refresh/state bucket; `survival` length gamma, values `[0,1]` nonincreasing, unique-state support count và backoff origin |
-| `cost_priors` | Key runtime/selector/B/gamma/context bucket/refresh; positive total round estimate, components finite nonnegative, repetition count, dispersion và timing scope |
+| `cost_priors` | Key runtime/selector/B/gamma/context bucket/refresh; positive action estimate và components finite nonnegative, repetition count, dispersion, timing scope; total-round estimate có thêm controller ID |
+| `controller_cost_priors` | Overhead của `choose` theo policy/runtime/action-set signature, measured sau khi action tables đã đủ; không mặc định joint/independent overhead bằng 0 |
 | `supported_actions` | Actions đã pass shape/correctness gate, không chỉ actions được checkpoint khai báo |
 | `observations_hash` | Hash của counterfactual/calibration trace tạo priors |
 | `collection_scope` | Diagnostic round profile hay production-compatible profile, collector mode, setup/warmup exclusions |
 
 Greedy repetitions trên cùng prefix/action chỉ tính một outcome cho prefix prior; timing mean dùng các repetitions thật. Null/nonfinite timing không tạo supported cost action. Cost profiles từ diagnostic collectors đổi kernel không dùng cho primary wall controller. Profile round có biên synchronize được phép làm surrogate prior nếu cùng production kernel/collector và khai báo overhead/scope; dev rollout wall-clock phải kiểm tra benefit trước khi lock, không coi profile latency bằng request latency.
 
-`locked_config.json` có `schema_version=cadflash.locked.v1`: model/runtime/data/split/calibration hashes, complete config, primary variants, best fixed pair, source-group counts, repetitions/seeds, output scopes và G0–G5 evidence paths/hashes. Test loader từ chối override đổi behavior; chỉ cho device/output/resume overrides không đổi experimental signature. Files này phải tạo từ measured artifacts; chưa có instance calibration/locked config trong bộ tài liệu.
+`locked_config.json` có `schema_version=cadflash.locked.v1`: config/variant/test matrix, calibration+implementation/split hashes, candidate dev report hash, fixed actions, repetitions/seeds, output cap/scope. Test loader xác thực signature và refuses `--max-samples`; hiện artifact ghi `candidate_locked_pending_heldout`, không G0–G5 pass.
 
 ## 3. Request records
 
@@ -77,7 +78,7 @@ Mọi request/error/summary đi qua [io_util.JsonlWriter](../../../../scripts/co
 
 **Chỉ là ví dụ schema, không phải kết quả.** Values minh họa không dùng để dựng report/claim; runner tính metrics từ counters/timestamps thật. `retained_tokens` là target prompt retained, luôn bằng `input_tokens`; draft budget ghi riêng. `peak_memory_gb` dùng convention GiB = bytes / `2**30`, kèm `memory_unit=gib`.
 
-Bổ sung bắt buộc: `prompt_hash`, `config_hash`, `model_signature`, `run_id`, `generation_temperature`, `output_cap`, `stopped_by`, `output_ids_hash`, `greedy_exact_match`, `correctness_status`, `round_count`, `draft_tokens_proposed`, `draft_tokens_accepted`, `mean_draft_context_tokens`, `mean_gamma`, `signal_latency_ms`, `controller_latency_ms`, `bank_update_latency_ms`, `draft_prefill_ms`, `fallback_rounds`, `dense_refresh_rounds`, `dense_bank_bytes`, `gather_bytes`, `physical_key_tokens`, `speedup_valid` và boundary counters ở integration contract.
+Bổ sung ở request: `prompt_hash`, `config_hash`, `model_signature`, `run_id`, phase/statistics/cost mode, calibration/data/split hashes, `generation_temperature`, `output_cap`, `stopped_by`, `output_ids_hash`, `greedy_exact_match`, `correctness_status`, `round_count`, draft/context counters, signal/controller/bank timings, `dense_bank_bytes`, `gather_bytes`, `physical_key_tokens` và boundary accounting. `speedup_valid` là report-level `headline_valid`, vì validity chỉ biết sau khi ghép paired requests.
 
 Error record chứa identifying metadata, `status=error`, `error_type`, message và component; các metrics không đo được là `null`, không là 0. Error record vẫn có base/spec keys với null values, không tham gia average success. `unsupported`, `source_span_unavailable`, `uncalibrated` hoặc `missing_reference` phải phân biệt bằng status/reason.
 
@@ -92,7 +93,7 @@ Schema `cadflash.round.v1`, type `round`, qua writer riêng và kết thúc bằ
 | Identity | `run_id`, `sample_id`, `variant`, `repetition`, `round_index`, `status` |
 | Causal state | `logical_length_before`, `processed_output_before`, `pending_anchor_position`, `parent_query_origin_round`, `parent_query_index`, `parent_entropy`, `entropy_signal_temperature`, `source_concentration`, `history_acceptance`, `ranking_origin_round`, `ranking_age` |
 | Action | `requested_budget`, `selected_context_tokens_by_layer`, `physical_context_tokens_by_layer`, `gamma_requested`, `gamma_executed`, `block_size`, `length_mode`, `selector_id`, `refresh_required`, `action_reason` |
-| Outcome | `accepted_candidates=L`, `processed_commits=1+L`, `logical_length_after`, `all_candidates_accepted`, `prefix_right_censored`, `eos_offset`, `boundary_round`, `trimmed_commits` |
+| Outcome | `accepted_candidates=L` from verifier, `emitted_accepted_candidates` through EOS, `processed_commits=1+L` before EOS trim, `logical_length_after`, `all_candidates_accepted`, `prefix_right_censored`, `eos_offset`, `boundary_round`, `trimmed_commits` |
 | Cost | `signal_ms`, `controller_ms`, `selection_ms`, `bank_update_ms`, `draft_ms`, `verify_ms`, `round_gpu_span_ms`, `round_host_ms`, `gather_bytes`, `cost_observation_ready`, `predicted_cost_per_commit`, `fallback_reason`, `wasted_work_ms` |
 
 Trace chỉ giữ scalars/IDs/hashes; full attention/logits/tensor snapshots nằm trong diagnostic run riêng. Source positions có thể lưu hash + chunk IDs để giảm IO. Không lưu score của future round làm current state.
@@ -105,14 +106,14 @@ TTFT: từ request timer start tới first target-selected output token sẵn s�
 
 `decode_ms=max(e2e_ms-ttft_ms,0)`. `tpot_ms=decode_ms/(output_tokens-1)` khi output>1; trường hợp <=1 là null. `throughput_tok_s=1000*output_tokens/e2e_ms`, `qps=1000/e2e_ms`. Decoder-only throughput phải có tên riêng; không gán nó vào E2E throughput.
 
-Draft prefill/project bank nằm trong E2E; `draft_prefill_ms` là component, không trừ lần nữa khỏi decode. Component GPU time dùng CUDA events, CPU controller time dùng wall clock; có thể overlap nên **không ép sum component bằng E2E**. `round_gpu_span_ms` gồm gaps stream có thể do host dispatch; không cộng thêm CPU time vào span đó để cập nhật total cost. `J` dùng estimate total round cost hoặc component estimates có accounting rõ, không double count.
+Draft prefill/project bank nằm trong E2E; `draft_prefill_ms` là component, không trừ lần nữa khỏi decode. GPU draft/verify/span dùng CUDA events; selection/signal/bank/controller components hiện là host wall observations và có thể gồm launch time. E2E với sync ở biên request là metric authoritative; **không ép sum component bằng E2E**. `J` dùng action replay wall cost có synchronization và controller profile; không double count.
 
 Mode `diagnostic`: được đồng bộ từng round để audit/cost profiling; mọi control dùng cùng instrumentation. Mode `wall`: primary matrix, chỉ đồng bộ biên request, events đọc khi ready; không gọi `synchronize` mỗi round chỉ để tính controller cost. Calibration profile ghi timing mode và controller lấy timing-compatible priors. `frozen_cost` là fallback hợp lệ khi không có async total-round observation; không gọi nó online latency adaptation.
 
 ## 6. Counter và memory
 
-- Acceptance rate: `sum(L)/sum(gamma_executed)` trên draft rounds; AR gamma 0 không đóng góp denominator.
-- Average accept length trong shared schema: mean `1+L` trên các speculative rounds, đúng convention DFlash; báo `mean_accepted_candidates` riêng.
+- Verifier acceptance rate: `sum(L)/sum(gamma_executed)` trên draft rounds; AR gamma 0 không đóng góp denominator. `L` đếm mọi candidate prefix được verifier chấp nhận.
+- Average accept length trong shared schema: mean `1+L` trên các speculative rounds, đúng convention DFlash. Báo thêm effective accepted length/rate đã cắt candidate suffix sau EOS; controller tối ưu số token thực sự được giữ.
 - Prefix survival analysis dùng đúng shape/action và censoring, không gán suffix sau mismatch thành token-level rejects.
 - Output count đối soát: `processed_commits + final_pending_emitted_count - trimmed_commits == output_tokens`. Prefill anchor đã được chọn nhưng thường được xử lý trong round đầu, không cộng lần hai.
 - EOS/cap boundary rounds được ghi và tính E2E, nhưng tách khỏi stationary cost-model fit.
@@ -122,8 +123,8 @@ Mode `diagnostic`: được đồng bộ từng round để audit/cost profiling
 
 `requests.jsonl` kết thúc bằng `type=summary`, status `complete|partial|error`, số requested/success/error/unsupported, variant, signature, metric aggregates, ROUGE aggregates, output equivalence và gate decision. Trace writer có summary riêng. Không gộp các variant hoặc repetition khác nhau vào một speedup không có pairing.
 
-Pair bằng `(source_group_id,prompt_hash,model_signature,sampling_signature,output_cap,repetition,timing_mode)`. Natural greedy output phải bằng nhau; mismatch/failed row invalidates comparison và được liệt kê, không âm thầm loại khỏi headline. Fixed-output scope cũng yêu cầu same token IDs, không chỉ cùng count.
+Pair bằng `(dataset,sample_id,repetition,output_scope)` sau đó kiểm tra `source_group_id`, prompt/model/runtime/calibration/data/split signatures, output cap, temperature và run ID. Natural greedy output phải bằng nhau; mismatch/error/missing request invalidates comparison, không âm thầm loại khỏi headline. Fixed-output scope cũng yêu cầu cùng token IDs, không chỉ cùng count. Report chỉ đọc một phase và một statistics mode.
 
-Report per-dataset và macro mean đều dataset; primary statistic là geometric mean paired `baseline_e2e/variant_e2e`, kèm median, P95 latency và paired 95% bootstrap CI. Bootstrap 10.000 lần, seed 42, cluster theo source document giữ mọi repetition/length variant cùng cluster. Không bootstrap round như các samples độc lập. Báo CI geometric speedup và uncertainty của component/acceptance metrics riêng.
+Report per-dataset và macro mean đều dataset; primary statistic là `exp(mean_dataset(mean_pair(log(baseline_e2e/variant_e2e))))`, kèm median, P95 latency và paired 95% bootstrap CI. Bootstrap 10.000 lần, seed 42, resample source-document clusters theo allocation strata của protocol, giữ mọi query/repetition/length variant cùng cluster rồi tính lại cùng statistic. Nếu group có records ở nhiều dataset, chúng dùng cùng bootstrap multiplicity; không resample độc lập bản sao của cùng source. Không bootstrap round như các samples độc lập. Báo CI geometric speedup và uncertainty của component/acceptance metrics riêng.
 
 Sampling distribution audit là gate riêng; same-seed trajectory mismatch trong production RNG không tự invalidates distribution-equivalent scheme. Không dùng unmatched sampled output length làm headline latency comparison; fixed-token workload hoặc debug coupled sampler phải có scope riêng.

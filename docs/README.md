@@ -27,12 +27,12 @@ cache/output Volume riêng; không dùng trực tiếp master-env chứa path
 
 ## Context-Adaptive DFlash training-free
 
-Bộ tài liệu triển khai mới nằm tại
-[TrainingFree README](../src/TrainingFree/README.md): đặc tả A/B/C, tích hợp
-KV/positions/verifier, protocol calibration/dev/test theo source document,
-schema/timing, runbook và task implementation. Trạng thái hiện tại là
-**đặc tả để triển khai**, chưa có executor/launcher hoặc kết quả riêng của
-phương pháp. Xem [baseline guide dự kiến](baselines/context_adaptive_dflash.md).
+Bộ phương pháp và executor nằm tại
+[TrainingFree README](../src/TrainingFree/README.md): A/B/C, tích hợp
+KV/positions/verifier, calibration/dev/test theo source document, schema/timing
+và runbook. CLI/launcher đã có trong dispatcher; **GPU parity và kết quả riêng
+của phương pháp chưa chạy**, nên trạng thái vẫn experimental. Xem
+[baseline guide](baselines/context_adaptive_dflash.md).
 
 ## Nội dung
 
@@ -43,6 +43,8 @@ phương pháp. Xem [baseline guide dự kiến](baselines/context_adaptive_dfla
 |---|---|---|
 | EAGLE-3 | `python3` server / `.venv` mô phỏng | `docs/baselines/eagle3.md` |
 | DFlash | `python3` server / `.venv` mô phỏng | `docs/baselines/dflash.md` |
+| Context-Adaptive DFlash (experimental, unvalidated) | `python3` server GPU | `docs/baselines/context_adaptive_dflash.md` |
+| AMR-DFlash (experimental) | `python3` server / `.venv` mô phỏng | `docs/baselines/amr_dflash.md` |
 | SSSD | `python3` server / `.venv` mô phỏng | `docs/baselines/sssd.md` |
 | FAFO | `python3` server / `.venv` mô phỏng | `docs/baselines/fafo.md` |
 | LLMLingua | `python3` server / `.venv` mô phỏng | `docs/baselines/llmlingua.md` |
@@ -73,8 +75,9 @@ các phép kiểm chứng còn cần thực hiện:
 Hướng AMR-DFlash acceptance-first cập nhật ngày 08/10/2026:
 [proposal và paper story](../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md)
 và [bộ tài liệu triển khai](../src/ARMdflash/AMR_DFlash_Implementation/README.md).
-Bộ này gồm đặc tả, data/train contract, protocol, kế hoạch và checklist; hiện
-chưa có implementation hoặc kết quả AMR.
+Implementation V0 và CPU synthetic contract tests đã có; Qwen3-4B/DFlash thật,
+B200 training/evaluation và pilot chưa chạy, nên chưa có kết quả khoa học hay
+claim speedup.
 
 Đề xuất cơ chế điều phối context tận dụng DFlash đã train: giữ block 16,
 chọn key bằng attention của chính drafter, tái sử dụng và dense refresh:

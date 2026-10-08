@@ -1,6 +1,6 @@
 # Hợp đồng dữ liệu và huấn luyện AMR-DFlash
 
-Ngày: **08/10/2026**. Trạng thái: đặc tả, các API/lệnh AMR dưới đây **chưa được triển khai**.
+Ngày: **08/10/2026**. Trạng thái: **pipeline V0 đã có code và CPU contract tests; model thật/B200 chưa chạy**. Đây là mô tả artifact hiện hành; các acceptance gate còn mở được ghi riêng bên dưới.
 
 Đọc cùng [đặc tả kỹ thuật](../../../docs/superpowers/specs/2026-10-08-amr-dflash-design.md) và [protocol](experiment_protocol.md). Proposal gốc xác định research intent; tài liệu này quy định artifact và cách hiện thực loss.
 
@@ -13,53 +13,76 @@ Document manifest đã khóa split
   → frozen DFlash + full target verification
   → acceptance preferences
   → train selector
-  → train complementary compressor/adapters
-  → shared evaluation: fixed-state và rollout
+  → train global-slot compressor
+  → rollout inference/evaluation qua schema benchmark chung
 ~~~
 
 Artifact dưới `outputs/amr_dflash/<run_id>/`:
 
 ~~~text
 manifest.json
-splits.json
 documents.jsonl
-features/manifest.json + shards/*.pt
 states.jsonl
+features/<document-id>.pt
+candidate_positions/<state-id>.pt
 candidates.jsonl
+candidate_labels.jsonl
 preferences.jsonl
-train_log.jsonl
-evaluation/<checkpoint_id>/fixed_state.jsonl
-evaluation/<checkpoint_id>/rollout.jsonl
-profiling/
-decision.json
+teacher/<state-id>.pt
+train_selector.jsonl
+train_compressor.jsonl
+resource_ledger.json
+evaluation/<mode>.jsonl
 ~~~
 
-Checkpoint dưới `checkpoints/amr_dflash/<run_id>/<phase>-step<step>/`. Manifest ghi cả hai root; không copy tensors vào Git.
+Mỗi `features/<document-id>.pt` chứa trajectory token IDs, projected target-feature bank và các state được capture. `states.jsonl` tham chiếu bundle cùng `state_index`; mặc định capture đều tối đa 6 state/document. Candidate positions và teacher logits nằm ở file tensor riêng. Checkpoint atomic dưới `checkpoints/amr_dflash/<run_id>/<phase>.pt`; hiện có optimizer snapshot để provenance, chưa có optimizer/RNG/sampler resume. Không copy tensors vào Git.
 
-JSONL index, trace, evaluation và training log dùng `JsonlWriter`, summary cuối có `record_type="summary"`. Dataset loader bỏ summary bằng record_type; không đếm summary như sample. Internal state/preference rows có schema riêng; base benchmark schema chỉ bắt buộc trên generation records.
+Tên file tensor hiện dùng prefix đọc được cộng SHA-256 của **toàn bộ ID gốc**,
+không cắt mất hậu tố state. Các path minh họa trong tài liệu là tên rút gọn.
+
+Benchmark rollout và fixed-state evaluation dùng `JsonlWriter` với summary `record_type="summary"`. Pipeline indexes/labels dùng atomic `write_jsonl`; các file có summary cũng đánh dấu `record_type="summary"`, còn train logs kết thúc bằng `phase_summary`. Reader bỏ summary records trước khi đếm sample. Internal state/preference rows có schema riêng; base benchmark schema bắt buộc trên generation records.
 
 ## 2. Fingerprint bắt buộc
 
-`manifest.json` chứa:
+`manifest.json` hiện ghi:
 
-- `schema_version="amr-v0"`, run ID, code commit và working-tree diff hash nếu có.
-- Target/draft/tokenizer resolved local paths, revision hoặc hash của weights/config/tokenizer.
-- DFlash depth, block size, feature layer IDs, hidden-state offset convention, mask/EOS/PAD IDs.
-- Prompt template chính xác và hash, chat-template arguments, source truncation policy, tokenizer options.
-- Dtype/backend, temperature, hardware/runtime versions, input/output caps, random seed.
-- Document IDs và content hashes theo split; `split_manifest_sha256`.
-- Storage policy, candidate generator version, raw/slot budgets, slot position policy, label semantics.
-- `label_generation_gpu_hours`, `training_gpu_hours` và `evaluation_gpu_hours` đo được; giá trị chưa đo là null.
+- `schema_version`, hash của input JSONL, resolved path và fingerprint SHA-256 đầy đủ cho target/draft snapshot (weights, config, tokenizer files).
+- Target feature-layer IDs, DFlash block size, dtype/backend, greedy temperature, input/output caps, seed.
+- Split policy, memory budgets, local/query windows, alignment history và resource-ledger path/capture GPU-hours.
+- Mỗi document có input-prompt hash và split; checkpoint có target/draft fingerprints, layer IDs, block size, memory config và index dimension.
 
-Model weights và feature store không khớp fingerprint phải fail trước train. Không dùng tên model hoặc path giống nhau làm bằng chứng weights giống nhau.
+`capture_contract` version 2 khóa input hash, model bytes, dtype/backend,
+memory/index config, caps token/state, sampling policy, seed, split fractions,
+prompt/truncation policy và alignment history. `capture_contract_sha256` đi
+theo documents/states/candidates/labels/preferences/teacher/checkpoint.
+Feature bundle có `feature_contract` riêng gồm target/draft SHA-256, layers,
+hidden offset, dtype và backend; thay weights projection drafter cũng bắt
+buộc capture lại. Model snapshot fingerprint tính cả weight index JSON.
+
+Candidate positions và teacher logits có file digest trong label; preferences
+khóa hash của `candidate_labels.jsonl`. Các pha kiểm tra state/document/split
+và hợp đồng artifact trước khi dùng dữ liệu. Teacher còn khóa state/candidate,
+feature contract và proposal history. Model/checkpoint được chuyển mount nếu
+file hashes/config giữ nguyên; `resolved_path` chỉ là provenance.
+
+ID document phải duy nhất trên toàn input. Source ID (`source_document_id`,
+`document_id`, `source_id`) hoặc nội dung source trùng giữa train/validation/
+holdout bị từ chối. Validation chạy trước cắt `max_samples`; split được khóa
+theo source ID khi có nhiều prompt của cùng source.
+
+Seed Python/Torch/CUDA được đặt trước khi load/khởi tạo runtime, gồm selector
+và compressor. Checkpoint ghi `training_seed` và trạng thái deterministic
+algorithms; chưa có cam kết bitwise giữa các CUDA kernel/stack khác nhau.
+
+Manifest V0 chưa ghi git diff/code hash, đầy đủ chat-template arguments, EOS/PAD IDs hoặc content hash độc lập cho raw/reference fields; split map nằm trong `documents.jsonl`, chưa có `splits.json` riêng. Checkpoint loader fail nếu model/config/memory fingerprint không khớp. Không dùng tên model hoặc path giống nhau làm bằng chứng weights giống nhau.
 
 ## 3. Capture state và feature store
 
-`DraftState` dùng convention context-before-anchor trong đặc tả. Snapshot gồm prefix đã xử lý, pending anchor, original positions, output emitter state và remaining budget.
+`DraftState` dùng convention context-before-anchor trong đặc tả. State index V0 gồm prefix length, pending anchor ID, split/document, prompt hash, bundle/index và remaining budget. Feature bundle giữ full target-greedy trajectory; query state dùng anchor embedding, feature mới nhất và trung bình của tối đa 16 feature gần nhất.
 
-Capture trên greedy target trajectory; lấy nhiều mốc đầu/giữa/cuối. Một document nhiều states vẫn chỉ là **một đơn vị split/thống kê**.
+Capture trên greedy target trajectory; mặc định chọn tối đa 6 state cách đều, gồm hai đầu trajectory. Có thể đổi bằng `--max-states-per-document`. Một document nhiều states vẫn chỉ là **một đơn vị split/thống kê**.
 
-Target features của một trajectory được lưu theo document/shard một lần; states tham chiếu prefix slice. Không nhân bản tensor 16K × d_H cho mỗi candidate hoặc state. Với candidate branch, persist chỉ features của prefix thực sự accepted; rejected suffix không trở thành feature store.
+Projected target features của một trajectory được lưu một lần theo document; states tham chiếu prefix slice trong bundle. Không nhân bản tensor cho mỗi candidate/state. Inference chỉ append features của anchor và accepted proposals đã được target xử lý; correction pending và rejected suffix chưa vào persistent bank.
 
 Ví dụ index state tổng hợp:
 
@@ -70,18 +93,18 @@ Ví dụ index state tổng hợp:
   "state_id": "synthetic-doc-001-round-003",
   "document_id": "synthetic-doc-001",
   "split": "train",
-  "feature_shard": "features/shards/00000.pt",
-  "feature_key": "synthetic-doc-001",
+  "bundle": "features/synthetic-doc-001-a1b2c3d4.pt",
+  "state_index": 3,
   "context_length": 16384,
-  "prompt_length": 16384,
-  "anchor_position": 16384,
+  "input_sha256": "<sha256-of-rendered-prompt>",
   "anchor_id": 101,
   "remaining_output_budget": 256,
-  "state_fingerprint": "synthetic-fixture-v0"
+  "feature_hidden_size": 12800,
+  "selection_was_bypassed": false
 }
 ~~~
 
-Đây là fixture schema, không phải artifact chạy thật. Loader kiểm tra length, feature dim, positions, anchor offset, prompt/output scope và remaining budget dương. Dùng mmap/lazy shard load khi phù hợp; một worker không materialize toàn feature store.
+Đây là ví dụ schema V0. Capture hiện ghi JSONL summary ở cuối index; loader pipeline bỏ summary. Tensor bundle dùng `torch.load` theo document, chưa dùng mmap/LRU và module train giữ bundle cache trong RAM; pilot cần theo dõi RAM khi tăng corpus.
 
 `apply_chat_template(..., return_tensors="pt", return_dict=False)` là contract tensor ở Transformers 5.x. Lưu tokenized prompt cuối cùng và so hash khi replay.
 
@@ -89,7 +112,7 @@ Ví dụ index state tổng hợp:
 
 Input: một immutable `DraftState`, raw budget, guard policy và seed.
 
-V0 thử recent, head, middle, random-window, random-scattered, previous-support và chunk-swap. DFlash-current attention và parent-target attention là candidate offline nếu artifact hợp lệ; thiếu signal phải ghi `unavailable`, không thay bằng zeros hoặc recent rồi giữ tên method.
+V0 tạo recent, head, middle, random-window, random-scattered và chunk-swap candidates. Previous-support, DFlash-current attention và parent-target attention chưa được nối vào generator; không gắn tên các heuristic này cho candidate khác.
 
 Candidates của cùng state:
 
@@ -107,11 +130,11 @@ Generator cho phép tối đa 12 distinct candidates/state ở pilot. Đây là 
 
 Mỗi candidate dùng cùng weights, state, block positions, dtype và full target history. Chạy reference target forward để tạo labels; reset/restore target prefix giữa candidate, tránh cache bị candidate trước làm bẩn.
 
-Record gồm:
+Record V0 gồm (candidate positions được lưu ở `candidate_positions/*.pt`; label lưu ở `candidate_labels.jsonl`):
 
 ~~~json
 {
-  "record_type": "candidate",
+  "record_type": "candidate_label",
   "state_id": "synthetic-doc-001-round-003",
   "candidate_id": "recent-4096",
   "method": "recent",
@@ -124,12 +147,14 @@ Record gồm:
   "committed_tokens": 4,
   "survival": [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
   "status": "success",
-  "timing_scope": "instrumented_reference",
-  "seed": 17
+  "censored": false,
+  "first_mismatch": 3,
+  "correction_token_id": 42,
+  "proposal_ids": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 }
 ~~~
 
-G trong fixture là emitter outcome cụ thể, không là công thức suy từ A. Save proposal IDs/target verifier choices trong tensor trace để audit first rejection.
+`committed_tokens` trong label hiện là `A+1` cho một state không bị cắt; label đánh dấu censor khi EOS/correction hoặc output cap làm so sánh không tương đương. Candidate proposal IDs được lưu để audit first rejection. Candidate order được tuần tự hóa và target DynamicCache được crop về đúng prefix sau mỗi candidate.
 
 V0 greedy: reward chính là `accepted_proposals_committed` với cùng remaining budget; chỉ train preference từ states chưa terminal/censored nghiêm trọng. Raw A cũng lưu để chẩn đoán. Nếu EOS/output cap khiến reward không so được, gắn `censored=true` và loại khỏi preference fit, nhưng giữ cho correctness/evaluation.
 
@@ -169,16 +194,16 @@ Phase I freeze compressor và backbone; optimizer selector riêng. Diagnostic: p
 
 ## 7. Compressor alignment: giữ đúng block semantics
 
-Phase II freeze selector, train compressor + slot adapters + slot gate. Raw support được chọn từ state; global slots build từ prefix features bằng **weights hiện tại**.
+Phase II freeze selector, train global-slot compressor + slot gate. Raw support của mỗi state/candidate được cố định từ phase labeling; global slots build từ prefix features bằng **weights hiện tại**. V0 chưa có per-layer slot adapters.
 
 DFlash xuất 15 proposal logits trong một forward từ anchor + masks. Nó không tự conditioning tuần tự trên previous proposals như AR model. Không viết `q_D(y_j | candidate[:j-1])` nếu forward không thực sự nhận history đó.
 
-V0 chọn **candidate-prefix alignment surrogate**:
+V0 dùng **candidate-prefix alignment surrogate**. Label phase lưu target logits của candidate không bị censor có acceptance cao nhất cho state; train phase giữ nguyên candidate proposal IDs/support và dùng logits đã lưu. Teacher logits không được tái tính theo weights mới mỗi bước.
 
-1. Forward AMR DFlash một lần để có `q_j` và greedy candidates `y_j = argmax(q_j.detach())`.
-2. Full target forward trên context + anchor + candidate block để có `p_T,j`, mỗi row đúng position và causal candidate prefix.
-3. Tính KL từ target rows detach sang các block logits tương ứng; mặc định `w_j = (1/j) / sum(1/k)` với j=1..15 để ưu tiên early prefix.
-4. Đánh giá actual accepted prefix bằng verifier. Candidate argmax/history không backprop; target không nhận gradient.
+1. Label phase chạy DFlash frozen một lần/candidate để tạo proposals, sau đó target verifier có cache đầy đủ để lưu các target rows tương ứng.
+2. Train phase chạy DFlash với cùng candidate raw support + slots hiện tại; các draft proposal logits được so với target logits đã lưu.
+3. Tính KL từ target rows detach; trọng số `w_j ∝ 1/j`, j=1..15. Candidate proposal IDs không backprop.
+4. Rollout inference đánh giá actual acceptance riêng; training loss không bảo đảm acceptance tăng.
 
 ~~~python
 def alignment_loss(draft_logits, target_logits, proposal_valid):
@@ -193,91 +218,88 @@ def alignment_loss(draft_logits, target_logits, proposal_valid):
     return (per_position * weight).sum() / weight.sum().clamp_min(1e-8)
 ~~~
 
-`proposal_valid` mask bỏ padding/positions ngoài valid horizon. Candidate-prefix target rows sau first rejection là counterfactual rows; đây là surrogate cho block drafting, **không phải KL giữa hai AR distributions cùng conditioning** và không là theorem bảo đảm acceptance. Ablate teacher-trajectory alignment nếu cần; luôn ghi `alignment_history` vào checkpoint/manifest.
+V0 hiện dùng mask toàn true vì label phase luôn draft đủ 15 proposals; target logits phía sau first rejection là counterfactual rows. Đây là surrogate cho block drafting, **không phải KL giữa hai AR distributions cùng conditioning** và không là theorem bảo đảm acceptance. Manifest/checkpoint ghi `alignment_history=captured_verifier_candidates`.
 
-Test bắt buộc: shift proposal/logit rows một position phải bị phát hiện bằng fixture; zero padding không ảnh hưởng loss; gradient nonzero vào compressor/adapters nhưng backbone/target grad là None.
+Acceptance tests còn cần: shift proposal/logit rows một position phải bị phát hiện bằng fixture; zero padding không ảnh hưởng loss. CPU test hiện xác nhận gradient vào compressor/slot gate qua frozen DFlash và target/backbone grad None; per-layer slot adapters chưa có.
 
 Không dùng `torch.inference_mode` cho features sẽ tham gia backward mà chưa chuyển thành ordinary detached tensors; không `no_grad` toàn bộ frozen DFlash forward khi học input memory.
 
 ## 8. Config pilot dự kiến
 
-YAML đặt ở `src/AMR_DFlash/configs/pilot.yaml` khi code được tạo. Tên env được resolve từ master trước run; thiếu env/path sẽ fail, không tải online.
+YAML hiện hành ở `src/AMR_DFlash/configs/pilot.yaml`. Tên env được resolve từ master trước run; thiếu env/path sẽ fail, không tải online.
 
 ~~~yaml
 schema_version: amr-v0
 model:
   target_model_env: TARGET_MODEL
   draft_model_env: DRAFT_MODEL
-  local_files_only: true
   draft_layers: 5
   block_size: 16
-  feature_layers_source: checkpoint
+  attention_backend: sdpa
   dtype: bfloat16
 inference:
   temperature: 0.0
   batch_size: 1
   mode: amr
-  executor: cached
+  use_cost_gate: true
 memory:
   raw_budget: 4096
   num_slots: 128
   local_window: 128
-  sink_tokens: 0
+  query_window: 16
   index_dim: 64
-  selector_refresh_rounds: 1
-  enable_selector: true
-  enable_compressor: true
-  slot_position_policy: observed_span_midpoint
+  slot_gate_init: -2.0
+  min_context_tokens: 4096
 training:
   seed: 17
+  max_states_per_document: 6
+  max_candidates: 12
   selector_steps: 200
   compressor_steps: 200
-  selector_lr: 0.0001
-  compressor_lr: 0.0001
-  weight_decay: 0.01
-  max_grad_norm: 1.0
-  state_batch_size: 1
-  gradient_accumulation_steps: 8
-  evaluate_every_steps: 50
-  checkpoint_every_steps: 50
-  validation_scope: full
-  alignment_history: candidate_prefix
   max_gpu_hours: 24
+  alignment_history: captured_verifier_candidates
 data:
   manifest_env: AMR_DATA_MANIFEST
+  input_env: DATA_FILE
 output:
+  run_root_env: AMR_RUN_ROOT
   run_id_env: AMR_RUN_ID
-  checkpoint_env: AMR_CHECKPOINT
 ~~~
 
-Các LR/steps/budget là điểm khởi đầu để calibration, không hứa hội tụ trong 200 step hoặc 24 GPU-giờ. Trần đề xuất gồm capture/label/train/eval; allocator phải trừ compute đã dùng trước khi mở pha tiếp theo. Khi chạy CPU synthetic, override dtype float32 và dùng tiny model; không load checkpoint 4B vào smoke.
+Các LR/steps/budget là điểm khởi đầu để calibration, không hứa hội tụ trong 200 step hoặc 24 GPU-giờ. Resource ledger V0 trừ capture/label/train elapsed GPU allocation-hours; inference/evaluation benchmark chưa được tính vào cap. Khi chạy CPU synthetic, override dtype float32 và dùng tiny model; không load checkpoint 4B vào smoke.
 
 ## 9. Evaluation, checkpoint và resume
 
-Evaluator chung `evaluate_model` phục vụ cả in-memory lúc train và checkpoint CLI. Mỗi 50 optimizer steps và cuối pha, đánh giá **toàn validation manifest đã khóa**, báo fixed-state A/G/survival và full greedy rollout. Có thể dùng manifest validation nhỏ ở pilot, nhưng không tự giảm scope khi thiếu VRAM.
+CLI V0 có `evaluate-fixed` để đo hard policy trên captured states giống nhau; command này chưa được gọi tự động sau mỗi 50 optimizer steps và chưa có calibration split/checkpoint resume đầy đủ. `train-selector` báo pairwise accuracy trên validation preferences; `train-compressor` log surrogate loss. CLI `infer` chạy greedy rollout trên input đã chỉ định và ghi schema/ROUGE. Fixed-state/rollout artifacts vẫn cần được tạo và audit riêng trước khi dùng làm scientific result.
 
-Log phase-start, progress, phase-end, số document/state thành công/thất bại, loss/A/G, timing và memory. Metrics không hữu hạn, dataloader rỗng hoặc restore mismatch là lỗi có status; không ghi checkpoint "best" từ evaluation lỗi.
+V0 in progress mỗi 10 optimizer steps và ghi JSONL phase logs. Chưa có full validation schedule, per-step memory metrics, document/state failure ledger hoặc best-checkpoint logic. Non-finite loss/gradient và empty train pairs dừng phase bằng exception.
 
-Checkpoint chứa:
+Checkpoint V0 chứa:
 
-- `amr_state.pt`: selector, compressor/adapters/gates, config và backbone fingerprint; không nhúng lại frozen target/draft weights.
-- `trainer_state.pt`: optimizer, scheduler, RNG Python/NumPy/Torch/CUDA, optimizer step, phase và sampler cursor.
-- `manifest.json`: split/data/code/config fingerprints, budget/position/loss semantics.
-- `COMPLETE` viết cuối sau atomic publish.
+- `<phase>.pt`: selector/compressor/slot gate weights, metadata fingerprints, phase, run root và optimizer state khi có; không nhúng frozen target/draft weights.
+- optimizer state và step trong cùng `.pt` với memory weights/metadata; atomic replace.
+- Model/checkpoint fingerprints, phase, run root và loss alignment history.
 
-Resume chỉ nhận checkpoint COMPLETE với đúng fingerprints. Warm-start weights-only là flag riêng, không khôi phục optimizer/sampler như resume. Slot accumulators/index caches phải rebuild khi checkpoint memory weights thay đổi.
+Loader kiểm tra model/memory fingerprints và strict state dict. Hiện chưa có resume optimizer/RNG/sampler; dùng checkpoint selector làm warm-start cho compressor. Slot accumulators/index caches được dựng lại khi bắt đầu mỗi inference.
 
-Training log mỗi optimizer step: loss thành phần, grad norm, LR, number of states/pairs, peak VRAM, elapsed GPU-giờ và evaluation status. MFU chỉ báo khi có FLOPs estimate/hardware denominator được ghi; nếu chưa đo được, dùng null + reason thay vì bịa phần trăm.
+`capture --resume` yêu cầu đủ manifest/document/state indexes và capture
+contract không đổi; có thể mở rộng `max_samples` trên cùng input file.
+Manifest gốc giữ nguyên, ledger ghi tài nguyên cộng dồn. Đổi caps, seed,
+split fractions, dtype/backend hoặc weights phải tạo run mới. Feature/manifest
+cũ thiếu hợp đồng version 2 bị từ chối với hướng dẫn recapture; cần tạo lại
+candidate/label/preference/checkpoint từ capture mới.
 
-## 10. Các lỗi phải dừng sớm
+Training JSONL ghi loss, grad norm, batch pairs/teacher row, elapsed wall time, GPU-hour ledger ở phase summary. LR, peak VRAM, full evaluation status và MFU chưa được log trong V0; không suy diễn các chỉ số này từ training loss.
+
+## 10. Các lỗi cần nghiệm thu trước khi scale
 
 | Lỗi | Hành vi |
 |---|---|
-| Split overlap/content duplicate | Fail dataset publication |
-| State fingerprint khác checkpoint | Fail load |
-| Current/future target outcomes xuất hiện trong selector inputs | Fail schema/leakage audit |
-| Rejected feature trong committed bank | Fail inference invariant |
-| Không có preference pair hợp lệ | Dừng fit, ghi no-headroom/tie distribution |
-| NaN/Inf hoặc gradient vào frozen weights | Dừng step, ghi diagnostic, không publish checkpoint |
-| Eval restore hoặc aggregation lỗi | Status failed, không cập nhật best checkpoint |
-| Hết compute cap | Save resumable checkpoint và quyết định dừng; không tự scale |
+| Split overlap/content duplicate | Chưa có detector V0; input split/content hashes phải audit trước khi chạy |
+| State/model fingerprint mismatch | Checkpoint loader fail model/config/state mismatch |
+| Future target outcomes trong selector inputs | Query V0 chỉ dùng anchor + projected committed context; cần leakage audit trên artifact |
+| Rejected feature trong committed bank | Cache crop giữ anchor + accepted prefix; CPU parity test đã cover |
+| Không có preference pair hợp lệ | Selector train dừng nếu preferences rỗng; chưa xuất no-headroom report đầy đủ |
+| NaN/Inf hoặc gradient vào frozen weights | Non-finite loss/gradient dừng phase; CPU test xác nhận frozen target/draft grad None |
+| Eval restore hoặc aggregation lỗi | Fixed-state CLI có summary; chưa có train-time best-checkpoint/evaluation flow |
+| Hết compute cap | Phase ghi status/ledger nếu thoát có kiểm soát; chưa hỗ trợ optimizer/RNG/sampler resume |

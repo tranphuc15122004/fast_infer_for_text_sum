@@ -289,6 +289,26 @@ fast_infer__load_dflash() {
   fast_infer_default_from SMOKE_MAX_NEW_TOKENS DFLASH_SMOKE_NEW_TOKENS
 }
 
+fast_infer__load_amr_dflash() {
+  fast_infer_default_from TARGET_MODEL MODEL_TARGET B200_TARGET_MODEL
+  fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT B200_DFLASH_MODEL
+  fast_infer_default_from DATA_FILE AMR_DATA_FILE DATA_INPUT
+  fast_infer_default_from MAX_SAMPLES AMR_MAX_SAMPLES RUN_SAMPLES
+  fast_infer_default_from MAX_NEW_TOKENS AMR_MAX_NEW_TOKENS RUN_MAX_NEW_TOKENS
+  fast_infer_default_from MAX_INPUT_TOKENS AMR_MAX_INPUT_TOKENS RUN_MAX_INPUT_TOKENS
+  fast_infer_default_from OUTPUT_FILE AMR_OUTPUT_FILE
+  fast_infer_default_from AMR_CONFIG
+  fast_infer_default_from AMR_RUN_ROOT
+  fast_infer_default_from AMR_CHECKPOINT
+  fast_infer_default_from AMR_MODE
+  fast_infer_default_from AMR_RAW_BUDGET
+  fast_infer_default_from AMR_NUM_SLOTS
+  fast_infer_default_from AMR_LOCAL_WINDOW
+  fast_infer_default_from AMR_QUERY_WINDOW
+  fast_infer_default_from AMR_INDEX_DIM
+  fast_infer_default_from AMR_MIN_CONTEXT_TOKENS
+}
+
 fast_infer__load_domino() {
   fast_infer_default_from TARGET_MODEL DOMINO_TARGET_MODEL MODEL_TARGET B200_TARGET_MODEL
   fast_infer_default_from DRAFT_MODEL DOMINO_DRAFT_MODEL MODEL_DOMINO_DRAFT MODEL_DOMINO B200_DOMINO_MODEL
@@ -557,6 +577,7 @@ fast_infer_load_config() {
     longbench) fast_infer__load_longbench ;;
     fa4_native) fast_infer__load_fa4_native ;;
     dflash) fast_infer__load_dflash ;;
+    amr_dflash) fast_infer__load_amr_dflash ;;
     domino) fast_infer__load_domino ;;
     fafo) fast_infer__load_fafo ;;
     eagle3) fast_infer__load_eagle3 ;;

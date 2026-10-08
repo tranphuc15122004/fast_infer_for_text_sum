@@ -1,6 +1,6 @@
 # Đặc tả kỹ thuật AMR-DFlash V0
 
-Ngày: **08/10/2026**. Trạng thái: **thiết kế triển khai, chưa có kết quả AMR**.
+Ngày: **08/10/2026**. Trạng thái: **V0 code/CPU synthetic tests đã có; model thật/B200 và kết quả khoa học chưa có**.
 
 Nguồn: [proposal](../../../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md); [index tài liệu triển khai](../../../src/ARMdflash/AMR_DFlash_Implementation/README.md).
 
@@ -58,7 +58,7 @@ Dense bypass dùng checkpoint và target verifier cùng backend. Memory modules 
 
 ## 4. Hợp đồng state và tensor
 
-Các kiểu được tạo trong `src/AMR_DFlash/contracts.py`; batch 1 ở V0.
+Các primitive/config nằm trong `src/AMR_DFlash/core.py` và `config.py`; batch 1 ở V0. V0 chưa có một `DraftState` dataclass riêng: index JSONL và bundle tensor giữ state fields.
 
 | Kiểu / field | Shape / nội dung |
 |---|---|
@@ -96,24 +96,24 @@ def verify_greedy(state: DraftState, draft: DraftOutput, target_cache: TargetCac
 def evaluate_model(model: AMRModel, states: Sequence[DraftState], mode: str) -> EvalReport: ...
 ~~~
 
-`Tensor` là `torch.Tensor`. `AMRConfig` ở `config.py`; `AMRModel` ở `model.py`; `TargetCacheState` ở `verifier.py`; `EvalReport` ở `evaluation.py`. Các kiểu tensor/state còn lại ở `contracts.py`. `mode` của evaluator chỉ nhận `fixed_state` hoặc `rollout`.
+`Tensor` là `torch.Tensor`. V0 dùng `MemoryConfig` trong `core.py`, `AMRDFlashDraft` trong `model.py`, target cache trực tiếp trong `inference.py`, và fixed-state evaluator trong `evaluation.py`; CLI có fixed-state và rollout evaluation. Train-time cadence/aggregate `EvalReport` chưa được triển khai.
 
 ## 5. Selector V0
 
 - Input index: `k_i = W_k h'_i`, dim 64, với `h'_i = hidden_norm(fc(h_i))`.
-- Query: concat anchor embedding và projected feature cuối context, linear → SiLU → linear tới dim 64. Không dùng current DFlash query chưa tính.
-- Score: dot product / sqrt(64), cộng learned bias cho log-distance và prompt/output flag.
+- Query: concat anchor embedding, projected feature mới nhất và mean của tối đa 16 projected features gần nhất; MLP Linear → SiLU → Linear tới dim 64. Tất cả đều thuộc prefix đã commit; không dùng current DFlash query.
+- Score: dot product / sqrt(64), cộng scalar bias theo normalized absolute position. Prompt/output flag chưa có trong V0.
 - Local guard mặc định 128 recent positions; sink guard mặc định 0. Các guard nằm **trong raw budget**.
 - Loại guard khỏi miền Top-K; chọn phần budget còn lại; sort selected positions theo absolute position sau lựa chọn.
 - Nếu N nhỏ hơn raw budget, giữ tất cả. Padding bị mask; zero valid context hoặc budget nhỏ hơn guards phải có xử lý đã định nghĩa: clamp guards theo budget, không tạo index âm.
 - Preference scorer V0 dùng mean token score của candidate set đã loại padding. Additive scoring không mô hình hóa mọi tương tác; chunk-swap/set-level labels vẫn là nguồn reward.
-- Reuse V0: rescore mỗi round để có đối chứng rõ. Sau pilot, thử mỗi 2/4 round; luôn đưa token mới vào local guard và giữ global index để key bị loại có thể quay lại.
+- V0 tính lại scores mỗi round, giữ compact selector-key index và append key của feature mới đã commit. Key bị loại ở round trước vẫn có thể quay lại; reuse mỗi 2/4 round chưa triển khai.
 
-## 6. Compressor V0: pooling học được với cập nhật chính xác
+## 6. Compressor thiết kế: pooling học được với cập nhật chính xác
 
 Chọn một baseline nhỏ có thể triển khai và replay streaming; chưa dùng HCA/CSA hoặc recurrent transformer phức tạp.
 
-Chia absolute timeline thành M bucket cố định trong run. `span = ceil((max_input_tokens + max_new_tokens)/M)`; bucket của token i là `floor(position_i/span)`. Đây là allocation toàn lịch sử có vị trí ổn định; nếu vượt capacity, báo lỗi cấu hình, không silently truncate.
+Thiết kế đề xuất chia absolute timeline thành M bucket cố định trong run. `span = ceil((max_input_tokens + max_new_tokens)/M)`; bucket của token i là `floor(position_i/span)`. Đây là allocation toàn lịch sử có vị trí ổn định; nếu vượt capacity, báo lỗi cấu hình, không silently truncate.
 
 Trên projected context:
 
@@ -137,9 +137,11 @@ Thêm logit bias `log(sigmoid(g_layer))` trên slot keys, khởi tạo `g_layer=
 
 Compressor/adapter được train bằng target alignment qua frozen DFlash. Không bọc draft forward trong `no_grad` khi train compressor; chỉ frozen feature extraction được detach.
 
+**Phần hiện thực V0:** `ComplementaryCompressor` dùng learned soft assignment trên toàn bộ projected context và weighted-mean slot values, cập nhật bằng running sums. Slot positions là weighted centroid của feature positions đã quan sát. V0 chưa hiện thực fixed timeline buckets, residual rank-16 projection hoặc per-layer slot K/V adapters; DFlash gốc chiếu cùng slot feature qua K/V projections của từng layer. Đây là scope rút gọn cần ghi khi báo cáo.
+
 ## 7. Memory interface của DFlash
 
-Triển khai `AMRDFlashBackbone` trong `backbone.py`, giữ reference tới backbone pretrained; không copy/giảm layer và không thay parameter names để load lại weights.
+`AMRDFlashDraft` trong `model.py` giữ reference tới backbone pretrained; không copy/giảm layer và không thay parameter names để load weights.
 
 Trên mỗi draft layer:
 
@@ -155,12 +157,12 @@ Trên mỗi draft layer:
 
 V0 verifier chỉ greedy. Không dùng equality với target sampled tokens để claim exact speculative sampling.
 
-Hai executor:
+Đường V0 hiện có:
 
-- `reference`: full-prefix target forward, phục vụ fixed-state correctness và label generation; timing gắn `instrumented_reference`.
-- `cached`: target KV cache full prefix, verify block, crop/rollback; dense và AMR đi qua **cùng** executor. Prefix cursor dùng logical absolute position, độc lập compact draft memory.
+- Labeling dùng target DynamicCache có prefix copy/crop về cùng state sau mỗi candidate.
+- Rollout inference dùng target KV cache full prefix, verify block và crop sau rejection; dense và AMR đi qua **cùng** engine. Prefix cursor dùng logical absolute position, độc lập compact draft memory.
 
-Target verify candidate proposals trên history tương ứng; chỉ accepted-prefix target features được persist. Correction/bonus có thể còn pending: xử lý token đó trước khi đưa feature vào context bank. Crop cache sau rejection; prune emitter theo EOS và remaining output cap; không giữ rejected hidden features.
+Fixed-state evaluation command hiện có trong `evaluation.py`; timing của nó là correctness-oriented và chưa được dùng làm production latency. Target verify candidate proposals trên history tương ứng; chỉ accepted-prefix target features được persist. Correction/bonus có thể còn pending: xử lý token đó trước khi đưa feature vào context bank. Crop cache sau rejection; prune emitter theo EOS và remaining output cap; không giữ rejected hidden features.
 
 Bootstrap/build bank, first draft, switching gate, compression update và terminal work đều nằm trong timing. Target prefill tách khỏi decode, nhưng cả hai thuộc E2E.
 
@@ -186,14 +188,14 @@ Extension chỉ sau full pilot: layer-specific support, advanced compressor, dif
 
 | File mới | Trách nhiệm |
 |---|---|
-| `src/AMR_DFlash/config.py`, `contracts.py` | Config và state/tensor invariants |
-| `backbone.py`, `model.py` | Load pretrained, frozen memory interface |
-| `memory.py`, `selector.py`, `compressor.py` | Bank, raw support, streaming slots/adapters |
-| `verifier.py`, `inference.py` | Greedy verify, cache lifecycle, emitter |
-| `data.py`, `candidates.py`, `preferences.py` | State store, candidate search, labels |
-| `losses.py`, `training.py`, `run_train.py` | Ranking/alignment, train/checkpoint/resume |
-| `evaluation.py`, `metrics.py`, `checkpoint.py` | Shared evaluator, accounting, fingerprint |
-| `src/AMR_DFlash/tests/` | Semantic/gradient/integration tests, CPU synthetic |
-| `scripts/amr_dflash/` | Capture, labeling, evaluation, profiling CLIs |
+| `core.py`, `config.py` | Memory config, selector/compressor, loss và primitive validation |
+| `model.py`, `memory.py` | Pretrained DFlash adapter, projected-feature memory interface |
+| `inference.py` | Cached greedy verifier, cache crop, pending anchor và rollout trace |
+| `pipeline.py`, `candidates.py`, `artifacts.py` | Capture, candidate labels/preferences, train phases và artifacts |
+| `checkpoint.py`, `runtime.py`, `budget.py` | Local model loading, strict fingerprints, checkpoint và GPU-hour ledger |
+| `tests/test_amr_dflash_*.py` | Semantic/gradient/launcher CPU synthetic tests |
+| `scripts/amr_dflash/cli.py`, `scripts/runners/run_amr_dflash.sh` | Preflight, capture, label, train và inference CLI |
+
+Fixed-state evaluation hiện có; full validation cadence, checkpoint resume, profiling CLI, calibrated gate và B200 experiment runner chưa có trong V0.
 
 Chữ ký, artifact và criteria chi tiết: [dữ liệu/train](../../../src/ARMdflash/AMR_DFlash_Implementation/data_training_contract.md), [protocol](../../../src/ARMdflash/AMR_DFlash_Implementation/experiment_protocol.md), [kế hoạch](../plans/2026-10-08-amr-dflash-implementation.md).

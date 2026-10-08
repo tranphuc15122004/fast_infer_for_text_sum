@@ -86,6 +86,7 @@ def test_all_baseline_launchers_use_the_shared_config_loader():
 def test_scripts_root_keeps_only_primary_entrypoints():
     assert sorted(path.name for path in (ROOT / "scripts").glob("run_*.sh")) == [
         "run_b200_smoke.sh",
+        "run_fa4_benchmark.sh",
         "run_longbench_200.sh",
         "run_representative_100.sh",
         "run_vllm_all.sh",

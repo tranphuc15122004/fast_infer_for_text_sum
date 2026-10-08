@@ -1,6 +1,6 @@
 # Giao thức thực nghiệm và quyết định AMR-DFlash
 
-Ngày: **08/10/2026**. Đây là protocol đề xuất; không có số AMR thực nghiệm trong tài liệu.
+Ngày: **08/10/2026**. Đây là protocol cho thí nghiệm tiếp theo; V0 code và CPU synthetic tests đã có nhưng chưa có số AMR trên model/data thật.
 
 Nguồn: [proposal](../AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md), [đặc tả](../../../docs/superpowers/specs/2026-10-08-amr-dflash-design.md), [data/train](data_training_contract.md).
 
@@ -30,9 +30,9 @@ Holdout mục tiêu: 30 GovReport + 30 Multi-News + 30 QMSum document mới, tá
 
 Same document IDs qua caps 3072/5120/8192/16384 khi có đủ độ dài. Cap ngắn làm nội dung thay đổi, nên thêm controlled distractor/position interventions để kiểm tra length/semantic confounding. Không tự khẳng định context length gây acceptance degradation.
 
-Pilot capture tối đa 6 states/document (hai đầu/hai giữa/hai cuối, loại terminal-censored states cho preference). Trần 12 candidates/state và 8 pairs/state. Ghi số states/candidates **thực**, tie rate và no-headroom fraction.
+Pilot capture mặc định tối đa 6 states/document, evenly spaced gồm hai endpoint; dùng `--max-states-per-document` để đổi cap. Trần 12 candidates/state và 8 pairs/state. Label phase đánh dấu EOS/output-cap censoring và bỏ censored pairs; calibration set và no-headroom report cần được tạo riêng.
 
-Khóa `splits.json` trước label generation. Holdout không dùng chọn gate, slot count, LR hoặc early stopping.
+Trước pilot, tạo input JSONL bất biến với `id` và explicit document-level `split` (`train`, `validation`, `holdout`), rồi ghi hash/run ID cùng artifact. V0 ghi split trong `documents.jsonl` và hash input JSONL trong `manifest.json`; chưa tạo/kiểm tra `splits.json`, chưa có split `calibration`, và chưa kiểm tra content overlap độc lập. Operator phải khóa split manifest bên ngoài trước label generation. Holdout không dùng chọn gate, slot count, LR hoặc early stopping.
 
 ## 3. P0 — Semantics và headroom sanity
 
@@ -55,7 +55,7 @@ Gate P0: all-context sparse forward khớp dense; greedy verifier khớp target 
 
 ## 4. P1 — Full integrated pilot
 
-Train selector từ actual preference labels; train compressor/adapters với frozen backbone. Chạy hệ thống đầy đủ local+selected+slots+gate.
+Train selector từ actual preference labels; train global compressor/slot gate với frozen backbone. Chạy local+selected+slots và threshold bypass. V0 chưa có per-layer slot adapters hoặc calibrated crossover gate.
 
 Đầu tiên force AMR/dense trên validation/calibration ở 8K/16K, output tối đa 256 token hoặc EOS. Short-context control 3K/5K. Giữ prompt/output protocol giống nhau; không ép sinh qua EOS hoặc cắt output mỗi method khác nhau để cân tốc độ.
 
@@ -80,7 +80,7 @@ Mốc P1 thành công kỹ thuật: artifact đầy đủ, greedy parity đạt,
 
 Layer-specific selection chỉ thêm sau shared-support pilot. Report total entries mỗi layer và sum bytes; không gọi shared 4K tương đương 5 tập 4K disjoint về storage/gather cost.
 
-**Matched-budget:** hybrid 4096 raw + 128 slots đối chiếu selection-only 4224 raw. Đồng thời giữ comparison 4096 raw để đo incremental gain của slots. Compression-only với cùng entry count có thể không khả thi/khác capacity; báo trade-off nhiều budget và matched measured cost, không ép equality giả.
+**Matched-budget:** hybrid 4096 raw + 128 slots đối chiếu selection-only 4224 raw. Đồng thời giữ comparison 4096 raw để đo incremental gain của slots. V0 checkpoint fingerprint khóa toàn bộ memory config; muốn đổi budget phải capture/label/train một run riêng. Compression-only với cùng entry count có thể không khả thi/khác capacity; báo trade-off nhiều budget và matched measured cost, không ép equality giả.
 
 ## 6. P3 — Holdout và systems benchmark
 
@@ -119,9 +119,26 @@ Model-transfer/32K là extension: chỉ báo nếu có checkpoint/context suppor
 
 Output length, first-token events, EOS và processed-cache cursor phải đối chiếu emitter trace. Báo cả per-document mean A/G và round-weighted mean, không trộn weighting giữa variants.
 
-Generation record mang toàn bộ keys của `validate_schema(record, spec=True)`: method/dataset/model/token counts/batch/timing/throughput/QPS/peak memory và speculative fields. `retained_tokens` là effective draft context entries; tách `raw_retained_tokens` và `compressed_slots`. Unknown timing dùng null + reason, không zero giả.
+V0 generation record có các keys của `validate_schema(record, spec=True)`: method/dataset/model/token counts/batch/timing/throughput/QPS/peak memory và speculative fields; CLI fail nếu thiếu key. Record bổ sung raw/committed A totals, G totals/mean, `verification_calls` và `decode_committed_tok_s`; `retained_tokens` là mean raw+slot entries theo round, raw/slot counts nằm trong `state_trace`. `memory_build_latency_ms` (cũng map vào base field `selector_latency_ms`) gồm key-index/update, slot build và memory assembly, không phải MLP-only latency. Target exactness độc lập và resident-memory breakdown chưa là output field V0. Unknown timing dùng null, không zero giả.
 
 Output ROUGE gọi helper chung. Summary ghi success/failed counts, total tokens/time, exactness, stage breakdown, draft/total memory và data/model fingerprints.
+
+Hợp đồng timing hiện hành: `prefill_ms` đo target prefix forward với
+`logits_to_keep=1`; verifier giữ toàn bộ logits của 16 vị trí. `ttft_ms` đo từ
+đầu engine đến khi token đầu và initial projected bank sẵn sàng.
+`decode_time_ms`/`decode_ms = e2e_ms - ttft_ms`; TPOT dùng decode time chia
+`output_tokens - 1`, null nếu không có khoảng decode. Build latency gồm
+bootstrap, selection/slots/mask và incremental key/slot/bank update;
+projection có field riêng. CUDA stage timings dùng events, không thêm
+synchronize riêng cho mỗi stage; E2E/TTFT đồng bộ tại ranh giới đo.
+
+Rollout ghi sample/document/source ID, split, tokenized `prompt_hash`, input
+manifest SHA-256, checkpoint SHA-256 và effective `run_config_hash`. Hash
+run gồm mode, cost gate, budget, precision/backend và checkpoint;
+`workload_hash` cho phép đối chiếu cùng workload giữa các mode. Pair theo
+ID/prompt/workload và kiểm tra timing policy; không ghép chỉ theo số thứ tự
+dòng. Summary throughput chuẩn dùng tổng committed decode tokens chia tổng
+decode time; `mean_decode_committed_tok_s` chỉ là trung bình mô tả sample.
 
 ## 9. Thống kê và decision gate
 
@@ -145,25 +162,40 @@ Scientific outcome có thể là selection-only thắng hybrid, heuristic đủ 
 
 ## 10. Compute và lệnh dự kiến
 
-Trần pilot đề xuất **24 GPU-giờ**, gồm capture, label generation, train và evaluation. Một run 4 GPU × 1 giờ dùng 4 GPU-giờ. Đo time/memory thực trước khi chia budget; không dự báo số giờ train từ trainable parameter count.
+Trần pilot đề xuất **24 GPU-giờ** cho adaptation. Resource ledger V0 tính allocation-hours gần đúng theo elapsed wall time của capture, label và training phases trên `cuda`; rollout benchmark/inference không bị trừ khỏi cap này. Một run 4 GPU × 1 giờ dùng 4 GPU-giờ. Đo time/memory thực trước khi chia budget; không dự báo số giờ train từ trainable parameter count.
 
-Các lệnh sau chỉ dùng **sau khi task tương ứng đã triển khai**. Production từ repo root với master đã load:
+Các lệnh hiện dùng được sau khi master config trỏ tới model paths local, corpus đã khóa và Python 3.12 runtime sẵn sàng. Chạy từ repo root trên B200:
 
 ~~~bash
-export FAST_INFER_PYTHON=python3
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export PYTHONPATH="$PWD/src:$PWD/scripts:$PWD/externals/dflash"
+export AMR_RUN_ID=pilot_2026_10_08
+export AMR_RUN_ROOT="$PWD/outputs/amr_dflash/$AMR_RUN_ID"
+export AMR_DATA_MANIFEST=/path/to/locked_train_validation_holdout.jsonl
 
-python3 scripts/amr_dflash/capture_states.py --config src/AMR_DFlash/configs/pilot.yaml
-python3 scripts/amr_dflash/label_candidates.py --config src/AMR_DFlash/configs/pilot.yaml
-python3 -m AMR_DFlash.run_train --config src/AMR_DFlash/configs/pilot.yaml --phase selector
-python3 -m AMR_DFlash.run_train --config src/AMR_DFlash/configs/pilot.yaml --phase compressor
-python3 scripts/amr_dflash/evaluate.py --config src/AMR_DFlash/configs/pilot.yaml --checkpoint "$AMR_CHECKPOINT" --split validation
-bash scripts/run.sh amr_dflash
+bash scripts/run.sh amr_dflash preflight --require-b200
+bash scripts/run.sh amr_dflash capture --max-samples 60 --max-new-tokens 256 --max-states-per-document 6
+bash scripts/run.sh amr_dflash candidates
+bash scripts/run.sh amr_dflash label
+bash scripts/run.sh amr_dflash train-selector --steps 200
+export AMR_CHECKPOINT="$PWD/checkpoints/amr_dflash/$AMR_RUN_ID/selector.pt"
+bash scripts/run.sh amr_dflash train-compressor --checkpoint-in "$AMR_CHECKPOINT" --steps 200
+export AMR_CHECKPOINT="$PWD/checkpoints/amr_dflash/$AMR_RUN_ID/compressor.pt"
+bash scripts/run.sh amr_dflash evaluate-fixed --split validation --mode dense --output "$AMR_RUN_ROOT/evaluation/fixed_dense.jsonl"
+bash scripts/run.sh amr_dflash evaluate-fixed --split validation --mode selection --checkpoint "$AMR_CHECKPOINT" --output "$AMR_RUN_ROOT/evaluation/fixed_selection.jsonl"
+bash scripts/run.sh amr_dflash evaluate-fixed --split validation --mode compressor --checkpoint "$AMR_CHECKPOINT" --output "$AMR_RUN_ROOT/evaluation/fixed_compressor.jsonl"
+bash scripts/run.sh amr_dflash evaluate-fixed --split validation --mode amr --checkpoint "$AMR_CHECKPOINT" --output "$AMR_RUN_ROOT/evaluation/fixed_amr.jsonl"
+bash scripts/run.sh amr_dflash infer --split holdout --mode dense --max-samples 30 --max-new-tokens 256 --output "$AMR_RUN_ROOT/evaluation/dense.jsonl"
+bash scripts/run.sh amr_dflash infer --split holdout --mode selection --checkpoint "$AMR_CHECKPOINT" --max-samples 30 --max-new-tokens 256 --output "$AMR_RUN_ROOT/evaluation/selection.jsonl"
+bash scripts/run.sh amr_dflash infer --split holdout --mode compressor --checkpoint "$AMR_CHECKPOINT" --max-samples 30 --max-new-tokens 256 --output "$AMR_RUN_ROOT/evaluation/compressor.jsonl"
+bash scripts/run.sh amr_dflash infer --split holdout --mode amr --checkpoint "$AMR_CHECKPOINT" --max-samples 30 --max-new-tokens 256 --output "$AMR_RUN_ROOT/evaluation/amr.jsonl"
 ~~~
 
-`AMR_DATA_MANIFEST`, `AMR_RUN_ID`, `AMR_CHECKPOINT`, target/draft paths, input/output và GPU assignment đến từ master shell-env. Checkpoint evaluation phải chỉ đến một directory COMPLETE cụ thể, không tự chọn “latest” mơ hồ. Không sửa `config/master.path` tự động. Local chỉ dùng CPU synthetic; không chạy các lệnh GPU như một bước kiểm chứng tài liệu.
+`infer --split` lọc toàn bộ manifest theo `split` trước khi áp dụng
+`--max-samples`; giá trị mặc định `all` giữ hành vi tương thích. Record có
+`split` rõ ràng được ưu tiên, còn record không có split dùng phép chia ổn định
+theo document ID và fraction trong config. Giữ holdout chỉ cho lần đánh giá
+confirmatory đã khóa; không dùng kết quả đó để chọn checkpoint hoặc ngưỡng.
+
+`run.sh` load master shell-env theo `config/master.path`; `AMR_DATA_MANIFEST`, `AMR_RUN_ID`, model paths, device và Python được resolve từ đó/runtime. Checkpoint là file `.pt` có fingerprint strict, không phải directory `COMPLETE`. Selection/compressor/amr inference cần `--checkpoint`. Local chỉ dùng CPU synthetic; các lệnh trên chưa được chạy với model thật.
 
 ## 11. Gói bằng chứng để viết paper
 

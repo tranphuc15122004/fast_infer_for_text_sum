@@ -1,8 +1,16 @@
 # Checklist nghiệm thu AMR-DFlash
 
-Ngày: **08/10/2026**. Checkbox chưa đánh dấu vì AMR code/training/benchmark chưa thực hiện.
+Ngày: **08/10/2026**. V0 code, launcher và CPU synthetic contracts đã có; model thật/B200 chưa chạy. Checkbox bên dưới là acceptance gates đầy đủ, không chỉ xác nhận file/code tồn tại.
 
 Đọc [kế hoạch](../../../docs/superpowers/plans/2026-10-08-amr-dflash-implementation.md) và [protocol](experiment_protocol.md). Khi đóng checkbox, ghi command/exit code/run ID/artifact.
+
+## Bằng chứng đã có
+
+- `.venv/bin/python -m pytest -q tests/test_amr_dflash_contracts.py tests/test_amr_dflash_launcher.py`: CPU synthetic contract tests pass; gồm dense DFlash identity, target greedy parity qua reject/EOS/cap cho dense/hybrid/compressor, fixed-state verifier parity, selector/query, candidate budgets, streaming compressor, gradient qua frozen DFlash, checkpoint mismatch và dispatcher/preflight với model assets giả lập.
+- `.venv/bin/python -m py_compile src/AMR_DFlash/*.py scripts/amr_dflash/cli.py scripts/infer_amr_dflash.py scripts/check_amr_dflash_b200.py`: syntax check đã pass ở revision trước; cần chạy lại sau thay đổi cuối.
+- Chưa có bằng chứng từ Qwen3-4B/DFlash checkpoint thật, CUDA/B200, runtime latency, fitted AMR checkpoint hoặc scientific gain.
+
+Test synthetic không thay thế checklist B200 bên dưới; các mục giữ unchecked tới khi có artifact của đúng model/data/config.
 
 ## M0 — Interface và correctness
 

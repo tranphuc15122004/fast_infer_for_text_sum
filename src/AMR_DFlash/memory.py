@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import time
+
 import torch
 from torch import nn
 
 from .core import (
     AcceptanceSelector,
+    CompressedMemory,
     ComplementaryCompressor,
     MemoryConfig,
     build_sparse_attention_mask,
@@ -46,6 +49,8 @@ class AMRMemory(nn.Module):
         mode: str = "amr",
         use_cost_gate: bool = True,
         candidate_positions: torch.Tensor | None = None,
+        compressed_override: CompressedMemory | None = None,
+        selector_keys: torch.Tensor | None = None,
     ) -> DraftMemory:
         if projected_context.ndim != 3 or projected_context.shape[0] != 1:
             raise ValueError("AMR-DFlash V0 supports one [1,N,H] context at a time")
@@ -54,16 +59,9 @@ class AMRMemory(nn.Module):
             raise ValueError("anchor embedding must have shape [1,H]")
         if live_positions.ndim != 2 or live_positions.shape[0] != batch:
             raise ValueError("live_positions must have shape [1,Q]")
-        if mode not in {"dense", "selection", "amr"}:
-            raise ValueError("mode must be one of: dense, selection, amr")
-        start = torch.cuda.Event(enable_timing=True) if projected_context.is_cuda else None
-        end = torch.cuda.Event(enable_timing=True) if projected_context.is_cuda else None
-        if start is not None:
-            start.record()
-        cpu_start = torch.cuda.synchronize if projected_context.is_cuda else None
-        if cpu_start is not None:
-            cpu_start(projected_context.device)
-        wall_start = __import__("time").perf_counter()
+        if mode not in {"dense", "selection", "compressor", "amr"}:
+            raise ValueError("mode must be one of: dense, selection, compressor, amr")
+        wall_start = time.perf_counter()
 
         all_positions = torch.arange(
             context_length, dtype=torch.long, device=projected_context.device
@@ -74,7 +72,9 @@ class AMRMemory(nn.Module):
             and context_length < self.config.min_context_tokens
         )
         effective_mode = "dense" if mode == "dense" or bypassed else mode
-        if candidate_positions is not None:
+        if effective_mode == "compressor":
+            raw_positions = all_positions[:, :0]
+        elif candidate_positions is not None:
             raw_positions = candidate_positions.to(
                 device=projected_context.device, dtype=torch.long
             )
@@ -95,18 +95,43 @@ class AMRMemory(nn.Module):
         elif effective_mode == "dense":
             raw_positions = all_positions
         else:
-            raw_positions = self.selector.select(
-                projected_context,
-                all_positions,
-                anchor_embedding,
-                raw_budget=self.config.raw_budget,
-                local_window=self.config.local_window,
+            query_state = self.selector.context_query(
+                projected_context, window=self.config.query_window
             )
+            if selector_keys is None:
+                raw_positions = self.selector.select(
+                    projected_context,
+                    all_positions,
+                    anchor_embedding,
+                    raw_budget=self.config.raw_budget,
+                    local_window=self.config.local_window,
+                    query_window=self.config.query_window,
+                    query_state=query_state,
+                )
+            else:
+                if selector_keys.shape[:2] != all_positions.shape:
+                    raise ValueError("cached selector keys must match the full context prefix")
+                raw_positions = self.selector.select_encoded(
+                    selector_keys,
+                    all_positions,
+                    anchor_embedding,
+                    raw_budget=self.config.raw_budget,
+                    local_window=self.config.local_window,
+                    query_state=query_state,
+                )
 
         raw_features = projected_context[:, raw_positions[0], :]
-        if effective_mode == "amr" and self.config.num_slots:
-            compressed = self.compressor(projected_context, all_positions)
-            slot_features = compressed.values
+        if effective_mode in {"amr", "compressor"} and self.config.num_slots and compressed_override is not None:
+            compressed = compressed_override
+            slot_features = compressed.values.to(projected_context.dtype)
+            slot_positions = compressed.positions.to(device=projected_context.device)
+            slot_valid = compressed.valid_mask.to(device=projected_context.device)
+        elif effective_mode in {"amr", "compressor"} and self.config.num_slots:
+            compressor_dtype = self.compressor.value_projection.weight.dtype
+            compressed = self.compressor(
+                projected_context.to(compressor_dtype), all_positions
+            )
+            slot_features = compressed.values.to(projected_context.dtype)
             slot_positions = compressed.positions
             slot_valid = compressed.valid_mask
         else:
@@ -115,7 +140,7 @@ class AMRMemory(nn.Module):
             slot_valid = torch.zeros((batch, 0), dtype=torch.bool, device=projected_context.device)
         live_count = live_positions.shape[1]
         key_features = torch.cat((raw_features, slot_features), dim=1)
-        position_ids = torch.cat((raw_positions, slot_positions, live_positions), dim=1)
+        position_ids = torch.cat((raw_positions, slot_positions), dim=1)
         mask = build_sparse_attention_mask(
             raw_positions,
             slot_positions,
@@ -125,12 +150,7 @@ class AMRMemory(nn.Module):
             slot_valid_mask=slot_valid,
             dtype=projected_context.dtype,
         )
-        if end is not None:
-            end.record()
-            torch.cuda.synchronize(projected_context.device)
-            latency_ms = float(start.elapsed_time(end))
-        else:
-            latency_ms = (__import__("time").perf_counter() - wall_start) * 1000.0
+        latency_ms = (time.perf_counter() - wall_start) * 1000.0
         return DraftMemory(
             features=key_features,
             positions=position_ids,

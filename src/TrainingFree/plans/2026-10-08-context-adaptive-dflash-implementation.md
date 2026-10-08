@@ -4,7 +4,9 @@
 
 **Mục tiêu:** tạo executor, controller và evaluator để kiểm chứng joint draft-context/block-length adaptation trên pretrained DFlash.
 
-**Thư mục implementation:** `src/TrainingFree/context_adaptive/` (cần tạo).
+**Thư mục implementation:** `src/TrainingFree/context_adaptive/` (đã có implementation pass đầu).
+
+**Trạng thái cập nhật 2026-10-08:** core modules, CLI, runner, dispatcher và runbook đã được thêm. Checklist bên dưới mô tả evidence cần để đóng từng gate; chúng vẫn chưa được đánh dấu vì chưa chạy test suite hoặc GPU validation. Host hiện tại CPU-only, do đó full DFlash/AR parity, server smoke và G0–G6 còn pending. Không xem trạng thái code-present là correctness/speedup result.
 
 **Giả thuyết:** budget/context selection làm thay đổi gamma tối ưu; policy phối hợp giảm E2E latency so strong fixed và independent controls.
 
@@ -27,9 +29,9 @@
 
 ## Scaffold và file map
 
-Hiện có: `externals/dflash/dflash/model.py`, `scripts/infer_dflash.py`, shared loader/writer/metrics, canonical data và attention probes. `TrainingFree.policy/run/schema` hiện là RECAP-KV; giữ nguyên.
+Hiện có: `externals/dflash/dflash/model.py`, `scripts/infer_dflash.py`, shared loader/writer/metrics, canonical data, attention probes và executor mới trong `src/TrainingFree/context_adaptive/`. `TrainingFree.policy/run/schema` hiện là RECAP-KV; giữ nguyên.
 
-Core files cần tạo được liệt kê đầy đủ ở integration contract. Tests tương lai đặt `src/TrainingFree/tests/context_adaptive/`, tách khỏi core. Launcher theo convention: `scripts/infer_context_adaptive_dflash.py`, `scripts/runners/run_context_adaptive_dflash.sh`, case trong `scripts/run.sh` và cập nhật [baseline guide](../../../docs/baselines/context_adaptive_dflash.md) từ proposed sang implemented sau validation.
+Core files theo integration contract đã được tạo. Không đặt tests bên trong core; bộ kiểm chứng CPU/GPU theo protocol vẫn là validation work. Launcher đã có tại `scripts/infer_context_adaptive_dflash.py`, `scripts/runners/run_context_adaptive_dflash.sh`, nối trong `scripts/run.sh`; baseline guide mô tả runner là experimental/unvalidated.
 
 ## Task 1: Config, prompt layout và source-group split
 
@@ -41,6 +43,7 @@ Core files cần tạo được liệt kê đầy đủ ở integration contract
 - [ ] Tạo dataclasses đúng field names/tensor contracts; validate mọi enum/value/signature, không thông qua invalid gamma silently.
 - [ ] Source span mapping trên final string với tokenizer offsets; ambiguous/missing span xử lý full/B-only hoặc explicit failure.
 - [ ] Build split theo source fingerprint + provenance union, không tách QMSum queries cùng conversation; exposure registry đọc IDs/source metadata.
+- [ ] Apply exposure trước quota; cross-dataset duplicates thừa hưởng một split theo allocation stratum. Fixture exposed group không vào test kể cả quota thiếu.
 - [ ] CPU fixtures: cùng context hai query phải cùng split; token boundary thuộc source/global protection; repeated source string báo ambiguous; `B<protected` infeasible; gamma vượt checkpoint bị chặn.
 
 **Evidence hoàn tất:** schema config + deterministic split manifest trên fixture; input IDs/hash bằng baseline formatter. Không chạy model để kiểm tra grouping.
@@ -81,6 +84,7 @@ Core files cần tạo được liệt kê đầy đủ ở integration contract
 **Consumes:** prompt layout, bank, verifier parent alignment. **Produces:** target-parent score vectors + `Selection`, sparse `generate_adaptive` fixed action.
 
 - [ ] Target capture Q/K không thay output backend; GQA repeat, scale/mask và full-scope FP32 softmax; thu query L sau outcome, prefill dùng last query.
+- [ ] Hook target-scoped, scratch lifetime hữu hạn, cleanup khi lỗi; không instrument draft qua shared registry hoặc giữ full Q/K tensors qua nhiều rounds.
 - [ ] Chunk source 128; protection global + first64 source + recent256 output; rank và whole-chunk budget rule trong design.
 - [ ] `recent_only` và seeded random controls cùng budget/protection; source score unavailable không tạo zero pseudo-evidence.
 - [ ] Gather selected post-RoPE bank + full current block, giữ absolute positions; target forward luôn full cache.
@@ -96,10 +100,12 @@ Core files cần tạo được liệt kê đầy đủ ở integration contract
 **Consumes:** state/action/outcome và completed timings. **Produces:** fixed/history/entropy/joint controllers với shared choose/observe contract.
 
 - [ ] Prefix survival update/smoothing/backoff theo design; mọi key chứa selector/B/gamma/runtime/refresh; không share shape outcomes.
-- [ ] Entropy quartiles/calibration bins, history EMA và source concentration; n>=8 support rule; reset request state từ prior.
+- [ ] Entropy quartiles/calibration bins, history EMA và source concentration; combined calibration/request support>=8 theo design; reset request counts/history về prior.
 - [ ] Cost query theo context bucket; `frozen_cost` mode rõ ràng, async EMA chỉ dùng event đã ready; không synchronize để đợi action statistics.
+- [ ] Shared action cost không gồm controller; profile `choose` từng policy khi tables đủ và cộng overhead đúng một lần. Total-round prior/EMA phải chứa controller ID.
 - [ ] Feasible actions, min J, tie order, margin2%, full fallback, refresh và output cap override đúng design.
 - [ ] Implement independent A+B đúng protocol: B-controller giữ reference gamma; gamma-controller giữ full context; không đọc action của controller kia.
+- [ ] `statistics_update_mode=frozen` giữ tables nhưng history scalar vẫn cập nhật; fixture executed `(1024,7)` không tăng support `(full,7)` hay `(1024,15)` trong independent reference models.
 - [ ] Fixture gamma3,L1: survival indicators `[1,0,0]`; L3 không update gamma7; no supported action → full fallback. Cost fixtures `(full,15):T=20,C=5` và `(1024,7):T=9,C=3` → chọn reduced vì 3<4 ms/commit, nếu đủ support/margin.
 
 **Evidence hoàn tất:** deterministic action selection và censor/backoff report; chưa claim adaptive speedup từ toy cost fixtures.
@@ -156,6 +162,7 @@ Core files cần tạo được liệt kê đầy đủ ở integration contract
 - [ ] Thu G0–G2 correctness evidence; có lỗi cache/mismatch thì sửa trước experiments hiệu năng.
 - [ ] Thu M1 fixed selection và M2 B-only; report G3/G4 cả kết quả fail, không bỏ control thua.
 - [ ] Thu action-grid/counterfactual và real joint/independent dev matrix, xác định G5; chọn locked config chỉ từ calibration/dev.
+- [ ] Thu cả frozen-table joint/independent comparison để đối soát interaction claim; không gộp frozen/online cells trong report.
 - [ ] Test heldout toàn cells khóa, 3 repetitions và paired document bootstrap; tạo G6 report với coverage/CI/correctness và natural-output ROUGE.
 - [ ] Cập nhật README/baseline guide theo mức đã đạt, chỉ đánh dấu experiment complete khi có artifacts thật; giữ proposal claims nếu gates fail hoặc incomplete.
 
@@ -171,4 +178,4 @@ Core files cần tạo được liệt kê đầy đủ ở integration contract
 - [ ] Không runtime API giả, placeholder scientific result, online installer hoặc test leakage.
 - [ ] Các files ngoài scope giữ nguyên; commit chỉ khi phiên làm việc yêu cầu, không commit artifacts.
 
-Trạng thái Task1–9: **pending implementation**. Bước bắt đầu là Task1 rồi full-mode parity; không bắt đầu joint heldout khi adapter/signal/correctness chưa có evidence.
+Trạng thái Task1–8: **implementation pass đầu có trong workspace; evidence gate pending**. Task9/G0–G6 và mọi benchmark claim vẫn pending. Bước tiếp theo trên server là chạy theo runbook: prepare/preflight, full DFlash/AR parity, smoke, rồi mới mở dev matrix; không bắt đầu heldout nếu adapter/signal/correctness chưa có evidence.

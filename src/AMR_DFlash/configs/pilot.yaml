@@ -1,0 +1,53 @@
+schema_version: amr-v0
+
+model:
+  target_model_env: TARGET_MODEL
+  draft_model_env: DRAFT_MODEL
+  local_files_only: true
+  draft_layers: 5
+  block_size: 16
+  attention_backend: sdpa
+  dtype: bfloat16
+
+inference:
+  temperature: 0.0
+  batch_size: 1
+  mode: amr
+  executor: cached_target
+  use_cost_gate: true
+
+memory:
+  raw_budget: 4096
+  num_slots: 128
+  local_window: 128
+  index_dim: 64
+  slot_gate_init: -2.0
+  min_context_tokens: 4096
+  query_window: 16
+
+training:
+  seed: 17
+  max_states_per_document: 6
+  max_candidates: 12
+  selector_steps: 200
+  compressor_steps: 200
+  selector_lr: 0.0001
+  compressor_lr: 0.0001
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_pairs_per_state: 8
+  max_gpu_hours: 24
+  alignment_history: captured_verifier_candidates
+
+data:
+  manifest_env: AMR_DATA_MANIFEST
+  input_env: DATA_FILE
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  max_input_tokens: 0
+  max_new_tokens: 256
+
+output:
+  run_root_env: AMR_RUN_ROOT
+  run_id_env: AMR_RUN_ID
+  checkpoint_env: AMR_CHECKPOINT

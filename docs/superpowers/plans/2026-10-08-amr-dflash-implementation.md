@@ -1,6 +1,6 @@
 # Kế hoạch triển khai AMR-DFlash
 
-> **Dành cho người/agent thực hiện:** dùng skill `executing-plans` để thực hiện tuần tự từng task. Theo dõi bằng checkbox; chỉ đánh dấu sau khi có bằng chứng mới. Kế hoạch này chưa được thực thi.
+> **Trạng thái 08/10/2026:** đã triển khai một V0 rút gọn cho T1–T11 và có CPU contract tests. Các checkbox dưới đây là acceptance gate đầy đủ; chưa đánh dấu chỉ vì code path tồn tại. T12 và mọi kiểm chứng bằng model thật/B200 còn pending.
 
 **Mục tiêu:** xây AMR memory interface trên pretrained DFlash-5L, train theo acceptance preferences, chạy full integrated pilot với full-context target verifier và measured cost.
 
@@ -11,6 +11,14 @@
 **Đặc tả:** [thiết kế](../specs/2026-10-08-amr-dflash-design.md), [data/train](../../../src/ARMdflash/AMR_DFlash_Implementation/data_training_contract.md), [protocol](../../../src/ARMdflash/AMR_DFlash_Implementation/experiment_protocol.md).
 
 **Evaluation:** mỗi 50 optimizer steps và cuối phase, toàn validation manifest; một evaluator cho checkpoint/in-memory và fixed-state/rollout. CPU synthetic override cadence=1; smoke không là scientific evidence.
+
+## Kết quả implementation V0
+
+Đã có `src/AMR_DFlash/` cho selector/compressor, DFlash adapter, sparse memory, cached greedy verifier, candidate generation/labels/preferences, selector/compressor training, fingerprinted checkpoints và GPU-hour ledger. CLI tại `scripts/amr_dflash/cli.py` nối `preflight`, `capture`, `candidates`, `label`, `train-selector`, `train-compressor`, `infer`; launcher được nối vào `scripts/run.sh amr_dflash`.
+
+CPU synthetic tests đã xác nhận dense forward parity và token parity với target greedy cho dense/hybrid/compressor modes, gồm rejection/EOS/output cap; fixed-state evaluator có tiny-model test. V0 chưa tự chạy full validation theo cadence, optimizer/RNG resume, measured crossover gate, genuine GPU performance results hay B200 model run. Vì vậy các checklist bên dưới vẫn là acceptance gates còn mở, không phải todo cho các file chưa được tạo.
+
+Một số đường dẫn test/entrypoint trong checklist chi tiết bên dưới là mục tiêu ban đầu của thiết kế. Lệnh CPU hiện chạy được là `.venv/bin/python -m pytest -q tests/test_amr_dflash_contracts.py tests/test_amr_dflash_launcher.py`; launcher B200 dùng `bash scripts/run.sh amr_dflash ...`.
 
 ## Ràng buộc toàn cục
 

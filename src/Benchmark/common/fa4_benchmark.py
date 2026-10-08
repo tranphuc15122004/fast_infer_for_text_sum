@@ -246,8 +246,14 @@ def _summarize_group(
             if row.get("acceptance_rate_percent") is not None
         ]),
         "mean_avg_accept_length": _mean([
-            float(row["avg_accept_length"]) for row in successful
-            if row.get("avg_accept_length") is not None
+            float(row.get("avg_accept_length") if row.get("avg_accept_length") is not None else row["accept_length"])
+            for row in successful
+            if row.get("avg_accept_length") is not None or row.get("accept_length") is not None
+        ]),
+        "mean_acceptance_length": _mean([
+            float(row.get("avg_accept_length") if row.get("avg_accept_length") is not None else row["accept_length"])
+            for row in successful
+            if row.get("avg_accept_length") is not None or row.get("accept_length") is not None
         ]),
         "total_draft_tokens_accepted": sum(
             int(row["draft_tokens_accepted"]) for row in successful

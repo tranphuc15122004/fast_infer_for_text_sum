@@ -19,6 +19,8 @@ case "$BASELINE" in
   vanilla_fa)   WRAPPER="scripts/runners/run_vanilla_fa.sh" ;;
   eagle3)      WRAPPER="scripts/runners/run_eagle3_qwen3.sh" ;;
   dflash)      WRAPPER="scripts/runners/run_dflash.sh" ;;
+  context_adaptive_dflash) WRAPPER="scripts/runners/run_context_adaptive_dflash.sh" ;;
+  amr_dflash)  WRAPPER="scripts/runners/run_amr_dflash.sh" ;;
   domino)      WRAPPER="scripts/runners/run_domino.sh" ;;
   sssd)       WRAPPER="scripts/runners/run_sssd.sh" ;;
   fafo)       WRAPPER="scripts/runners/run_fafo.sh" ;;
@@ -39,7 +41,7 @@ case "$BASELINE" in
   fa4_native)      WRAPPER="scripts/run_fa4_benchmark.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: vllm_all fa4_native longbench_200 vanilla_hf vanilla_fa eagle3 dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
+    echo "Available: vllm_all fa4_native longbench_200 vanilla_hf vanilla_fa eagle3 dflash context_adaptive_dflash amr_dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
     exit 1
     ;;
 esac

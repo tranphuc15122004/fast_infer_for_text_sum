@@ -18,6 +18,7 @@ class MemoryConfig:
     local_window: int = 128
     slot_gate_init: float = -2.0
     min_context_tokens: int = 4096
+    query_window: int = 16
 
     def __post_init__(self) -> None:
         if self.raw_budget < 0 or self.num_slots < 0 or self.local_window < 0:
@@ -26,6 +27,8 @@ class MemoryConfig:
             raise ValueError("local_window must fit inside raw_budget")
         if self.min_context_tokens < 0:
             raise ValueError("min_context_tokens must be non-negative")
+        if self.query_window < 1:
+            raise ValueError("query_window must be positive")
 
 
 @dataclass
@@ -50,6 +53,14 @@ class Acceptance:
     first_mismatch: int | None
 
 
+@dataclass(frozen=True)
+class CommitOutcome:
+    committed_proposals: list[int]
+    emitted_tokens: list[int]
+    processed_tokens: int
+    stopped_on_eos: bool
+
+
 class AcceptanceSelector(nn.Module):
     """Pre-draft state-conditioned score over projected context features."""
 
@@ -58,7 +69,11 @@ class AcceptanceSelector(nn.Module):
         if hidden_size < 1 or index_dim < 1:
             raise ValueError("hidden_size and index_dim must be positive")
         self.key_projection = nn.Linear(hidden_size, index_dim, bias=False)
-        self.query_projection = nn.Linear(hidden_size, index_dim, bias=False)
+        self.query_projection = nn.Sequential(
+            nn.Linear(hidden_size * 3, index_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(index_dim, index_dim, bias=False),
+        )
         self.position_bias = nn.Parameter(torch.zeros(()))
         self.scale = index_dim**-0.5
 
@@ -67,17 +82,61 @@ class AcceptanceSelector(nn.Module):
         features: torch.Tensor,
         anchor: torch.Tensor,
         positions: torch.Tensor | None = None,
+        query_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if features.ndim != 3 or anchor.ndim != 2:
             raise ValueError("features must be [B,N,H] and anchor [B,H]")
         if features.shape[0] != anchor.shape[0] or features.shape[2] != anchor.shape[1]:
             raise ValueError("feature and anchor batch/hidden dimensions must match")
-        query = self.query_projection(anchor)
-        keys = self.key_projection(features)
+        keys = self.encode_keys(features)
+        if query_state is None:
+            query_state = self.context_query(features)
+        return self.score_keys(keys, anchor, positions, query_state=query_state)
+
+    @staticmethod
+    def context_query(features: torch.Tensor, *, window: int = 16) -> torch.Tensor:
+        """Summarize only committed context as [latest feature, recent mean]."""
+        if features.ndim != 3:
+            raise ValueError("features must have shape [B,N,H]")
+        if window < 1:
+            raise ValueError("query window must be positive")
+        if features.shape[1] == 0:
+            zeros = features.new_zeros((features.shape[0], features.shape[2]))
+            return torch.stack((zeros, zeros), dim=1)
+        recent = features[:, -window:, :]
+        return torch.stack((recent[:, -1, :], recent.mean(dim=1)), dim=1)
+
+    def encode_keys(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 3:
+            raise ValueError("features must have shape [B,N,H]")
+        return self.key_projection(features.to(self.key_projection.weight.dtype))
+
+    def score_keys(
+        self,
+        keys: torch.Tensor,
+        anchor: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        *,
+        query_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if keys.ndim != 3 or anchor.ndim != 2:
+            raise ValueError("keys must be [B,N,D] and anchor [B,H]")
+        if keys.shape[0] != anchor.shape[0] or keys.shape[2] != self.key_projection.out_features:
+            raise ValueError("encoded key and anchor dimensions do not match selector")
+        if query_state is None:
+            query_state = anchor.new_zeros((anchor.shape[0], 2, anchor.shape[1]))
+        if query_state.shape != (anchor.shape[0], 2, anchor.shape[1]):
+            raise ValueError("query_state must have shape [B,2,H]")
+        query_input = torch.cat(
+            (anchor.unsqueeze(1), query_state), dim=1
+        ).flatten(start_dim=1)
+        query = self.query_projection(
+            query_input.to(self.query_projection[0].weight.dtype)
+        )
         scores = torch.einsum("bd,bnd->bn", query, keys) * self.scale
         if positions is not None and positions.numel():
-            if positions.shape != features.shape[:2]:
-                raise ValueError("positions must match [B,N] feature dimensions")
+            if positions.shape != keys.shape[:2]:
+                raise ValueError("positions must match [B,N] encoded key dimensions")
             # A weak, learned relative-position term; positions are normalized
             # per example and depend only on already-observed context.
             relative = positions.to(dtype=scores.dtype)
@@ -94,6 +153,8 @@ class AcceptanceSelector(nn.Module):
         *,
         raw_budget: int,
         local_window: int,
+        query_window: int = 16,
+        query_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return sorted original positions, including the recent guard.
 
@@ -114,9 +175,43 @@ class AcceptanceSelector(nn.Module):
         if budget == 0:
             return positions[:, :0]
 
-        scores = self(features, anchor, positions)
+        return self.select_encoded(
+            self.encode_keys(features), positions, anchor,
+            raw_budget=raw_budget, local_window=local_window,
+            query_state=(
+                query_state
+                if query_state is not None
+                else self.context_query(features, window=query_window)
+            ),
+        )
+
+    @torch.no_grad()
+    def select_encoded(
+        self,
+        keys: torch.Tensor,
+        positions: torch.Tensor,
+        anchor: torch.Tensor,
+        *,
+        raw_budget: int,
+        local_window: int,
+        query_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if raw_budget < 0 or local_window < 0:
+            raise ValueError("raw_budget and local_window must be non-negative")
+        if local_window > raw_budget:
+            raise ValueError("local_window must fit inside raw_budget")
+        if keys.ndim != 3 or positions.shape != keys.shape[:2]:
+            raise ValueError("positions must match [B,N] encoded key dimensions")
+        if anchor.shape != (keys.shape[0], self.key_projection.in_features):
+            raise ValueError("anchor must have shape [B,H]")
+        if positions.shape[1] > 1 and torch.any(positions[:, 1:] <= positions[:, :-1]):
+            raise ValueError("positions must be strictly increasing")
+        budget = min(raw_budget, keys.shape[1])
+        if budget == 0:
+            return positions[:, :0]
+        scores = self.score_keys(keys, anchor, positions, query_state=query_state)
         selected_rows: list[torch.Tensor] = []
-        for batch_index in range(features.shape[0]):
+        for batch_index in range(keys.shape[0]):
             row_positions = positions[batch_index]
             recent_count = min(local_window, budget)
             local_indices = torch.arange(
@@ -160,6 +255,7 @@ class ComplementaryCompressor(nn.Module):
         self.scale = hidden_size**-0.5
 
     def _assign(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = features.to(self.key_projection.weight.dtype)
         keys = self.key_projection(features)
         scores = torch.einsum("bnh,sh->bns", keys, self.slot_queries) * self.scale
         assignment = torch.softmax(scores, dim=-1)
@@ -361,3 +457,41 @@ def greedy_acceptance(proposals: torch.Tensor, target_choices: torch.Tensor) -> 
         first = int(mismatches[0].item())
         return Acceptance(first, first)
     return Acceptance(proposals.shape[1], None)
+
+
+def resolve_greedy_commit(
+    proposals: list[int] | tuple[int, ...],
+    *,
+    accepted: int,
+    correction: int,
+    remaining: int,
+    eos_token_ids: set[int],
+) -> CommitOutcome:
+    """Resolve the emitted and processed prefix without crossing EOS/cap."""
+    if remaining < 1:
+        raise ValueError("remaining output budget must be positive")
+    if accepted < 0 or accepted > len(proposals):
+        raise ValueError("accepted proposal count is outside the proposal block")
+    accepted_prefix = [int(token) for token in proposals[:accepted]]
+    eos_index = next(
+        (index for index, token in enumerate(accepted_prefix) if token in eos_token_ids),
+        None,
+    )
+    if eos_index is not None and eos_index < remaining:
+        committed = accepted_prefix[: eos_index + 1]
+        emitted = committed
+        stopped_on_eos = True
+    elif accepted >= remaining:
+        committed = accepted_prefix[:remaining]
+        emitted = committed
+        stopped_on_eos = False
+    else:
+        committed = accepted_prefix
+        emitted = committed + [int(correction)]
+        stopped_on_eos = int(correction) in eos_token_ids
+    return CommitOutcome(
+        committed_proposals=committed,
+        emitted_tokens=emitted,
+        processed_tokens=1 + len(committed),
+        stopped_on_eos=stopped_on_eos,
+    )

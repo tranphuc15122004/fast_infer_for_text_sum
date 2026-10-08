@@ -8,7 +8,7 @@
 Benchmark reference để đối chiếu Training-Free: [Modal reference](experiments/2026-09-21_modal_trainingfree_reference.md)
 và [metadata/config JSON](experiments/2026-09-21_modal_trainingfree_reference.json).
 
-**Ngày snapshot:** 2026-10-05  
+**Ngày snapshot:** 2026-10-08
 **Commit nền:** `ffe40fc` (`cap nhat quá trình Eval`)  
 **Lưu ý trạng thái:** working tree hiện có thay đổi chưa commit ở các nhánh
 `MR_DFlash`, `TrainingFree` và các tài liệu/runtime liên quan. Những phần này
@@ -42,6 +42,7 @@ Nhãn dùng trong tài liệu:
 | `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Fine-tune và GrowMTP loss from scratch trên B200 đã chạy xong theo báo cáo; audit hidden cache và đánh giá chất lượng/acceptance còn mở** |
 | `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |
 | `T2` | Context-Adaptive DFlash training-free | `src/TrainingFree/docs/context_adaptive_dflash/` | **Đặc tả và protocol đã có; executor/launcher và G0–G6 đang pending** |
+| `A2` | AMR-DFlash acceptance-aware adaptive memory | `src/AMR_DFlash/`, `scripts/amr_dflash/`, `docs/baselines/amr_dflash.md` | **V0 code + launcher đã có; CPU contracts pass; checkpoint thật/B200 train/eval và scientific gates pending** |
 | `Y1` | SyncSpec-v1 speculative decoding | `src/SyncSpec/`, `docs/baselines/syncspec.md` | **Core, test và smoke đã có; chưa có full benchmark canonical để claim** |
 | `A1` | Phân tích chẩn đoán và quyết định nghiên cứu | `src/analyze/`, `outputs/dflash_residual/`, `outputs/safe_budget_sum/`, `outputs/specextend_*` | **Nhiều thí nghiệm đã chạy; kết quả dùng để lọc giả thuyết, không tự động là baseline** |
 
@@ -55,6 +56,10 @@ Nhãn dùng trong tài liệu:
    triển khai physical KV executor khi expansion vẫn gần 100%.
 4. Đưa SyncSpec và Finetuning qua target/model snapshot thật theo đúng gate của
    từng nhánh trước khi đưa vào bảng claim chung.
+5. Trên B200, preflight model/data; chạy AMR capture → candidate labels →
+   selector/compressor train → fixed-state dense/selection/compressor/hybrid
+   evaluation → paired rollout smoke. Chỉ sau exactness và matched-cost gate
+   mới mở pilot/holdout.
 
 Các mục trên là định hướng kỹ thuật rút ra từ trạng thái repo. Khi có giao việc
 cụ thể mới, ghi giao việc đó vào trường **Việc tiếp theo được giao** của

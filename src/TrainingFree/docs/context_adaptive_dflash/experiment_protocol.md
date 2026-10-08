@@ -1,6 +1,6 @@
 # Protocol thực nghiệm Context-Adaptive DFlash
 
-Ngày: **2026-10-08**. Trạng thái: **protocol để triển khai và khóa trước heldout**. [Thiết kế](design.md), [measurement contract](measurement_contract.md), [runbook](runbook.md).
+Ngày: **2026-10-08**. Trạng thái: **protocol thực nghiệm cho executor đã có; G0–G6 còn pending**. [Thiết kế](design.md), [measurement contract](measurement_contract.md), [runbook](runbook.md).
 
 ## 1. Research questions và evidence
 
@@ -47,7 +47,7 @@ def split_order(group_id: str, seed: int = 42) -> str:
 
 Gom context hashes giống nhau; đồng thời merge variants có cùng `(dataset,source_split,source_index)` khi xác định cùng document. Truncation/length variants và nhiều queries giữ cùng group. Cross-dataset duplicate source groups chỉ được vào một split; không dedup chỉ bằng sample ID.
 
-Trong mỗi dataset, sort source groups theo `split_order`; 20% groups đầu calibration, 20% tiếp dev, phần còn lại test. Dùng `floor(0.2*groups)` cho calibration/dev, yêu cầu ít nhất 1 group/split. Với pool chưa loại exposed groups: GovReport/Multi-News là 20/20/60 groups; QMSum là 4/4/12 groups. Số query records thực trong từng split phải ghi manifest, không mặc định QMSum cũng có 20/20/60 records.
+Sau global grouping, mỗi group thuộc allocation stratum là dataset có tên nhỏ nhất theo thứ tự lexicographic trong các records của group; tất cả records thừa hưởng cùng split. Trong từng stratum có N groups, reserve exposed groups vào dev trước. Sort các groups còn lại theo `split_order`; lấy `floor(0.2*N)` vào calibration, rồi thêm vào dev tới `max(exposed_count,floor(0.2*N))`, còn lại test. Yêu cầu ít nhất 1 group/split, thiếu quota thì báo `insufficient_data`, không chuyển exposed group vào test. Với pool không có exposure/cross-dataset duplicates: GovReport/Multi-News là 20/20/60 groups; QMSum là 4/4/12 groups. Số query records thực trong từng split phải ghi manifest, không mặc định QMSum cũng có 20/20/60 records.
 
 Exposure registry nhập các cohort đã phân tích từ artifact source manifests, map cả source index và context fingerprint. Cohort DFlash 10 GovReport ngày 2026-10-06 có manifest tại `outputs/dflash_attention_probe/dflash-attention-fullmass-govreport10-l40s-20261006/manifest.json`; IDs có thể khác canonical nên resolve qua `data/longbench_200/gov_report.jsonl` và source metadata. Những group đã phát triển ý tưởng phải ở dev/exploratory, không ở untouched test. Nếu provenance không đủ để đối soát, không claim test chưa từng quan sát.
 
@@ -97,8 +97,10 @@ Các ngưỡng speedup dưới đây là **tiêu chí nghiên cứu mặc địn
 
 - Grid 4 budgets × supported gammas, mỗi gamma được **draft lại**; log `p_i(s,B,gamma)`.
 - Calibration chạy 3 round repetitions/action/state sau warmup; prior prefix outcomes lấy từ actual verification, timings cùng hardware/signature. Với greedy, cùng state/action lặp lại chỉ là timing repetitions: prefix outcome được tính một lần, không tăng giả support. Ngoài các state M1, thu 512/1024/1536 processed tokens nếu natural trajectory đủ dài để bổ sung context/cost support. Không gọi neural fitting hoặc thay weights.
+- Sau action profiling, đo controller `choose` của từng policy trên cùng causal state/action set với tables đã dựng. Shared action-cost priors không gồm controller; tổng J thêm overhead đúng policy. Total-round observations khác controller không được tái sử dụng như cùng signature.
 - Lập cost surface/argmin gamma theo budget và generation state. Ước lượng local oracle gap chỉ trên state replay; không trình bày nó như E2E oracle rollout speedup.
 - So joint với best fixed pair, A-only, B-only và independent A+B trong bảng dưới.
+- Chạy joint/independent với cùng online-update mode; thêm cặp `statistics_update_mode=frozen` dùng cùng calibration tables/cost priors, history vẫn causal. Không relabel outcome của executed pair thành reference-axis observation. Frozen comparison phải cho thấy joint gain cùng chiều và CI lower >1 mới quy phần gain cho phối hợp action; nếu gain chỉ ở online mode thì phân tích như hiệu quả tổng hợp của policy và online statistics.
 - G5: joint đạt >=1.03 paired E2E speedup so cả best fixed pair và independent A+B, CI lower >1 cho mỗi comparison; có evidence budget làm thay đổi gamma tối ưu vượt timing noise. Nếu thiếu interaction/gain thì thu hẹp claim về các thành phần riêng.
 
 ### M4 — Lock và heldout, G6
@@ -123,6 +125,8 @@ Các ngưỡng speedup dưới đây là **tiêu chí nghiên cứu mặc địn
 | `joint` | Adaptive B | Dynamic | Cùng argmin trên `(B,gamma)` |
 
 Independent A+B: context controller chọn B bằng cost/acceptance model tại **fixed dev gamma reference**, không nhận gamma hiện chọn của B-controller. Gamma controller chọn gamma bằng model calibrated **full context**, không nhận B hiện chọn. Cả hai đọc causal state trước round, gộp actions rồi execute; refresh/boundary constraints giống joint và phải log override. Không cho independent controller lặp coordinate descent đến hội tụ vì khi đó nó đã dùng joint interaction.
+
+Quan sát sau round chỉ cập nhật table tại executed `(B,gamma)` cho cả joint và independent. Reference-axis models không được nhận pseudo-label từ sparse/khác-shape outcomes; frozen ablation ở M3 dùng cùng priors cho hai controller và khóa mode trong manifest/locked config.
 
 Selector và score-refresh schedule giữ giống nhau giữa best fixed/A/independent/joint trong một comparison. B-only không cần source collector; cost difference collector là một phần thực của A/C. Thêm `joint_no_entropy` và `joint_no_source_relevance` để xác định đóng góp signals.
 

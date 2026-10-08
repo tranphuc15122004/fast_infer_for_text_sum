@@ -29,55 +29,55 @@
 
 ### 1.1. Nền tảng inference
 
-Gọi target autoregressive model là \(T\) và pretrained diffusion/block-parallel drafter là \(D_{\theta_0}\).
+Gọi target autoregressive model là $T$ và pretrained diffusion/block-parallel drafter là $D_{\theta_0}$.
 
-Tại speculative round \(t\), target đã xử lý toàn bộ prefix gồm prompt và các token đầu ra đã commit, cung cấp target hidden features:
+Tại speculative round $t$, target đã xử lý toàn bộ prefix gồm prompt và các token đầu ra đã commit, cung cấp target hidden features:
 
-\[
+$$
 H_t=[h_1,\ldots,h_{N_t}],\qquad h_i\in\mathbb R^{d_H}.
-\]
+$$
 
-Ở checkpoint dùng cho phân tích attention, DFlash lấy features từ target layers \([1,9,17,25,33]\). Các features được fuse/project theo thiết kế gốc để tạo **context K/V của DFlash**. **Đây không phải bản sao raw target K/V cache.**
+Ở checkpoint dùng cho phân tích attention, DFlash lấy features từ target layers $[1,9,17,25,33]$. Các features được fuse/project theo thiết kế gốc để tạo **context K/V của DFlash**. **Đây không phải bản sao raw target K/V cache.**
 
 DFlash gốc có 5 draft layers, mỗi round có **16 live positions = 1 anchor + 15 proposal positions**, kết hợp các context states để dự đoán block song song:
 
-\[
+$$
 q_t^{\rm full}=D_{\theta_0}(B_t,H_t).
-\]
+$$
 
 Target verifier kiểm tra proposal trên **full original context/KV** với verification/correction scheme đúng của speculative decoding.
 
 ### 1.2. Long-context challenge có hai vế
 
-- **Draft conditioning cost:** context K/V dài làm tăng lượng K/V được đọc/tính trong draft attention; trong block-parallel decoding với số query cố định \(K\), thành phần cross-attention điển hình tăng khoảng \(O(KN_td)\), **không phải** \(O(N_t^2)\).
+- **Draft conditioning cost:** context K/V dài làm tăng lượng K/V được đọc/tính trong draft attention; trong block-parallel decoding với số query cố định $K$, thành phần cross-attention điển hình tăng khoảng $O(KN_td)$, **không phải** $O(N_t^2)$.
 - **Target–draft mismatch:** pretrained drafter có năng lực hạn chế; full memory có thể bao gồm nhiều states ít giá trị cho bước dự đoán hiện tại. Một tập *được chọn đúng* có khả năng cải thiện logits/accepted prefix — **đây là giả thuyết, chưa có bằng chứng nhân quả trên DFlash**.
 
 Vấn đề chính **không** phải “tất cả long context đều thừa” mà là: **những thông tin nào nên có độ phân giải cao và những thông tin nào chỉ cần được giữ dạng tổng hợp ở mỗi draft round?**
 
 ### 1.3. Vì sao cần acceptance-first?
 
-Profiling do người nghiên cứu thông báo: một verification round mất khoảng \(6\times\) một draft round. Nếu chuẩn hóa \(T_D=1\), \(T_V=6\), khi giữ nguyên số committed tokens per round:
+Profiling do người nghiên cứu thông báo: một verification round mất khoảng $6\times$ một draft round. Nếu chuẩn hóa $T_D=1$, $T_V=6$, khi giữ nguyên số committed tokens per round:
 
-\[
+$$
 \operatorname{Speedup}_{\text{draft only}}(s)
 =\frac{T_D+T_V}{T_D/s+T_V}
 =\frac{7}{6+1/s}.
-\]
+$$
 
-Ngay cả khi draft time giảm về 0, speedup vòng chỉ có trần \(7/6\approx1.167\times\), **nếu** acceptance/verification time và overhead khác không đổi. Tỷ lệ này chưa được xác nhận trên mọi context length, batch size và hardware; không dùng nó như kết quả hệ thống tổng quát.
+Ngay cả khi draft time giảm về 0, speedup vòng chỉ có trần $7/6\approx1.167\times$, **nếu** acceptance/verification time và overhead khác không đổi. Tỷ lệ này chưa được xác nhận trên mọi context length, batch size và hardware; không dùng nó như kết quả hệ thống tổng quát.
 
 Cơ hội lớn hơn là tăng số token được commit trong mỗi lần verifier chạy:
 
-\[
+$$
 \boxed{
 U\;\equiv\;\frac{\mathbb E[\text{committed tokens/round}]}{
 \mathbb E[T_{\rm select}+T_{\rm compress/update}+T_{\rm gather}+T_{\rm draft}+T_{\rm verify}+T_{\rm other}]}
 }.
-\]
+$$
 
 Tối ưu cuối cùng là **decode committed tokens/s** và **end-to-end summarization latency**; acceptance là đòn bẩy chính, memory cost là điều kiện ràng buộc.
 
-> Cần tách **accepted proposal length \(A\)** và **số committed tokens \(G\)**: correction/bonus/EOS làm \(G\) không luôn bằng \(A+1\). Với K=16 live positions có 15 proposal positions, \(A\in\{0,\ldots,15\}\) nếu đếm proposals theo mô hình hiện tại. \(\mathbb E[A]=\sum_{j=1}^{15}P(A\ge j)\). Đo \(G\) trực tiếp từ verifier để tránh nhầm định nghĩa.
+> Cần tách **accepted proposal length $A$** và **số committed tokens $G$**: correction/bonus/EOS làm $G$ không luôn bằng $A+1$. Với K=16 live positions có 15 proposal positions, $A\in\{0,\ldots,15\}$ nếu đếm proposals theo mô hình hiện tại. $\mathbb E[A]=\sum_{j=1}^{15}P(A\ge j)$. Đo $G$ trực tiếp từ verifier để tránh nhầm định nghĩa.
 
 ---
 
@@ -120,12 +120,12 @@ Bằng chứng chính lấy từ ZIP `bao_cao_phan_tich.zip`, nhóm `nhom_1_dfla
 
 Các E41–E44 trên Qwen3-0.6B cho thấy attention/head heterogeneity, temporal support reuse và giới hạn của fixed oracle/gating/quantization khi đưa vào ràng buộc cost/tail risk. Đây là **kinh nghiệm thiết kế hệ thống** (đặc biệt về overhead, tail failure và reuse), không phải bằng chứng của learned AMR-DFlash. Điểm nối hợp lý:
 
-\[
+$$
 \text{Observed sparse/structured attention}
 \not\Rightarrow\text{free speedup or preserved accuracy};
 \quad
 \text{need causal and cost-aware memory allocation}.
-\]
+$$
 
 ---
 
@@ -186,36 +186,36 @@ flowchart TD
 
 ### 4.2. Working memory và budget
 
-Tại round \(t\), giả sử tập cache positions đã commit là \(\mathcal C_t\) và 16 live block positions là \(\mathcal B_t\). AMR xây memory:
+Tại round $t$, giả sử tập cache positions đã commit là $\mathcal C_t$ và 16 live block positions là $\mathcal B_t$. AMR xây memory:
 
-\[
+$$
 \boxed{\mathcal M_t=
 \mathcal M_{\rm local,t}
 \cup\mathcal M_{\rm select,t}
 \cup\mathcal M_{\rm global,t}}
-\]
+$$
 
 với:
 
-\[
+$$
 \begin{aligned}
 \mathcal M_{\rm local,t}&=\operatorname{ExactRecent}(H_t,W)\;\text{(+ optional small sink guard)},\\
 \mathcal M_{\rm select,t}&=\{h_i:i\in\mathcal S_t\},\\
 \mathcal M_{\rm global,t}&=G_\eta(H_{\rm historical};\text{incremental state}).
 \end{aligned}
-\]
+$$
 
-Các local/sink positions là guard chống mất thông tin, được **trừ trong raw budget**, tránh double counting. Tránh trùng positions giữa local và selected. \(H_{\rm historical}\) là toàn bộ history được cập nhật dần; **không nén lại toàn bộ complement \(H_{\mathcal C_t\setminus\mathcal S_t}\) mỗi speculative round** nếu không có chiến lược incremental.
+Các local/sink positions là guard chống mất thông tin, được **trừ trong raw budget**, tránh double counting. Tránh trùng positions giữa local và selected. $H_{\rm historical}$ là toàn bộ history được cập nhật dần; **không nén lại toàn bộ complement $H_{\mathcal C_t\setminus\mathcal S_t}$ mỗi speculative round** nếu không có chiến lược incremental.
 
-Nếu tổng budget draft context là \(B\):
+Nếu tổng budget draft context là $B$:
 
-\[
+$$
 B=B_{\rm raw}+B_{\rm slots},\qquad
 |\mathcal M_{\rm local}\cup\mathcal M_{\rm select}|\le B_{\rm raw},\quad
 |\mathcal M_{\rm global}|=B_{\rm slots}.
-\]
+$$
 
-**Live 16-position block không tính vào \(B\)** và không bị rút gọn.
+**Live 16-position block không tính vào $B$** và không bị rút gọn.
 
 *Pilot configuration để thử, không phải optimum:* context length 3K/5K/8K/16K, raw budgets 1K/2K/4K/8K; thử local window 128/256 và slots 64/128; trước hết dùng shared-support selector, sau đó xem per-layer extension.
 
@@ -223,49 +223,49 @@ B=B_{\rm raw}+B_{\rm slots},\qquad
 
 Tạo compact index cho mỗi committed target-derived feature, khi token được commit:
 
-\[
+$$
 k_i=W_Kh_i\in\mathbb R^{d_r}.
-\]
+$$
 
-Trước khi tạo draft block ở round \(t\), build query từ **thông tin đã có trước draft**:
+Trước khi tạo draft block ở round $t$, build query từ **thông tin đã có trước draft**:
 
-\[
+$$
 u_t=f_\phi(z_t),\qquad
 z_t=\operatorname{Fuse}(\text{anchor},\text{recent target states},\text{committed history metadata},\ldots).
-\]
+$$
 
 Score:
 
-\[
+$$
 s_{t,i}=\frac{u_t^\top k_i}{\sqrt{d_r}}+b_\phi(\text{relative position}_i,\text{prompt/output flag}_i).
-\]
+$$
 
 Chọn dynamic support:
 
-\[
+$$
 \mathcal S_t=\operatorname{TopK}_{B_{\rm raw}-|\mathcal M_{\rm local,t}|}
 \{s_{t,i}\mid i\notin \mathcal M_{\rm local,t}\}.
-\]
+$$
 
 **Không dùng** current-round dense DFlash attention hoặc current-round target verification như input của selector khi inference. Các tín hiệu này chỉ có thể xuất hiện trong *offline label generation*. Previous-round target attention là optional ablation, không phải teacher mặc định.
 
-**Layer-aware extension** (chỉ triển khai nếu cần): \(u_{t,\ell}=f_\phi(z_t,e_\ell)\), cấp subset riêng cho từng draft layer. Đây là lựa chọn tốn metadata/gather; phải so cùng total budget và CUDA latency.
+**Layer-aware extension** (chỉ triển khai nếu cần): $u_{t,\ell}=f_\phi(z_t,e_\ell)$, cấp subset riêng cho từng draft layer. Đây là lựa chọn tốn metadata/gather; phải so cùng total budget và CUDA latency.
 
 ### 4.4. Learned complementary compressed global memory
 
 Một compressor cập nhật các slots biểu diễn thông tin bổ trợ của lịch sử xa:
 
-\[
+$$
 R_t=G_\eta(H_{\le t};R_{t-1}),\qquad R_t\in\mathbb R^{B_{\rm slots}\times d_M}.
-\]
+$$
 
 **Nó không học reconstruct raw tokens, và cũng không được mặc định học attention mass.** Nhiệm vụ là thêm thông tin để **DFlash dự đoán gần target hơn và tăng accepted prefix** trong khi tiêu tốn ít entries.
 
 Cần adapter đưa slot representations vào K/V của mỗi DFlash layer:
 
-\[
+$$
 (K_{\ell}^{\rm slot},V_{\ell}^{\rm slot})=P_{\eta,\ell}(R_t).
-\]
+$$
 
 Các raw selected states giữ absolute positions/RoPE như bản gốc. Learned slots cần quy tắc vị trí và normalization rõ ràng (slot positions, bias/temperature, attention scaling) vì softmax sẽ **renormalize** sau pruning/fusion. Không thể chỉ concat vector nén một cách tùy tiện rồi giả định pretrained DFlash hiểu được.
 
@@ -273,7 +273,7 @@ Các raw selected states giữ absolute positions/RoPE như bản gốc. Learned
 
 ### 4.5. Online memory lifecycle
 
-1. Target verifier giữ full KV và commit \(c_t\) tokens hợp lệ; loại temporary/rejected proposals khỏi persistent bank.
+1. Target verifier giữ full KV và commit $c_t$ tokens hợp lệ; loại temporary/rejected proposals khỏi persistent bank.
 2. Incrementally append corresponding target-derived features/compact indexes và cập nhật global slots (theo schedule được profile).
 3. Reuse support trong vài rounds nếu state và cost model cho phép; vẫn có cơ chế global rescore/retrieval để key ngoài support có thể quay trở lại.
 4. Tạo working memory, draft K positions, verify với original target/correction; preserve rollback, EOS và positional semantics.
@@ -283,10 +283,10 @@ Các raw selected states giữ absolute positions/RoPE như bản gốc. Learned
 
 V0: threshold được calibrate theo **context length × batch size × hardware**. V1 mới thêm recent acceptance và empirical latency để điều chỉnh memory budget/gate.
 
-\[
+$$
 m_t=\arg\max_{m\in\{\mathrm{dense},\mathrm{AMR}\}}
 \widehat U_m(N_t,b_t,\mathrm{acceptance\ history},\mathrm{cost\ estimates}).
-\]
+$$
 
 Không cần một learned router mới trong pilot nếu rule-based threshold đủ hiệu quả. Trong short context, ưu tiên zero/near-zero AMR overhead.
 
@@ -296,69 +296,69 @@ Không cần một learned router mới trong pilot nếu rule-based threshold �
 
 ### 5.1. Học cái gì? Không phải tái tạo attention
 
-**Đã chốt thay đổi:** **Bỏ Attention-Guided Warm-Up khỏi phần bắt buộc**. Trước đây định học \(s_{t,i}\approx a_{t,i}^{DFlash}\); nhưng cái ta thực sự muốn là:
+**Đã chốt thay đổi:** **Bỏ Attention-Guided Warm-Up khỏi phần bắt buộc**. Trước đây định học $s_{t,i}\approx a_{t,i}^{DFlash}$; nhưng cái ta thực sự muốn là:
 
-\[
+$$
 \boxed{\mathcal S_t^*=\arg\max_{\mathcal S:\,|\mathcal S|\le B}
 \mathbb E[A_t\mid z_t,\mathcal S]}
-\]
+$$
 
 hoặc chính xác hơn ở mức hệ thống:
 
-\[
+$$
 \boxed{\pi^*=\arg\max_\pi
 \mathbb E\left[\frac{\sum_tG_t}{\sum_tT_t}\right]}
-\]
+$$
 
-với \(\pi\) quyết định selection/compression/mode/budget. Đây là optimization intent; tìm tối ưu toàn cục trên \(2^{N_t}\) subsets là bất khả thi, nên cần candidate search + supervised surrogate + online measurement.
+với $\pi$ quyết định selection/compression/mode/budget. Đây là optimization intent; tìm tối ưu toàn cục trên $2^{N_t}$ subsets là bất khả thi, nên cần candidate search + supervised surrogate + online measurement.
 
 **Attention chỉ còn dùng cho**: tạo diverse candidate subsets, phân tích behaviors, diagnostic, và ablation baseline `attention imitation`. Không lấy high attention = high usefulness làm tiên đề.
 
 ### 5.2. Training data: state-conditioned acceptance preference
 
-Trên mỗi fixed draft state \(z_t\) từ full target + committed prefix:
+Trên mỗi fixed draft state $z_t$ từ full target + committed prefix:
 
-1. Tạo tập ứng viên cùng budget \(\{C_t^{(1)},\ldots,C_t^{(m)}\}\): recent/head/middle/random contiguous/random scattered, DFlash attention Top-K (diagnostic offline), parent-target Top-K, incremental reuse và *chunk swap/mix*; những ứng viên tốt có thể làm seed cho local search.
+1. Tạo tập ứng viên cùng budget $\{C_t^{(1)},\ldots,C_t^{(m)}\}$: recent/head/middle/random contiguous/random scattered, DFlash attention Top-K (diagnostic offline), parent-target Top-K, incremental reuse và *chunk swap/mix*; những ứng viên tốt có thể làm seed cho local search.
 2. Chạy **cùng frozen DFlash** dưới từng context subset, không thay target input/hidden history.
-3. Chạy full target verification đúng algorithm; log \(A_t^{(i)}\), \(G_t^{(i)}\), survival \(P(A\ge j)\), logit agreement/alignment, cùng latency.
-4. Nếu stochastic speculation, estimate \(\mathbb E[A_t\mid C]\) bằng nhiều replicates/common-random-number strategies phù hợp; không rank bằng một mẫu ngẫu nhiên duy nhất. Với greedy, paired comparison vẫn cần kiểm soát prefix/truncation/EOS.
+3. Chạy full target verification đúng algorithm; log $A_t^{(i)}$, $G_t^{(i)}$, survival $P(A\ge j)$, logit agreement/alignment, cùng latency.
+4. Nếu stochastic speculation, estimate $\mathbb E[A_t\mid C]$ bằng nhiều replicates/common-random-number strategies phù hợp; không rank bằng một mẫu ngẫu nhiên duy nhất. Với greedy, paired comparison vẫn cần kiểm soát prefix/truncation/EOS.
 5. Tạo pairwise preference hoặc set-level utility labels từ những context subsets làm acceptance tốt hơn (có threshold xử lý ties/noise).
 
 Score của một selected set có thể được dựng từ token/chunk logits hoặc từ learned set scorer:
 
-\[
+$$
 F_\phi(z_t,C)=\operatorname{Aggregate}_{i\in C}s_\phi(z_t,h_i)\quad
 \text{(V1; không mô hình hóa hết tương tác giữa chunks)}.
-\]
+$$
 
 Train preference ranking:
 
-\[
+$$
 \boxed{\mathcal L_{\rm pref}
 =\log\bigl(1+\exp[-(F_\phi(z_t,C^+)-F_\phi(z_t,C^-))]\bigr).}
-\]
+$$
 
-Có thể thay bằng listwise ranking / contextual bandit offline trong phiên bản sau. **Causal chunk utility** \(\Delta_c\) đo khi remove/swap chunk so với một reference context, không phải global oracle; các chunks tương tác phi tuyến và reward ranking có thể khác theo tập đã chọn.
+Có thể thay bằng listwise ranking / contextual bandit offline trong phiên bản sau. **Causal chunk utility** $\Delta_c$ đo khi remove/swap chunk so với một reference context, không phải global oracle; các chunks tương tác phi tuyến và reward ranking có thể khác theo tập đã chọn.
 
 ### 5.3. Compressor training với frozen drafter
 
-Khi selector có một support hợp lý, train \(G_\eta,P_{\eta,\ell}\) qua frozen DFlash bằng objective differentiable **ở cùng conditioning prefix**:
+Khi selector có một support hợp lý, train $G_\eta,P_{\eta,\ell}$ qua frozen DFlash bằng objective differentiable **ở cùng conditioning prefix**:
 
-\[
+$$
 \mathcal L_{\rm align}(\eta)
 =\sum_{j=1}^{15} w_j
 D_{\rm KL}\!\left(p_T^{(j)}(\cdot\mid x,y_{<j})\;\|\;
 q_{\rm AMR}^{(j)}(\cdot\mid x,y_{<j})\right).
-\]
+$$
 
-Ở đây logits phải được đánh giá/align trên **cùng history/prefix** tại từng candidate position; không tùy tiện KL hai distributions điều kiện trên các prefix khác nhau. \(w_j\) có thể hướng tới prefix survival, nhưng weighted KL **chỉ là surrogate** cho acceptance.
+Ở đây logits phải được đánh giá/align trên **cùng history/prefix** tại từng candidate position; không tùy tiện KL hai distributions điều kiện trên các prefix khác nhau. $w_j$ có thể hướng tới prefix survival, nhưng weighted KL **chỉ là surrogate** cho acceptance.
 
 Quan trọng:
 
 - DFlash frozen nhưng để train memory qua downstream DFlash cần backprop gradient qua **forward của frozen backbone đến input/slot**; không mặc định training time rẻ tỷ lệ với số trainable params.
-- Hard Top-K **không khả vi theo selected indices**. Loss KL không tự truyền gradient vào selector nếu dùng plain gather; cập nhật selector qua \(\mathcal L_{\rm pref}\) hoặc differentiable relaxation/estimator riêng.
+- Hard Top-K **không khả vi theo selected indices**. Loss KL không tự truyền gradient vào selector nếu dùng plain gather; cập nhật selector qua $\mathcal L_{\rm pref}$ hoặc differentiable relaxation/estimator riêng.
 - Có thể thêm reference DFlash distillation để ổn định **nếu xảy ra distribution shift**, nhưng không để imitate old DFlash trở thành mục tiêu cuối khi old DFlash đang mismatch target.
-- Không train decoder mới từ đầu. Target \(T\) và DFlash \(\theta_0\) frozen ban đầu; chỉ mở LoRA nhỏ nếu evidenced bottleneck là adaptation với memory slot.
+- Không train decoder mới từ đầu. Target $T$ và DFlash $\theta_0$ frozen ban đầu; chỉ mở LoRA nhỏ nếu evidenced bottleneck là adaptation với memory slot.
 
 ### 5.4. Joint adaptation / full-method pilot
 
@@ -370,23 +370,23 @@ Quan trọng:
 
 **Paper-level ideal objective:**
 
-\[
+$$
 \max_{\phi,\eta}\ \mathbb E[A_t]
 \quad\text{s.t.}\quad
 T_{\rm AMR}\le T_{\max},\ B\le B_{\max},
-\]
+$$
 
-và cuối cùng \(\max U\). **Implementation** dùng ranking labels / differentiable alignment surrogates rồi *validate* bằng actual target verification. Tránh tuyên bố model được end-to-end backprop trực tiếp từ discrete accepted length khi chưa cài đặt estimator thích hợp.
+và cuối cùng $\max U$. **Implementation** dùng ranking labels / differentiable alignment surrogates rồi *validate* bằng actual target verification. Tránh tuyên bố model được end-to-end backprop trực tiếp từ discrete accepted length khi chưa cài đặt estimator thích hợp.
 
 ### 5.5. Cost–benefit gate (minh họa)
 
-Nếu \(T_D=1,T_V=6\), cần:
+Nếu $T_D=1,T_V=6$, cần:
 
-\[
+$$
 \frac{\mathbb E[G_{\rm AMR}]}{\mathbb E[G_{\rm dense}]}
 >
 \frac{6+T_{D,\rm AMR}+T_{\rm AMR\ overhead}}{7}
-\]
+$$
 
 để cải thiện committed tokens/s (giả định verifier time không đổi). Ví dụ nếu tổng overhead làm round time từ 7 lên 7.5, phải tăng committed tokens/round **hơn ~7.1% chỉ để hòa vốn**. Các số ví dụ không phải forecast của AMR.
 
@@ -438,17 +438,17 @@ Nếu \(T_D=1,T_V=6\), cần:
 
 **Quality of speculative decoding (primary mechanism):**
 
-\[
+$$
 \mathbb E[A],\quad P(A\ge j),\quad\mathbb E[G],\quad
 \mathrm{TV/KL}(p_T,q_D)\ \text{(conditioned correctly)}.
-\]
+$$
 
 **System (final outcome):**
 
-\[
+$$
 \operatorname{cost/token}=\frac{\sum_t T_t}{\sum_t G_t},\qquad
 \operatorname{decode\ throughput}=\frac{\sum_t G_t}{\sum_t T_t}.
-\]
+$$
 
 Report `T_select`, `T_index/update`, `T_compress`, `T_gather`, `T_draft`, `T_verify`, `T_prefill`, decode/E2E, TTFT/TPOT, p50/p95, peak draft-only memory và total VRAM. **Masked dense attention không là bằng chứng acceleration**: cần sparse gather/kernel physical execution.
 
@@ -531,7 +531,7 @@ Report `T_select`, `T_index/update`, `T_compress`, `T_gather`, `T_draft`, `T_ver
 |---|---|---|
 | **M0** | Exact-context masking/gather intervention test, verifier/EOS correctness; FULL vs 1K/4K/8K controls | Có quality headroom; interface đúng |
 | **M1** | Acceptance preference dataset (fixed-state, repeated seeds nếu stochastic), data split | Acceptance rank có signal ổn định |
-| **M2** | Train tiny state-conditioned selector; frozen DFlash eval | Learned vs heuristic tăng \(A\) ở cùng budget |
+| **M2** | Train tiny state-conditioned selector; frozen DFlash eval | Learned vs heuristic tăng $A$ ở cùng budget |
 | **M3** | Train compact residual slots + fused inference, test full AMR | Hybrid thật sự hơn selection-only? |
 | **M4** | Online physical rollout, cost-aware gate, runtime breakdown | Decoding committed tok/s tăng; short context no-regression |
 | **M5** | Matched-cost ablations, holdout, batch/length sweep, GPU-hours | Claim paper có đứng vững không |

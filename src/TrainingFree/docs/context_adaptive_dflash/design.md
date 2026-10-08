@@ -1,6 +1,6 @@
 # Đặc tả Context-Adaptive DFlash V1
 
-Ngày: **2026-10-08**. Trạng thái: **thiết kế để triển khai**. [Index](../../README.md), [tích hợp](integration.md), [protocol](experiment_protocol.md).
+Ngày: **2026-10-08**. Trạng thái: **đặc tả canonical cho executor experimental; chưa có GPU parity hoặc benchmark result**. [Index](../../README.md), [tích hợp](integration.md), [protocol](experiment_protocol.md), [runbook](runbook.md).
 
 ## 1. Mục tiêu, giới hạn và bất biến
 
@@ -74,6 +74,8 @@ Reconstruct attention từ Q/K đã qua normalization/RoPE của selected target
 
 Target kernel output vẫn dùng SDPA/FA backend đã khóa. Collector không được âm thầm đổi target sang eager. Collector nghiên cứu trong probe là hướng dẫn audit, không import trực tiếp vào core. Nếu kernel không cung cấp Q/K hook đáng tin cậy, đánh dấu backend unsupported; không bịa signal hoặc bỏ overhead.
 
+Hook chỉ gắn vào selected **target module**, không sửa attention registry dùng chung khiến draft cũng bị instrument. Prefill chỉ giữ last Q; verification giữ tối đa `gamma+1` Q rows đến khi biết L rồi reconstruct row L với K/cache view đúng forward. Future keys trong view phải bị causal mask loại. Release tensor references/scratch trước forward kế tiếp; không lưu toàn Q/K/attention theo round vào artifacts. Hook phải được tháo cả khi request lỗi.
+
 ### 3.4. Draft-refresh signal
 
 Round đầu dùng `full`; subsequent dense refresh mỗi 4 round theo `(round_index % 4 == 0)`, với round 0 là bootstrap. So period 2/4/8 trên dev. Refresh ép `B=full` nhưng controller vẫn được chọn `gamma` có support. Lượt đó sinh và verify bình thường, không chạy thêm dense draft để lấy ranking rồi bỏ candidates.
@@ -103,6 +105,7 @@ Signal temperature 1.0 độc lập generation temperature; greedy vẫn có ent
 
 - Entropy bins: 4 bins theo 25/50/75% quantiles trên calibration, giữ cutpoints cố định khi chạy dev/test.
 - Source concentration: mass của tối đa 8 source chunks cao nhất / total source mass; bins `<0.5`, `>=0.5`, `unknown` nếu không có source mass.
+- Với `draft_refresh`, tính concentration trên từng layer có source mass rồi mean đều các layer hợp lệ; scalar giữ origin/age của dense ranking. Không tính lại global concentration từ sparse observations.
 - History: EMA `L/gamma`, alpha 0.1; bins `<0.5`, `>=0.5`, `unknown` trước observation đầu.
 - Cost context buckets: `ceil(n_t / 2048)`; không dùng chi phí context ngắn cho context dài ngoài support.
 - Statistics key luôn chứa checkpoint/runtime signature, selector ID, length mode, budget, gamma và refresh/non-refresh.
@@ -128,9 +131,13 @@ u_i <- 0.95*u_i + indicator(L >= i)
 p_i <- (u_i + 16*p_calibration_i) / (n + 16)
 ```
 
-Prior `p_calibration_i` lấy từ calibration cùng action. Với state bucket ít hơn 8 observations hiệu dụng, backoff lần lượt bỏ concentration/history, rồi entropy; cuối cùng dùng action-global prior. Không chia sẻ outcome giữa gamma khác nhau. Repair `p_i=min(p_i,p_(i-1))`, clamp `[0,1]`. Không có prior hợp lệ cho action thì action không có support.
+Prior `p_calibration_i` lấy từ calibration cùng action; n/u ban đầu bằng 0 là request-local online counts. Bucket support là `calibration_unique_state_count + n_request_effective`, không đếm timing repetitions. Với support ít hơn 8, backoff lần lượt bỏ concentration/history, rồi entropy; cuối cùng dùng action-global prior. Không chia sẻ outcome giữa gamma khác nhau. Repair `p_i=min(p_i,p_(i-1))`, clamp `[0,1]`. Không có prior hợp lệ cho action thì action không có support.
 
 Latency prior là arithmetic mean các profiling repetitions cho cùng signature/action/context bucket; record đủ total cost và components. Cập nhật EMA alpha 0.1 bằng measurements đã hoàn tất; CUDA event chưa ready không được đọc/chờ chỉ để ra quyết định. V1 có mode `frozen_cost` khi backend chưa cung cấp reliable async timing; vẫn adapt acceptance online và phải báo mode đó. Đo E2E thực để kiểm chứng surrogate.
+
+Cost table dùng chung giữa policies lưu action cost không gồm controller. Sau khi dựng table, profile `choose` trên causal states với đủ action set để có controller overhead riêng từng policy/signature; thêm overhead đó vào J. Fixed-action replay không được giả chi phí joint controller bằng 0. Nếu lưu total-round prior/EMA thay vì components, key phải chứa controller ID và chỉ dùng cho đúng policy; không cộng controller lần hai. `cost_update_mode` có hai giá trị `frozen_cost|async_event`, async chỉ bật khi completed total/component observations có accounting hợp lệ.
+
+`statistics_update_mode=online` là mặc định: cập nhật prefix statistics đúng executed action. Mode `frozen` giữ nguyên prefix/cost priors trong request để làm control; causal history scalar vẫn cập nhật từ các round thực. `frozen` bắt buộc đi cùng `cost_update_mode=frozen_cost`. Không dùng outcome ở `(B,gamma)` để cập nhật action giả định `(full,gamma)` hoặc `(B,gamma_reference)`. Independent A+B truy vấn các reference axes trong cùng table nhưng chỉ cập nhật cell thực đã execute; reference cells có thể vẫn dùng prior. So joint/independent ở cùng mode, thêm frozen comparison để tách joint decision khỏi khác biệt học thống kê online.
 
 ### 5.3. Chọn action
 

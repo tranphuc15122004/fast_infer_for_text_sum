@@ -1,6 +1,6 @@
 # Hợp đồng tích hợp DFlash và tính đúng đắn
 
-Ngày: **2026-10-08**. Trạng thái: **giao diện cần triển khai, chưa là API có sẵn**. [Đặc tả](design.md), [đo lường](measurement_contract.md).
+Ngày: **2026-10-08**. Trạng thái: **executor dùng các interface dưới đây đã có trong repository; parity/correctness GPU vẫn pending**. [Đặc tả](design.md), [đo lường](measurement_contract.md), [runbook](runbook.md).
 
 ## 1. Điểm tích hợp có thật trong repo
 
@@ -18,9 +18,9 @@ Ngày: **2026-10-08**. Trạng thái: **giao diện cần triển khai, chưa l�
 
 Không import `scripts/probe_*` hoặc `src/TrainingFree/tests` từ core inference. Logic collector cần được port thành module production, với cost và capability checks riêng.
 
-## 2. Module và interface cần xây
+## 2. Module và interface đã triển khai
 
-| File dự kiến dưới `context_adaptive/` | Trách nhiệm |
+| Module dưới `context_adaptive/` | Trách nhiệm |
 |---|---|
 | `config.py` | `AdaptiveConfig`, validation và signature |
 | `types.py` | Các dataclass/tensor contracts dưới đây |
@@ -29,11 +29,11 @@ Không import `scripts/probe_*` hoặc `src/TrainingFree/tests` từ core infere
 | `attention.py` | Adapter attention với selected bank + temporary block |
 | `signals.py` | Parent entropy, target-parent scores và collector capability |
 | `selection.py` | Protection/chunk ranking và dense-refresh ranking |
-| `controller.py` | `FixedController`, `HistoryController`, `JointController` |
+| `controller.py` | `AdaptiveController` cho fixed, one-axis, independent và joint policies |
 | `statistics.py` | Prefix survival, cost priors, EMA và serialization |
 | `generation.py` | Exact loop, boundary accounting và request timing |
 | `schema.py` | Validation manifest/request/round artifacts |
-| `benchmark.py` | Chạy cell, correctness/control và shared writer |
+| `benchmark.py` | Corpus/model signatures, runtime loading và request record |
 | `calibration.py` | Thu states, action-grid observations và locked priors |
 | `report.py` | Paired aggregation/bootstrap và gate reports |
 
@@ -90,7 +90,20 @@ Tensor contracts và các method dưới đây là yêu cầu API tương lai:
 | `verify_block(anchor, proposal, target_cache, positions) -> VerificationOutcome` | Full target forward; `accepted_prefix`, pending anchor, retained features, parent logits |
 | `generate_adaptive(...) -> GenerationResult` | Output IDs, counters, timings, round events, correctness metadata |
 
-`LayerContext`, `DraftProposal`, `VerificationOutcome`, `GenerationResult` là dataclass cần thêm vào `types.py`. Chúng phải chứa tensors nêu trong bảng; outcome bổ sung `executed_gamma`, `eos_offset`, `logical_length_before/after`; result bổ sung `prefill_selected_anchor_count`, `processed_commits`, `final_pending_emitted_count`, `trimmed_commits` để đối soát output.
+`LayerContext`, `DraftProposal` và `GenerationResult` nằm trong `types.py`. Interface thực tế giữ verifier trong generation loop; không có public `verify_block` riêng. `generate_adaptive` trả output/counters/timings/rounds, bao gồm processed commits, final pending token, EOS trimming và output-accounting invariant.
+
+```python
+prepare_prompt(sample, tokenizer, *, chunk_size=128, max_tokens=0)
+DraftContextBank.append(target_features, positions)
+DraftContextBank.gather(selection) -> tuple[LayerContext, ...]
+select_context(state, layout, rankings, budget, *, processed_output_start, bank_length, ...)
+AdaptiveController.choose(state, feasible_actions) -> (Action, reason, elapsed_ms)
+AdaptiveController.observe(state, action, accepted_prefix, action_cost_ms=None)
+draft_block(draft, target, bank, selection, anchor_and_masks, position_ids, action, *, layout, ...)
+generate_adaptive(target, draft, input_ids, tokenizer, layout, config, *, max_new_tokens, ...)
+```
+
+`select_context` trả `None` khi protection set không vừa budget; generation ghi fallback về full context. V1 nhận batch 1 và action `draft_shape`; `async_event` cùng `verify_prefix` bị từ chối trong config validation.
 
 ## 3. Prompt/source mapping
 
@@ -169,4 +182,4 @@ Checks cần có trước GPU matrix:
 - Greedy tới EOS/cap và request lỗi không tạo success record.
 - Sampling delta-proposal verifier khôi phục toy target distribution; RNG debug parity không bị suffix draws ảnh hưởng.
 
-Các checks này là công việc trong [kế hoạch triển khai](../../plans/2026-10-08-context-adaptive-dflash-implementation.md), chưa được đánh dấu đã pass trong bộ tài liệu này.
+Các checks runtime/GPU vẫn là gate trong [kế hoạch triển khai](../../plans/2026-10-08-context-adaptive-dflash-implementation.md); việc có module và CLI không đồng nghĩa chúng đã pass.

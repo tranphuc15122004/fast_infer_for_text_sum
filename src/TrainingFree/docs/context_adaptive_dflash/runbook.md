@@ -1,14 +1,10 @@
-# Runbook và cấu hình triển khai
+# Runbook Context-Adaptive DFlash
 
-Ngày: **2026-10-08**. [Index](../../README.md), [integration](integration.md), [protocol](experiment_protocol.md).
+Ngày: **2026-10-08**. Trạng thái: **executor/launcher đã có trong repository; chưa có kết quả GPU hoặc parity report**. Xem [integration](integration.md), [protocol](experiment_protocol.md), [measurement contract](measurement_contract.md).
 
-## 1. Trạng thái các lệnh
+## 1. Runtime và asset
 
-`scripts/infer_dflash.py` và `bash scripts/run.sh dflash` đã có trong repo. `scripts/infer_context_adaptive_dflash.py`, runner tương ứng và case dispatcher mới **chưa tồn tại**; các lệnh CAD bên dưới là CLI contract cần hoàn thành theo plan. Không chạy chúng như một implementation đã sẵn sàng.
-
-## 2. Runtime và asset preflight hiện có
-
-Trên server:
+Trên server dùng Python 3.12 từ PATH, model snapshots local và dependency đã mirror. Không cài online hoặc tạo venv riêng cho phương pháp.
 
 ```bash
 cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
@@ -16,87 +12,16 @@ python3 scripts/setup_server_env.py --check
 python3 scripts/check_shared_env.py
 ```
 
-Master canonical ở `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env`, pointer `config/master.path`. Dùng `FI_PYTHON=python3`, `FI_DEVICE=cuda`, `FI_OFFLINE=1`; giữ `MODEL_TARGET` và `MODEL_DFLASH_DRAFT` theo snapshot operator đã có. Không suy đường dẫn model từ máy local; ví dụ model root trong các run cũ khác nhau. Không tải Hub, cài online hoặc thêm dependency cho controller.
+Master config ở `config/master.path` trỏ tới shell-env ngoài repository. Cấu hình `MODEL_TARGET`, `MODEL_DFLASH_DRAFT`, `DATA_INPUT` (hoặc `CAD_DATA_DIR`), `RUN_MAX_NEW_TOKENS`, `RUN_MAX_INPUT_TOKENS`, `RUN_TEMPERATURE` và `LONG_BENCH_SEED` như DFlash baseline. Các `CAD_*` caller overrides được runner giữ lại khi load master. Token HF chỉ dùng nếu snapshot local cần xác thực; runner bật offline mode khi load model.
 
-Trên local CPU, chỉ chạy các checks pure Python sau khi implementation tương ứng có; preflight GPU/timing thực chạy trên server. Không cố sửa driver T4/cu130 hoặc cài profile server vào venv local.
+`prepare`, `preflight`, `lock`, `report` không cần model forward. `preflight --model-check` đọc config snapshot local. `smoke`, `calibrate`, `dev`, `test` yêu cầu CUDA và load model; máy local T4 chỉ chạy CPU, không dùng để benchmark.
 
-Baseline smoke **hiện chạy được khi master/model/GPU server hợp lệ**:
+## 2. Chuẩn bị split và preflight
 
-```bash
-bash scripts/run.sh dflash \
-  --data-file data/longbench_100_14k/gov_report.jsonl \
-  --max-samples 1 --block-size 16 --smoke \
-  --output outputs/context_adaptive_dflash/baseline_smoke/requests.jsonl
-```
-
-Baseline writer append; dùng output path mới cho mỗi lần smoke, không chạy lại trên file đã có rồi coi duplicated rows là samples mới. Không có lệnh GPU nào trong runbook được thực thi khi viết tài liệu.
-
-## 3. Namespace master-env dự kiến
-
-Operator thêm block này vào master **ngoài repository** sau khi launcher được triển khai. Không tạo file runtime mới trong `config/`.
+Đặt `CAD_RUN_ID` duy nhất cho một protocol run. Exposure manifest đưa các document đã dùng để phát triển ý tưởng vào dev trước khi chia split.
 
 ```bash
-CAD_PHASE=smoke
-CAD_VARIANT=joint
-CAD_SELECTOR=target_parent
-CAD_BUDGETS=1024,2048,4096,full
-CAD_GAMMAS=3,7,11,15
-CAD_FIXED_GAMMA=15
-CAD_FIXED_BUDGET=4096
-CAD_LENGTH_MODE=draft_shape
-CAD_SOURCE_CHUNK_SIZE=128
-CAD_SOURCE_ANCHORS=64
-CAD_RECENT_OUTPUT=256
-CAD_TARGET_LAYER=middle
-CAD_REFRESH_PERIOD=4
-CAD_SIGNAL_UPDATE_PERIOD=1
-CAD_CONTROLLER_MARGIN=0.02
-CAD_ENTROPY_SIGNAL_TEMPERATURE=1.0
-CAD_PRIOR_STRENGTH=16
-CAD_MIN_STATE_SUPPORT=8
-CAD_STATISTICS_DECAY=0.95
-CAD_LATENCY_EMA_ALPHA=0.1
-CAD_COST_UPDATE_MODE=frozen_cost
-CAD_TIMING_MODE=wall
-CAD_OUTPUT_ROOT=outputs/context_adaptive_dflash
-```
-
-`MODEL_TARGET`, `MODEL_DFLASH_DRAFT`, `DATA_INPUT`, `RUN_SAMPLES`, `RUN_MAX_NEW_TOKENS`, `RUN_TEMPERATURE` và `LONG_BENCH_SEED` vẫn lấy từ master chung. `CAD_DATA_DIR` nếu đặt dùng canonical dataset directory, không thay namespace data chung. `CAD_PHASE=smoke` áp cap 32 và 2 source groups/dataset; primary cap 2048 được khóa trong test config, không lấy cap smoke cho full run.
-
-Thứ tự precedence: CLI > caller environment > master values > defaults trong `AdaptiveConfig`. Launcher phải bảo toàn caller overrides qua `fast_infer_load_master`; helper hiện tại không tự bảo đảm mọi `CAD_*` override nên wrapper phải snapshot/restore các keys liên quan khi source master. `--phase`/`--variant` là nguồn quyết định cuối. `SMOKE=1` hoặc `FULL=1` chỉ đặt default phase khi CAD phase chưa được chọn; nếu cả hai bật phải báo configuration error.
-
-Validation: budgets số nguyên dương hoặc `full`, gammas trong checkpoint/parity support, `gamma>=1` cho draft actions; zero chỉ AR. Margin `[0,1)`, EMA alpha `(0,1]`, decay `(0,1)`, entropy signal temperature dương, protection/chunk integers hợp lệ. Không silently clip checkpoint-incompatible gamma.
-
-## 4. CLI phải xây
-
-Entry point `scripts/infer_context_adaptive_dflash.py` với các options:
-
-| Option | Hợp đồng |
-|---|---|
-| `--phase` | `prepare|preflight|smoke|calibrate|dev|test|report`; default smoke |
-| `--variant` | Các ID trong protocol, thêm `joint_no_entropy`, `joint_no_source_relevance` |
-| `--target-model`, `--draft-model` | Snapshot local bắt buộc cho model phases |
-| `--data-dir`, `--data-file` | Canonical multi-dataset hoặc single file; không truyền cả hai |
-| `--output-root`, `--run-id` | Artifact root và ID duy nhất |
-| `--split-manifest` | Bắt buộc calibration/dev/test; prepare tạo manifest |
-| `--exposure-manifest` | Có thể lặp để import các cohort trước |
-| `--calibration-file` | Bắt buộc dev/test joint; schema/signature phải match |
-| `--locked-config` | Bắt buộc test/report, không cho runtime đổi hyperparameters |
-| `--budgets`, `--gammas`, `--fixed-budget`, `--fixed-gamma` | Actions theo design |
-| `--selector`, `--target-layer`, `--refresh-period` | Selection/collector configuration |
-| `--max-new-tokens`, `--temperature`, `--seed` | Sampling/stopping signature |
-| `--fixed-output-tokens` | Performance stress scope riêng, disable EOS đồng nhất |
-| `--timing-mode`, `--cost-update-mode` | Diagnostic/wall và frozen/async cost |
-| `--smoke`, `--full`, `--resume` | Smoke alias; full alias test cần locked config; resume kiểm tra compatibility |
-
-`prepare`/`report` là model-free, chạy CPU; parser phải dispatch trước model load/CUDA requirements. Core benchmark dùng evaluator chung cho live generation và artifact replay/report. Prefix replay/calibration là offline experimental mode, không phải online extra target forwards.
-
-## 5. Các lệnh sau khi implementation pass
-
-**Các lệnh trong mục này chưa chạy được trước khi task launcher/integration hoàn tất.** `CAD_RUN_ID` dưới đây phải đổi khi chạy experiment mới; không dùng ID cũ nếu không resume.
-
-```bash
-export CAD_RUN_ID=cadflash_v1_dev_001
+export CAD_RUN_ID=cadflash_v1_001
 export CAD_DATA_DIR=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k
 export CAD_RUN_ROOT=outputs/context_adaptive_dflash/$CAD_RUN_ID
 
@@ -106,43 +31,101 @@ bash scripts/run.sh context_adaptive_dflash --phase prepare \
 
 bash scripts/run.sh context_adaptive_dflash --phase preflight \
   --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
-  --split-manifest "$CAD_RUN_ROOT/split_manifest.json"
-
-bash scripts/run.sh context_adaptive_dflash --phase smoke \
-  --variant dflash_full_fixed --data-dir "$CAD_DATA_DIR" \
-  --output-root "$CAD_RUN_ROOT" \
-  --split-manifest "$CAD_RUN_ROOT/split_manifest.json"
-
-bash scripts/run.sh context_adaptive_dflash --phase calibrate \
-  --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
-  --split-manifest "$CAD_RUN_ROOT/split_manifest.json"
-
-bash scripts/run.sh context_adaptive_dflash --phase dev --variant joint \
-  --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
-  --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
-  --calibration-file "$CAD_RUN_ROOT/calibration.json"
+  --split-manifest "$CAD_RUN_ROOT/split_manifest.json" --model-check
 ```
 
-Dev phải chạy toàn bộ variants của protocol, không chỉ joint trong ví dụ. Chạy report dev để chọn config và tạo `locked_config.json` có selector/actions/splits/signatures/gate decisions. Test không tự khóa hyperparameters từ test result.
+`prepare` ghi `split_manifest.json` và checksum dataset. Nó trả exit code khác 0 khi mỗi dataset/source stratum không đủ nhóm cho calibration/dev/test; không được tiếp tục bằng split tổng hợp. `preflight` kiểm tra vocab, hidden size, target feature layers, mask token, DFlash block size và sliding-window config. Nếu model chưa được mirror thì bỏ `--model-check` để chỉ kiểm dữ liệu.
+
+## 3. GPU smoke và calibration
+
+Smoke tối đa 32 token, lấy tối đa hai source groups mỗi dataset. Đây là kiểm tra đường chạy, không phải bằng chứng correctness hoặc speedup.
 
 ```bash
-bash scripts/run.sh context_adaptive_dflash --phase test --variant joint \
+bash scripts/run.sh context_adaptive_dflash --phase smoke --variant dflash_full_fixed \
   --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
-  --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
-  --calibration-file "$CAD_RUN_ROOT/calibration.json" \
-  --locked-config "$CAD_RUN_ROOT/locked_config.json"
-
-bash scripts/run.sh context_adaptive_dflash --phase report \
-  --output-root "$CAD_RUN_ROOT" \
-  --locked-config "$CAD_RUN_ROOT/locked_config.json"
+  --split-manifest "$CAD_RUN_ROOT/split_manifest.json"
 ```
 
-Artifact cells ở `<run_root>/<phase>/<variant>/rep_<index>/`; mỗi cell có manifest/request/round stream theo measurement contract. Run root chứa split/calibration/locked config và aggregate reports. `calibrate` ghi riêng signatures cho các selector/modes đã profile; `dev`/`test` từ chối missing prior, không âm thầm lấy số đo của selector khác.
+V1 calibration hiện chỉ dùng greedy target (`--temperature 0`) và full fixed trajectory. Mỗi checkpoint chạy lại từng feasible `(budget,gamma)` trên bản clone target cache của cùng prefix; clone setup được ghi riêng, còn controller cost được profile sau khi action table đã fit.
 
-## 6. Lock, resume và kết luận
+```bash
+bash scripts/run.sh context_adaptive_dflash --phase calibrate \
+  --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
+  --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
+  --max-samples 16 \
+  --max-new-tokens 2048 --calibration-checkpoints 0,512,1024,1536 \
+  --repetitions 3 --warmup-runs 3
+```
 
-Locked config chứa model/runtime/data/split hashes, action set và shape capabilities, selector/refresh/protection, entropy cutpoints/priors, cost support buckets, seeds/repetitions, output scopes, baseline fixed pair và G0–G5 reports. Người triển khai tạo nó từ completed dev artifacts; file cấu hình ví dụ trong tài liệu không thay artifact đã đo.
+Lệnh trên đăng ký trước cohort tối đa 16 records, ưu tiên một đại diện cho mỗi source group và cân bằng theo dataset; `run_manifest.json` khóa IDs/hash và cỡ cohort. Output ở `calibration/calibration.json`, `action_observations.jsonl` và `run_manifest.json`. Mọi selector, layer, action grid, source chunk/protection và entropy temperature dùng ở dev/test phải giống signature calibration.
 
-Resume kiểm tra từng cell trước model load, giữ request IDs và repetition order. Summary chỉ finalize khi cell đã đủ expected rows. Error/mismatch làm cell partial/error; không bỏ request để report trông đẹp hơn.
+## 4. Dev matrix, report và lock
 
-Hoàn tất thực nghiệm nghĩa là G6 có completed heldout artifacts và report với uncertainty/correctness, không chỉ launcher chạy hoặc GPU smoke pass.
+Chạy AR và tất cả controls/candidate trên đúng split/config/output scope. Có thể chạy từng variant bằng lệnh sau; mặc định dev có 3 repetitions và 3 warmups. Dùng cùng `--run-id`, action settings, split và calibration cho mọi variant. `dflash_full_fixed` dùng `gamma_reference`; `best_fixed_pair` và `a_only` dùng `fixed_gamma` cùng `fixed_budget`.
+
+```bash
+for variant in ar dflash_full_fixed best_fixed_pair a_only b_only_history b_only_entropy independent_ab joint joint_no_entropy joint_no_source_relevance; do
+  bash scripts/run.sh context_adaptive_dflash --phase dev --variant "$variant" \
+    --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
+    --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
+    --calibration-file "$CAD_RUN_ROOT/calibration/calibration.json" \
+    --fixed-budget 4096 --fixed-gamma 7 --gamma-reference 15
+done
+
+bash scripts/run.sh context_adaptive_dflash --phase report --output-root "$CAD_RUN_ROOT" \
+  --report-phase dev --report-statistics-mode online --bootstrap-samples 10000
+```
+
+`report` ghi `dev/online/comparison.json` và `report.md`. Nó pair theo dataset/sample/repetition/output scope; kiểm prompt/model/runtime/source group/implementation/fixed-action provenance, lỗi, độ phủ và token hash greedy; bootstrap theo source-document cluster. `headline_valid=false` khi thiếu request, mismatch, có lỗi hoặc trộn provenance. Tạo report riêng cho `--report-statistics-mode frozen`; không gộp frozen và online.
+
+Chọn fixed gamma/budget và candidate chỉ từ dev. Khi sweep nhiều fixed pairs, dùng output root riêng cho mỗi setting (kèm AR trong cùng root), sau đó chọn cặp tốt nhất theo report; không ghi nhiều setting vào cùng cell. Sau khi chọn, chạy lại đầy đủ dev matrix với fixed settings cuối và tạo report mới. Lock yêu cầu report dev có paired exact comparison đầy đủ cho candidate, calibration khớp split và cùng statistics mode:
+
+```bash
+bash scripts/run.sh context_adaptive_dflash --phase lock --variant joint \
+  --output-root "$CAD_RUN_ROOT" \
+  --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
+  --calibration-file "$CAD_RUN_ROOT/calibration/calibration.json" \
+  --dev-report "$CAD_RUN_ROOT/dev/online/comparison.json" \
+  --locked-config-out "$CAD_RUN_ROOT/locked_config.json" \
+  --fixed-budget 4096 --fixed-gamma 7 --gamma-reference 15
+```
+
+Lock ghi `run_id`, implementation hash và danh sách `test_variants` có paired comparison exact, đủ coverage trên dev. Test cũng xác thực target/tokenizer/runtime signature từ calibration, kể cả với AR. Lock là candidate config cho heldout, không tuyên bố G0–G5 đã pass.
+
+## 5. Heldout test và report
+
+Test không nhận `--max-samples`; runner bắt buộc dùng toàn bộ test split. Chỉ `--variant`, device/runtime output path và resume được thay theo lock contract. Chạy cùng các test variants, cùng `CAD_RUN_ID` và cùng master config:
+
+```bash
+mapfile -t CAD_TEST_VARIANTS < <(python3 -c 'import json,sys; print(*json.load(open(sys.argv[1], encoding="utf-8"))["test_variants"], sep="\n")' "$CAD_RUN_ROOT/locked_config.json")
+for variant in "${CAD_TEST_VARIANTS[@]}"; do
+  bash scripts/run.sh context_adaptive_dflash --phase test --variant "$variant" \
+    --data-dir "$CAD_DATA_DIR" --output-root "$CAD_RUN_ROOT" \
+    --split-manifest "$CAD_RUN_ROOT/split_manifest.json" \
+    --locked-config "$CAD_RUN_ROOT/locked_config.json"
+done
+
+bash scripts/run.sh context_adaptive_dflash --phase report --output-root "$CAD_RUN_ROOT" \
+  --report-phase test --report-statistics-mode online --bootstrap-samples 10000
+```
+
+Calibration path/hash được nạp từ lock. `test` từ chối đổi model/data split/output cap/temperature/input cap/seed/repetitions/warmups, config hoặc action settings. Report heldout nằm ở `test/online/`. Không có permission để đổi lock sau khi xem test results; thay đổi method cần run ID/split mới.
+
+## 6. Artifact layout và giới hạn V1
+
+```text
+<run_root>/
+  split_manifest.json
+  prepare_manifest.json
+  preflight.json
+  calibration/{calibration.json,action_observations.jsonl,run_manifest.json}
+  locked_config.json
+  {smoke,dev,test}/<variant>/<online|frozen>/
+    manifest.json
+    rep_N/{requests.jsonl,rounds.jsonl,output_token_ids.jsonl}
+  {dev,test}/<online|frozen>/{comparison.json,report.md}
+```
+
+Mỗi JSONL có summary cuối; `--resume` giữ các sample success tương thích và retry lỗi. Mỗi request ghi prompt/output hashes, runtime signatures, counters, timing và ROUGE khi có reference. Manifest hashing weights đầy đủ trước khi timing nên có thể làm startup lâu; thời gian này ngoài E2E.
+
+V1 chỉ hỗ trợ `length_mode=draft_shape`, `cost_update_mode=frozen_cost`, batch 1, greedy-calibrated action priors và request-local online/frozen prefix statistics. `verify_prefix` và `async_event` chưa triển khai nên bị parser từ chối. Sampling có thể chạy theo verifier DFlash nhưng calibration action priors cần greedy. Sliding-window draft attention dùng mask theo absolute logical positions. Không có G0–G6 result cho đến khi các lệnh GPU trên server hoàn tất và được review.

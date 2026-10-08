@@ -2306,6 +2306,8 @@ def run_flashattn_benchmark(
             "esr": "(mean Vanilla prefill + Vanilla TPOT * mean paired minimum output length) / (mean Vanilla prefill + method TPOT * mean paired minimum output length)",
             "token_lcs_overlap_with_vanilla": "token-ID LCS divided by Vanilla output token count, weighted by reference token count",
             "acceptance_rate": "accepted speculative draft tokens / proposed speculative draft tokens",
+            "mean_avg_accept_length": "mean accepted draft tokens plus one target token per verification step (tau)",
+            "mean_acceptance_length": "alias for mean_avg_accept_length",
             "quality_valid": "non-empty output, at least 4 generated tokens, and no repetition collapse flag",
         },
         "measurement_limitations": [
@@ -2355,6 +2357,7 @@ def run_flashattn_benchmark(
             "mean_rouge1", "mean_rouge2", "mean_rougeL", "mean_bleu4",
             "mean_e2e_ms", "median_e2e_ms", "p90_e2e_ms", "mean_tpot_ms",
             "mean_throughput_tok_s", "dsr", "esr", "mean_acceptance_rate_percent",
+            "mean_avg_accept_length",
             "greedy_exact_matches", "greedy_compared_samples",
             "token_lcs_overlap_with_vanilla",
         ]
@@ -2393,6 +2396,7 @@ def run_flashattn_benchmark(
                     "dsr": paired.get("dsr"),
                     "esr": paired.get("esr"),
                     "mean_acceptance_rate_percent": metric.get("mean_acceptance_rate_percent"),
+                    "mean_avg_accept_length": metric.get("mean_avg_accept_length"),
                     "greedy_exact_matches": metric.get("greedy_exact_matches"),
                     "greedy_compared_samples": metric.get("greedy_compared_samples"),
                     "token_lcs_overlap_with_vanilla": metric.get("token_lcs_overlap_with_vanilla"),
@@ -2453,6 +2457,7 @@ def _render_report(result: dict[str, Any]) -> str:
             f"| {fmt(prefill.get('mean'))} | {fmt(tpot.get('mean'))} "
             f"| {fmt(throughput.get('mean'))} | {fmt(paired.get('dsr'))} "
             f"| {fmt(paired.get('esr'))} | {fmt(metric.get('mean_acceptance_rate_percent'), 2)} "
+            f"| {fmt(metric.get('mean_avg_accept_length'), 2)} "
             f"| {metric.get('greedy_exact_matches', 0)}/{metric.get('greedy_compared_samples', 0)} "
             f"| {fmt(metric.get('token_lcs_overlap_with_vanilla'), 4)} "
             f"| {metric.get('quality_valid_outputs', 0)}/{metric.get('successful_samples', 0)} |"
@@ -2468,8 +2473,8 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Runtime FA4/no-fallback: {summary.get('runtime_validation', {}).get('passed')}; greedy parity: {summary.get('correctness_pass')}; quality gate: {summary.get('quality_pass')}",
         f"- Thời gian: {fmt(summary.get('evaluation_runtime_seconds'))} giây; repeats: {summary.get('repetitions')}; seed: {summary.get('seed')}",
         "",
-        "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB (ms/token) | Tok/s TB | DSR | ESR | Accept (%) | Greedy exact | LCS overlap | Output hợp lệ |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB (ms/token) | Tok/s TB | DSR | ESR | Accept (%) | Accept len | Greedy exact | LCS overlap | Output hợp lệ |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for method in summary.get("methods", []):
         lines.append(render_row(method, summary.get("method_metrics", {}).get(method, {})))
@@ -2480,8 +2485,8 @@ def _render_report(result: dict[str, Any]) -> str:
                 "",
                 f"## Dataset: {dataset}",
                 "",
-                "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB | Tok/s TB | DSR | ESR | Accept (%) | Greedy exact | LCS | Output hợp lệ |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB | Tok/s TB | DSR | ESR | Accept (%) | Accept len | Greedy exact | LCS | Output hợp lệ |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for method in summary.get("methods", []):
@@ -2505,6 +2510,7 @@ def _render_report(result: dict[str, Any]) -> str:
             "- TPOT = (E2E - prefill) / (output_tokens - 1). Vanilla và DSpark dùng CUDA-event thời gian target forward đầu làm prefill proxy; speculative method dùng native TTFT nếu có.",
             "- Throughput = output_tokens / E2E; decode throughput = (output_tokens - 1) / decode time. Queue wait, batch wait, server startup và server E2E là null do chạy native Transformers không có request server.",
             "- Quality hợp lệ khi output không rỗng, có ít nhất 4 token và không có cờ repetition collapse. JSONL lưu ROUGE, ROUGE-Lsum, BLEU, length ratio, token IDs, acceptance counters và latency đầy đủ.",
+            "- Accept len: mean acceptance length (tau) = (draft tokens accepted + 1 target token) / verification step.",
             "",
             "Runtime gate yêu cầu tất cả target/draft attention dispatch qua FA4, không fallback. Runner dùng Transformers native, không nạp vLLM.",
         ]
