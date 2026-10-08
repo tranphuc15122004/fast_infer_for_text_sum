@@ -103,3 +103,40 @@ Mỗi run tạo một thư mục độc lập dưới `outputs/vllm_unified/<run
 - `events.jsonl`: Timeline sự kiện theo thời gian thực (nạp model, warmup, request, snapshot GPU).
 - `samples.jsonl` & `excluded_samples.jsonl`: Danh sách mẫu được chọn và mẫu bị loại trừ.
 - `console.log`: Log đầy đủ của phiên chạy.
+
+## 5. Pipeline native Transformers + FlashAttention-4
+
+Để đo riêng đường native Transformers trên B200 với FA4, chạy baseline
+`fa4_native`. Pipeline này tải tuần tự target và draft cho năm method
+`vanilla_hf`, `eagle3`, `dflash`, `domino`, `dspark`; mỗi request dùng batch 1,
+greedy decoding và cùng prompt tokenized. Runner yêu cầu Blackwell SM100+ và
+xác minh dispatch FA4 thực tế cho target cùng draft trước khi chấp nhận kết quả.
+FA4 b15 dùng shim CUTLASS process-local đang có trong
+`scripts/common/vanilla_inference.py`; không thay đổi package trong môi trường.
+
+```bash
+# Preflight trên B200: kiểm tra runtime FA4 và manifest dữ liệu, chưa nạp model.
+bash scripts/run.sh fa4_native --preflight-only
+
+# Mặc định chạy smoke (1 mẫu mỗi dataset, giới hạn output theo master config).
+bash scripts/run.sh fa4_native --smoke
+
+# Benchmark toàn bộ 100 mẫu cho mỗi dataset.
+bash scripts/run.sh fa4_native --full
+
+# Chọn method/dataset và master config khác.
+bash scripts/run.sh fa4_native /path/to/fast_infer_master.env \
+  --methods vanilla_hf,dflash --datasets gov_report --representative
+```
+
+Master config phải cung cấp `MODEL_TARGET`, `MODEL_DFLASH_DRAFT` và path draft
+của từng method được chọn (`MODEL_EAGLE_DRAFT`, `MODEL_DOMINO_DRAFT`,
+`MODEL_DSPARK_DRAFT`). Dữ liệu mặc định là `data/longbench_100_14k`; runner
+kiểm tra schema version, số mẫu và SHA-256 theo `manifest.json` trước inference.
+Có thể đặt `FA4_DATA_DIR`/`LONG_BENCH_DATA_DIR` hoặc `FA4_OUTPUT_ROOT` để đổi thư mục dữ liệu
+hoặc kết quả. Kết quả nằm dưới `outputs/fa4_native_benchmark/<run-id>/` và có
+`results.jsonl` (kết thúc bằng summary record), `run_report.json`,
+`report_vi.md`, `metrics_summary.csv`, warmup, event và checkpoint artifacts.
+
+Các lần chạy có số liệu chỉ thực hiện trên B200; máy Tesla T4 chỉ dùng để rà
+soát logic CPU và không thể thực thi FA4.

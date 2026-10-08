@@ -36,9 +36,10 @@ case "$BASELINE" in
   flexprefill)     WRAPPER="scripts/runners/run_flexprefill.sh" ;;
   syncspec)        WRAPPER="scripts/runners/run_syncspec.sh" ;;
   vllm_all)        WRAPPER="scripts/run_vllm_all.sh" ;;
+  fa4_native)      WRAPPER="scripts/run_fa4_benchmark.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: vllm_all longbench_200 vanilla_hf vanilla_fa eagle3 dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
+    echo "Available: vllm_all fa4_native longbench_200 vanilla_hf vanilla_fa eagle3 dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
     exit 1
     ;;
 esac

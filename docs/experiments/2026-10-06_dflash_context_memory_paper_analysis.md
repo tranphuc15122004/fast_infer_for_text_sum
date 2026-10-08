@@ -1,18 +1,20 @@
 # DFlash trên context dài: tổng hợp thực nghiệm và cơ sở phân tích cho paper về chọn/nén memory
 
-Ngày tổng hợp: **2026-10-06**. Phiên bản: **1.0**. Phạm vi: các khảo sát DFlash trong phiên nghiên cứu hiện tại, liên hệ với chuỗi thực nghiệm Training-Free E41–E44 và bài *Strong Drafts Need Compact Memories* do nhóm cung cấp.
+Ngày tổng hợp: **2026-10-06**. Phiên bản: **1.1**. Phạm vi: các khảo sát DFlash trong phiên nghiên cứu hiện tại, liên hệ với chuỗi thực nghiệm Training-Free E41–E44 và bài *Strong Drafts Need Compact Memories* do nhóm cung cấp. Phiên bản này cập nhật nhận xét về block/thiên lệch đầu–cuối và hướng cơ chế inference tận dụng DFlash đã train; không thêm thực nghiệm.
 
 Tài liệu này là hồ sơ bằng chứng và phân tích để phát triển paper. Các số liệu DFlash lấy từ artifact của những run đã hoàn tất; việc tổng hợp không chạy thêm GPU, training hoặc can thiệp KV. Các thiết kế module và thực nghiệm tiếp theo được ghi là đề xuất, chưa có kết quả.
 
 ## 1. Kết luận nghiên cứu hiện tại
 
-Hướng có cơ sở để tiếp tục khảo sát là **giữ năng lực của backbone DFlash đã train, giữ nguyên block 16 vị trí và học cách chọn hoặc tổng hợp cache context phục vụ drafter**. Cache này gồm prompt và output đã commit; target verifier tiếp tục dùng full context. Chi phí retrain là động cơ vận hành, còn tính hữu ích của module cần được kiểm tra bằng acceptance và chi phí inference.
+Hướng ưu tiên sau làm rõ của người nghiên cứu là **tận dụng backbone DFlash đã train, giữ nguyên block 16 vị trí và cải tiến cơ chế chọn/đọc/cập nhật cache context phục vụ drafter**. Cache này gồm prompt và output đã commit; target verifier tiếp tục dùng full context. Đề xuất cụ thể hiện tại dùng attention của chính DFlash để chọn key, tái sử dụng ngắn hạn và dense refresh; xem [cơ chế inference](2026-10-06_dflash_context_execution_mechanism.md) và mục 8.3. Các nhánh học module trong hồ sơ được giữ như phương án nghiên cứu đã thảo luận, không phải hướng đã chốt. Chi phí retrain là động cơ vận hành, còn tính hữu ích của cơ chế cần được kiểm tra bằng acceptance và chi phí inference.
 
 Các quan sát chính tại prompt 16K:
 
+- **Block 16 vị trí nhận tỷ trọng attention ổn định tương đối:** mean toàn trajectory khoảng **21–23% tổng mass** qua bốn cap; riêng 16K, lượt đầu/giữa/cuối là **24,37% / 20,56% / 20,23%**. Đây không phải hằng số 20% ở mọi layer/round (I1).
+- **Attention thường ưu tiên vùng đầu/cuối, đặc biệt cuối context:** tại 16K, hai bin 10% ở hai đầu nhận **58,43% tổng mass**; khi bỏ block, hai đầu cache nhận **47,16% cache mass**. Vùng đầu có thể liên quan attention sink, vùng cuối có thể liên quan recency/output; chưa có can thiệp tách các nguyên nhân (I5/I8).
 - Top-1K/4K trên mọi key bao phủ **67,29% / 82,61% tổng attention mass**, cao hơn cửa sổ liên tiếp tốt nhất cùng budget (**49,61% / 63,36%**). Các key có score cao phân bố ở nhiều vị trí.
 - Khi bỏ đúng 16 block key khỏi phép đo, Top-1K/4K cache bao phủ **58,58% / 77,96% cache mass**. Nếu luôn giữ block, tập này giữ **67,43% / 82,66% tổng mass gốc**. Phần cache sẽ nén vẫn có mass đáng kể ngoài tập chọn.
-- Phân bố có cả nhóm key rất tập trung và phần mass trải rộng. Top-64 mọi key nhận **46,54% mass**, trong khi cần khoảng **7.035 key để đạt 90%**. Context dài đi cùng giảm độ tập trung tương đối; chưa có bằng chứng attention trở thành phân bố đều.
+- Phân bố có cả nhóm key rất tập trung và phần mass trải rộng. Top-64 mọi key nhận **46,53% mass**, trong khi cần khoảng **7.035 key để đạt 90%**. Context dài đi cùng giảm độ tập trung tương đối; chưa có bằng chứng attention trở thành phân bố đều.
 - Tập key được ưu tiên ổn định hơn giữa hai lượt liền kề, nhưng thay đổi nhiều giữa các mốc xa. Tại 16K, Top-1K cache trùng **82,65%** giữa hai lượt liền kề và **31,11%** giữa lượt giữa–cuối. Điều này gợi ý cập nhật memory theo trạng thái sinh, đồng thời để ngỏ khả năng tái sử dụng ngắn hạn.
 - Một tập key chung có coverage khác nhau giữa năm draft layer. Phép mean phù hợp cho overview và proxy của memory chung, nhưng không chứng minh mọi layer/head/query có cùng nhu cầu.
 - Attention target chưa cho thấy quan hệ đủ ổn định để dùng làm **selector độc lập** cho DFlash. Parent Top-1K ở lượt trước chỉ nhận **29,80% tổng DFlash mass** ở lượt sau, hay **38,01% cache mass**, tại 16K. Khi cộng block được giữ sẵn, coverage gốc là **51,12%** trên phép tổng hợp layer-pair của khảo sát parent.
@@ -50,6 +52,8 @@ Những kết quả này tạo động cơ nghiên cứu memory thích ứng và
 
 D2 và D2-C **không thêm sample hoặc trajectory độc lập**. D3/D4 là replay của cùng 10 document, 40 conditions và continuation D1. Không cộng số round của các replay để tăng cỡ mẫu thống kê. Smoke, replaycheck và run bị loại chỉ dùng kiểm tra quy trình, không được gộp vào scientific aggregate.
 
+Mốc “30 giờ trên 4 GPU” là chi phí người nghiên cứu cung cấp, tương đương 120 GPU-giờ nếu cả bốn GPU được dùng trong suốt thời gian đó. Chưa gắn được mốc này với một raw run MR cụ thể. Log T0 ghi một run **DFlash baseline**, dừng ở step 2.155 sau 9h17m05s; train accuracy 23,1% không chứng minh hội tụ acceptance. Các nhận định cũ “thu được >90% năng lực” hoặc “warm-start trong 1 giờ” chưa có kiểm chứng và không dùng làm claim cho paper. Xem [T0](2026-10-05-dflash-4gpu-training-log.md) và [phân tích hướng MR](2026-10-06_mr_dflash_research_directions.md).
+
 ### 2.3. Kết quả D0 và lý do chuyển sang toàn bộ key scope
 
 D0 đã đo cả breakdown prompt/generated/block, nhưng hình và chỉ số concentration ban đầu ưu tiên **prompt-conditioned**. Bảng lịch sử dưới đây chỉ dùng cho truy vết; các insight chính của tài liệu dùng full mass và cache + block của D1 trở đi.
@@ -64,8 +68,6 @@ D0 đã đo cả breakdown prompt/generated/block, nhưng hình và chỉ số c
 Tại 16K, D0 không quan sát 1K chứa gần toàn bộ prompt mass; vị trí ưu tiên đổi trong tám round đầu. D1 sau đó mở rộng sang mười document và toàn continuation, đưa output đã commit cùng block vào key scope. D0 và D1 khác sample/round weighting, nên không lấy chênh lệch hai bảng làm tác động nhân quả của output hoặc số instance.
 
 Một coverage 90% **trong prompt** không có nghĩa 90% tổng mass. Quy đổi cần cộng mass đúng tập key trên mỗi round rồi mới aggregate. Do đó nhận xét cũ Top-1K prompt cao và block khoảng 20% không mâu thuẫn: chúng dùng mẫu số/phạm vi khác nhau.
-
-Mốc “30 giờ trên 4 GPU” là chi phí người nghiên cứu cung cấp, tương đương 120 GPU-giờ nếu cả bốn GPU được dùng trong suốt thời gian đó. Chưa gắn được mốc này với một raw run MR cụ thể. Log T0 ghi một run **DFlash baseline**, dừng ở step 2.155 sau 9h17m05s; train accuracy 23,1% không chứng minh hội tụ acceptance. Các nhận định cũ “thu được >90% năng lực” hoặc “warm-start trong 1 giờ” chưa có kiểm chứng và không dùng làm claim cho paper. Xem [T0](2026-10-05-dflash-4gpu-training-log.md) và [phân tích hướng MR](2026-10-06_mr_dflash_research_directions.md).
 
 ## 3. Thiết lập, đối tượng đo và mẫu số
 
@@ -226,7 +228,7 @@ Trong full-key analysis, best-window 1K/4K trùng cửa sổ cuối ở 4.366/4.
 | 8K | 74,81% | 36,80% | 0,737 | 67,80% | 43,85% | 0,785 |
 | 16K | 71,95% | 42,58% | 0,745 | 64,45% | 49,60% | 0,803 |
 
-So cùng tỷ lệ key giúp tránh kết luận chỉ từ việc 1K trở thành budget nhỏ hơn tương đối. Top 10% mọi key giảm từ 81,16% xuống 71,95% mass; tỷ lệ key cần cho 90% mass tăng từ 23,99% lên 42,58%. Tại 16K, Top-16 nhận **26,23%**, Top-64 nhận **46,54%**, dù Top-64 chỉ khoảng 0,39% key count.
+So cùng tỷ lệ key giúp tránh kết luận chỉ từ việc 1K trở thành budget nhỏ hơn tương đối. Top 10% mọi key giảm từ 81,16% xuống 71,95% mass; tỷ lệ key cần cho 90% mass tăng từ 23,99% lên 42,58%. Tại 16K, Top-16 nhận **26,23%**, Top-64 nhận **46,53%**, dù Top-64 chỉ khoảng 0,39% key count.
 
 **Khi loại block:** Top 10% cache vẫn giữ **64,45% cache mass**, Top-16/64 cache nhận **22,49% / 34,31%** tại 16K. Cache entropy chuẩn hóa tăng từ 0,749 lên 0,803; tỷ lệ key cần cho 90% cache mass tăng từ 30,66% lên 49,60%. Nhóm tập trung không chỉ đến từ block.
 
@@ -248,6 +250,8 @@ So cùng tỷ lệ key giúp tránh kết luận chỉ từ việc 1K trở thà
 Bin chứa khoảng 10% số key được chia riêng trên U_t hoặc C_t. Ở 16K, 10% key cuối full sequence nhận **50,93% tổng mass**; khi bỏ block, 10% cache cuối vẫn nhận **37,61% cache mass**. Hai vùng đầu/cuối cache gộp nhận 47,16%; **52,84% cache mass còn ở 80% vị trí giữa**.
 
 **Khi loại block:** ưu thế recency giảm nhưng còn rõ. Phần cuối cache chứa cả cuối prompt và output đã commit, nên chưa quy được spike cuối hoàn toàn cho nội dung ở cuối report. So các cap cũng thay prefix nội dung.
+
+**Diễn giải attention sink:** ưu tiên đầu/cuối là quan sát về phân phối; attention sink ở đầu và recency/output ở cuối là các giải thích có thể có. Các token format được attend cao trong I8 bổ sung động cơ khảo sát sink, nhưng chưa xác nhận cơ chế nhân quả. Không gọi mọi spike ở cuối là attention sink hoặc coi high-mass key mặc định là evidence nội dung.
 
 **Hàm ý:** giữ recent context là đối chứng hợp lý; allocation cố định chỉ theo đầu/cuối chưa được chứng minh đủ. Trong toàn scope, spike cuối còn bao gồm block hiện tại. Phát biểu “hai nửa đầu/cuối” không chính xác với phép đo: các bảng này xét hai **bin 10% ở hai đầu**, không phải hai nửa vốn cộng thành toàn sequence.
 
@@ -456,6 +460,16 @@ Target attention chưa được chọn làm tín hiệu mặc định hoặc lab
 
 Loss tiềm năng gồm target-token prediction, distillation dense draft logits hoặc tái tạo attention output từng layer; attention coverage có thể là metric/phụ trợ. Chưa khóa loss/architecture từ study quan sát. Freeze tham số backbone giảm optimizer/gradient tham số, nhưng có thể vẫn cần backward qua backbone để học module trước nó; không suy thời gian train tỷ lệ với số tham số trainable.
 
+### 8.3. Cập nhật hướng ưu tiên: cơ chế inference trên DFlash đã train
+
+Người nghiên cứu đã làm rõ mục tiêu là phát triển **cơ chế tận dụng trained DFlash cho long context**. Đề xuất scorer học riêng được giữ tại [tài liệu lịch sử](2026-10-06_dflash_learned_context_proposal.md); hướng ưu tiên mới được trình bày trong [cơ chế điều phối context](2026-10-06_dflash_context_execution_mechanism.md).
+
+V1 được đề xuất: lượt đầu DFlash đọc toàn context và tạo ranking cache bằng attention của chính nó; những lượt gần nhau dùng key được ưu tiên rải rác cùng một nhóm bảo vệ nhỏ ở đầu/gần block; thêm output thực sự commit và đọc lại toàn context để refresh. Có thể dùng phản hồi số token commit để điều chỉnh budget hoặc refresh ở lượt sau. Block 16 luôn giữ nguyên, target verifier vẫn full context. Tập chung và ranking riêng layer cần so ở cùng budget mỗi layer.
+
+Hai giới hạn cần giữ trong thiết kế: attention trên cache đã cắt không nhìn thấy key bị loại, nên không coi key không quan sát là zero hoặc tự suy toàn context từ sparse attention; pruning cũng làm softmax chuẩn hóa lại, nên giữ block không bảo đảm block tiếp tục nhận đúng 20% mass. Lịch refresh, budget, lợi ích layer-specific routing và mọi speedup/acceptance sau can thiệp đều **chưa được đo**.
+
+Nhánh dùng layer đầu DFlash đọc toàn context để chọn key cho các layer sau cũng được ghi trong đề xuất. Chưa có kết quả cho thấy ranking layer đầu đại diện đủ cho bốn layer còn lại. Những nội dung này là hàm ý và kế hoạch, không thêm observation vào D0–D4.
+
 ## 9. Khoảng trống bằng chứng và thực nghiệm kế tiếp
 
 Các mục trong phần này là **kế hoạch**, chưa thực hiện trong lần tổng hợp.
@@ -554,6 +568,8 @@ Các đường dẫn dưới đây tính từ repository root; thư mục `outpu
 | D3 | `dflash-target-attention-compare-fullmass-govreport10-l40s-20261006b` | [summary](../../outputs/dflash_attention_probe/dflash-target-attention-compare-fullmass-govreport10-l40s-20261006b/analysis/summary.json), [audit](../../outputs/dflash_attention_probe/dflash-target-attention-compare-fullmass-govreport10-l40s-20261006b/analysis/analysis_audit.json) |
 | D4 | `dflash-parent-attention-next-draft-govreport10-l40s-20261006b` | [summary](../../outputs/dflash_attention_probe/dflash-parent-attention-next-draft-govreport10-l40s-20261006b/analysis/summary.json), [audit](../../outputs/dflash_attention_probe/dflash-parent-attention-next-draft-govreport10-l40s-20261006b/analysis/analysis_audit.json) |
 
+Audit của lần tổng hợp tài liệu: [document audit](../../outputs/research_documents/dflash_context_memory_analysis_20261006/document_audit.json), ghi kiểm tra bảng số liệu, nguồn/hash, link hình và phạm vi bằng chứng. Đây là kiểm tra tài liệu, không thêm inference hoặc test chất lượng phương pháp.
+
 D1 audit đã đối chiếu **4.366 NPZ**, shape `(5, prefix_tokens + 16)`, finite/nonnegative, mean vector khớp JSONL; max sai số tổng mass mean là **4,26×10⁻⁵**. D2 tính lại Top-1K khớp record gốc trong **4,11×10⁻¹⁵**, kiểm tra oracle bounds/budget monotonicity. D2-C kiểm tra loại đúng 16 key, cache + block mass, công thức R và consistency theo layer.
 
 D3 và D4 khớp token output cùng số draft round với D1 ở **40/40 trajectory**. Tổng mass riêng layer lệch tối đa **1,07×10⁻⁴**; target future-key mass bằng 0. D4 audit kiểm tra **4.326/4.326** parent-query/prefix/role/layer-pair alignments, giữ riêng số bonus transition bằng 0. Các code snapshots có trong artifact; collector hiện tại đã phát triển qua nhiều phase, nên dùng bản code của từng run khi cần tái lập chính xác.
@@ -569,6 +585,7 @@ Các run bị loại: attempt đổi backend target làm trajectory lệch ngu�
 - [D4: parent query lượt trước](2026-10-06_dflash_parent_attention_next_draft.md).
 - [Protocol attention](2026-10-06_dflash_context_support_design.md) và [hướng phát triển MR](2026-10-06_mr_dflash_research_directions.md).
 - [Training-Free E41/E42](2026-09-21_trainingfree_controlled_search.md), [E43](2026-09-23_trainingfree_e43_temporal_support_reuse.md), [E44](2026-09-23_fidelitykv_e44_results.md).
+- [Cơ chế inference tận dụng DFlash đã train, hướng ưu tiên hiện tại](2026-10-06_dflash_context_execution_mechanism.md); [selector học riêng, đề xuất cũ được giữ để truy vết](2026-10-06_dflash_learned_context_proposal.md).
 
 ### 13.3. Lệnh xử lý artifact đã có
 

@@ -61,6 +61,10 @@ insight, mẫu số attention, liên hệ Training-Free/MASW, giới hạn bằn
 các phép kiểm chứng còn cần thực hiện:
 [hồ sơ phân tích nghiên cứu](experiments/2026-10-06_dflash_context_memory_paper_analysis.md).
 
+Đề xuất cơ chế điều phối context tận dụng DFlash đã train: giữ block 16,
+chọn key bằng attention của chính drafter, tái sử dụng và dense refresh:
+[cơ chế context khi inference](experiments/2026-10-06_dflash_context_execution_mechanism.md).
+
 Thăm dò attention của DFlash trên một instance GovReport, bốn mức 3K/5K/8K/16K
 và tám lượt draft/mức trên Modal L40S:
 [báo cáo và histogram/heatmap](experiments/2026-10-06_dflash_attention_probe_results.md).

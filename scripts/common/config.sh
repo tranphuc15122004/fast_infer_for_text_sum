@@ -528,6 +528,26 @@ fast_infer__load_syncspec() {
   fast_infer_default_from LOCAL_FILES_ONLY SYNCSPEC_LOCAL_FILES_ONLY
 }
 
+fast_infer__load_fa4_native() {
+  fast_infer__load_longbench
+  fast_infer_default_from LONG_BENCH_DOMINO_MODEL MODEL_DOMINO_DRAFT MODEL_DOMINO DOMINO_DRAFT_MODEL B200_DOMINO_MODEL
+  fast_infer_default_from LONG_BENCH_DSPARK_MODEL MODEL_DSPARK_DRAFT MODEL_DSPARK DSPARK_DRAFT_MODEL B200_DSPARK_MODEL
+  fast_infer_default_from FA4_DATA_DIR LONG_BENCH_DATA_DIR
+  fast_infer_default_from FA4_OUTPUT_ROOT
+  fast_infer_default_from FA4_METHODS
+  fast_infer_default_from FA4_WARMUP_TOKENS
+  fast_infer_default_from FA4_REPETITIONS
+  fast_infer_default_from FA4_SAMPLE_RETRIES
+  fast_infer_default_from FA4_CHECKPOINT_INTERVAL
+  fast_infer_default FA4_DATA_DIR "${LONG_BENCH_DATA_DIR:-data/longbench_100_14k}"
+  fast_infer_default FA4_OUTPUT_ROOT "outputs/fa4_native_benchmark"
+  fast_infer_default FA4_METHODS "all"
+  fast_infer_default FA4_WARMUP_TOKENS "8"
+  fast_infer_default FA4_REPETITIONS "1"
+  fast_infer_default FA4_SAMPLE_RETRIES "1"
+  fast_infer_default FA4_CHECKPOINT_INTERVAL "20"
+}
+
 fast_infer_load_config() {
   local baseline="${1:-}"
 
@@ -535,6 +555,7 @@ fast_infer_load_config() {
 
   case "$baseline" in
     longbench) fast_infer__load_longbench ;;
+    fa4_native) fast_infer__load_fa4_native ;;
     dflash) fast_infer__load_dflash ;;
     domino) fast_infer__load_domino ;;
     fafo) fast_infer__load_fafo ;;
