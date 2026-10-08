@@ -21,6 +21,9 @@ LongBench canonical:
 
 Legacy representative data:
 /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/representative_100
+
+Length bins partition data:
+/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/length_bins
 ```
 
 Tên dataset đúng là `representative_100`.

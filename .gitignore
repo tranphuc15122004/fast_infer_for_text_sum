@@ -35,6 +35,18 @@ externals/MagicDec/Data/c4_small.json
 externals/MagicDec/Data/pg19/
 externals/MagicDec/Data/Ruler/synthetic/json/*.json
 
+# Binary documents & packages
+*.pdf
+*.whl
+envs/legacy/wheels/
+
+# Unused datasets in externals
+externals/DeepSpec/eval_datasets/
+externals/SpecExtend/specextend/data/pg-19/
+externals/FAFO/dataset/
+externals/EAGLE/eagle/data/mt_bench/model_judgment/
+externals/EAGLE/eagle/data/mt_bench/reference_answer/
+
 # Large, regenerable datasets (prepare_data.py tải từ HuggingFace; xem data/README.md)
 data/raw/
 data/normalized/

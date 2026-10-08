@@ -71,6 +71,21 @@ chung tự render prompt từ `dataset/context/input`; reference chung là
 `reference_output`. Ba task summarization dùng ROUGE/BLEU; hai task code
 completion dùng `code_exact_match` và `code_edit_similarity`, không dùng ROUGE.
 
+## Bộ dữ liệu phân vùng theo độ dài (data/length_bins/)
+
+Thư mục `data/length_bins/` gồm **250 mẫu** chia thành **5 phân vùng độ dài** (50 mẫu/khoảng) nhằm đánh giá scaling đường cong hiệu năng và điểm nghẽn phần cứng (Prefill vs Decode, KV Cache, Speculative decoding):
+
+- `bin1_00k_02k.jsonl`: [0, 2,000) token (Overhead & baseline test)
+- `bin2_02k_04k.jsonl`: [2,000, 4,000) token (Transition zone)
+- `bin3_04k_08k.jsonl`: [4,000, 8,000) token (Compression zone)
+- `bin4_08k_12k.jsonl`: [8,000, 12,000) token (Attention scaling zone)
+- `bin5_12k_16k.jsonl`: [12,000, 16,000) token (Memory stress test)
+
+> **Đường dẫn canonical trên server:**
+> `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/length_bins/`
+
+Chi tiết xem tại [`data/length_bins/README.md`](length_bins/README.md) hoặc [`docs/length_bins_benchmark.md`](../docs/length_bins_benchmark.md).
+
 ## Dữ liệu tùy biến
 
 Để chạy một baseline với **dữ liệu của bạn**, chỉ cần bỏ file jsonl vào thư mục
