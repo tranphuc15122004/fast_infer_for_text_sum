@@ -123,6 +123,33 @@ def _dtype_and_attention() -> tuple[torch.dtype, str]:
         raise SystemExit("DFlash Transformers adapter requires CUDA")
     capability = torch.cuda.get_device_capability()
     dtype = torch.bfloat16 if capability[0] >= 8 else torch.float16
+
+    # FA2 is not a supported Blackwell backend.  Prefer FA4 on B200, using
+    # the same process-local CUTLASS compatibility shim as vanilla_fa; if the
+    # FA4 import probe fails, use PyTorch SDPA rather than asking Transformers
+    # 5 to resolve the FA2 kernel from the Hub (the server is offline).
+    if capability[0] >= 10:
+        try:
+            from common.vanilla_inference import (
+                _install_flash_attention_4_cutlass_compat,
+                _probe_flash_attention_4,
+            )
+
+            _install_flash_attention_4_cutlass_compat()
+            fa4_available, fa4_reason = _probe_flash_attention_4()
+        except Exception as exc:
+            fa4_available = False
+            fa4_reason = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+        if fa4_available:
+            print("[dflash] B200 attention backend: flash_attention_4", flush=True)
+            return dtype, "flash_attention_4"
+        print(
+            "[dflash] FA4 unavailable; using sdpa on Blackwell"
+            + (f" ({fa4_reason})" if fa4_reason else ""),
+            flush=True,
+        )
+        return dtype, "sdpa"
+
     try:
         import flash_attn  # noqa: F401
     except Exception:

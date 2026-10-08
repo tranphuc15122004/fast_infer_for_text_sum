@@ -97,6 +97,45 @@ Trước khi chạy toàn ma trận, kiểm tra baseline có adapter phù hợp 
 `task_type`. Không dùng prompt summarization cho LCC/RepoBench-P và không đưa
 ROUGE vào báo cáo code-completion.
 
+### Bốn baseline speculative bằng FlashAttention-4 trên B200
+
+Ma trận `run_longbench_200.sh` không đăng ký Domino và DsPark. Trên B200,
+dùng runner native FA4 để chạy `dflash`, `eagle3`, `domino`, `dspark` cùng một
+đối chứng `vanilla_hf`. Đối chứng này cũng chạy với FA4; runner kiểm tra
+attention dispatch của target và draft, và dừng nếu có fallback sang backend
+khác. Cấu hình master phải trỏ tới target và bốn checkpoint draft local.
+
+`run_fa4_benchmark.sh` nhận đường dẫn master config ở vị trí đầu tiên (không
+dùng cờ `--config`). Trước hết preflight một dataset:
+
+```bash
+# Chạy tại root của checkout chứa scripts/run_fa4_benchmark.sh.
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+METHODS="vanilla_hf dflash eagle3 domino dspark"
+
+bash scripts/run_fa4_benchmark.sh "$MASTER" \
+  --mode smoke --datasets gov_report --samples-per-dataset 1 \
+  --max-input-tokens 4096 --max-new-tokens 8 \
+  --methods "$METHODS" --preflight-only
+```
+
+Nếu preflight qua, chạy smoke có inference:
+
+```bash
+bash scripts/run_fa4_benchmark.sh "$MASTER" \
+  --mode smoke --datasets gov_report --samples-per-dataset 1 \
+  --max-input-tokens 4096 --max-new-tokens 8 \
+  --methods "$METHODS" --run-id b200-fa4-four-smoke
+```
+
+Sau đó chạy representative hoặc full bằng cùng runner. `full` mặc định chọn
+toàn bộ mẫu trong dataset đã chọn; đặt `--max-input-tokens` và
+`--max-new-tokens` theo protocol cần báo cáo. Kết quả nằm dưới
+`outputs/fa4_native_benchmark/<run-id>/`, gồm `results.jsonl`,
+`run_report.json`, `report_vi.md` và `console.log`. Chỉ diễn giải tốc độ khi
+report ghi `flash_attention_4` cho cả target lẫn draft và có record thành công
+ghép với `vanilla_hf` trên cùng sample IDs.
+
 ## Orchestrator 3 profile
 
 Toàn bộ ma trận dùng một master shell-env ngoài repository, được trỏ bởi
@@ -259,9 +298,15 @@ trên server:
   đã build cho đúng tokenizer/model; nếu path đã khai báo nhưng không tồn tại,
   preflight vẫn dừng cell với `missing_checkpoint`.
 - SSSD cần binary wheel `sglang-kernel==0.4.7` khớp Torch 2.14/CUDA/GPU và
-  package `gguf==0.19.0`. Nếu
-  `sgl_kernel` không import được, preflight ghi `missing_dependency` và không
-  khởi chạy child process để tránh traceback import sâu.
+  package `gguf==0.19.0`. Nếu `sgl_kernel` không import được, preflight ghi
+  `missing_dependency` và không khởi chạy child process để tránh traceback
+  import sâu.
+
+Với target Qwen3, EAGLE-3 và SpecExtend dùng RoPE mặc định theo công thức Qwen3
+thay vì tra `default` trong `ROPE_INIT_FUNCTIONS` (Transformers 5 không còn
+đăng ký kiểu này trong map). DFlash chọn FA4 trên Blackwell khi probe FA4 pass;
+nếu probe thất bại thì dùng SDPA, không gọi FA2 qua Hub trong môi trường offline.
+MagicDec và FAFO không thuộc runner FA4 native bên dưới.
 
 Ví dụ kiểm tra đầy đủ pipeline local (preflight-only nên **không** tự tổng
 hợp; phải chạy collector tay):

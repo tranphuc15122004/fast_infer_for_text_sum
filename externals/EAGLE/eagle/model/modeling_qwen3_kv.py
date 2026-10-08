@@ -393,18 +393,56 @@ class Qwen3PreTrainedModel(PreTrainedModel):
 
 
 class Qwen3RotaryEmbedding(nn.Module):
+    @staticmethod
+    def _compute_default_rope_parameters(config, device=None, seq_len=None):
+        """Compute the original RoPE frequencies for Qwen3.
+
+        Transformers 5 no longer keeps ``default`` in
+        ``ROPE_INIT_FUNCTIONS``.  Its native Qwen3 implementation handles this
+        type with a model-specific function, so the vendored EAGLE copy must
+        do the same instead of indexing the reduced registry.
+        """
+        del seq_len  # Original RoPE does not vary its frequencies by length.
+        parameters = getattr(config, "rope_parameters", None)
+        rope_theta = (
+            parameters.get("rope_theta")
+            if isinstance(parameters, dict)
+            else None
+        )
+        if rope_theta is None:
+            rope_theta = getattr(config, "rope_theta", 10000.0)
+        dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        exponent = (
+            torch.arange(0, dim, 2, dtype=torch.int64, device=device).float()
+            / dim
+        )
+        return 1.0 / (float(rope_theta) ** exponent), 1.0
+
     def __init__(self, config: Qwen3Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type", "default")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if self.rope_type == "default":
+            self.rope_init_fn = self._compute_default_rope_parameters
+        else:
+            try:
+                self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unsupported Qwen3 RoPE type {self.rope_type!r}; "
+                    f"available scaled types: {sorted(ROPE_INIT_FUNCTIONS)}"
+                ) from exc
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
