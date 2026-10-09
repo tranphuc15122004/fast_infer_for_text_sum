@@ -84,6 +84,61 @@ def test_prepare_inputs_rejects_duplicate_identity_across_splits(tmp_path: Path)
         prepare_inputs(source, tmp_path / "output")
 
 
+def test_prepare_inputs_deduplicates_identical_prompts_inside_one_split(tmp_path: Path) -> None:
+    source = tmp_path / "stratified"
+    first = _row("sharegpt:first", "sharegpt", split="train")
+    duplicate = _row("sharegpt:duplicate", "sharegpt", split="train")
+    duplicate["conversations"] = first["conversations"]
+    _write_jsonl(source / "train_prompts.jsonl", [first, duplicate])
+    _write_jsonl(source / "val_prompts.jsonl", [_row("val", "arxiv", split="val")])
+
+    report = prepare_inputs(source, tmp_path / "output")
+
+    train = (tmp_path / "output" / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(train) == 1
+    assert report["splits"]["train"]["records"] == 1
+    assert report["splits"]["train"]["deduplicated_same_split_prompts"] == 1
+
+
+def test_prepare_inputs_rejects_same_prompt_across_splits_even_with_different_ids(tmp_path: Path) -> None:
+    source = tmp_path / "stratified"
+    train = _row("train-id", "sharegpt", split="train")
+    validation = _row("validation-id", "sharegpt", split="val")
+    validation["conversations"] = train["conversations"]
+    _write_jsonl(source / "train_prompts.jsonl", [train])
+    _write_jsonl(source / "val_prompts.jsonl", [validation])
+
+    with pytest.raises(ValueError, match="prompt content overlap between train and validation"):
+        prepare_inputs(source, tmp_path / "output")
+
+
+def test_prepare_inputs_allows_same_source_document_inside_one_split(tmp_path: Path) -> None:
+    source = tmp_path / "stratified"
+    first = _row("first", "arxiv", split="train")
+    second = _row("second", "arxiv", split="train")
+    first["metadata"]["original_id"] = "same-paper"
+    second["metadata"]["original_id"] = "same-paper"
+    _write_jsonl(source / "train_prompts.jsonl", [first, second])
+    _write_jsonl(source / "val_prompts.jsonl", [_row("val", "sharegpt", split="val")])
+
+    report = prepare_inputs(source, tmp_path / "output")
+
+    assert report["splits"]["train"]["records"] == 2
+
+
+def test_prepare_inputs_rejects_source_document_overlap_across_splits(tmp_path: Path) -> None:
+    source = tmp_path / "stratified"
+    train = _row("train-id", "arxiv", split="train")
+    validation = _row("validation-id", "arxiv", split="val")
+    train["metadata"]["original_id"] = "same-paper"
+    validation["metadata"]["original_id"] = "same-paper"
+    _write_jsonl(source / "train_prompts.jsonl", [train])
+    _write_jsonl(source / "val_prompts.jsonl", [validation])
+
+    with pytest.raises(ValueError, match="source-document overlap between train and validation"):
+        prepare_inputs(source, tmp_path / "output")
+
+
 def test_prepare_inputs_refuses_to_overwrite_output(tmp_path: Path) -> None:
     source = tmp_path / "stratified"
     _write_jsonl(source / "train_prompts.jsonl", [_row("a", "arxiv", split="train")])

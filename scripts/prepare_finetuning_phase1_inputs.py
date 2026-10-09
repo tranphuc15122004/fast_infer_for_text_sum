@@ -211,21 +211,26 @@ def prepare_inputs(
                         raise ValueError(
                             f"ID overlap between train and validation: {sample_id} ({old_split}, {split})"
                         )
-                    doc_hash = hashlib.sha256(record["document"].encode("utf-8")).hexdigest()
-                    old_content_split = seen_content.get(doc_hash)
-                    if old_content_split is not None:
-                        raise ValueError(
-                            f"prompt content overlap between train and validation ({old_content_split}, {split}): {sample_id}"
-                        )
+                    seen_ids[sample_id] = split
+
                     source_doc = str(record["metadata"]["source_document_id"])
                     old_doc_split = seen_source_docs.get(source_doc)
-                    if old_doc_split is not None:
+                    if old_doc_split is not None and old_doc_split != split:
                         raise ValueError(
                             f"source-document overlap between train and validation ({old_doc_split}, {split}): {source_doc}"
                         )
-                    seen_ids[sample_id] = split
+                    seen_source_docs.setdefault(source_doc, split)
+
+                    doc_hash = hashlib.sha256(record["document"].encode("utf-8")).hexdigest()
+                    old_content_split = seen_content.get(doc_hash)
+                    if old_content_split is not None and old_content_split != split:
+                        raise ValueError(
+                            f"prompt content overlap between train and validation ({old_content_split}, {split}): {sample_id}"
+                        )
+                    if old_content_split == split:
+                        counts["deduplicated_same_split_prompts"] += 1
+                        continue
                     seen_content[doc_hash] = split
-                    seen_source_docs[source_doc] = split
                     output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                     counts["records"] += 1
                     counts[record["metadata"]["source"]] += 1
@@ -248,6 +253,7 @@ def prepare_inputs(
                 },
                 "length_bin_counts": dict(sorted(length_bins.items())),
                 "reference_counts": dict(sorted(references.items())),
+                "deduplicated_same_split_prompts": counts["deduplicated_same_split_prompts"],
                 "skipped_summary_metadata_rows": counts["skipped_summary_metadata_rows"],
             }
 

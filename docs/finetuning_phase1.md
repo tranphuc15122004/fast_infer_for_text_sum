@@ -33,8 +33,9 @@ Dataset phân tầng 50K đã build sẵn trên server tại:
 Trong đó dùng `train_prompts.jsonl` và `val_prompts.jsonl`; không đưa
 `test_prompts.jsonl` vào train hay validation. Bộ stratified 50K có 45.000 train,
 2.500 validation và 2.500 test. Script dưới đây tạo schema `id/document/summary`,
-giữ nguyên hai split, kiểm tra ID/prompt/document overlap và ghi `report.json`.
-Nó không ghi đè dữ liệu nguồn hoặc output đã tồn tại.
+giữ nguyên hai split, loại prompt trùng bên trong cùng split và ghi số lượng vào
+`report.json`. ID lặp vẫn là lỗi; ID/prompt/document trùng chéo train-eval làm
+script dừng để tránh leakage. Nó không ghi đè dữ liệu nguồn hoặc output đã tồn tại.
 
 `summary` ở đây chỉ lấy `metadata.reference_summary` gốc cho ArXiv; ShareGPT để
 trống vì split prompt-only không có gold summary. Target generation vẫn chạy cho
@@ -70,8 +71,9 @@ for path in sys.argv[1:]:
 PY
 ```
 
-Sau khi pilot report/spot-check hợp lệ, tạo bộ đầy đủ vào thư mục mới. Kết quả
-Phase 1 là 45K train và 2.5K eval; 2.5K test vẫn được giữ ngoài run này:
+Sau khi pilot report/spot-check hợp lệ, tạo bộ đầy đủ vào thư mục mới. Đầu ra có
+tối đa 45K train và 2.5K eval; số thực tế sau khi loại prompt trùng nằm trong
+`report.json`. 2.5K test vẫn được giữ ngoài run này:
 
 ```bash
 export PHASE1_INPUTS="$PWD/outputs/finetuning/mr_dflash_50k_phase1_inputs"
