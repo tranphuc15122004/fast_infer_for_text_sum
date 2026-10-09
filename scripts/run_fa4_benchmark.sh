@@ -9,7 +9,7 @@ fi
 
 source "$ROOT/scripts/common/config.sh"
 fast_infer_load_config fa4_native
-source "$ROOT/scripts/common/runtime.sh"
+source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 export MODEL_TARGET="${LONG_BENCH_MODEL:-${MODEL_TARGET:-}}"
 export MODEL_EAGLE_DRAFT="${LONG_BENCH_EAGLE_MODEL:-${MODEL_EAGLE_DRAFT:-}}"

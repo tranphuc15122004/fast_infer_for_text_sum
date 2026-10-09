@@ -33,6 +33,8 @@ from .core import alignment_kl_loss, greedy_acceptance, preference_loss, resolve
 from .evaluation import evaluate_one_fixed_state
 from .inference import AMRDFlashEngine
 from .runtime import load_runtime
+from .prompts import PROMPT_POLICY, render_prompt, source_content_hash
+from .training_data import training_signal_summary
 
 
 LONG_BENCH_DATASETS = {"gov_report", "qmsum", "multi_news", "lcc", "repobench-p"}
@@ -63,22 +65,7 @@ def _run_root(config: dict[str, Any], supplied: str | Path | None, *, create: bo
 
 
 def _prompt_for(tokenizer: Any, sample: dict[str, Any]) -> str:
-    raw = sample.get("raw") or {}
-    prompt = str(sample.get("prompt") or "")
-    if raw.get("dataset") in LONG_BENCH_DATASETS or not getattr(tokenizer, "chat_template", None):
-        return prompt
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    return render_prompt(tokenizer, sample)
 
 
 def _tokenize_prompt(
@@ -115,10 +102,18 @@ def _split_for(raw: dict[str, Any], document_id: str, config: dict[str, Any]) ->
         return "holdout"
     data_cfg = config["data"]
     return stable_split(
-        str(raw.get("source_document_id") or raw.get("document_id") or raw.get("source_id") or document_id),
+        _source_identity(raw, document_id),
         train_fraction=float(data_cfg.get("train_fraction", 0.8)),
         validation_fraction=float(data_cfg.get("validation_fraction", 0.1)),
     )
+
+
+def _source_identity(raw: dict[str, Any], document_id: str) -> str:
+    return str(raw.get("source_document_id") or raw.get("document_id") or raw.get("source_id") or document_id)
+
+
+def _source_content_hash(raw: dict[str, Any], prompt: str) -> str:
+    return source_content_hash(raw, prompt)
 
 
 def validate_document_records(records: list[dict[str, Any]], config: dict[str, Any]) -> None:
@@ -133,12 +128,10 @@ def validate_document_records(records: list[dict[str, Any]], config: dict[str, A
         ids.add(document_id)
         raw = record.get("raw") or {}
         split = _split_for(raw, document_id, config)
-        source_id = str(raw.get("source_document_id") or raw.get("document_id") or raw.get("source_id") or document_id)
-        content = next((str(raw[key]) for key in ("context", "document", "text")
-                        if raw.get(key)), str(record.get("prompt") or ""))
-        content_hash = sha256_text(" ".join(content.split()))
+        source_id = _source_identity(raw, document_id)
+        content_hash = _source_content_hash(raw, str(record.get("prompt") or ""))
         identities_to_check = [(sources, source_id)]
-        if content.strip():
+        if content_hash:
             identities_to_check.append((contents, content_hash))
         for identities, identity in identities_to_check:
             if identity in identities and identities[identity] != split:
@@ -162,7 +155,7 @@ def _capture_contract(config: dict[str, Any], *, input_sha256: str,
         "max_input_tokens": max_input_tokens,
         "max_states_per_document": max_states_per_document,
         "state_sampling": "evenly_spaced_including_endpoints",
-        "prompt_policy": "chat_template_no_thinking_or_longbench_v1",
+        "prompt_policy": PROMPT_POLICY,
         "truncate_policy": "common_truncate_input_ids_v1",
         "seed": int(config["training"].get("seed", 17)),
         "train_fraction": float(config["data"].get("train_fraction", 0.8)),
@@ -191,6 +184,8 @@ def _validate_run_index(root: Path, *, metadata: dict[str, Any] | None = None,
     states = read_jsonl(root / "states.jsonl")
     document_by_id = {}
     state_by_id = {}
+    seen_sources: dict[str, str] = {}
+    seen_contents: dict[str, str] = {}
     for document in documents:
         key = str(document["document_id"])
         if key in document_by_id:
@@ -199,7 +194,16 @@ def _validate_run_index(root: Path, *, metadata: dict[str, Any] | None = None,
             raise ValueError("document capture contract differs from manifest")
         if document.get("split") not in {"train", "validation", "holdout"}:
             raise ValueError("invalid captured document split")
+        for identities, identity in (
+            (seen_sources, str(document.get("source_document_id", key))),
+            (seen_contents, str(document.get("source_content_sha256") or "")),
+        ):
+            if identity and identity in identities and identities[identity] != document["split"]:
+                raise ValueError("captured source/content occurs in more than one split")
+            if identity:
+                identities[identity] = document["split"]
         document_by_id[key] = document
+    states_by_document: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for state in states:
         key = str(state["state_id"])
         if key in state_by_id:
@@ -209,8 +213,9 @@ def _validate_run_index(root: Path, *, metadata: dict[str, Any] | None = None,
                                    for field in ("split", "bundle", "input_sha256", "capture_contract_sha256")):
             raise ValueError(f"state/document split or capture contract mismatch: {key}")
         state_by_id[key] = state
+        states_by_document[str(state["document_id"])].append(state)
     for key, document in document_by_id.items():
-        saved_states = [state for state in states if str(state["document_id"]) == key]
+        saved_states = states_by_document.get(key, [])
         if len(saved_states) != document.get("states_saved") or sorted(
                 int(state["state_index"]) for state in saved_states) != list(range(len(saved_states))):
             raise ValueError(f"incomplete captured state index for document {key}; recapture this run")
@@ -412,6 +417,8 @@ def capture_run(
         }
         atomic_torch_save(feature_payload, root / feature_relative)
         split = _split_for(raw, document_id, config)
+        source_id = _source_identity(raw, document_id)
+        source_content_sha256 = _source_content_hash(raw, prompt)
         dataset = str(raw.get("dataset") or source_path.stem)
         for state_index, state in enumerate(captured_states):
             state_id = f"{safe_document_id}-s{state_index:05d}"
@@ -440,6 +447,8 @@ def capture_run(
                 "schema_version": "amr-v0",
                 "capture_contract_sha256": capture_digest,
                 "document_id": document_id,
+                "source_document_id": source_id,
+                "source_content_sha256": source_content_sha256,
                 "dataset": dataset,
                 "split": split,
                 "bundle": str(feature_relative),
@@ -1020,11 +1029,14 @@ def label_candidates(
             "states_with_preferences": len({row["state_id"] for row in preferences}),
         },
     )
+    signal = training_signal_summary(labeled_rows, preferences)
+    _write_json(root / "training_signal.json", signal)
     return {
         "candidate_labels": len(labeled_rows),
         "preferences": len(preferences),
         "labels": str(label_path),
         "preferences_file": str(pref_path),
+        "training_signal": signal,
     }
 
 

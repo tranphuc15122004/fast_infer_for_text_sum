@@ -6,7 +6,7 @@ COMMAND="infer"
 
 if [[ $# -gt 0 && "$1" != -* ]]; then
   case "$1" in
-    preflight|capture|candidates|label|train-selector|train-compressor|evaluate-fixed|infer)
+    preflight|prepare-data|capture|candidates|label|train-selector|train-compressor|evaluate-fixed|infer)
       COMMAND="$1"
       shift
       ;;

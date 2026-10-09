@@ -21,7 +21,7 @@ for NAME in \
   CAD_STATISTICS_UPDATE_MODE CAD_LENGTH_MODE CAD_FIXED_BUDGET CAD_FIXED_GAMMA \
   CAD_GAMMA_REFERENCE CAD_MAX_NEW_TOKENS MODEL_TARGET MODEL_DFLASH_DRAFT TARGET_MODEL \
   DRAFT_MODEL DATA_INPUT DATA_FILE RUN_SAMPLES RUN_MAX_NEW_TOKENS RUN_MAX_INPUT_TOKENS \
-  RUN_TEMPERATURE MAX_SAMPLES MAX_INPUT_TOKENS TEMPERATURE LONG_BENCH_SEED SMOKE FULL; do
+  RUN_TEMPERATURE MAX_SAMPLES MAX_NEW_TOKENS MAX_INPUT_TOKENS TEMPERATURE LONG_BENCH_SEED SMOKE FULL; do
   if [[ -v "$NAME" ]]; then
     SAVED_NAMES+=("$NAME")
     SAVED_VALUES+=("${!NAME}")
@@ -35,6 +35,33 @@ for INDEX in "${!SAVED_NAMES[@]}"; do
   printf -v "${SAVED_NAMES[$INDEX]}" '%s' "${SAVED_VALUES[$INDEX]}"
   export "${SAVED_NAMES[$INDEX]}"
 done
+
+was_caller_set() {
+  local wanted="$1" saved
+  for saved in "${SAVED_NAMES[@]}"; do
+    [[ "$saved" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+# The shared loader computes aliases before caller canonical values are
+# restored. Recompute an alias from a caller's canonical override unless that
+# caller explicitly supplied the alias too (the alias then keeps precedence).
+prefer_canonical_override() {
+  local canonical="$1" alias="$2"
+  if was_caller_set "$canonical" && ! was_caller_set "$alias" && [[ -n "${!canonical}" ]]; then
+    printf -v "$alias" '%s' "${!canonical}"
+    export "$alias"
+  fi
+}
+prefer_canonical_override MODEL_TARGET TARGET_MODEL
+prefer_canonical_override MODEL_DFLASH_DRAFT DRAFT_MODEL
+prefer_canonical_override DATA_INPUT DATA_FILE
+prefer_canonical_override RUN_TEMPERATURE TEMPERATURE
+prefer_canonical_override RUN_SAMPLES MAX_SAMPLES
+prefer_canonical_override RUN_MAX_NEW_TOKENS MAX_NEW_TOKENS
+prefer_canonical_override RUN_MAX_INPUT_TOKENS MAX_INPUT_TOKENS
+
 # shellcheck disable=SC1091
 source "$ROOT/scripts/common/runtime.sh" || exit 1
 
@@ -57,7 +84,6 @@ elif [[ -n "${DATA_FILE:-${DATA_INPUT:-}}" ]]; then
 fi
 [[ -n "${CAD_OUTPUT_ROOT:-}" ]] && ARGS+=(--output-root "$CAD_OUTPUT_ROOT")
 [[ -n "${CAD_RUN_ID:-}" ]] && ARGS+=(--run-id "$CAD_RUN_ID")
-[[ -n "${MAX_SAMPLES:-}" && "${CAD_PHASE:-smoke}" == "smoke" ]] && ARGS+=(--max-samples "$MAX_SAMPLES")
 [[ -n "${MAX_INPUT_TOKENS:-}" ]] && ARGS+=(--max-input-tokens "$MAX_INPUT_TOKENS")
 [[ -n "${TEMPERATURE:-}" ]] && ARGS+=(--temperature "$TEMPERATURE")
 
@@ -67,6 +93,30 @@ elif [[ "${SMOKE:-0}" == "1" ]]; then
   ARGS+=(--phase smoke)
 elif [[ "${FULL:-0}" == "1" ]]; then
   ARGS+=(--phase test)
+fi
+
+EFFECTIVE_PHASE="${CAD_PHASE:-}"
+FORWARDED_ARGS=("$@")
+for ((INDEX = 0; INDEX < ${#FORWARDED_ARGS[@]}; INDEX++)); do
+  case "${FORWARDED_ARGS[$INDEX]}" in
+    --phase)
+      INDEX=$((INDEX + 1))
+      if (( INDEX < ${#FORWARDED_ARGS[@]} )); then
+        EFFECTIVE_PHASE="${FORWARDED_ARGS[$INDEX]}"
+      fi
+      ;;
+    --phase=*) EFFECTIVE_PHASE="${FORWARDED_ARGS[$INDEX]#--phase=}" ;;
+  esac
+done
+if [[ -z "$EFFECTIVE_PHASE" ]]; then
+  if [[ "${SMOKE:-0}" == "1" ]]; then
+    EFFECTIVE_PHASE=smoke
+  elif [[ "${FULL:-0}" == "1" ]]; then
+    EFFECTIVE_PHASE=test
+  fi
+fi
+if [[ -n "${MAX_SAMPLES:-}" && "$EFFECTIVE_PHASE" == "smoke" ]]; then
+  ARGS+=(--max-samples "$MAX_SAMPLES")
 fi
 
 cd "$ROOT"

@@ -226,3 +226,62 @@ ghi rõ gồm validation cadence, optimizer/RNG resume, calibrated cost gate,
 resident-memory profiling, matched-budget/statistical experiment runner và
 một số cấu trúc compressor trong thiết kế đầy đủ. Những mục này cần được
 đóng riêng; passing contract tests không đóng các gate đó.
+
+## Tình trạng sửa lỗi
+
+Ngày 08/10/2026, sau yêu cầu sửa cả chín finding, implementation đã được cập
+nhật:
+
+| Finding | Sửa đổi |
+|---|---|
+| R1 | Prefix chỉ tạo logits cuối; feature extraction vẫn dùng đầy đủ hidden states, verifier giữ cả 16 logits. |
+| R2 | Feature/capture contract khóa target, drafter, layers, dtype/backend; downstream kiểm tra bundle, state, labels, teacher và checkpoint. |
+| R3 | Kiểm tra toàn bộ manifest trước slicing; từ chối ID/source/content trùng split và kiểm tra lại split/state links khi đọc artifact. |
+| R4 | Seed Python/Torch/CUDA trước khi khởi tạo model và memory; checkpoint ghi seed cùng cờ deterministic algorithms. |
+| R5 | Resume khóa input/model/config/caps/split/sampling; cho phép tăng sample cap, giữ manifest ban đầu và từ chối run thiếu index. |
+| R6 | Artifact filename giữ prefix dễ đọc cộng digest toàn identity cho feature, candidate và teacher. |
+| R7 | Checkpoint so fingerprint theo content/files; resolved path chỉ là provenance, không ảnh hưởng portability. |
+| R8 | Rollout và summary ghi ID/split, prompt/input/config/checkpoint hashes, run/workload identity và timing policy. |
+| R9 | Sửa TTFT/TPOT; tách prefill, projection, memory build/update, draft, verification; CUDA dùng events thay cho sync từng stage. |
+
+Thêm regression tests trên target/drafter tiny local thật, gồm capture/label,
+selector/compressor training và fixed-state/rollout ở FP32/BF16. Lần chạy
+suite cuối ghi **104 passed, 2 failed**: cả hai failure cùng chỉ ra launcher
+FA4 thiếu status check sau khi source shared runtime. Đã thêm status check và
+kiểm tra state index theo một lượt tuyến tính; không chạy lại suite sau hai
+điều chỉnh cuối này. Kết quả local không chứng minh throughput hoặc độ chính
+xác trên B200; các research gates ở trên vẫn mở.
+
+## Kiểm tra lại mức sẵn sàng train — 09/10/2026
+
+Đã chạy lại suite sau các sửa đổi cuối, bao gồm source/content split checks,
+state index và launcher FA4:
+
+```bash
+CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q \
+  tests/test_amr_dflash_regressions.py tests/test_amr_dflash_contracts.py \
+  tests/test_amr_dflash_launcher.py tests/test_dflash_wrapper_contract.py \
+  tests/test_master_config_contract.py tests/test_paired_reference.py \
+  tests/test_paired_output_capture.py tests/test_acceptance_metrics.py \
+  tests/test_b200_launcher_contract.py tests/test_b200_preflight_contract.py \
+  tests/test_shared_runtime_contract.py --tb=short
+```
+
+Kết quả: **106 passed, 1 warning, exit 0**, 87.52 giây. Warning liên quan
+driver CUDA local đã được ghi trong AGENTS.md; workload kiểm tra chạy trên CPU.
+Log tại `/tmp/amr_readiness_2026_10_09.log`. Kết quả này thay thế tình trạng
+104 passed / 2 failed trước khi sửa launcher. `py_compile` cho modules/CLI
+AMR, `bash -n` cho launcher và `git diff --check` cũng exit 0.
+
+Pipeline tiny với safetensors/tokenizer local thật đã chạy capture, candidate
+labeling, hai bước selector và compressor training, fixed-state evaluation
+và rollout bốn modes ở cả FP32/BF16. Selector training dùng preference fixture
+được kiểm soát; compressor dùng logits teacher từ verifier thật. Chưa có
+bằng chứng preference signal tự nhiên trên corpus production.
+
+**Mức sẵn sàng:** code V0 đủ cho train pilot. Trước khi mở run dài trên B200,
+cần preflight đúng target/drafter/data, capture/label với hợp đồng mới, xác
+nhận có train preferences không tie/censor và train teacher hợp lệ, rồi chạy
+20 bước mỗi phase để kiểm tra loss/gradient, VRAM và checkpoint trên server.
+Optimizer/RNG resume và validation định kỳ vẫn chưa có; các scientific gates
+giữ trạng thái mở.

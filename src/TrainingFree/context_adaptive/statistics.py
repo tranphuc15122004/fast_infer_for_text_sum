@@ -132,12 +132,10 @@ class AdaptiveStatistics:
         bucket = self.bucket(state)
         table = self.calibration.get("cost_priors", {})
         akey = action_key(action)
-        keys = (
-            f"{akey}::context={bucket['context']}::refresh={bucket['refresh']}",
-            f"{akey}::context={bucket['context']}::refresh=*",
-            f"{akey}::context=*::refresh={bucket['refresh']}",
-            f"{akey}::global",
-        )
+        # A draft/verification cost depends on the logical context and refresh
+        # path. Do not use short-context or global timing to price an unseen
+        # context bucket.
+        keys = (f"{akey}::context={bucket['context']}::refresh={bucket['refresh']}",)
         row = next(
             (
                 table[key]

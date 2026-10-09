@@ -8,6 +8,11 @@ checkpoint AMR đã fingerprint khi bật selector/compressor.
 
 ## Chuẩn bị trên B200
 
+Nếu đã có corpus ShareGPT/ArXiv regenerate, dùng `prepare-data` để tạo manifest
+giữ hội thoại nhiều lượt và split gốc, rồi capture/label supervision AMR mới.
+Lệnh pilot và các điều kiện kiểm tra nằm trong
+[hướng dẫn chuẩn bị dữ liệu train](../amr_dflash_training_data.md).
+
 Đặt `TARGET_MODEL`, `DRAFT_MODEL`, `DATA_INPUT` và `FI_DEVICE=cuda` trong master
 env ngoài repository. Model/tokenizer phải là snapshot local; không có bước
 tải model hoặc cài package từ Internet. Config mặc định nằm ở
@@ -54,6 +59,8 @@ khôi phục target cache một lần/state rồi crop về prefix sau từng ca
 Labels ghi accepted prefix, survival, tie/censor status và candidate proposal
 IDs. Với candidate tốt nhất chưa censor, lưu thêm target logits để train slot
 compressor. Dữ liệu tạm và feature bundle theo document nằm trong `outputs/`.
+Sau label, `training_signal.json` đếm preference/teacher hợp lệ theo split;
+train cần có cả train preferences và train uncensored teachers.
 
 Feature bundle khóa SHA-256 của cả target lẫn drafter tạo projection, feature
 layers, dtype và attention backend. Manifest ghi `capture_contract` version 2

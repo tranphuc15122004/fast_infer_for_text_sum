@@ -2,11 +2,11 @@
 
 ## Kết luận
 
-**Chưa sẵn sàng chạy matrix thực nghiệm lớn.** Rà soát phát hiện **10 vấn đề: 7 P1 và 3 P2**, được tái hiện bằng **14 ca thất bại trong 45 ca kiểm tra CPU**. Có 31 ca đạt, xác nhận một phần quan trọng của adapter và greedy verifier trên mô hình nhỏ. Những kết quả này chưa thay thế kiểm chứng checkpoint thật hoặc các gate G0–G6.
+**Đã sửa 10/10 vấn đề được rà soát; cả 45 ca hồi quy CPU hiện đạt.** Phần dưới lưu lại lỗi và bằng chứng từ lần kiểm tra ban đầu để giữ provenance. Chưa chạy parity với checkpoint/GPU thật, nên chưa mở matrix lớn và chưa coi phương pháp là baseline đã validated.
 
-P1 cần sửa trước khi mở matrix: lỗi chặn đường chạy, làm sai cấu hình/dữ liệu hoặc che giấu thất bại. P2 cần xử lý trước khi dùng kết quả để đánh giá contribution hay chốt heldout.
+Trong snapshot ban đầu, P1 chặn đường chạy hoặc có thể làm sai cấu hình/dữ liệu; P2 ảnh hưởng đánh giá contribution và độ an toàn của heldout. Cả 10 lỗi đó hiện đã được sửa theo bảng kết quả cuối tài liệu.
 
-Rà soát này không sửa implementation. Nó bổ sung bộ kiểm tra, bằng chứng và tài liệu; các thay đổi AMR DFlash đang có trong workspace không thuộc phạm vi rà soát.
+Lần kiểm tra ban đầu không sửa implementation. Đợt khắc phục tiếp theo đã sửa code, thêm regression suite vào `tests/` và cập nhật trạng thái bên dưới. Các thay đổi AMR DFlash trong workspace không thuộc phạm vi.
 
 ## Phạm vi và bằng chứng
 
@@ -21,16 +21,16 @@ Artifact nằm trong [`outputs/context_adaptive_dflash/implementation_review_202
 
 | Artifact | Nội dung |
 |---|---|
-| [test_review.py](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/test_review.py) | Bộ kiểm tra 45 ca có thể chạy lại |
-| [cpu_review_full.log](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/cpu_review_full.log) | Traceback và kết quả toàn bộ |
-| [cpu_review_full.xml](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/cpu_review_full.xml) | JUnit từng ca |
-| [review_evidence.json](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/review_evidence.json) | Runtime, số ca, snapshot nguồn và giới hạn kiểm chứng |
+| [test_context_adaptive_dflash_regressions.py](../../../../tests/test_context_adaptive_dflash_regressions.py) | Regression suite hiện tại, 45 ca |
+| [cpu_review_full.log](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/cpu_review_full.log) | Lần kiểm tra ban đầu: 14 ca thất bại |
+| [cpu_review_fixed.xml](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/cpu_review_fixed.xml) | JUnit sau sửa: 56 ca đạt, gồm 45 ca hồi quy |
+| [review_evidence.json](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/review_evidence.json) | Bằng chứng ban đầu và cập nhật kiểm chứng sau sửa |
 | [source_snapshot.json](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/source_snapshot.json) | SHA256 nguồn và Git HEAD; workspace đang có thay đổi chưa commit |
-| [real_prepare/prepare_manifest.json](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/real_prepare/prepare_manifest.json) | Prepare trên corpus LongBench đang có |
+| [real_prepare_after_fix/prepare_manifest.json](../../../../outputs/context_adaptive_dflash/implementation_review_20261008/real_prepare_after_fix/prepare_manifest.json) | Prepare sau sửa trên corpus LongBench đang có |
 
 Các artifact này chỉ tồn tại tại workspace đã rà soát, không được commit cùng tài liệu. Khi chia sẻ báo cáo, cần giữ kèm bộ kiểm tra/log và snapshot.
 
-## Các vấn đề theo mức ưu tiên
+## Các vấn đề theo mức ưu tiên trong lần rà soát ban đầu
 
 | ID | Mức | Vấn đề | Ca thất bại |
 |---|---|---|---:|
@@ -186,24 +186,31 @@ Prepare metadata trên `data/longbench_100_14k` thành công: **500 records, 420
 
 Chưa kiểm chứng: nạp checkpoint thật, parity trên backend GPU production, CUDA timing/memory, E2E speedup, ROUGE thực, sampling distribution audit hoặc G0–G6. Các ca rollout ở đây kiểm tra fixed sparse pairs và refresh; không chứng minh chất lượng quyết định của joint controller trên workload thật.
 
-## Chạy lại và thứ tự xử lý
+## Kết quả khắc phục
 
-Từ repo root trên máy local CPU:
+| ID | Sửa đổi |
+|---|---|
+| F1 | Preflight/runtime xác nhận `num_target_layers` bằng depth của target; feature layer IDs cần duy nhất và nằm trong range. |
+| F2 | `generate_target_only` hoàn tất các trường round bắt buộc trước khi trả kết quả. |
+| F3 | Sampling flatten các chiều batch/block về `[N, vocab]`, sample theo hàng rồi khôi phục shape. |
+| F4 | Runner resolve phase cuối cùng từ CAD, SMOKE/FULL và CLI; chỉ thêm sample cap mặc định cho smoke. |
+| F5 | Runner đồng bộ canonical caller overrides sang alias sau khi nạp master, giữ alias caller đặt rõ ràng. |
+| F6 | Resume/completion/error/pruning dùng khóa `(dataset, sample_id, repetition)`. |
+| F7 | Sau khi ghi summary, phase trả exit code 1 nếu có repetition chưa hoàn chỉnh. |
+| F8 | Cost lookup chỉ dùng đúng context bucket và refresh mode đã profile; thiếu support trả `None`. |
+| F9 | Report thêm paired comparisons: DFlash full→A-only/B-only và best fixed/independent→joint. |
+| F10 | Split giữ raw ID theo dataset; exposure raw ID được resolve theo namespace. Raw ID mơ hồ không có dataset bảo vệ mọi bản ghi trùng. |
+
+Kiểm chứng sau sửa: bộ hồi quy **45 passed**, master-config contract **10 passed**, DFlash wrapper contract **1 passed** (**56 passed tổng cộng**); `bash -n` và `git diff --check` đạt. Phase prepare trên corpus LongBench tạo manifest complete với 500 records và 420 source groups.
+
+Mười exposure IDs trong probe manifest vẫn unresolved trên corpus 500 records. Đây không phải bằng chứng leakage; ID không khớp pool hiện tại cần được phân loại trước khi khóa heldout.
+
+Từ repo root, chạy lại CPU suite bằng:
 
 ```bash
 CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  .venv/bin/python -m pytest \
-  outputs/context_adaptive_dflash/implementation_review_20261008/test_review.py \
-  -q --tb=short \
-  --junitxml=outputs/context_adaptive_dflash/implementation_review_20261008/cpu_review_rerun.xml
+  .venv/bin/python -m pytest tests/test_context_adaptive_dflash_regressions.py \
+  -q --tb=short
 ```
 
-Ở snapshot được rà soát, exit code dự kiến là 1 vì 14 ca đang thất bại. Bộ kiểm tra hiện có đường dẫn repo local cố định ở biến `ROOT`; khi chuyển sang workspace khác cần cập nhật biến này. Không cài profile server lên local và không cần tải model.
-
-Thứ tự xử lý đề nghị:
-
-1. Sửa F1/F2/F3 và chạy lại preflight, AR pipeline, block sampling fixtures.
-2. Sửa F4/F5/F6/F7; yêu cầu argv đúng, resume đầy đủ mọi dataset và phase lỗi trả nonzero.
-3. Sửa F8/F9/F10 trước calibration/lock/heldout để chi phí, comparisons và exposure đúng contract.
-4. Chạy lại toàn bộ CPU suite rồi G0/G1/G2 trên checkpoint và GPU server thật. Chỉ mở matrix lớn sau khi có bằng chứng tương ứng; G3–G6 vẫn cần thực nghiệm theo protocol.
-
+Parity với checkpoint thật, backend/kernel GPU, CUDA timing/memory và G0–G6 vẫn chưa được kiểm chứng. Bước tiếp theo là preflight bằng snapshot production rồi chạy G0/G1/G2 trên GPU server; chỉ sau đó mới mở matrix lớn. G3–G6 cần kết quả thực nghiệm theo protocol.

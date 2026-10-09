@@ -1,6 +1,6 @@
 # Protocol thực nghiệm Context-Adaptive DFlash
 
-Ngày: **2026-10-08**. Trạng thái: **protocol thực nghiệm cho executor đã có; G0–G6 còn pending**. [Thiết kế](design.md), [measurement contract](measurement_contract.md), [runbook](runbook.md).
+Ngày: **2026-10-09**. Trạng thái: **protocol cho executor đã có; G0–G6 còn pending**. [Thiết kế](design.md), [measurement contract](measurement_contract.md), [runbook](runbook.md), [ma trận và exposure audit](experiment_matrix.md), [GPU validation](gpu_validation.md), [mẫu báo cáo](results_template.md).
 
 ## 1. Research questions và evidence
 
@@ -31,6 +31,8 @@ Primary canonical: `data/longbench_100_14k/{gov_report,qmsum,multi_news}.jsonl`;
 
 QMSum có nhiều query trên cùng conversation; không split/CI theo query như independent documents. `lcc`/`repobench-p` chỉ secondary generalization, không trộn vào summarization headline.
 
+CLI chưa có dataset filter, đọc mọi JSONL trong data-dir. Runbook stage chỉ ba primary files; không dùng trực tiếp thư mục năm datasets cho headline.
+
 Quy tắc source grouping:
 
 ```python
@@ -51,7 +53,7 @@ Sau global grouping, mỗi group thuộc allocation stratum là dataset có tên
 
 Exposure registry nhập các cohort đã phân tích từ artifact source manifests, map cả source index và context fingerprint. Cohort DFlash 10 GovReport ngày 2026-10-06 có manifest tại `outputs/dflash_attention_probe/dflash-attention-fullmass-govreport10-l40s-20261006/manifest.json`; IDs có thể khác canonical nên resolve qua `data/longbench_200/gov_report.jsonl` và source metadata. Những group đã phát triển ý tưởng phải ở dev/exploratory, không ở untouched test. Nếu provenance không đủ để đối soát, không claim test chưa từng quan sát.
 
-Khóa `split_manifest.json`: file hashes, mapping group→split, IDs, exposed registry và lý do loại. Không tự tạo synthetic docs để đủ quota; không có đủ nhóm thì báo `insufficient_data`. Chưa chạy build split hoặc khóa cohort trong lần hoàn thiện tài liệu này.
+Khóa `split_manifest.json`: file hashes, mapping group→split, IDs, exposed registry và lý do loại. Không tạo synthetic docs để đủ quota; thiếu nhóm báo `insufficient_data`. Prepare CPU ngày 2026-10-08 trên cả năm datasets đã có 500 records/420 groups, nhưng 10 exposure IDs còn unresolved; chưa có primary split được audit cho heldout. Đối soát theo matrix; CLI không tự fail vì unresolved IDs. Chỉ claim untouched test sau khi mọi exposure có mapping dev hoặc evidence absent xác minh được.
 
 ## 4. Natural summarization và scaling
 
@@ -70,6 +72,7 @@ Các ngưỡng speedup dưới đây là **tiêu chí nghiên cứu mặc địn
 - G0: local asset signatures, source mapping, shapes, backend, collector capability và static schema checks đều hợp lệ.
 - CPU: fixtures cho budget/protection, position math, prefix censoring, entropy, statistics và toy sampling; không benchmark GPU local.
 - GPU smoke: 2 dev source groups/dataset, một query/group, tối đa 32 output tokens.
+- Phase smoke chưa tự lọc dev bằng manifest; phải truyền dev-only corpus xuất theo runbook. Smoke exit 0 chưa thay tensor/vendored/cache parity harness.
 - G1: full adapter khớp vendored DFlash và greedy AR; target KV invariant không violation, EOS/cap accounting đúng. Chạy gamma 3/7/11/15 và gamma 0; unsupported shape được loại trước grid.
 - Correctness expansion trước rollout lớn: ít nhất 20 dev source groups tổng (8 GovReport, 8 Multi-News, 4 QMSum nếu pool cho phép), cap 256. Không có mismatch hoặc cache corruption.
 
@@ -88,6 +91,7 @@ Các ngưỡng speedup dưới đây là **tiêu chí nghiên cứu mặc địn
 - Sweep fixed gamma đã hỗ trợ; chọn best fixed gamma bằng mean log E2E speedup trên dev, giữ cùng output scope.
 - So history-only cost policy; entropy-threshold policy; entropy+history cost policy. Các policy cùng prior/cost accounting; threshold theo calibration quartiles, không theo token entropy sau verify của current block.
 - History-only dùng action-global statistics + request EMA, không entropy bins. Entropy-threshold chọn gamma lớn/giữa/nhỏ theo calibration quartiles, phải ghi mapping cụ thể trước chạy; default bins 1/2→15, bin3→7, bin4→3.
+- V1 có `b_only_history` và `b_only_entropy` cost policies; entropy-threshold chưa có variant CLI, là diagnostic extension cần harness trước khi đưa vào comparison. Không relabel cost policy thành threshold policy.
 - Phân tích `parent_entropy` và accepted length ở unseen dev groups, theo gamma/block position/context bucket. Token-level entropy sau verification là phân tích riêng.
 - Đánh giá discrimination/calibration của predicted prefix survival và cost regret trên counterfactual states; bootstrap theo document. Không gộp rounds độc lập để phóng đại significance.
 - G4: B cost policy đạt >=1.03 paired E2E speedup so best fixed gamma, CI lower >1; entropy+history cải thiện so history-only để giữ entropy trong contribution.
@@ -107,7 +111,8 @@ Các ngưỡng speedup dưới đây là **tiêu chí nghiên cứu mặc địn
 
 - Khóa selector/layer/refresh, protection, budgets/gammas, priors/cutpoints, margin, fallback và reporting trước test.
 - Calibration priors reset mỗi request; không dùng test outcomes của request trước để cải thiện request sau trong primary matrix.
-- 3 timed repetitions/request/variant, warmup 3 requests ngoài measured set; order variants shuffle seed 42/43/44, cùng data IDs mỗi repetition.
+- V1: 3 timed repetitions/request/variant; warmup 3 lần trên selected cohort, cap 16, ngoài measured artifacts/timing, fresh request cache/statistics. Warmup này chưa phủ mọi shape/bucket; diagnostic shape warmup bổ sung phải khai báo và áp dụng cùng controls.
+- Shuffle thứ tự variant blocks seed 42, lưu schedule trước chạy; mỗi block chạy repetitions RNG seeds 42/43/44 trên cùng data IDs. CLI chưa interleave/shuffle variants theo từng repetition; nếu dùng scheduler riêng phải đăng ký và ghi đúng chế độ, không coi RNG seeds là order seeds.
 - G6: đủ toàn bộ locked cells, không missing/error/mismatch bị âm thầm loại; exactness checks pass và paired 95% CI được báo. Chưa đủ coverage thì report partial, chưa có headline claim.
 - Chạy sampling correctness audit riêng với toy exact enumeration và ít nhất 10.000 independent draws cho toy states; ngưỡng kiểm định và multiple-comparison correction khóa trước audit. Exactness dựa trên algorithm proof + implementation audit, empirical test không tự chứng minh equality tuyệt đối.
 
@@ -145,5 +150,7 @@ SpecExtend/SparseSpec-L là external context baselines nếu có matched checkpo
 ## 8. Deliverable của mỗi milestone
 
 M0: preflight/correctness report. M1: intervention trace + real A rollout + G3 decision. M2: entropy/history analysis + B rollout + G4 decision. M3: action surfaces + joint/independent comparison + G5 decision. M4: locked manifests + completed heldout request/round streams + G6 report.
+
+Reporter kiểm comparison validity/paired coverage, chưa tự enforce ngưỡng G3–G5 hoặc biết một planned variant hoàn toàn chưa chạy. Lock tạo candidate config từ valid dev comparison, chưa tự xác nhận G0–G5. Reviewer đối chiếu full planned cohort/cells, ngưỡng, parity và exposure theo matrix trước heldout.
 
 Trạng thái ban đầu của **mọi gate G0–G6 là pending** đối với executor mới. Dataset metadata inspection và prior attention reports không thay các gate này.

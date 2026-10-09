@@ -24,7 +24,10 @@ def _sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     if temperature <= 0:
         return torch.argmax(logits, dim=-1)
     probabilities = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+    leading_shape = probabilities.shape[:-1]
+    flat_probabilities = probabilities.reshape(-1, probabilities.shape[-1])
+    samples = torch.multinomial(flat_probabilities, num_samples=1).squeeze(-1)
+    return samples.reshape(leading_shape)
 
 
 def _feature_rows(hidden_states: Sequence[torch.Tensor], layer_ids: Sequence[int]) -> torch.Tensor:
@@ -1170,6 +1173,15 @@ def generate_target_only(
         "output_accounting_valid": processed + final_pending == output_count,
         "peak_memory_gib": torch.cuda.max_memory_allocated(input_ids.device) / (2**30) if torch.cuda.is_available() else None,
     }
+    _complete_round_schema(
+        rounds,
+        run_id="target-only",
+        sample_id="sample",
+        dataset="unknown",
+        split="unknown",
+        variant="ar",
+        repetition=0,
+    )
     return GenerationResult(
         output_ids=torch.tensor(generated, dtype=torch.long, device=input_ids.device),
         output_tokens=output_count, rounds=rounds, counters=counters, timings=timings,

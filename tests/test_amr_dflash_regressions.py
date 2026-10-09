@@ -115,6 +115,49 @@ def test_prefill_projects_only_one_logit_row_but_preserves_all_features(assets):
         handle.remove()
 
 
+def test_regenerated_multiturn_manifest_reaches_real_capture_and_verifier_labels(assets, tmp_path, monkeypatch):
+    from transformers import AutoTokenizer
+    from AMR_DFlash.training_data import prepare_manifest
+
+    config, asset_root = assets
+    target_path = tmp_path / "target-with-chat"
+    shutil.copytree(asset_root / "target", target_path)
+    tokenizer = AutoTokenizer.from_pretrained(target_path, local_files_only=True)
+    tokenizer.chat_template = (
+        "{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\n' }}"
+        "{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}"
+    )
+    tokenizer.save_pretrained(target_path)
+    monkeypatch.setenv("TARGET_MODEL", str(target_path))
+    inputs = {}
+    for split, context in (("train", "a b c"), ("validation", "d e f")):
+        inputs[split] = [write_jsonl(tmp_path / f"{split}.jsonl", [{
+            "id": split, "source": "sharegpt",
+            "conversations": [{"role": "user", "content": context},
+                              {"role": "assistant", "content": "b c d"},
+                              {"role": "user", "content": "e f a b c"},
+                              {"role": "assistant", "content": "SHOULD NOT ENTER PROMPT"}],
+        }])]
+    prepared = prepare_manifest(inputs=inputs, output_dir=tmp_path / "prepared",
+                                tokenizer_path=target_path, min_input_tokens=5,
+                                max_input_tokens=24, progress=False)
+    run = tmp_path / "capture"
+    capture(config, run, prepared["manifest"], max_input_tokens=24)
+    documents = read_jsonl(run / "documents.jsonl")
+    assert len(documents) == 2
+    for sample, document in zip(pipeline.read_records_for_pipeline(Path(prepared["manifest"]), max_samples=None), documents):
+        rendered, ids = pipeline._tokenize_prompt(tokenizer, sample, max_input_tokens=24)
+        bundle = load_torch(run / document["bundle"])
+        assert "SHOULD NOT ENTER PROMPT" not in rendered
+        assert "assistant: b c d" in rendered
+        assert torch.equal(bundle["trajectory_ids"][:ids.shape[1]], ids[0])
+        assert document["source_content_sha256"] == pipeline._source_content_hash(sample["raw"], rendered)
+    pipeline.generate_candidates_for_run(config, run_root=run)
+    report = pipeline.label_candidates(config, run_root=run, device=CPU)
+    assert report["training_signal"]["by_split"]["train"]["uncensored_teacher_rows"] > 0
+    assert (run / "training_signal.json").is_file()
+
+
 @pytest.mark.parametrize("field,value", [("draft_fingerprint", {"sha256": "changed"}),
                                          ("dtype", "bfloat16"), ("attention_backend", "eager")])
 def test_feature_bank_rejects_changed_projection_or_execution_contract(captured, field, value):

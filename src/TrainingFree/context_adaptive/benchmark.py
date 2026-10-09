@@ -50,12 +50,32 @@ def split_records(samples: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         raw = sample.get("raw") or {}
         rows.append({
             "id": str(sample["_cad_record_key"]),
+            "sample_id": str(sample.get("id", "")),
             "dataset": str(sample.get("dataset", "unknown")),
             "context": str(raw.get("context") or ""),
             "source_split": str(raw.get("source_split", "unknown")),
             "source_index": str(raw.get("source_index", raw.get("document_id", sample.get("id")))),
         })
     return rows
+
+
+def validate_dflash_target_layers(
+    target_layer_ids: Sequence[int],
+    *,
+    target_hidden_layers: int,
+    draft_num_target_layers: int,
+) -> None:
+    """Validate the target depth and the drafter's selected feature layers."""
+    target_depth = int(target_hidden_layers)
+    if int(draft_num_target_layers) != target_depth:
+        raise ValueError("DFlash num_target_layers does not match target num_hidden_layers")
+    if not target_layer_ids or any(
+        not isinstance(layer, int) or layer < 0 or layer >= target_depth
+        for layer in target_layer_ids
+    ):
+        raise ValueError("DFlash target_layer_ids are outside the target model")
+    if len(set(target_layer_ids)) != len(target_layer_ids):
+        raise ValueError("DFlash target_layer_ids must be unique")
 
 
 def select_split(
@@ -245,12 +265,11 @@ def load_runtime(target_path: str, draft_path: str | None, *, load_draft: bool =
             raise ValueError("target and DFlash vocabulary sizes differ")
         if int(draft.config.hidden_size) != int(target.config.hidden_size):
             raise ValueError("target and DFlash hidden sizes differ")
-        if (
-            len(draft.target_layer_ids) != int(draft.config.num_target_layers)
-            or len(set(draft.target_layer_ids)) != len(draft.target_layer_ids)
-            or any(int(layer) < 0 or int(layer) >= int(target.config.num_hidden_layers) for layer in draft.target_layer_ids)
-        ):
-            raise ValueError("DFlash target_layer_ids are incompatible with target checkpoint")
+        validate_dflash_target_layers(
+            draft.target_layer_ids,
+            target_hidden_layers=target.config.num_hidden_layers,
+            draft_num_target_layers=draft.config.num_target_layers,
+        )
         if int(draft.block_size) < 2:
             raise ValueError("DFlash checkpoint block_size must be at least 2")
     else:

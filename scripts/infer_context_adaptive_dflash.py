@@ -17,7 +17,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -256,7 +256,11 @@ def _prepare(args: argparse.Namespace, output_root: Path, source_paths: list[Pat
 
 
 def _preflight(args: argparse.Namespace, output_root: Path, source_paths: list[Path], split_path: Path | None) -> int:
-    from TrainingFree.context_adaptive.benchmark import load_corpus, validate_rotary_compatibility
+    from TrainingFree.context_adaptive.benchmark import (
+        load_corpus,
+        validate_dflash_target_layers,
+        validate_rotary_compatibility,
+    )
     from TrainingFree.context_adaptive.schema import atomic_json, sha256_file
 
     data_file, data_dir, _ = _data_source(args)
@@ -319,10 +323,11 @@ def _preflight(args: argparse.Namespace, output_root: Path, source_paths: list[P
             raise ValueError("target and DFlash vocab sizes differ")
         if checks["target_hidden_size"] != checks["draft_hidden_size"]:
             raise ValueError("DFlash and target hidden sizes differ")
-        if not target_layer_ids or any(not isinstance(layer, int) or layer < 0 or layer >= checks["target_hidden_layers"] for layer in target_layer_ids):
-            raise ValueError("DFlash target_layer_ids are outside the target model")
-        if len(target_layer_ids) != int(draft_config.num_target_layers) or len(set(target_layer_ids)) != len(target_layer_ids):
-            raise ValueError("DFlash target_layer_ids must be unique and match num_target_layers")
+        validate_dflash_target_layers(
+            target_layer_ids,
+            target_hidden_layers=checks["target_hidden_layers"],
+            draft_num_target_layers=draft_config.num_target_layers,
+        )
         mask_token_id = dflash.get("mask_token_id")
         if not isinstance(mask_token_id, int) or not 0 <= mask_token_id < checks["target_vocab_size"]:
             raise ValueError("DFlash mask_token_id is missing or outside the shared vocabulary")
@@ -489,7 +494,15 @@ def _error_record(sample: dict[str, Any], variant: str, run_id: str, repetition:
     }
 
 
-def _stream_prepare(path: Path, *, resume: bool, config_hash: str, retry_errors: bool = True) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
+def _request_key(row: Mapping[str, Any]) -> tuple[str, str, int]:
+    return (
+        str(row.get("dataset", "unknown")),
+        str(row.get("sample_id", "")),
+        int(row.get("repetition", 0)),
+    )
+
+
+def _stream_prepare(path: Path, *, resume: bool, config_hash: str, retry_errors: bool = True) -> tuple[set[tuple[str, str, int]], list[dict[str, Any]]]:
     from TrainingFree.context_adaptive.schema import atomic_json, read_jsonl
 
     if not path.exists():
@@ -501,17 +514,13 @@ def _stream_prepare(path: Path, *, resume: bool, config_hash: str, retry_errors:
     for row in data_rows:
         if row.get("config_hash") not in {None, config_hash}:
             raise ValueError(f"resume configuration mismatch in {path}")
-    failed_keys = {
-        (str(row.get("sample_id")), int(row.get("repetition", 0)))
-        for row in data_rows if row.get("type") == "error"
-    }
     if retry_errors:
         data_rows = [row for row in data_rows if row.get("type") != "error"]
     # JsonlWriter is append-only; remove an old summary while keeping verified rows.
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in data_rows), encoding="utf-8")
     completed = {
-        (str(row.get("sample_id")), int(row.get("repetition", 0)))
+        _request_key(row)
         for row in data_rows if row.get("type") == "sample" and row.get("status") == "ok"
     }
     return completed, data_rows
@@ -865,6 +874,7 @@ def _run_model_phase(args: argparse.Namespace, phase: str, variant: str, output_
                     stop_token_ids=() if args.fixed_output_tokens is not None else None,
                 )
             print(f"[{phase} warmup {warmup + 1}/{warmups}] complete", flush=True)
+    phase_exit_code = 0
     for repetition in range(repetitions):
         rep_root = cell_root / f"rep_{repetition}"
         rep_root.mkdir(parents=True, exist_ok=True)
@@ -885,7 +895,7 @@ def _run_model_phase(args: argparse.Namespace, phase: str, variant: str, output_
         token_writer = io_util.JsonlWriter(token_path)
         rep_rows = list(existing)
         for sample_index, sample in enumerate(selected):
-            key = (str(sample["id"]), repetition)
+            key = (str(sample["dataset"]), str(sample["id"]), repetition)
             if key in completed:
                 continue
             try:
@@ -1015,16 +1025,18 @@ def _run_model_phase(args: argparse.Namespace, phase: str, variant: str, output_
             "status": summary["status"], "request_count": len(success_rows),
             "output_scope": summary["output_scope"],
         })
-    return 0
+        if summary["status"] != "complete":
+            phase_exit_code = 1
+    return phase_exit_code
 
 
-def _prune_request_artifact(path: Path, completed: set[tuple[str, int]]) -> None:
+def _prune_request_artifact(path: Path, completed: set[tuple[str, str, int]]) -> None:
     from TrainingFree.context_adaptive.schema import read_jsonl
     rows = read_jsonl(path)
     kept = [
         row for row in rows
         if row.get("type") != "summary"
-        and (str(row.get("sample_id")), int(row.get("repetition", 0))) in completed
+        and _request_key(row) in completed
     ]
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in kept), encoding="utf-8")
 

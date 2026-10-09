@@ -10,6 +10,13 @@ Ngày: **08/10/2026**. V0 code, launcher và CPU synthetic contracts đã có; m
 - `.venv/bin/python -m py_compile src/AMR_DFlash/*.py scripts/amr_dflash/cli.py scripts/infer_amr_dflash.py scripts/check_amr_dflash_b200.py`: syntax check đã pass ở revision trước; cần chạy lại sau thay đổi cuối.
 - Chưa có bằng chứng từ Qwen3-4B/DFlash checkpoint thật, CUDA/B200, runtime latency, fitted AMR checkpoint hoặc scientific gain.
 
+Cập nhật **09/10/2026**: suite AMR/regression/launcher/runtime/paired metrics
+đã chạy lại sau sửa cuối, **106 passed**, exit 0. Pipeline tiny FP32/BF16 có
+capture/label, hai bước mỗi phase train và fixed-state/rollout evaluation;
+selector dùng preference fixture được kiểm soát, teacher logits được label
+bằng verifier thật. Syntax checks hiện hành cũng pass. Chi tiết command và
+phạm vi bằng chứng tại [review](../../../docs/reviews/2026-10-08_amr_dflash_implementation_review.md).
+
 Test synthetic không thay thế checklist B200 bên dưới; các mục giữ unchecked tới khi có artifact của đúng model/data/config.
 
 ## M0 — Interface và correctness

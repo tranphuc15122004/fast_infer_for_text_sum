@@ -199,19 +199,33 @@ def build_report(
         if row.get("type") in {"sample", "error"} and row.get("variant")
     })
     baseline = "ar" if "ar" in variants else None
-    comparisons = []
+    comparison_pairs: list[tuple[str, str]] = []
     if baseline:
-        comparisons = [
-            paired_comparison(
-                rows,
-                baseline_variant=baseline,
-                candidate_variant=variant,
-                bootstrap_samples=bootstrap_samples,
-                expected_requests=expected_requests,
-            )
-            for variant in variants
-            if variant != baseline
-        ]
+        comparison_pairs.extend((baseline, variant) for variant in variants if variant != baseline)
+    # Primary ablations required to attribute gains to context selection,
+    # block-length adaptation, and joint interaction (experiment protocol G3-G5).
+    protocol_pairs = (
+        ("dflash_full_fixed", "a_only"),
+        ("dflash_full_fixed", "b_only_history"),
+        ("dflash_full_fixed", "b_only_entropy"),
+        ("best_fixed_pair", "joint"),
+        ("independent_ab", "joint"),
+    )
+    for baseline_variant, candidate_variant in protocol_pairs:
+        if baseline_variant in variants and candidate_variant in variants:
+            pair = (baseline_variant, candidate_variant)
+            if pair not in comparison_pairs:
+                comparison_pairs.append(pair)
+    comparisons = [
+        paired_comparison(
+            rows,
+            baseline_variant=baseline_variant,
+            candidate_variant=candidate_variant,
+            bootstrap_samples=bootstrap_samples,
+            expected_requests=expected_requests,
+        )
+        for baseline_variant, candidate_variant in comparison_pairs
+    ]
     summaries: dict[str, Any] = {}
     for variant in variants:
         success = [row for row in rows if row.get("type") == "sample" and row.get("variant") == variant and row.get("status") == "ok"]

@@ -38,6 +38,8 @@ from AMR_DFlash.pipeline import (  # noqa: E402
     validate_document_records,
 )
 from AMR_DFlash.runtime import load_runtime  # noqa: E402
+from AMR_DFlash.prompts import PROMPT_POLICY  # noqa: E402
+from AMR_DFlash.training_data import prepare_manifest  # noqa: E402
 
 
 DEFAULT_CONFIG = ROOT / "src" / "AMR_DFlash" / "configs" / "pilot.yaml"
@@ -51,6 +53,20 @@ def _parser() -> argparse.ArgumentParser:
 
     preflight = subparsers.add_parser("preflight", help="check offline model assets and runtime")
     preflight.add_argument("--require-b200", action="store_true")
+
+    prepare = subparsers.add_parser("prepare-data", help="convert regenerated ShareGPT/ArXiv into an AMR pilot manifest")
+    prepare.add_argument("--train-input", action="append", required=True)
+    prepare.add_argument("--validation-input", action="append", required=True)
+    prepare.add_argument("--holdout-input", action="append", default=[])
+    prepare.add_argument("--tokenizer-path")
+    prepare.add_argument("--output-dir", required=True)
+    prepare.add_argument("--train-samples", type=int, default=200)
+    prepare.add_argument("--validation-samples", type=int, default=50)
+    prepare.add_argument("--holdout-samples", type=int, default=0)
+    prepare.add_argument("--min-input-tokens", type=int, default=4097)
+    prepare.add_argument("--max-input-tokens", type=int, default=16384)
+    prepare.add_argument("--seed", type=int, default=17)
+    prepare.add_argument("--resume", action="store_true")
 
     capture = subparsers.add_parser("capture", help="capture target features and verifier-consistent states")
     _add_data_args(capture)
@@ -256,7 +272,7 @@ def _run_inference(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
         "dtype": metadata["dtype"], "attention_backend": metadata["attention_backend"],
         "max_input_tokens": max_input_tokens, "max_new_tokens": max_new_tokens,
         "split": args.split, "max_samples": max_samples, "temperature": 0.0, "batch_size": 1,
-        "prompt_policy": "chat_template_no_thinking_or_longbench_v1",
+        "prompt_policy": PROMPT_POLICY,
     }
     run_config = {**workload, "mode": mode, "use_cost_gate": engine.use_cost_gate,
                   "model_metadata": contract_identity(metadata),
@@ -468,7 +484,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preflight":
         _preflight(config, args.device, require_b200=args.require_b200)
         return 0
-    if args.command == "capture":
+    if args.command == "prepare-data":
+        result = prepare_manifest(
+            inputs={"train": args.train_input, "validation": args.validation_input, "holdout": args.holdout_input},
+            output_dir=args.output_dir,
+            tokenizer_path=args.tokenizer_path or resolve_env_path(config, "target_model_env"),
+            limits={"train": args.train_samples, "validation": args.validation_samples, "holdout": args.holdout_samples},
+            min_input_tokens=args.min_input_tokens, max_input_tokens=args.max_input_tokens,
+            seed=args.seed, resume=args.resume,
+        )
+    elif args.command == "capture":
         result = capture_run(
             config,
             input_path=args.input,

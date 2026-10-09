@@ -54,6 +54,7 @@ def build_split_manifest(
     provenance_to_rows: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     raw_hash_to_rows: dict[str, list[int]] = defaultdict(list)
     ids_to_rows: dict[str, list[int]] = defaultdict(list)
+    dataset_sample_ids_to_rows: dict[tuple[str, str], list[int]] = defaultdict(list)
     rows = list(records)
     for index, row in enumerate(rows):
         context = str(row.get("context") or "")
@@ -73,6 +74,7 @@ def build_split_manifest(
             fingerprint_to_rows[fingerprint].append(index)
         provenance_to_rows[(dataset, source_split, source_index)].append(index)
         ids_to_rows[str(row.get("id", ""))].append(index)
+        dataset_sample_ids_to_rows[(dataset, str(row.get("sample_id", row.get("id", ""))))].append(index)
 
     parent = list(range(len(rows)))
 
@@ -95,27 +97,45 @@ def build_split_manifest(
     fingerprints, exposed_raw_hashes, exposed_samples = _exposure_values(exposures)
     exposed_ids: set[str] = set()
     resolved_exposure_ids: set[str] = set()
+    exposed_rows: set[int] = set()
     for sample in exposed_samples:
         if not isinstance(sample, Mapping):
             continue
         sample_id = sample.get("sample_id", sample.get("id"))
         if sample_id is not None:
-            exposed_ids.add(str(sample_id))
-            if str(sample_id) in ids_to_rows:
-                resolved_exposure_ids.add(str(sample_id))
+            sample_id = str(sample_id)
+            exposed_ids.add(sample_id)
+            # Accept already namespaced IDs and raw probe IDs. If a raw ID has
+            # no dataset attached, protect every matching corpus row so an
+            # ambiguous ID cannot leave an exposed source in heldout test.
+            exact_matches = ids_to_rows.get(sample_id, ())
+            if exact_matches:
+                exposed_rows.update(exact_matches)
+                resolved_exposure_ids.add(sample_id)
+            else:
+                dataset = sample.get("dataset")
+                if dataset is not None:
+                    matches = dataset_sample_ids_to_rows.get((str(dataset), sample_id), ())
+                else:
+                    matches = [
+                        index
+                        for (candidate_dataset, candidate_id), indexes in dataset_sample_ids_to_rows.items()
+                        if candidate_id == sample_id
+                        for index in indexes
+                    ]
+                if matches:
+                    exposed_rows.update(matches)
+                    resolved_exposure_ids.add(sample_id)
         source_hash = sample.get("source_sha256") or sample.get("context_sha256")
         if source_hash:
             exposed_raw_hashes.add(str(source_hash))
             if str(source_hash) in raw_hash_to_rows:
                 resolved_exposure_ids.add(str(sample_id)) if sample_id is not None else None
 
-    exposed_rows: set[int] = set()
     for fingerprint in fingerprints:
         exposed_rows.update(fingerprint_to_rows.get(fingerprint, ()))
     for raw_hash in exposed_raw_hashes:
         exposed_rows.update(raw_hash_to_rows.get(raw_hash, ()))
-    for sample_id in exposed_ids:
-        exposed_rows.update(ids_to_rows.get(sample_id, ()))
 
     grouped: dict[int, list[int]] = defaultdict(list)
     for index in range(len(rows)):

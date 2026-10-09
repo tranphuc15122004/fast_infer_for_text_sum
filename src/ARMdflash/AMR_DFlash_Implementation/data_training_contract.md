@@ -6,6 +6,14 @@ Ngày: **08/10/2026**. Trạng thái: **pipeline V0 đã có code và CPU contra
 
 ## 1. Pipeline và artifact
 
+Với corpus MR-DFlash đã regenerate, `prepare-data` tạo manifest prompt AMR:
+giữ lịch sử trước lượt assistant cuối, dùng structured `messages` để áp dụng
+chat template một lần, giữ split nguồn và chọn mẫu dài theo tokenizer target.
+Human reference ArXiv được giữ riêng; generated response không vào prompt
+hay reference. Xem [quy trình pilot trên B200](../../../docs/amr_dflash_training_data.md).
+Cache hidden MR chưa có importer trực tiếp; feature/state/preference/teacher
+AMR được tạo mới qua capture và verifier labeling.
+
 ~~~text
 Document manifest đã khóa split
   → target greedy trajectory + state snapshots
@@ -29,6 +37,7 @@ candidates.jsonl
 candidate_labels.jsonl
 preferences.jsonl
 teacher/<state-id>.pt
+training_signal.json
 train_selector.jsonl
 train_compressor.jsonl
 resource_ledger.json
@@ -64,6 +73,11 @@ khóa hash của `candidate_labels.jsonl`. Các pha kiểm tra state/document/sp
 và hợp đồng artifact trước khi dùng dữ liệu. Teacher còn khóa state/candidate,
 feature contract và proposal history. Model/checkpoint được chuyển mount nếu
 file hashes/config giữ nguyên; `resolved_path` chỉ là provenance.
+
+Prompt policy hiện là `chat_template_no_thinking_or_longbench_messages_v2`.
+Với manifest structured messages, content hash dùng toàn lịch sử hội thoại;
+prompt phẳng và LongBench vẫn giữ cách render cũ. Thay prompt policy làm đổi
+capture contract; không resume capture có policy version 1 bằng policy mới.
 
 ID document phải duy nhất trên toàn input. Source ID (`source_document_id`,
 `document_id`, `source_id`) hoặc nội dung source trùng giữa train/validation/
