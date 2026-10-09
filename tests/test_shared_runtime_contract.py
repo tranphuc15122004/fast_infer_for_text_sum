@@ -15,6 +15,21 @@ def test_shared_runtime_helper_and_offline_setup_exist():
     assert "--offline" in setup.read_text()
 
 
+def test_shared_runtime_returns_failure_before_cache_setup_for_wrong_python(tmp_path):
+    fake_python = tmp_path / "wrong-python"
+    fake_python.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    cache = tmp_path / "runtime-cache"
+    env = {**os.environ, "FAST_INFER_PYTHON": str(fake_python),
+           "FAST_INFER_CACHE_ROOT": str(cache), "FLASHINFER_WORKSPACE_BASE": str(cache / "flashinfer"),
+           "TRITON_CACHE_DIR": str(cache / "triton"), "TORCH_EXTENSIONS_DIR": str(cache / "torch_extensions")}
+    result = subprocess.run(["bash", "-c", 'ROOT="$1"; source "$ROOT/scripts/common/runtime.sh"',
+                             "runtime-check", str(ROOT)], env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "must use Python 3.12" in result.stderr
+    assert not cache.exists()
+
+
 def test_project_manifest_targets_python312():
     assert (ROOT / ".python-version").read_text().strip() == "3.12"
     pyproject = (ROOT / "pyproject.toml").read_text()

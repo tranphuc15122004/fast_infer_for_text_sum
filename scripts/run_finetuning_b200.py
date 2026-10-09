@@ -1,0 +1,1973 @@
+#!/usr/bin/env python3
+"""Resumable DFlash Phase 1 regeneration, validation, and cache launcher."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import copy
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from typing import Callable, Iterator, Sequence
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+import yaml
+from tqdm import tqdm
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PYTHON = os.environ.get("FINETUNING_PYTHON", sys.executable)
+_CURRENT_PROCESS: subprocess.Popen[str] | None = None
+_PROGRESS_EVENT_PREFIX = "@@FINETUNE_PROGRESS "
+
+
+class LauncherError(RuntimeError):
+    """A user-actionable configuration, stage, or artifact failure."""
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    output_root: Path
+    teacher_train: Path
+    teacher_eval: Path
+    teacher_train_clean: Path
+    teacher_eval_clean: Path
+    teacher_train_report: Path
+    teacher_eval_report: Path
+    features_train: Path
+    features_eval: Path
+    checkpoints: Path
+    run_config: Path
+    run_manifest: Path
+    state_dir: Path
+    log_dir: Path
+    lock_path: Path
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class _RunConsoleLog:
+    """Persist the concise messages shown to the operator during one run."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def emit(self, level: str, message: str) -> None:
+        line = f"{_utc_now()} | {level.upper():5s} | {message}"
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+        tqdm.write(line, file=sys.stderr)
+
+
+def _count_nonblank_jsonl(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _short_line(value: str, maximum: int = 360) -> str:
+    compact = " ".join(value.strip().split())
+    return compact if len(compact) <= maximum else compact[: maximum - 1] + "…"
+
+
+class _BackendLogMonitor:
+    """Tail managed vLLM/SGLang logs and surface only their warnings/errors."""
+
+    def __init__(self, paths: Sequence[Path], console: _RunConsoleLog) -> None:
+        self.paths = tuple(paths)
+        self.console = console
+        self._offsets: dict[Path, int] = {}
+        self._seen: set[tuple[Path, str]] = set()
+        self._stop = threading.Event()
+        for root in self.paths:
+            candidates = list(root.glob("*.log")) if root.is_dir() else [root]
+            for path in candidates:
+                if path.is_file():
+                    try:
+                        self._offsets[path] = path.stat().st_size
+                    except OSError:
+                        pass
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _scan(self) -> None:
+        for root in self.paths:
+            candidates = list(root.glob("*.log")) if root.is_dir() else [root]
+            for path in candidates:
+                if not path.is_file():
+                    continue
+                offset = self._offsets.get(path, 0)
+                try:
+                    with path.open("r", encoding="utf-8", errors="replace") as handle:
+                        size = path.stat().st_size
+                        if offset > size:
+                            offset = 0
+                        handle.seek(offset)
+                        for raw_line in handle:
+                            message = raw_line.strip()
+                            if not message:
+                                continue
+                            match = re.search(r"\b(CRITICAL|ERROR|WARNING|WARN)\b", message, re.I)
+                            if match is None:
+                                continue
+                            key = (path, message)
+                            if key in self._seen:
+                                continue
+                            self._seen.add(key)
+                            level = "ERROR" if match.group(1).upper() in {"ERROR", "CRITICAL"} else "WARN"
+                            self.console.emit(level, f"server={path.name} {_short_line(message)}")
+                        self._offsets[path] = handle.tell()
+                except OSError:
+                    continue
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.5):
+            self._scan()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._scan()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _load_yaml(path: Path) -> dict[str, object]:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise LauncherError(f"config not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise LauncherError(f"invalid YAML config {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise LauncherError(f"config root must be a mapping: {path}")
+    return payload
+
+
+def _mapping(payload: dict[str, object], key: str) -> dict[str, object]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise LauncherError(f"config section {key!r} must be a mapping")
+    return value
+
+
+def _safe_run_id(value: object) -> str:
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise LauncherError("run_id must be a simple directory-safe name")
+    return value
+
+
+def resolve_paths(args: argparse.Namespace, run_id: str) -> RunPaths:
+    output_root = Path(args.output_root).expanduser().resolve()
+    feature_cache = (
+        Path(args.feature_cache_dir).expanduser().resolve()
+        if getattr(args, "feature_cache_dir", None)
+        else output_root
+    )
+    features_root = (
+        feature_cache / "features"
+        if (feature_cache / "features").is_dir()
+        else feature_cache
+    )
+    teacher_root = (
+        feature_cache / "teacher"
+        if (feature_cache / "teacher").is_dir()
+        else output_root / "teacher"
+    )
+    return RunPaths(
+        output_root=output_root,
+        teacher_train=teacher_root / "train.jsonl",
+        teacher_eval=teacher_root / "eval.jsonl",
+        teacher_train_clean=teacher_root / "train.filtered.jsonl",
+        teacher_eval_clean=teacher_root / "eval.filtered.jsonl",
+        teacher_train_report=teacher_root / "train_validation_report.json",
+        teacher_eval_report=teacher_root / "eval_validation_report.json",
+        features_train=features_root / "train",
+        features_eval=features_root / "eval",
+        checkpoints=output_root / "checkpoints",
+        run_config=output_root / "run_config.yaml",
+        run_manifest=output_root / "run_manifest.json",
+        state_dir=output_root / ".state",
+        log_dir=output_root / "logs",
+        lock_path=output_root / ".run.lock",
+    )
+
+
+def _config_value(
+    mapping: dict[str, object], key: str, *, minimum: int = 1
+) -> object:
+    value = mapping.get(key)
+    if value is None:
+        raise LauncherError(f"resolved config requires {key!r}")
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise LauncherError(
+            f"resolved config field {key!r} must be an integer >= {minimum}"
+        )
+    return value
+
+
+def materialize_config(
+    source_path: Path,
+    destination: Path,
+    paths: RunPaths,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    payload = copy.deepcopy(_load_yaml(source_path))
+    model = _mapping(payload, "model")
+    data = _mapping(payload, "data")
+    training = _mapping(payload, "training")
+
+    target_model = args.target_model_path or model.get("target_model_path")
+    if not isinstance(target_model, str) or not target_model:
+        raise LauncherError(
+            "target model is missing; pass --target-model-path or set model.target_model_path"
+        )
+    model["target_model_path"] = str(Path(target_model).expanduser().resolve())
+
+    if getattr(args, "draft_init_path", None) is not None:
+        model["draft_init_path"] = str(Path(args.draft_init_path).expanduser().resolve())
+
+    model_dtype = model.get("torch_dtype", "float32")
+    feature_dtype = data.get("feature_dtype", model_dtype)
+    if model_dtype != feature_dtype:
+        raise LauncherError(
+            "model.torch_dtype and data.feature_dtype must match because "
+            "capture_features stores the requested model dtype"
+        )
+
+    _config_value(data, "max_length", minimum=1)
+    _config_value(data, "max_source_tokens", minimum=0)
+    _config_value(data, "max_summary_tokens", minimum=1)
+    prompt_template = data.get("prompt_template")
+    if not isinstance(prompt_template, str) or prompt_template.count("{document}") != 1:
+        raise LauncherError(
+            "data.prompt_template must contain {document} exactly once"
+        )
+
+    data["train_data_path"] = None
+    data["eval_data_path"] = None
+    data["hidden_states_path"] = str(paths.features_train)
+    data["eval_hidden_states_path"] = str(paths.features_eval)
+
+    payload["output_dir"] = str(paths.checkpoints)
+    payload["device"] = "cuda"
+    payload["offline"] = True
+    if args.run_id is not None:
+        payload["run_id"] = args.run_id
+    run_id = _safe_run_id(payload.get("run_id", "dflash"))
+
+    training["adaptive_batch_size"] = True
+    if args.target_memory_fraction is not None:
+        training["target_memory_fraction"] = args.target_memory_fraction
+    if args.adaptive_min_batch_size is not None:
+        training["adaptive_min_batch_size"] = args.adaptive_min_batch_size
+    if args.adaptive_max_batch_size is not None:
+        training["adaptive_max_batch_size"] = args.adaptive_max_batch_size
+    if args.probe_batches is not None:
+        training["adaptive_probe_batches"] = args.probe_batches
+    if args.max_steps is not None:
+        training["max_steps"] = args.max_steps
+    if getattr(args, "num_epochs", None) is not None:
+        training["num_epochs"] = args.num_epochs
+    if args.batch_size is not None:
+        training["batch_size"] = args.batch_size
+    if getattr(args, "loss_type", None) is not None:
+        training["loss_type"] = args.loss_type
+
+    if not isinstance(model.get("num_draft_layers"), int) or model["num_draft_layers"] < 1:
+        if not isinstance(model.get("target_layer_ids"), list) or not model["target_layer_ids"]:
+            raise LauncherError(
+                "model.num_draft_layers or model.target_layer_ids is required"
+            )
+
+    serialized = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    _atomic_write_text(destination, serialized)
+    return payload
+
+
+def _gpu_count_from_nvidia_smi() -> int:
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        raise LauncherError("nvidia-smi is required when --nproc-per-node is omitted")
+    result = subprocess.run(
+        [executable, "-L"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LauncherError(f"nvidia-smi -L failed: {result.stderr.strip()}")
+    count = sum(bool(line.strip()) for line in result.stdout.splitlines())
+    if count <= 0:
+        raise LauncherError("nvidia-smi reported no visible GPUs")
+    return count
+
+
+def _python_check(
+    python_bin: str,
+    *,
+    env: dict[str, str],
+    require_cuda: bool,
+    expected_gpu_count: int,
+) -> None:
+    code = (
+        "import torch; "
+        "assert torch.cuda.is_available(), 'CUDA is unavailable'; "
+        f"count=torch.cuda.device_count(); assert count >= {expected_gpu_count}, "
+        "f'visible GPU count {count} is smaller than requested'; "
+        "print(torch.__version__, count)"
+        if require_cuda
+        else "import torch; print(torch.__version__)"
+    )
+    result = subprocess.run(
+        [python_bin, "-c", code],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LauncherError(
+            f"Python/CUDA preflight failed for {python_bin}:\n"
+            f"{result.stdout}{result.stderr}"
+        )
+
+
+def _module_help(python_bin: str, module: str, env: dict[str, str]) -> None:
+    result = subprocess.run(
+        [python_bin, "-m", module, "--help"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LauncherError(
+            f"module preflight failed for {module}:\n{result.stdout}{result.stderr}"
+        )
+
+
+def validate_preflight(
+    config: dict[str, object],
+    paths: RunPaths,
+    *,
+    python_bin: str,
+    nproc_per_node: int,
+    train_input: Path,
+    eval_input: Path,
+    dry_run: bool,
+) -> None:
+    if not Path(python_bin).is_file() and shutil.which(python_bin) is None:
+        raise LauncherError(f"Python interpreter not found: {python_bin}")
+    for input_path in (train_input, eval_input):
+        if not input_path.is_file():
+            raise LauncherError(f"input JSONL not found: {input_path}")
+
+    model = _mapping(config, "model")
+    target_model = Path(str(model["target_model_path"]))
+    if not target_model.is_dir() or not (target_model / "config.json").is_file():
+        raise LauncherError(
+            f"target model must be a local snapshot containing config.json: {target_model}"
+        )
+
+    if nproc_per_node <= 0:
+        raise LauncherError("--nproc-per-node must be positive")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{ROOT / 'src'}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    env["PYTHONUNBUFFERED"] = "1"
+    _python_check(
+        python_bin,
+        env=env,
+        require_cuda=not dry_run,
+        expected_gpu_count=nproc_per_node,
+    )
+    for module in (
+        "Finetuning.generate_targets",
+        "Finetuning.validate_targets",
+        "Finetuning.capture_features",
+        "Finetuning.run_train",
+    ):
+        _module_help(python_bin, module, env)
+
+
+def _adaptive_args(args: argparse.Namespace) -> list[str]:
+    values = [
+        "--adaptive-batch",
+        "--target-memory-fraction",
+        str(args.target_memory_fraction),
+        "--adaptive-min-batch-size",
+        str(args.adaptive_min_batch_size),
+        "--adaptive-max-batch-size",
+        str(args.adaptive_max_batch_size),
+        "--max-tokens-per-batch",
+        str(args.max_tokens_per_batch),
+        "--bucket-window",
+        str(args.bucket_window),
+        "--probe-batches",
+        str(args.probe_batches),
+    ]
+    return values
+
+
+def _distributed_prefix(python_bin: str, nproc_per_node: int) -> list[str]:
+    return [
+        python_bin,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(nproc_per_node),
+    ]
+
+
+def generation_command_args(args: argparse.Namespace) -> list[str]:
+    """Build remote generation flags without starting a second torchrun tree."""
+
+    backend = str(args.generation_backend)
+    if backend == "hf":
+        return []
+    if backend not in {"sglang", "vllm"}:
+        raise LauncherError(f"unsupported generation backend: {backend}")
+    urls = [str(url) for url in getattr(args, "generation_server_urls", []) if str(url)]
+    if not urls:
+        raise LauncherError(
+            f"--generation-backend {backend} requires at least one --generation-server-url"
+        )
+    values = ["--generation-backend", backend]
+    for url in urls:
+        values.extend(["--generation-server-url", url])
+    model = getattr(args, "generation_model", None)
+    if model:
+        values.extend(["--generation-model", str(model)])
+    values.extend(
+        [
+            "--generation-concurrency-per-server",
+            str(args.generation_concurrency_per_server),
+            "--generation-timeout-seconds",
+            str(args.generation_timeout_seconds),
+            "--generation-retries",
+            str(args.generation_retries),
+            "--generation-backoff-seconds",
+            str(args.generation_backoff_seconds),
+            "--generation-window-size",
+            str(args.generation_window_size),
+        ]
+    )
+    return values
+
+
+def _default_generation_gpu_groups(nproc_per_node: int) -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        groups = [value.strip() for value in visible.split(",") if value.strip()]
+        if len(groups) >= nproc_per_node:
+            return groups[:nproc_per_node]
+    return [str(index) for index in range(nproc_per_node)]
+
+
+def resolve_generation_server_urls(
+    args: argparse.Namespace,
+    *,
+    nproc_per_node: int,
+) -> list[str]:
+    """Resolve endpoint URLs for external or launcher-managed servers."""
+
+    if not args.generation_launch_servers:
+        return list(args.generation_server_urls)
+    if args.generation_backend == "hf":
+        raise LauncherError("--generation-launch-servers requires sglang or vllm backend")
+    if args.generation_server_urls:
+        raise LauncherError(
+            "do not combine --generation-launch-servers with explicit server URLs"
+        )
+    groups = list(args.generation_server_gpu_groups)
+    if not groups:
+        groups = _default_generation_gpu_groups(nproc_per_node)
+        args.generation_server_gpu_groups = groups
+    host = str(args.generation_server_host).strip()
+    return [
+        f"http://{host}:{args.generation_server_base_port + index}/v1"
+        for index in range(len(groups))
+    ]
+
+
+def build_commands(
+    config: dict[str, object],
+    paths: RunPaths,
+    args: argparse.Namespace,
+    *,
+    python_bin: str,
+    nproc_per_node: int,
+) -> list[tuple[str, list[str], Path]]:
+    if getattr(args, "skip_validation", False) or getattr(args, "validate_warn_only", False):
+        raise LauncherError(
+            "quality gate cannot be bypassed in the Phase 1-only launcher"
+        )
+    if getattr(args, "stages", None):
+        raise LauncherError(
+            "partial stage selection is disabled; run the resumable Phase 1 pipeline"
+        )
+    model = _mapping(config, "model")
+    data = _mapping(config, "data")
+    model_path = str(model["target_model_path"])
+    max_length = str(data["max_length"])
+    max_source = str(data["max_source_tokens"])
+    max_summary = str(data["max_summary_tokens"])
+    chat_template = str(data.get("chat_template", "qwen3"))
+    prompt_template = str(data["prompt_template"])
+    dtype = str(model.get("torch_dtype", "float32"))
+    capture_backend = str(args.capture_backend)
+    capture_method = str(args.capture_method)
+    prep_common = [
+        "--target-model-path",
+        model_path,
+        "--max-length",
+        max_length,
+        "--max-source-tokens",
+        max_source,
+        "--max-summary-tokens",
+        max_summary,
+        "--chat-template",
+        chat_template,
+        "--prompt-template",
+        prompt_template,
+        "--torch-dtype",
+        dtype,
+        "--device",
+        "cuda",
+    ]
+    adaptive = _adaptive_args(args)
+    prefix = _distributed_prefix(python_bin, nproc_per_node)
+
+    if args.generation_backend == "hf":
+        generate_base = [
+            *prefix,
+            "-m",
+            "Finetuning.generate_targets",
+            *prep_common,
+            *adaptive,
+        ]
+    else:
+        # Remote servers already own the target model and their GPU workers.
+        # A torchrun wrapper would replicate clients and multiply requests.
+        generate_base = [
+            python_bin,
+            "-m",
+            "Finetuning.generate_targets",
+            *prep_common,
+            *generation_command_args(args),
+        ]
+    cache_base = [
+        *prefix,
+        "-m",
+        "Finetuning.capture_features",
+        *prep_common,
+        *adaptive,
+        "--capture-backend",
+        capture_backend,
+        "--capture-method",
+        capture_method,
+        "--sglang-tp-size",
+        str(args.sglang_tp_size),
+        "--sglang-attention-backend",
+        str(args.sglang_attention_backend),
+        "--sglang-mem-fraction-static",
+        str(args.sglang_mem_fraction_static),
+        "--sglang-max-running-requests",
+        str(args.sglang_max_running_requests),
+        "--sglang-max-total-tokens",
+        str(args.sglang_max_total_tokens),
+        "--parity-samples",
+        str(args.parity_samples),
+        "--parity-max-abs-error",
+        str(args.parity_max_abs_error),
+        "--parity-mean-abs-error",
+        str(args.parity_mean_abs_error),
+        "--parity-relative-l2-error",
+        str(args.parity_relative_l2_error),
+        "--parity-min-cosine-similarity",
+        str(args.parity_min_cosine_similarity),
+    ]
+    if args.sglang_context_length is not None:
+        cache_base.extend(["--sglang-context-length", str(args.sglang_context_length)])
+    if args.sglang_disable_radix_cache:
+        cache_base.append("--sglang-disable-radix-cache")
+
+    target_layer_ids = model.get("target_layer_ids")
+    if isinstance(target_layer_ids, list) and target_layer_ids:
+        layer_args = ["--target-layer-ids", ",".join(str(item) for item in target_layer_ids)]
+    else:
+        layer_args = ["--num-draft-layers", str(model["num_draft_layers"])]
+
+    commands: list[tuple[str, list[str], Path]] = [
+        (
+            "generate_train",
+            [
+                *generate_base,
+                "--input",
+                str(args.train_input),
+                "--output",
+                str(paths.teacher_train),
+            ],
+            paths.teacher_train,
+        ),
+        (
+            "generate_eval",
+            [
+                *generate_base,
+                "--input",
+                str(args.eval_input),
+                "--output",
+                str(paths.teacher_eval),
+            ],
+            paths.teacher_eval,
+        ),
+    ]
+
+    if not getattr(args, "skip_validation", False):
+        val_train_cmd = [
+            python_bin,
+            "-m",
+            "Finetuning.validate_targets",
+            "--input",
+            str(paths.teacher_train),
+            "--report-path",
+            str(paths.teacher_train_report),
+            "--max-anomaly-rate",
+            str(args.max_anomaly_rate),
+            "--min-rouge1",
+            str(args.min_teacher_rouge1),
+        ]
+        if getattr(args, "filter_anomalies", False):
+            val_train_cmd.extend(
+                ["--filter-anomalies", "--clean-output", str(paths.teacher_train_clean)]
+            )
+
+        val_eval_cmd = [
+            python_bin,
+            "-m",
+            "Finetuning.validate_targets",
+            "--input",
+            str(paths.teacher_eval),
+            "--report-path",
+            str(paths.teacher_eval_report),
+            "--max-anomaly-rate",
+            str(args.max_anomaly_rate),
+            "--min-rouge1",
+            str(args.min_teacher_rouge1),
+        ]
+        if getattr(args, "filter_anomalies", False):
+            val_eval_cmd.extend(
+                ["--filter-anomalies", "--clean-output", str(paths.teacher_eval_clean)]
+            )
+
+        commands.extend([
+            (
+                "validate_teacher_train",
+                val_train_cmd,
+                paths.teacher_train_report,
+            ),
+            (
+                "validate_teacher_eval",
+                val_eval_cmd,
+                paths.teacher_eval_report,
+            ),
+        ])
+
+    commands.extend([
+        (
+            "cache_train",
+            [
+                *cache_base,
+                "--input",
+                str(
+                    paths.teacher_train_clean
+                    if getattr(args, "filter_anomalies", False)
+                    else paths.teacher_train
+                ),
+                "--output",
+                str(paths.features_train),
+                *layer_args,
+            ],
+            paths.features_train,
+        ),
+        (
+            "cache_eval",
+            [
+                *cache_base,
+                "--input",
+                str(
+                    paths.teacher_eval_clean
+                    if getattr(args, "filter_anomalies", False)
+                    else paths.teacher_eval
+                ),
+                "--output",
+                str(paths.features_eval),
+                *layer_args,
+            ],
+            paths.features_eval,
+        ),
+        (
+            "train",
+            (
+                [
+                    *prefix,
+                    "-m",
+                    "Finetuning.run_train",
+                    "--config",
+                    str(paths.run_config),
+                    "--device",
+                    "cuda",
+                    "--adaptive-batch-size",
+                ]
+                + (
+                    [
+                        "--resume-from",
+                        str(
+                            sorted(
+                                [
+                                    c
+                                    for c in paths.checkpoints.glob(
+                                        f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step*"
+                                    )
+                                    if (c / "COMPLETE").is_file()
+                                    and (c / "draft_state_dict.pt").is_file()
+                                ],
+                                key=lambda item: int(
+                                    item.name.removeprefix(
+                                        f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step"
+                                    )
+                                )
+                                if item.name.removeprefix(
+                                    f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step"
+                                ).isdigit()
+                                else -1,
+                            )[-1]
+                        ),
+                    ]
+                    if paths.checkpoints.is_dir()
+                    and not getattr(args, "draft_init_path", None)
+                    and [
+                        c
+                        for c in paths.checkpoints.glob(
+                            f"{str(getattr(args, 'run_id', None) or config.get('run_id') or 'dflash')}-step*"
+                        )
+                        if (c / "COMPLETE").is_file()
+                        and (c / "draft_state_dict.pt").is_file()
+                    ]
+                    else []
+                )
+                + (
+                    ["--draft-init-path", str(args.draft_init_path)]
+                    if getattr(args, "draft_init_path", None)
+                    else []
+                )
+            ),
+            paths.checkpoints,
+        ),
+    ])
+    # This entry point is deliberately Phase 1 only. Training has a separate
+    # launcher and must never be started by a data preparation command.
+    commands = [cmd for cmd in commands if cmd[0] != "train"]
+    return commands
+
+
+def _valid_report(path: Path) -> None:
+    if not path.is_file():
+        raise LauncherError(f"validation report is missing: {path}")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"invalid validation report: {path}") from exc
+    if not isinstance(report, dict) or "passed_gate" not in report:
+        raise LauncherError(f"malformed validation report: {path}")
+    if report["passed_gate"] is not True:
+        raise LauncherError(f"teacher validation failed the quality gate: {path}")
+
+
+def _valid_teacher_report(report_path: Path, clean_path: Path | None = None) -> None:
+    _valid_report(report_path)
+    if clean_path is not None:
+        _valid_jsonl(clean_path)
+
+
+def _valid_jsonl(path: Path) -> None:
+    if not path.is_file():
+        raise LauncherError(f"teacher artifact is missing: {path}")
+    count = 0
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise LauncherError(f"invalid teacher JSONL {path}:{line_number}") from exc
+            if not isinstance(value, dict):
+                raise LauncherError(f"teacher row is not an object: {path}:{line_number}")
+            count += 1
+    if count == 0:
+        raise LauncherError(f"teacher artifact is empty: {path}")
+
+
+def _valid_features(path: Path) -> None:
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise LauncherError(f"feature manifest is missing: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"invalid feature manifest: {manifest_path}") from exc
+    generation = manifest.get("generation_dir")
+    if not isinstance(generation, str) or not generation:
+        raise LauncherError(f"feature manifest lacks generation_dir: {manifest_path}")
+    generation_path = path / generation
+    if not generation_path.is_dir():
+        raise LauncherError(f"feature generation directory is missing: {generation_path}")
+    if not any(generation_path.glob("feature_*.pt")):
+        raise LauncherError(f"feature generation contains no feature records: {generation_path}")
+
+
+def _valid_checkpoint(path: Path, run_id: str) -> None:
+    if not path.is_dir():
+        raise LauncherError(f"checkpoint root is missing: {path}")
+    complete = [
+        candidate
+        for candidate in path.glob(f"{run_id}-step*")
+        if candidate.is_dir() and (candidate / "COMPLETE").is_file() and (candidate / "draft_state_dict.pt").is_file()
+    ]
+    if not complete:
+        raise LauncherError(f"no complete checkpoint found under {path}")
+    latest = sorted(
+        complete,
+        key=lambda item: int(item.name.removeprefix(f"{run_id}-step"))
+        if item.name.removeprefix(f"{run_id}-step").isdigit()
+        else -1,
+    )[-1]
+    trainer_state_file = latest / "trainer_state.json"
+    extra_file = latest / "extra.json"
+    if trainer_state_file.is_file() and extra_file.is_file():
+        try:
+            t_state = json.loads(trainer_state_file.read_text(encoding="utf-8"))
+            extra_state = json.loads(extra_file.read_text(encoding="utf-8"))
+            g_step = int(t_state.get("global_step", 0))
+            tot_steps = int(extra_state.get("total_steps", 0))
+            if tot_steps > 0 and g_step < tot_steps:
+                raise LauncherError(
+                    f"checkpoint at step {g_step}/{tot_steps} is intermediate, training must resume"
+                )
+        except (ValueError, KeyError, json.JSONDecodeError):
+            pass
+
+
+def _write_marker(path: Path, *, stage: str, command: Sequence[str], artifact: Path, status: str) -> None:
+    payload = {
+        "stage": stage,
+        "status": status,
+        "completed_at": _utc_now(),
+        "command": list(command),
+        "artifact": str(artifact),
+    }
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _read_marker(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"invalid stage marker: {path}") from exc
+    if not isinstance(value, dict):
+        raise LauncherError(f"stage marker must be an object: {path}")
+    return value
+
+
+def run_stage(
+    name: str,
+    command: Sequence[str],
+    *,
+    log_path: Path,
+    marker_path: Path,
+    artifact: Path,
+    validator: Callable[[], None],
+    environment: dict[str, str],
+    dry_run: bool,
+    console: _RunConsoleLog | None = None,
+    metadata: str = "",
+    progress_total: int | None = None,
+) -> None:
+    console = console or _RunConsoleLog(log_path.parent / "run.log")
+    marker = _read_marker(marker_path)
+    if marker is not None:
+        if marker.get("stage") != name:
+            raise LauncherError(f"stage marker name mismatch: {marker_path}")
+        try:
+            validator()
+            console.emit("INFO", f"SKIP {name} artifact={artifact}")
+            return
+        except LauncherError as exc:
+            # If checkpoint is intermediate, remove premature marker and proceed to resume
+            if "intermediate" in str(exc) and marker_path.is_file():
+                marker_path.unlink()
+            else:
+                console.emit("ERROR", f"RESUME CHECK FAILED {name}: {_short_line(str(exc))}")
+                raise
+
+    try:
+        validator()
+    except LauncherError:
+        pass
+    else:
+        _write_marker(
+            marker_path,
+            stage=name,
+            command=command,
+            artifact=artifact,
+            status="recovered",
+        )
+        console.emit("INFO", f"RECOVER {name} artifact={artifact}")
+        return
+
+    command_text = shlex.join(list(command))
+    if dry_run:
+        console.emit("INFO", f"DRY RUN {name} {metadata}".strip())
+        return
+
+    console.emit("INFO", f"RUN {name} {metadata}".strip())
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_handle:
+        log_handle.write(
+            f"\n[{_utc_now()}] START {name}\n"
+            f"metadata={metadata}\n$ {command_text}\n"
+        )
+        log_handle.flush()
+        global _CURRENT_PROCESS
+        _CURRENT_PROCESS = subprocess.Popen(
+            list(command),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
+        assert _CURRENT_PROCESS.stdout is not None
+        progress_bar = (
+            tqdm(
+                total=progress_total,
+                desc=name,
+                unit="records",
+                dynamic_ncols=True,
+                mininterval=1.0,
+                disable=not sys.stderr.isatty(),
+                file=sys.stderr,
+            )
+            if progress_total is not None
+            else None
+        )
+        last_progress_log = time.monotonic()
+        summary_payload: dict[str, object] | None = None
+        shown_warnings: set[str] = set()
+        repeated_warnings = 0
+        for line in _CURRENT_PROCESS.stdout:
+            log_handle.write(line)
+            log_handle.flush()
+            clean = line.rstrip("\r\n")
+            if clean.startswith(_PROGRESS_EVENT_PREFIX):
+                try:
+                    event = json.loads(clean[len(_PROGRESS_EVENT_PREFIX) :])
+                    total = int(event["total"])
+                    current = int(event["n"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    console.emit("WARN", f"{name}: malformed progress event in {log_path.name}")
+                    continue
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=total,
+                        desc=name,
+                        unit=str(event.get("unit", "records")),
+                        dynamic_ncols=True,
+                        mininterval=1.0,
+                        disable=not sys.stderr.isatty(),
+                        file=sys.stderr,
+                    )
+                progress_bar.total = total
+                current = min(max(current, 0), total)
+                delta = current - progress_bar.n
+                if delta > 0:
+                    progress_bar.update(delta)
+                elif delta < 0:
+                    # A resumed child may restart its event counter after a
+                    # fresh parent process. Keep the display aligned.
+                    progress_bar.n = current
+                    progress_bar.refresh()
+                postfix: dict[str, str] = {}
+                if event.get("epoch") is not None:
+                    postfix["epoch"] = str(event["epoch"])
+                if event.get("loss") is not None:
+                    try:
+                        postfix["loss"] = f"{float(event['loss']):.4f}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("accuracy") is not None:
+                    try:
+                        postfix["acc"] = f"{float(event['accuracy']):.3f}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("lr") is not None:
+                    try:
+                        postfix["lr"] = f"{float(event['lr']):.2e}"
+                    except (TypeError, ValueError):
+                        pass
+                if event.get("tokens_per_s") is not None:
+                    try:
+                        postfix["tok/s"] = f"{float(event['tokens_per_s']):.0f}"
+                    except (TypeError, ValueError):
+                        pass
+                if postfix:
+                    progress_bar.set_postfix(postfix)
+
+                now = time.monotonic()
+                if now - last_progress_log >= 15.0:
+                    pct = 100.0 if total == 0 else progress_bar.n * 100.0 / total
+                    eta = "unknown"
+                    rate = progress_bar.format_dict.get("rate")
+                    if rate and total > progress_bar.n:
+                        eta = tqdm.format_interval(int((total - progress_bar.n) / rate))
+                    metrics_str = f" [{' '.join(f'{k}={v}' for k, v in postfix.items())}]" if postfix else ""
+                    console.emit(
+                        "INFO",
+                        f"PROGRESS {name} {progress_bar.n}/{total} ({pct:.1f}%){metrics_str} eta={eta}",
+                    )
+                    last_progress_log = now
+                continue
+
+            if clean.startswith("{"):
+                try:
+                    payload = json.loads(clean)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict) and (
+                    "stats" in payload or {"written", "rejected"} <= set(payload)
+                ):
+                    summary_payload = payload
+                    continue
+
+            if "Teacher Trajectory Validation:" in clean:
+                console.emit("INFO", _short_line(clean))
+                continue
+            severity = re.search(r"\b(CRITICAL|ERROR|WARNING|WARN)\b", clean, re.I)
+            if severity is not None:
+                warning_key = _short_line(clean)
+                if warning_key in shown_warnings:
+                    repeated_warnings += 1
+                    continue
+                shown_warnings.add(warning_key)
+                level = (
+                    "ERROR"
+                    if severity.group(1).upper() in {"CRITICAL", "ERROR"}
+                    else "WARN"
+                )
+                console.emit(level, f"{name}: {_short_line(clean)}")
+
+        return_code = _CURRENT_PROCESS.wait()
+        _CURRENT_PROCESS = None
+        log_handle.write(f"[{_utc_now()}] END {name} returncode={return_code}\n")
+    if progress_bar is not None:
+        progress_bar.close()
+    if repeated_warnings:
+        console.emit("WARN", f"{name}: suppressed {repeated_warnings} duplicate warning lines")
+    if return_code != 0:
+        console.emit("ERROR", f"FAILED {name} returncode={return_code}; details={log_path}")
+        raise LauncherError(
+            f"stage {name} failed with return code {return_code}; inspect {log_path}"
+        )
+    try:
+        validator()
+    except LauncherError as exc:
+        console.emit("ERROR", f"ARTIFACT CHECK FAILED {name}: {_short_line(str(exc))}")
+        raise
+    _write_marker(
+        marker_path,
+        stage=name,
+        command=command,
+        artifact=artifact,
+        status="completed",
+    )
+    if summary_payload is not None:
+        stats_value = summary_payload.get("stats", summary_payload)
+        stats = stats_value if isinstance(stats_value, dict) else {}
+        if name.startswith("generate_"):
+            detail = (
+                f"written={stats.get('written', '?')} rejected={stats.get('rejected', '?')} "
+                f"tokens={stats.get('tokens', '?')} oom_retries={stats.get('oom_retries', 0)}"
+            )
+            rate_x1000 = stats.get("samples_per_sec_x1000")
+            if isinstance(rate_x1000, (int, float)):
+                detail += f" samples_per_s={float(rate_x1000) / 1000.0:.2f}"
+            if int(stats.get("rejected", 0) or 0) > 0 or int(stats.get("oom_retries", 0) or 0) > 0:
+                console.emit("WARN", f"RESULT {name} {detail}")
+            else:
+                console.emit("INFO", f"RESULT {name} {detail}")
+        elif name.startswith("cache_"):
+            parity = stats.get("parity")
+            parity_status = (
+                "not_run"
+                if not isinstance(parity, dict)
+                else "passed"
+                if parity.get("passed")
+                else "failed"
+            )
+            detail = (
+                f"captured={stats.get('captured', '?')} source_records="
+                f"{stats.get('source_records', '?')} unrenderable="
+                f"{stats.get('unrenderable_records', 0)} tokens={stats.get('tokens', '?')} "
+                f"oom_retries={stats.get('oom_retries', 0)} parity={parity_status}"
+            )
+            rate_x1000 = stats.get("samples_per_sec_x1000")
+            if isinstance(rate_x1000, (int, float)):
+                detail += f" samples_per_s={float(rate_x1000) / 1000.0:.2f}"
+            if (
+                int(stats.get("unrenderable_records", 0) or 0) > 0
+                or int(stats.get("oom_retries", 0) or 0) > 0
+                or parity_status == "failed"
+            ):
+                console.emit("WARN", f"RESULT {name} {detail}")
+            else:
+                console.emit("INFO", f"RESULT {name} {detail}")
+        else:
+            console.emit("INFO", f"RESULT {name} complete")
+    console.emit("INFO", f"DONE {name} artifact={artifact}")
+
+
+def _signal_handler(signum: int, _frame: object) -> None:
+    if _CURRENT_PROCESS is not None:
+        try:
+            os.killpg(_CURRENT_PROCESS.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    raise SystemExit(128 + signum)
+
+
+@contextmanager
+def _signal_guard() -> Iterator[None]:
+    previous_term = signal.signal(signal.SIGTERM, _signal_handler)
+    previous_int = signal.signal(signal.SIGINT, _signal_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+
+@contextmanager
+def _job_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LauncherError(f"another fine-tuning job holds the lock: {path}") from exc
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+@dataclass
+class _ManagedGenerationServers:
+    process: subprocess.Popen[str]
+    log_handle: object
+    monitor: _BackendLogMonitor
+
+
+def _server_probe_urls(base_url: str) -> tuple[str, ...]:
+    value = base_url.rstrip("/")
+    root = value[:-3] if value.endswith("/v1") else value
+    return (f"{root}/health", f"{value}/models")
+
+
+def _wait_for_generation_servers(
+    handle: _ManagedGenerationServers,
+    urls: Sequence[str],
+    *,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    pending = set(urls)
+    while pending and time.monotonic() < deadline:
+        if handle.process.poll() is not None:
+            raise LauncherError(
+                "managed generation server launcher exited early; "
+                "inspect logs/target_servers_launcher.log"
+            )
+        ready: set[str] = set()
+        for base_url in pending:
+            for probe_url in _server_probe_urls(base_url):
+                try:
+                    with urllib_request.urlopen(probe_url, timeout=2) as response:
+                        if 200 <= int(response.status) < 300:
+                            ready.add(base_url)
+                            break
+                except (urllib_error.URLError, TimeoutError, OSError):
+                    continue
+        pending.difference_update(ready)
+        if pending:
+            time.sleep(1.0)
+    if pending:
+        raise LauncherError(
+            "managed generation servers did not become ready within "
+            f"{timeout_seconds:.0f}s: {sorted(pending)}"
+        )
+
+
+def _start_managed_generation_servers(
+    args: argparse.Namespace,
+    config: dict[str, object],
+    paths: RunPaths,
+    environment: dict[str, str],
+    console: _RunConsoleLog,
+) -> _ManagedGenerationServers:
+    model_path = str(_mapping(config, "model")["target_model_path"])
+    console.emit(
+        "INFO",
+        f"SERVER START backend={args.generation_backend} model={Path(model_path).name} "
+        f"endpoints={len(args.generation_server_urls)} "
+        f"gpu_groups={','.join(args.generation_server_gpu_groups)} "
+        f"tp={args.generation_server_tp_size} "
+        f"mem_fraction={args.generation_server_mem_fraction:.2f}",
+    )
+    command = [
+        args.python_bin,
+        str(ROOT / "scripts" / "launch_finetuning_target_servers.py"),
+        "--backend",
+        args.generation_backend,
+        "--model-path",
+        model_path,
+        "--host",
+        args.generation_server_host,
+        "--base-port",
+        str(args.generation_server_base_port),
+        "--tp-size",
+        str(args.generation_server_tp_size),
+        "--mem-fraction",
+        str(args.generation_server_mem_fraction),
+        "--log-dir",
+        str(paths.log_dir / "target_servers"),
+    ]
+    if args.generation_server_context_length is not None:
+        command.extend(["--context-length", str(args.generation_server_context_length)])
+    if args.generation_server_max_num_seqs:
+        command.extend(["--max-num-seqs", str(args.generation_server_max_num_seqs)])
+    if args.generation_model:
+        command.extend(["--served-model-name", str(args.generation_model)])
+    for group in args.generation_server_gpu_groups:
+        command.extend(["--gpu-group", str(group)])
+    log_path = paths.log_dir / "target_servers_launcher.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    log_handle.write(f"\n$ {shlex.join(command)}\n")
+    log_handle.flush()
+    monitor = _BackendLogMonitor(
+        (paths.log_dir / "target_servers", log_path),
+        console,
+    )
+    try:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception:
+        monitor.close()
+        log_handle.close()
+        raise
+    handle = _ManagedGenerationServers(process, log_handle, monitor)
+    try:
+        _wait_for_generation_servers(
+            handle,
+            args.generation_server_urls,
+            timeout_seconds=args.generation_server_startup_timeout_seconds,
+        )
+    except Exception:
+        _stop_managed_generation_servers(handle)
+        raise
+    console.emit(
+        "INFO",
+        f"SERVER READY backend={args.generation_backend} endpoints={len(args.generation_server_urls)}",
+    )
+    return handle
+
+
+def _stop_managed_generation_servers(handle: _ManagedGenerationServers | None) -> None:
+    if handle is None:
+        return
+    process = handle.process
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+    handle.monitor.close()
+    handle.log_handle.close()  # type: ignore[union-attr]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_run_manifest(
+    paths: RunPaths,
+    *,
+    config: dict[str, object],
+    args: argparse.Namespace,
+    nproc_per_node: int,
+) -> None:
+    serialized = yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode()
+    payload = {
+        "created_at": _utc_now(),
+        "config_sha256": hashlib.sha256(serialized).hexdigest(),
+        "train_input": str(args.train_input),
+        "eval_input": str(args.eval_input),
+        "target_model_path": str(_mapping(config, "model")["target_model_path"]),
+        "nproc_per_node": nproc_per_node,
+        "target_memory_fraction": args.target_memory_fraction,
+        "adaptive_min_batch_size": args.adaptive_min_batch_size,
+        "adaptive_max_batch_size": args.adaptive_max_batch_size,
+        "max_tokens_per_batch": args.max_tokens_per_batch,
+        "bucket_window": args.bucket_window,
+        "probe_batches": args.probe_batches,
+        "capture_backend": args.capture_backend,
+        "capture_method": args.capture_method,
+        "generation_backend": args.generation_backend,
+        "generation_server_urls": list(args.generation_server_urls),
+        "generation_model": args.generation_model,
+        "generation_concurrency_per_server": args.generation_concurrency_per_server,
+        "generation_timeout_seconds": args.generation_timeout_seconds,
+        "generation_retries": args.generation_retries,
+        "generation_backoff_seconds": args.generation_backoff_seconds,
+        "generation_window_size": args.generation_window_size,
+        "generation_launch_servers": args.generation_launch_servers,
+        "generation_server_gpu_groups": list(args.generation_server_gpu_groups),
+        "generation_server_host": args.generation_server_host,
+        "generation_server_base_port": args.generation_server_base_port,
+        "generation_server_tp_size": args.generation_server_tp_size,
+        "generation_server_mem_fraction": args.generation_server_mem_fraction,
+        "generation_server_context_length": args.generation_server_context_length,
+        "generation_server_max_num_seqs": args.generation_server_max_num_seqs,
+        "generation_server_startup_timeout_seconds": args.generation_server_startup_timeout_seconds,
+        "sglang_tp_size": args.sglang_tp_size,
+        "sglang_attention_backend": args.sglang_attention_backend,
+        "sglang_mem_fraction_static": args.sglang_mem_fraction_static,
+        "sglang_max_running_requests": args.sglang_max_running_requests,
+        "sglang_max_total_tokens": args.sglang_max_total_tokens,
+        "sglang_context_length": args.sglang_context_length,
+        "sglang_disable_radix_cache": args.sglang_disable_radix_cache,
+        "parity_samples": args.parity_samples,
+        "parity_max_abs_error": args.parity_max_abs_error,
+        "parity_mean_abs_error": args.parity_mean_abs_error,
+        "parity_relative_l2_error": args.parity_relative_l2_error,
+        "parity_min_cosine_similarity": args.parity_min_cosine_similarity,
+        "max_anomaly_rate": args.max_anomaly_rate,
+        "min_teacher_rouge1": args.min_teacher_rouge1,
+        "filter_anomalies": args.filter_anomalies,
+        "validate_warn_only": args.validate_warn_only,
+        "skip_validation": args.skip_validation,
+    }
+    payload["train_input_sha256"] = _sha256_file(args.train_input)
+    payload["eval_input_sha256"] = _sha256_file(args.eval_input)
+    contract_keys = (
+        "config_sha256",
+        "train_input",
+        "train_input_sha256",
+        "eval_input",
+        "eval_input_sha256",
+        "target_model_path",
+        "generation_backend",
+        "generation_model",
+        "generation_server_urls",
+        "capture_backend",
+        "capture_method",
+        "max_anomaly_rate",
+        "min_teacher_rouge1",
+        "filter_anomalies",
+    )
+    contract = {key: payload[key] for key in contract_keys}
+    payload["phase1_contract_sha256"] = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    if paths.run_manifest.exists():
+        try:
+            previous = json.loads(paths.run_manifest.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise LauncherError(f"invalid run manifest: {paths.run_manifest}") from exc
+        if previous.get("phase1_contract_sha256") != payload["phase1_contract_sha256"]:
+            raise LauncherError(
+                "Phase 1 inputs, config, generation, validation, or cache contract differ from "
+                "the existing run_manifest.json; "
+                "use a new --output-root"
+            )
+        # Operational settings such as worker count and memory limits may be
+        # tuned while resuming the same immutable data/model contract.
+        _atomic_write_text(paths.run_manifest, json.dumps({**previous, **payload}, indent=2) + "\n")
+        return
+    _atomic_write_text(paths.run_manifest, json.dumps(payload, indent=2) + "\n")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run resumable DFlash Phase 1 regeneration, validation, and caching on B200"
+    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--train-input", type=Path, required=True)
+    parser.add_argument("--eval-input", type=Path, required=True)
+    parser.add_argument("--target-model-path")
+    parser.add_argument(
+        "--draft-init-path",
+        type=Path,
+        default=os.environ.get("FINETUNE_DRAFT_INIT_PATH"),
+        help="path to pretrained DFlash model or draft_export to finetune from",
+    )
+    parser.add_argument(
+        "--loss-type",
+        choices=("dflash", "growmtp", "dpace"),
+        default=os.environ.get("FINETUNE_LOSS_TYPE"),
+        help="loss objective type: dflash, growmtp, or dpace",
+    )
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        help="Optional external directory containing features/ and teacher/ cache from Phase 1",
+    )
+    parser.add_argument("--run-id")
+    parser.add_argument("--nproc-per-node", type=int)
+    parser.add_argument("--python", dest="python_bin", default=DEFAULT_PYTHON)
+    parser.add_argument("--target-memory-fraction", type=float)
+    parser.add_argument("--adaptive-min-batch-size", type=int)
+    parser.add_argument("--adaptive-max-batch-size", type=int)
+    parser.add_argument("--max-tokens-per-batch", type=int, default=0)
+    parser.add_argument("--bucket-window", type=int, default=512)
+    parser.add_argument("--probe-batches", type=int, default=2)
+    parser.add_argument(
+        "--max-anomaly-rate",
+        type=float,
+        default=float(os.environ.get("FINETUNE_MAX_ANOMALY_RATE", "0.05")),
+        help="maximum allowable anomaly rate in teacher trajectories before failure (default 0.05)",
+    )
+    parser.add_argument(
+        "--min-teacher-rouge1",
+        type=float,
+        default=float(os.environ.get("FINETUNE_MIN_TEACHER_ROUGE1", "0.0")),
+        help="minimum required teacher average ROUGE-1 F1 against gold references",
+    )
+    parser.add_argument(
+        "--filter-anomalies",
+        action="store_true",
+        default=os.environ.get("FINETUNE_FILTER_ANOMALIES", "0") == "1",
+        help="automatically prune anomalous/degenerated records from teacher JSONL before caching",
+    )
+    parser.add_argument(
+        "--validate-warn-only",
+        action="store_true",
+        default=os.environ.get("FINETUNE_VALIDATE_WARN_ONLY", "0") == "1",
+        help="legacy option; rejected because Phase 1 requires a passing quality gate",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        default=os.environ.get("FINETUNE_SKIP_VALIDATION", "0") == "1",
+        help="legacy option; rejected because Phase 1 always validates teacher output",
+    )
+    parser.add_argument(
+        "--phase1-only",
+        action="store_true",
+        default=True,
+        help="accepted for compatibility; this launcher only runs Phase 1 and never trains",
+    )
+    parser.add_argument(
+        "--stages",
+        default=os.environ.get("FINETUNE_STAGES"),
+        help="legacy option; partial stage selection is rejected to preserve pipeline order",
+    )
+    parser.add_argument(
+        "--capture-backend",
+        choices=("hf", "sglang"),
+        default=os.environ.get("FINETUNE_CAPTURE_BACKEND", "hf"),
+    )
+    parser.add_argument(
+        "--capture-method",
+        choices=("eagle3", "dflash", "dspark"),
+        default=os.environ.get("FINETUNE_CAPTURE_METHOD", "dflash"),
+    )
+    parser.add_argument(
+        "--generation-backend",
+        choices=("hf", "sglang", "vllm"),
+        default=os.environ.get("FINETUNE_GENERATION_BACKEND", "hf"),
+    )
+    parser.add_argument(
+        "--generation-server-url",
+        dest="generation_server_urls",
+        action="append",
+        default=[
+            value
+            for value in os.environ.get("FINETUNE_GENERATION_SERVER_URLS", "").split(",")
+            if value
+        ],
+    )
+    parser.add_argument(
+        "--generation-model",
+        default=os.environ.get("FINETUNE_GENERATION_MODEL"),
+    )
+    parser.add_argument(
+        "--generation-concurrency-per-server",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_CONCURRENCY_PER_SERVER", "8")),
+    )
+    parser.add_argument(
+        "--generation-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_TIMEOUT_SECONDS", "120")),
+    )
+    parser.add_argument(
+        "--generation-retries",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_RETRIES", "2")),
+    )
+    parser.add_argument(
+        "--generation-backoff-seconds",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_BACKOFF_SECONDS", "0.25")),
+    )
+    parser.add_argument(
+        "--generation-window-size",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_WINDOW_SIZE", "0")),
+    )
+    parser.add_argument(
+        "--generation-launch-servers",
+        action="store_true",
+        default=os.environ.get("FINETUNE_GENERATION_LAUNCH_SERVERS", "0") == "1",
+        help="start target servers for regenerate and stop them before cache",
+    )
+    parser.add_argument(
+        "--generation-server-gpu-group",
+        dest="generation_server_gpu_groups",
+        action="append",
+        default=[],
+        help="GPU id/group per managed endpoint, e.g. 0 or 0,1; default one per GPU",
+    )
+    parser.add_argument(
+        "--generation-server-host",
+        default=os.environ.get("FINETUNE_GENERATION_SERVER_HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--generation-server-base-port",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_BASE_PORT", "30000")),
+    )
+    parser.add_argument(
+        "--generation-server-tp-size",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_TP_SIZE", "1")),
+    )
+    parser.add_argument(
+        "--generation-server-mem-fraction",
+        type=float,
+        default=float(os.environ.get("FINETUNE_GENERATION_SERVER_MEM_FRACTION", "0.88")),
+    )
+    parser.add_argument(
+        "--generation-server-context-length",
+        type=int,
+        default=(
+            int(os.environ["FINETUNE_GENERATION_SERVER_CONTEXT_LENGTH"])
+            if os.environ.get("FINETUNE_GENERATION_SERVER_CONTEXT_LENGTH")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--generation-server-max-num-seqs",
+        type=int,
+        default=int(os.environ.get("FINETUNE_GENERATION_SERVER_MAX_NUM_SEQS", "0")),
+    )
+    parser.add_argument(
+        "--generation-server-startup-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get("FINETUNE_GENERATION_SERVER_STARTUP_TIMEOUT_SECONDS", "900")
+        ),
+    )
+    parser.add_argument(
+        "--sglang-tp-size",
+        type=int,
+        default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_TP_SIZE", "1")),
+    )
+    parser.add_argument(
+        "--sglang-attention-backend",
+        default=os.environ.get("FINETUNE_CAPTURE_SGLANG_ATTENTION_BACKEND", "flashinfer"),
+    )
+    parser.add_argument(
+        "--sglang-mem-fraction-static",
+        type=float,
+        default=float(os.environ.get("FINETUNE_CAPTURE_SGLANG_MEM_FRACTION_STATIC", "0.88")),
+    )
+    parser.add_argument(
+        "--sglang-max-running-requests",
+        type=int,
+        default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_MAX_RUNNING_REQUESTS", "0")),
+    )
+    parser.add_argument(
+        "--sglang-max-total-tokens",
+        type=int,
+        default=int(os.environ.get("FINETUNE_CAPTURE_SGLANG_MAX_TOTAL_TOKENS", "0")),
+    )
+    parser.add_argument(
+        "--sglang-context-length",
+        type=int,
+        default=(
+            int(os.environ["FINETUNE_CAPTURE_SGLANG_CONTEXT_LENGTH"])
+            if os.environ.get("FINETUNE_CAPTURE_SGLANG_CONTEXT_LENGTH")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--sglang-disable-radix-cache",
+        action="store_true",
+        default=os.environ.get("FINETUNE_CAPTURE_SGLANG_DISABLE_RADIX_CACHE", "0") == "1",
+    )
+    parser.add_argument(
+        "--parity-samples",
+        type=int,
+        default=int(os.environ.get("FINETUNE_CAPTURE_PARITY_SAMPLES", "2")),
+    )
+    parser.add_argument(
+        "--parity-max-abs-error",
+        type=float,
+        default=float(os.environ.get("FINETUNE_CAPTURE_PARITY_MAX_ABS_ERROR", "0.05")),
+    )
+    parser.add_argument(
+        "--parity-mean-abs-error",
+        type=float,
+        default=float(os.environ.get("FINETUNE_CAPTURE_PARITY_MEAN_ABS_ERROR", "0.01")),
+    )
+    parser.add_argument(
+        "--parity-relative-l2-error",
+        type=float,
+        default=float(os.environ.get("FINETUNE_CAPTURE_PARITY_RELATIVE_L2_ERROR", "0.05")),
+    )
+    parser.add_argument(
+        "--parity-min-cosine-similarity",
+        type=float,
+        default=float(os.environ.get("FINETUNE_CAPTURE_PARITY_MIN_COSINE_SIMILARITY", "0.999")),
+    )
+    parser.add_argument("--epochs", "--num-epochs", dest="num_epochs", type=int, default=int(os.environ.get("FINETUNE_NUM_EPOCHS", "6")) if "FINETUNE_NUM_EPOCHS" in os.environ else None)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.skip_validation or args.validate_warn_only:
+        raise LauncherError(
+            "quality gate cannot be bypassed in the Phase 1-only launcher"
+        )
+    if args.stages:
+        raise LauncherError(
+            "partial stage selection is disabled; run the resumable Phase 1 pipeline"
+        )
+    args.config = str(Path(args.config).expanduser().resolve())
+    args.train_input = Path(args.train_input).expanduser().resolve()
+    args.eval_input = Path(args.eval_input).expanduser().resolve()
+    if args.target_model_path:
+        args.target_model_path = str(Path(args.target_model_path).expanduser().resolve())
+    if args.nproc_per_node is None:
+        args.nproc_per_node = _gpu_count_from_nvidia_smi()
+    args.generation_server_urls = resolve_generation_server_urls(
+        args,
+        nproc_per_node=args.nproc_per_node,
+    )
+    if args.target_memory_fraction is None:
+        args.target_memory_fraction = 0.90
+    if args.adaptive_min_batch_size is None:
+        args.adaptive_min_batch_size = 1
+    if args.adaptive_max_batch_size is None:
+        args.adaptive_max_batch_size = 256
+    if not 0.0 < args.target_memory_fraction < 1.0:
+        raise LauncherError("--target-memory-fraction must be between 0 and 1")
+    if args.adaptive_min_batch_size <= 0:
+        raise LauncherError("--adaptive-min-batch-size must be positive")
+    if args.adaptive_max_batch_size < args.adaptive_min_batch_size:
+        raise LauncherError(
+            "--adaptive-max-batch-size must be >= --adaptive-min-batch-size"
+        )
+    if args.max_tokens_per_batch < 0:
+        raise LauncherError("--max-tokens-per-batch must be non-negative")
+    if args.bucket_window < args.adaptive_min_batch_size:
+        raise LauncherError("--bucket-window must be >= --adaptive-min-batch-size")
+    if args.probe_batches <= 0:
+        raise LauncherError("--probe-batches must be positive")
+    if args.generation_backend != "hf":
+        generation_command_args(args)
+    if args.generation_concurrency_per_server <= 0:
+        raise LauncherError("--generation-concurrency-per-server must be positive")
+    if args.generation_timeout_seconds <= 0 or args.generation_retries < 0:
+        raise LauncherError("generation server retry/timeout settings are invalid")
+    if args.generation_backoff_seconds < 0 or args.generation_window_size < 0:
+        raise LauncherError("generation server backoff/window settings are invalid")
+    if args.generation_server_tp_size <= 0:
+        raise LauncherError("--generation-server-tp-size must be positive")
+    if args.generation_server_base_port <= 0 or args.generation_server_base_port > 65535:
+        raise LauncherError("--generation-server-base-port must be a valid TCP port")
+    if not args.generation_server_host.strip():
+        raise LauncherError("--generation-server-host must not be empty")
+    if not 0.0 < args.generation_server_mem_fraction < 1.0:
+        raise LauncherError("--generation-server-mem-fraction must be in (0, 1)")
+    if args.generation_server_max_num_seqs < 0:
+        raise LauncherError("--generation-server-max-num-seqs must be non-negative")
+    if args.generation_server_startup_timeout_seconds <= 0:
+        raise LauncherError("--generation-server-startup-timeout-seconds must be positive")
+    if args.sglang_tp_size != 1:
+        raise LauncherError(
+            "--sglang-tp-size must be 1 for the current data-parallel cache launcher"
+        )
+    if args.sglang_mem_fraction_static <= 0 or args.sglang_mem_fraction_static >= 1:
+        raise LauncherError("--sglang-mem-fraction-static must be in (0, 1)")
+    if args.sglang_max_running_requests < 0 or args.sglang_max_total_tokens < 0:
+        raise LauncherError("SGLang request/token limits are invalid")
+    if args.parity_samples < 0:
+        raise LauncherError("--parity-samples must be non-negative")
+
+    source_config = _load_yaml(Path(args.config))
+    source_run_id = _safe_run_id(args.run_id or source_config.get("run_id", "dflash"))
+    paths = resolve_paths(args, source_run_id)
+    paths.output_root.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    console = _RunConsoleLog(paths.log_dir / "run.log")
+
+    with _signal_guard(), _job_lock(paths.lock_path):
+        config = materialize_config(Path(args.config), paths.run_config, paths, args)
+        _write_run_manifest(
+            paths,
+            config=config,
+            args=args,
+            nproc_per_node=args.nproc_per_node,
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{ROOT / 'src'}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        env["PYTHONUNBUFFERED"] = "1"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        env["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        env["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+        env["FINETUNE_PROGRESS_MODE"] = "events"
+        console.emit(
+            "INFO",
+            f"PREFLIGHT model={Path(str(_mapping(config, 'model')['target_model_path'])).name} "
+            f"workers={args.nproc_per_node} offline=true",
+        )
+        try:
+            validate_preflight(
+                config,
+                paths,
+                python_bin=args.python_bin,
+                nproc_per_node=args.nproc_per_node,
+                train_input=args.train_input,
+                eval_input=args.eval_input,
+                dry_run=args.dry_run,
+            )
+        except Exception as exc:
+            console.emit("ERROR", f"PREFLIGHT FAILED {_short_line(str(exc))}")
+            raise
+        console.emit("INFO", "PREFLIGHT PASS")
+        run_id = _safe_run_id(config.get("run_id", source_run_id))
+        model_path = str(_mapping(config, "model").get("target_model_path", ""))
+        model_config = _mapping(config, "model")
+        data_config = _mapping(config, "data")
+        console.emit(
+            "INFO",
+            "RUN START "
+            f"run_id={run_id} model={Path(model_path).name or 'unknown'} "
+            f"dtype={model_config.get('torch_dtype', 'unknown')} "
+            f"generate_backend={args.generation_backend} "
+            f"cache_backend={args.capture_backend}/{args.capture_method} "
+            f"max_length={data_config.get('max_length', 'unknown')} "
+            f"workers={args.nproc_per_node} "
+            f"train_input={args.train_input.name} eval_input={args.eval_input.name} "
+            f"output_root={paths.output_root}",
+        )
+        commands = build_commands(
+            config,
+            paths,
+            args,
+            python_bin=args.python_bin,
+            nproc_per_node=args.nproc_per_node,
+        )
+        validators: dict[str, Callable[[], None]] = {
+            "generate_train": lambda: _valid_jsonl(paths.teacher_train),
+            "generate_eval": lambda: _valid_jsonl(paths.teacher_eval),
+            "validate_teacher_train": lambda: _valid_teacher_report(
+                paths.teacher_train_report,
+                paths.teacher_train_clean if args.filter_anomalies else None,
+            ),
+            "validate_teacher_eval": lambda: _valid_teacher_report(
+                paths.teacher_eval_report,
+                paths.teacher_eval_clean if args.filter_anomalies else None,
+            ),
+            "cache_train": lambda: _valid_features(paths.features_train),
+            "cache_eval": lambda: _valid_features(paths.features_eval),
+            "train": lambda: _valid_checkpoint(paths.checkpoints, run_id),
+        }
+        managed_servers: _ManagedGenerationServers | None = None
+        try:
+            if args.generation_launch_servers and not args.dry_run:
+                generation_ready = True
+                for teacher_path in (paths.teacher_train, paths.teacher_eval):
+                    try:
+                        _valid_jsonl(teacher_path)
+                    except LauncherError:
+                        generation_ready = False
+                        break
+                if not generation_ready:
+                    try:
+                        managed_servers = _start_managed_generation_servers(
+                            args,
+                            config,
+                            paths,
+                            env,
+                            console,
+                        )
+                    except Exception as exc:
+                        console.emit("ERROR", f"SERVER START FAILED {_short_line(str(exc))}")
+                        raise
+            for name, command, artifact in commands:
+                stage_command = list(command)
+                metadata = f"artifact={artifact}"
+                progress_total: int | None = None
+                if name.startswith(("generate_", "validate_teacher_", "cache_")):
+                    input_path = Path(stage_command[stage_command.index("--input") + 1])
+                    if input_path.is_file():
+                        progress_total = _count_nonblank_jsonl(input_path)
+                        stage_command.extend(["--progress-total", str(progress_total)])
+                    else:
+                        progress_total = 0
+                    split = name.rsplit("_", 1)[-1]
+                    if name.startswith("generate_"):
+                        backend = args.generation_backend
+                        workers = (
+                            len(args.generation_server_urls)
+                            if backend != "hf"
+                            else args.nproc_per_node
+                        )
+                        metadata = (
+                            f"dataset={split} model={Path(model_path).name} backend={backend} "
+                            f"records={progress_total} workers={workers} "
+                            f"max_length={data_config.get('max_length', 'unknown')} "
+                            f"source_tokens={data_config.get('max_source_tokens', 'unknown')} "
+                            f"summary_tokens={data_config.get('max_summary_tokens', 'unknown')} "
+                            f"dtype={model_config.get('torch_dtype', 'unknown')}"
+                        )
+                    elif name.startswith("cache_"):
+                        metadata = (
+                            f"dataset={split} model={Path(model_path).name} "
+                            f"backend={args.capture_backend}/{args.capture_method} "
+                            f"records={progress_total} workers={args.nproc_per_node} "
+                            f"max_length={data_config.get('max_length', 'unknown')} "
+                            f"dtype={model_config.get('torch_dtype', 'unknown')} "
+                            f"layers={model_config.get('target_layer_ids') or model_config.get('num_draft_layers')} "
+                            f"parity_samples={args.parity_samples}"
+                        )
+                    else:
+                        metadata = (
+                            f"dataset={split} gate=teacher_quality records={progress_total} "
+                            f"max_anomaly_rate={args.max_anomaly_rate} "
+                            f"min_rouge1={args.min_teacher_rouge1} "
+                            f"filter={args.filter_anomalies} warn_only={args.validate_warn_only}"
+                        )
+                elif name == "train":
+                    metadata = f"model={Path(model_path).name} workers={args.nproc_per_node}"
+                run_stage(
+                    name,
+                    stage_command,
+                    log_path=paths.log_dir / f"{name}.log",
+                    marker_path=paths.state_dir / f"{name}.json",
+                    artifact=artifact,
+                    validator=validators[name],
+                    environment=env,
+                    dry_run=args.dry_run,
+                    console=console,
+                    metadata=metadata,
+                    progress_total=progress_total,
+                )
+                if name == "generate_eval" and managed_servers is not None:
+                    _stop_managed_generation_servers(managed_servers)
+                    managed_servers = None
+        finally:
+            _stop_managed_generation_servers(managed_servers)
+        console.emit("INFO", f"ALL DONE output_root={paths.output_root}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (LauncherError, KeyboardInterrupt) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

@@ -7,11 +7,36 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any
 
 import torch
 
-from .data import DEFAULT_SUMMARY_PROMPT_TEMPLATE, iter_summary_jsonl, render_summary_prompt
+from .data import (
+    DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+    iter_summary_jsonl,
+    render_summary_prompt,
+    render_summary_user_prompt_budgeted,
+)
+from .adaptive_inference import (
+    AdaptiveInferenceSettings,
+    BackoffResult,
+    PreparedExample,
+    adaptive_settings_from_args,
+    add_adaptive_cli_args,
+    length_bucket_batches,
+    run_with_oom_backoff,
+    select_cuda_batch_size,
+    validate_adaptive_inference_settings,
+)
+from .distributed import (
+    DistributedContext,
+    cleanup_distributed,
+    initialize_distributed,
+    merge_ranked_jsonl,
+    ranked_path,
+)
+from .run_logging import ProgressReporter, count_jsonl_records
 
 
 def _generated_ids(output: Any, prompt_length: int) -> list[int]:
@@ -26,6 +51,78 @@ def _generated_ids(output: Any, prompt_length: int) -> list[int]:
     return [int(token) for token in value[0, prompt_length:].detach().cpu().tolist()]
 
 
+def _pad_prompt_batch(
+    prompts: list[torch.Tensor],
+    *,
+    pad_token_id: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    if not prompts:
+        raise ValueError("cannot pad an empty prompt batch")
+    lengths = [int(prompt.numel()) for prompt in prompts]
+    width = max(lengths)
+    input_ids = torch.full(
+        (len(prompts), width),
+        int(pad_token_id),
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros((len(prompts), width), dtype=torch.long, device=device)
+    for row, prompt in enumerate(prompts):
+        length = lengths[row]
+        input_ids[row, width - length :] = prompt.to(device=device, dtype=torch.long)
+        attention_mask[row, width - length :] = 1
+    return input_ids, attention_mask, lengths
+
+
+def _generated_id_rows(output: Any, padded_prompt_length: int) -> list[list[int]]:
+    if isinstance(output, torch.Tensor):
+        value = output
+    elif hasattr(output, "sequences"):
+        value = output.sequences
+    else:
+        raise TypeError("target.generate must return token sequences")
+    if value.ndim != 2:
+        raise ValueError("target.generate must return a rank-2 sequence tensor")
+    if value.shape[1] <= padded_prompt_length:
+        return [[] for _ in range(value.shape[0])]
+    return [
+        [int(token) for token in row[padded_prompt_length:].detach().cpu().tolist()]
+        for row in value
+    ]
+
+
+def _generate_batch(
+    examples: list[PreparedExample],
+    *,
+    tokenizer: Any,
+    target: Any,
+    max_summary_tokens: int,
+    device: torch.device,
+) -> list[list[int]]:
+    prompts = [example.payload["prompt"] for example in examples]
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = 0
+    input_ids, attention_mask, _lengths = _pad_prompt_batch(
+        prompts,
+        pad_token_id=int(pad_token_id),
+        device=device,
+    )
+    with torch.inference_mode():
+        output = target.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=max_summary_tokens,
+            pad_token_id=int(pad_token_id),
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
+    return _generated_id_rows(output, input_ids.shape[1])
+
+
 def _trim_at_eos(token_ids: list[int], eos_token_id: int | None) -> list[int]:
     if eos_token_id is None:
         return token_ids
@@ -33,6 +130,33 @@ def _trim_at_eos(token_ids: list[int], eos_token_id: int | None) -> list[int]:
         return token_ids[: token_ids.index(int(eos_token_id))]
     except ValueError:
         return token_ids
+
+
+def _load_completed_records(path: Path) -> tuple[set[str], set[int], int]:
+    """Load already written record IDs and internal source indices from a partial/completed JSONL."""
+    completed_ids: set[str] = set()
+    completed_indices: set[int] = set()
+    valid_count = 0
+    if not path.is_file():
+        return completed_ids, completed_indices, 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                payload = json.loads(line_str)
+            except json.JSONDecodeError:
+                break
+            if isinstance(payload, dict):
+                rec_id = payload.get("id")
+                if rec_id is not None:
+                    completed_ids.add(str(rec_id))
+                src_idx = payload.get("_source_index")
+                if isinstance(src_idx, int):
+                    completed_indices.add(src_idx)
+                valid_count += 1
+    return completed_ids, completed_indices, valid_count
 
 
 def generate_teacher_jsonl(
@@ -48,59 +172,305 @@ def generate_teacher_jsonl(
     chat_template: str,
     prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
     device: str | torch.device,
+    rank: int = 0,
+    world_size: int = 1,
+    allow_empty: bool = False,
+    adaptive_settings: AdaptiveInferenceSettings | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, int]:
     """Write target-generated summaries while retaining human references."""
 
     destination = Path(output_path)
-    if destination.exists():
-        raise FileExistsError(f"teacher trajectory output already exists: {destination}")
+    part_path = destination.with_name(f"{destination.name}.part")
+    if destination.is_file():
+        _comp_ids, _comp_indices, existing_count = _load_completed_records(destination)
+        if existing_count > 0 and not allow_empty:
+            return {"written": existing_count, "rejected": 0, "resumed": existing_count}
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    written = 0
+    completed_ids, completed_indices, written = _load_completed_records(part_path)
     rejected = 0
+    processed_tokens = 0
+    oom_retries = 0
+    started = time.perf_counter()
     device_obj = torch.device(device)
+    settings = adaptive_settings or AdaptiveInferenceSettings(
+        enabled=False,
+        min_batch_size=1,
+        max_batch_size=1,
+        bucket_window=1,
+    )
+    validate_adaptive_inference_settings(settings)
+    current_batch_size = settings.min_batch_size
+    selection = None
+    observed_peak_reserved = 0
+    handle = part_path.open("a", encoding="utf-8")
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            for record in iter_summary_jsonl(input_path):
-                try:
-                    prompt = render_summary_prompt(
-                        record,
-                        tokenizer,
-                        max_length,
-                        max_source_tokens=max_source_tokens,
-                        max_summary_tokens=max_summary_tokens,
-                        chat_template=chat_template,
-                        prompt_template=prompt_template,
-                    )
-                    input_ids = prompt.unsqueeze(0).to(device_obj)
-                    with torch.inference_mode():
-                        output = target.generate(
-                            input_ids,
-                            do_sample=False,
-                            max_new_tokens=max_summary_tokens,
-                            pad_token_id=getattr(tokenizer, "pad_token_id", None),
-                            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        window: list[PreparedExample] = []
+
+        def flush_window(items: list[PreparedExample]) -> None:
+            nonlocal written, rejected, processed_tokens, oom_retries
+            nonlocal current_batch_size, selection, observed_peak_reserved
+            if not items:
+                return
+            if selection is None:
+                probe_items = sorted(items, key=lambda item: (-item.length, item.index))
+
+                def probe(batch_size: int) -> None:
+                    selected = probe_items[:batch_size]
+                    for _ in range(settings.probe_batches):
+                        _generate_batch(
+                            selected,
+                            tokenizer=tokenizer,
+                            target=target,
+                            max_summary_tokens=max_summary_tokens,
+                            device=device_obj,
                         )
+                    return None
+
+                selection = select_cuda_batch_size(
+                    probe,
+                    settings=settings,
+                    device=device_obj,
+                    maximum=min(settings.max_batch_size, len(probe_items)),
+                )
+                current_batch_size = selection.batch_size
+                if device_obj.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats(device_obj)
+            results: dict[int, list[int]] = {}
+            for batch in length_bucket_batches(
+                items,
+                batch_size=current_batch_size,
+                max_tokens=settings.max_tokens_per_batch,
+                window=max(settings.bucket_window, current_batch_size),
+            ):
+                offset = 0
+                while offset < len(batch):
+                    subset = batch[offset : offset + current_batch_size]
+
+                    def work(size: int) -> list[list[int]]:
+                        return _generate_batch(
+                            subset[:size],
+                            tokenizer=tokenizer,
+                            target=target,
+                            max_summary_tokens=max_summary_tokens,
+                            device=device_obj,
+                        )
+
+                    result = run_with_oom_backoff(
+                        work,
+                        initial_batch_size=len(subset),
+                        minimum_batch_size=min(settings.min_batch_size, len(subset)),
+                    ) if settings.oom_backoff else BackoffResult(
+                        work(len(subset)), len(subset), 0
+                    )
+                    for example, token_ids in zip(
+                        subset[: result.batch_size], result.value, strict=True
+                    ):
+                        results[example.index] = token_ids
+                        processed_tokens += example.length
+                    oom_retries += result.oom_retries
+                    if device_obj.type == "cuda" and torch.cuda.is_available():
+                        observed_peak_reserved = max(
+                            observed_peak_reserved,
+                            int(torch.cuda.max_memory_reserved(device_obj)),
+                        )
+                    current_batch_size = min(current_batch_size, result.batch_size)
+                    offset += result.batch_size
+            for example in sorted(items, key=lambda item: item.index):
+                try:
                     token_ids = _trim_at_eos(
-                        _generated_ids(output, input_ids.shape[1]),
+                        results[example.index],
                         getattr(tokenizer, "eos_token_id", None),
                     )
+                    record = example.payload["record"]
                     summary = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
                     if len(token_ids) < 2 or not summary:
-                        raise ValueError("target generated fewer than two usable summary tokens")
-                except (TypeError, ValueError) as exc:
+                        rejected += 1
+                        continue
+                    payload = {
+                        "id": record.id,
+                        "document": record.document,
+                        "summary": summary,
+                        "reference_summary": record.summary,
+                        **dict(record.metadata),
+                        "teacher": {
+                            "target_model_path": str(target_model_path),
+                            "chat_template": chat_template,
+                            "prompt_template": prompt_template,
+                            "do_sample": False,
+                            "max_length": max_length,
+                            "max_source_tokens": max_source_tokens,
+                            "max_summary_tokens": max_summary_tokens,
+                        },
+                    }
+                    if world_size > 1:
+                        payload["_source_index"] = example.index
+                    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                    handle.flush()
+                    written += 1
+                except Exception:
+                    rejected += 1
+                    continue
+
+        for source_index, record in enumerate(iter_summary_jsonl(input_path)):
+            if progress is not None:
+                progress.update()
+            if source_index % world_size != rank:
+                continue
+            if record.id in completed_ids or source_index in completed_indices:
+                continue
+            try:
+                prompt = render_summary_prompt(
+                    record,
+                    tokenizer,
+                    max_length,
+                    max_source_tokens=max_source_tokens,
+                    max_summary_tokens=max_summary_tokens,
+                    chat_template=chat_template,
+                    prompt_template=prompt_template,
+                )
+                window.append(
+                    PreparedExample(
+                        source_index,
+                        int(prompt.numel()) + max_summary_tokens,
+                        {"record": record, "prompt": prompt},
+                    )
+                )
+                if len(window) >= max(settings.bucket_window, settings.min_batch_size):
+                    flush_window(window)
+                    window = []
+            except (TypeError, ValueError, RuntimeError):
+                rejected += 1
+                continue
+        flush_window(window)
+        handle.close()
+        if written == 0 and not allow_empty:
+            raise ValueError("target generation produced no usable summaries")
+        os.replace(part_path, destination)
+    except Exception:
+        handle.close()
+        raise
+    stats: dict[str, int] = {
+        "written": written,
+        "rejected": rejected,
+    }
+    if adaptive_settings is not None:
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        stats.update(
+            {
+                "tokens": processed_tokens,
+                "elapsed_ms": int(elapsed * 1000),
+                "samples_per_sec_x1000": int(written / elapsed * 1000),
+                "tokens_per_sec_x1000": int(processed_tokens / elapsed * 1000),
+                "oom_retries": oom_retries,
+                "adaptive_batch_size": int(current_batch_size),
+                "adaptive_target_memory_bytes": int(
+                    selection.target_memory_bytes if selection is not None else 0
+                ),
+                "adaptive_peak_reserved_bytes": int(
+                    max(
+                        observed_peak_reserved,
+                        selection.peak_reserved_bytes if selection is not None else 0,
+                    )
+                ),
+                "adaptive_probe_count": int(selection.probes if selection is not None else 0),
+                "adaptive_hit_maximum": int(
+                    selection.hit_maximum if selection is not None else False
+                ),
+            }
+        )
+    return stats
+
+
+def generate_teacher_jsonl_server(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    tokenizer: Any,
+    server_pool: Any,
+    target_model_path: str,
+    generation_backend: str,
+    server_model: str | None,
+    max_length: int,
+    max_source_tokens: int,
+    max_summary_tokens: int,
+    chat_template: str,
+    prompt_template: str = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+    window_size: int = 0,
+    allow_empty: bool = False,
+    progress: ProgressReporter | None = None,
+) -> dict[str, int]:
+    """Generate teacher summaries through a SGLang/vLLM server pool.
+
+    The local tokenizer is still used for the source budget and cache prompt
+    contract; model weights stay inside the server pool, so one launcher rank
+    does not replicate a target model on every GPU.
+    """
+
+    if generation_backend not in {"sglang", "vllm"}:
+        raise ValueError("server generation backend must be sglang or vllm")
+    destination = Path(output_path)
+    part_path = destination.with_suffix(".part")
+    if destination.is_file():
+        _comp_ids, _comp_indices, existing_count = _load_completed_records(destination)
+        if existing_count > 0 and not allow_empty:
+            return {"written": existing_count, "rejected": 0, "resumed": existing_count}
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    completed_ids, completed_indices, written = _load_completed_records(part_path)
+    window_limit = window_size or max(1, int(getattr(server_pool, "max_in_flight", 1)) * 2)
+    if window_limit <= 0:
+        raise ValueError("window_size must be positive")
+    rejected = 0
+    requests_sent = 0
+    started = time.perf_counter()
+    handle = part_path.open("a", encoding="utf-8")
+    try:
+        window: list[tuple[int, Any, str]] = []
+
+        def flush_window(items: list[tuple[int, Any, str]]) -> None:
+            nonlocal written, rejected, requests_sent
+            if not items:
+                return
+            requests = [
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_summary_tokens,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "stream": False,
+                }
+                for _source_index, _record, prompt in items
+            ]
+            requests_sent += len(requests)
+            try:
+                summaries = server_pool.generate_many(requests)
+            except Exception:
+                # If batch failed, fallback to individual generation to isolate bad samples
+                summaries = []
+                for req in requests:
+                    try:
+                        summaries.append(server_pool._generate_one(0, req))
+                    except Exception:
+                        summaries.append("")
+            for (_source_index, record, _prompt), summary in zip(
+                items, summaries, strict=True
+            ):
+                cleaned = str(summary).strip()
+                if not cleaned:
                     rejected += 1
                     continue
                 payload = {
                     "id": record.id,
                     "document": record.document,
-                    "summary": summary,
+                    "summary": cleaned,
                     "reference_summary": record.summary,
                     **dict(record.metadata),
                     "teacher": {
                         "target_model_path": str(target_model_path),
+                        "generation_backend": generation_backend,
+                        "server_model": server_model,
                         "chat_template": chat_template,
                         "prompt_template": prompt_template,
                         "do_sample": False,
@@ -110,14 +480,47 @@ def generate_teacher_jsonl(
                     },
                 }
                 handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
                 written += 1
-        if written == 0:
-            raise ValueError("target generation produced no usable summaries")
-        os.replace(temporary_name, destination)
+
+        for source_index, record in enumerate(iter_summary_jsonl(input_path)):
+            if progress is not None:
+                progress.update()
+            if record.id in completed_ids or source_index in completed_indices:
+                continue
+            try:
+                prompt = render_summary_user_prompt_budgeted(
+                    record,
+                    tokenizer,
+                    max_length,
+                    max_source_tokens=max_source_tokens,
+                    max_summary_tokens=max_summary_tokens,
+                    chat_template=chat_template,
+                    prompt_template=prompt_template,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                rejected += 1
+                continue
+            window.append((source_index, record, prompt))
+            if len(window) >= window_limit:
+                flush_window(window)
+                window = []
+        flush_window(window)
+        handle.close()
+        if written == 0 and not allow_empty:
+            raise ValueError("target server generation produced no usable summaries")
+        os.replace(part_path, destination)
     except Exception:
-        Path(temporary_name).unlink(missing_ok=True)
+        handle.close()
         raise
-    return {"written": written, "rejected": rejected}
+    elapsed = max(time.perf_counter() - started, 1e-9)
+    return {
+        "written": written,
+        "rejected": rejected,
+        "requests": requests_sent,
+        "elapsed_ms": int(elapsed * 1000),
+        "samples_per_sec_x1000": int(written / elapsed * 1000),
+    }
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -140,44 +543,195 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--generation-backend",
+        choices=("hf", "sglang", "vllm"),
+        default="hf",
+        help="local HF generation or an OpenAI-compatible SGLang/vLLM pool",
+    )
+    parser.add_argument(
+        "--generation-server-url",
+        action="append",
+        default=[],
+        help="repeat once per SGLang/vLLM endpoint (each endpoint may serve one GPU)",
+    )
+    parser.add_argument("--generation-model")
+    parser.add_argument("--generation-concurrency-per-server", type=int, default=8)
+    parser.add_argument("--generation-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--generation-retries", type=int, default=2)
+    parser.add_argument("--generation-backoff-seconds", type=float, default=0.25)
+    parser.add_argument("--generation-window-size", type=int, default=0)
+    parser.add_argument(
+        "--progress-total",
+        type=int,
+        help="known input record count supplied by the run launcher",
+    )
+    add_adaptive_cli_args(parser)
     args = parser.parse_args(argv)
     if args.max_source_tokens < 0 or args.max_summary_tokens < 1:
         raise ValueError("source budget must be non-negative and summary budget positive")
     if args.max_source_tokens + args.max_summary_tokens > args.max_length:
         raise ValueError("source and summary token budgets exceed --max-length")
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if args.generation_backend != "hf":
+        if not args.generation_server_url:
+            raise ValueError("remote generation requires at least one --generation-server-url")
+        if args.generation_concurrency_per_server <= 0:
+            raise ValueError("--generation-concurrency-per-server must be positive")
+        if args.generation_timeout_seconds <= 0 or args.generation_retries < 0:
+            raise ValueError("generation server retry/timeout settings are invalid")
+        if args.generation_backoff_seconds < 0 or args.generation_window_size < 0:
+            raise ValueError("generation server backoff/window settings are invalid")
+    if args.generation_backend != "hf":
+        from transformers import AutoTokenizer
 
-    device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.target_model_path,
-        trust_remote_code=args.trust_remote_code,
-        local_files_only=True,
-    )
-    target = AutoModelForCausalLM.from_pretrained(
-        args.target_model_path,
-        trust_remote_code=args.trust_remote_code,
-        torch_dtype=_dtype(args.torch_dtype),
-        low_cpu_mem_usage=True,
-        local_files_only=True,
-    ).to(device).eval()
-    stats = generate_teacher_jsonl(
-        args.input,
-        args.output,
-        tokenizer=tokenizer,
-        target=target,
-        target_model_path=args.target_model_path,
-        max_length=args.max_length,
-        max_source_tokens=args.max_source_tokens,
-        max_summary_tokens=args.max_summary_tokens,
-        chat_template=args.chat_template,
-        prompt_template=args.prompt_template,
-        device=device,
-    )
-    print(json.dumps(stats, ensure_ascii=False, sort_keys=True))
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=True,
+        )
+        from .server_pool import OpenAICompatibleServerPool
+
+        server_model = args.generation_model or args.target_model_path
+        server_pool = OpenAICompatibleServerPool(
+            args.generation_server_url,
+            model=server_model,
+            concurrency_per_server=args.generation_concurrency_per_server,
+            timeout_seconds=args.generation_timeout_seconds,
+            max_retries=args.generation_retries,
+            retry_backoff_seconds=args.generation_backoff_seconds,
+        )
+        progress = ProgressReporter(
+            f"generate:{Path(args.input).stem}",
+            args.progress_total
+            if args.progress_total is not None
+            else count_jsonl_records(args.input),
+        )
+        succeeded = False
+        try:
+            stats = generate_teacher_jsonl_server(
+                args.input,
+                args.output,
+                tokenizer=tokenizer,
+                server_pool=server_pool,
+                target_model_path=args.target_model_path,
+                generation_backend=args.generation_backend,
+                server_model=server_model,
+                max_length=args.max_length,
+                max_source_tokens=args.max_source_tokens,
+                max_summary_tokens=args.max_summary_tokens,
+                chat_template=args.chat_template,
+                prompt_template=args.prompt_template,
+                window_size=args.generation_window_size,
+                progress=progress,
+            )
+            succeeded = True
+        finally:
+            progress.close(complete=succeeded)
+        print(json.dumps(stats, ensure_ascii=False, sort_keys=True))
+        return
+    context = initialize_distributed(args.device)
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        device = (
+            torch.device("cuda", context.local_rank)
+            if context.is_distributed and torch.cuda.is_available()
+            else torch.device(args.device)
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=True,
+        )
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            torch_dtype=_dtype(args.torch_dtype),
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+        ).to(device).eval()
+        adaptive_settings = adaptive_settings_from_args(args, device)
+        shard_output = ranked_path(args.output, context.rank, context.world_size)
+        progress = ProgressReporter(
+            f"generate:{Path(args.input).stem}",
+            args.progress_total
+            if args.progress_total is not None
+            else count_jsonl_records(args.input),
+            enabled=context.is_main_process,
+        )
+        succeeded = False
+        try:
+            stats = generate_teacher_jsonl(
+                args.input,
+                shard_output,
+                tokenizer=tokenizer,
+                target=target,
+                target_model_path=args.target_model_path,
+                max_length=args.max_length,
+                max_source_tokens=args.max_source_tokens,
+                max_summary_tokens=args.max_summary_tokens,
+                chat_template=args.chat_template,
+                prompt_template=args.prompt_template,
+                device=device,
+                rank=context.rank,
+                world_size=context.world_size,
+                allow_empty=context.is_distributed,
+                adaptive_settings=adaptive_settings,
+                progress=progress,
+            )
+            succeeded = True
+        finally:
+            progress.close(complete=succeeded)
+        totals = context.all_reduce_sum(
+            torch.tensor(
+                [
+                    stats["written"],
+                    stats["rejected"],
+                    stats.get("tokens", 0),
+                    stats.get("oom_retries", 0),
+                ],
+                dtype=torch.float64,
+                device=device,
+            )
+        ).cpu()
+        context.barrier()
+        if context.is_main_process:
+            merge_ranked_jsonl(
+                [ranked_path(args.output, rank, context.world_size) for rank in range(context.world_size)],
+                args.output,
+            ) if context.is_distributed else None
+            summary = {
+                "written": int(totals[0]),
+                "rejected": int(totals[1]),
+                "tokens": int(totals[2]),
+                "oom_retries": int(totals[3]),
+            }
+            if adaptive_settings.enabled:
+                elapsed_ms = max(int(stats.get("elapsed_ms", 0)), 1)
+                summary.update(
+                    {
+                        "elapsed_ms_rank0": elapsed_ms,
+                        "tokens_per_sec_x1000_rank0": int(
+                            totals[2].item() / (elapsed_ms / 1000.0) * 1000
+                        ),
+                        "adaptive_batch_size_rank0": int(
+                            stats.get("adaptive_batch_size", 1)
+                        ),
+                        "adaptive_target_memory_bytes": int(
+                            stats.get("adaptive_target_memory_bytes", 0)
+                        ),
+                        "adaptive_peak_reserved_bytes_rank0": int(
+                            stats.get("adaptive_peak_reserved_bytes", 0)
+                        ),
+                    }
+                )
+            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    finally:
+        cleanup_distributed(context)
 
 
 if __name__ == "__main__":
     main()
 
 
-__all__ = ["generate_teacher_jsonl", "main"]
+__all__ = ["generate_teacher_jsonl", "generate_teacher_jsonl_server", "main"]

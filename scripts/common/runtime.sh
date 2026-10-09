@@ -66,5 +66,5 @@ fast_infer_prepare_cache_defaults() {
   mkdir -p "$FLASHINFER_WORKSPACE_BASE" "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
 }
 
-fast_infer_require_python312
+fast_infer_require_python312 || return 1
 fast_infer_prepare_cache_defaults

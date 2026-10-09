@@ -1,201 +1,468 @@
-# Đặc tả kỹ thuật AMR-DFlash V0
+# AMR-DFlash — memory adapter nhẹ trên pretrained DFlash
 
-Ngày: **08/10/2026**. Trạng thái: **V0 code/CPU synthetic tests đã có; model thật/B200 và kết quả khoa học chưa có**.
+Ngày tạo: **08/10/2026**. Cập nhật thiết kế: **09/10/2026**.
 
-Nguồn: [proposal](../../../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md); [index tài liệu triển khai](../../../src/ARMdflash/AMR_DFlash_Implementation/README.md).
+**Quyết định hiện tại:** giữ nguyên target và toàn bộ pretrained DFlash-5L;
+chỉ huấn luyện một memory adapter nhỏ dùng chung giữa năm draft layers.
+Thiết kế này thay hướng train selector bằng acceptance preferences.
+**Trạng thái:** thiết kế đã thống nhất; code hiện có vẫn là V0
+preference-selector + global slots. Trainer và compressor mới chưa được triển khai.
+Người vận hành xác nhận regenerated data và target-feature cache 50K từ Qwen3-4B
+đã có trên server; parity/fingerprint với snapshot và trainer AMR vẫn cần kiểm tra.
 
-## 1. Mục tiêu và phạm vi
+Tên canonical trong repository là **AMR-DFlash**; “ARM-DFlash” trong trao đổi
+chỉ cùng phương pháp. File giữ ngày tạo trong tên để bảo toàn các liên kết.
 
-Xây memory interface cho pretrained DFlash để thử giả thuyết selection theo acceptance và global compression bổ trợ làm tăng accepted prefix trên long context với overhead đủ thấp.
+[Hồ sơ ý tưởng và dàn ý paper](../../amr_dflash_paper_story.md) là tài liệu
+chính để kiểm soát paper story, recipe training và các quyết định nghiên cứu.
+File này là **đặc tả kỹ thuật đi kèm** cho kiến trúc và implementation contracts.
+Xem [dữ liệu/train](../../amr_dflash_training_data.md),
+[kế hoạch triển khai](../plans/2026-10-08-amr-dflash-implementation.md)
+và [launcher V0](../../baselines/amr_dflash.md).
+[Proposal 08/10](../../../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md)
+và các contracts trong src/ARMdflash là lịch sử V0, chưa đồng bộ thiết kế này.
 
-V0 giữ checkpoint DFlash-5L, block 16, target full-context, greedy temperature 0 và batch 1. Ưu tiên một backend HF/PyTorch cached có dense control chung. Batch lớn, layer-specific routing, adaptive block size, LoRA và speculative sampling là extension sau pilot.
+## 1. Bài toán, giả thuyết và mục tiêu
 
-**Ràng buộc toàn cục:**
+DFlash dự đoán song song một block từ target hidden features của prefix.
+Ở long context, đọc context K/V dài làm tăng chi phí drafting. Phương pháp
+phân bổ thông tin thành ba mức: global summaries, selected fine context và
+exact local context, rồi dùng chính pretrained drafter để dự đoán block.
 
-- Tài liệu tiếng Việt; Python **3.12**; server dùng `python3` hệ thống.
-- Local chỉ CPU qua `.venv/bin/python` hoặc executable do `FAST_INFER_PYTHON` chọn. Không sửa GPU/driver local.
-- Không thêm dependency mới, installer online hoặc venv từng baseline.
-- Model/tokenizer/dataset dùng local snapshot; đặt `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` và `local_files_only=True`.
-- Giữ nguyên toàn bộ **5 draft layer**, weights pretrained, block **16** và feature-layer metadata của checkpoint. Bộ `[1,9,17,25,33]` là cấu hình của cohort đã đo, không áp đặt mù cho checkpoint khác.
-- Trọng số target và backbone frozen; optimizer chỉ chứa selector/compressor/adapters được khai báo.
-- Raw keys giữ original absolute positions/RoPE; live block không bị prune.
-- Mọi generation record qua `common.io_util.JsonlWriter`, kết thúc bằng summary; gọi `rouge.add_rouge`/`aggregate_rouge` khi có reference.
-- Không sửa trực tiếp `externals/dflash` và không làm thay đổi default DFlash baseline.
-- Không dùng full-prefix reference timing, dense mask hoặc attention collector timing để claim acceleration.
+**Giả thuyết:** memory adapter học bằng draft prediction có thể giữ phần lớn
+acceptance của dense DFlash với context attention rẻ hơn, tạo lợi ích về
+committed tokens/s mà không cần cập nhật backbone.
 
-## 2. Những điểm phải xử lý từ code hiện có
+Primary metric là tổng decode committed tokens chia tổng decode seconds.
+Actual accepted proposals, committed tokens/round, draft latency, TTFT,
+E2E, resident memory và tổng adaptation GPU-hours giải thích sự đánh đổi.
+Giảm số keys hay giảm training loss chưa chứng minh tăng tốc.
+Tăng acceptance vượt dense là kết quả có thể đạt, chưa phải điều kiện tiên quyết.
 
-| Quan sát code | Hệ quả |
+- Biến độc lập: thành phần memory, budget, learned/fixed pooling và learned/fixed selection.
+- Biến phụ thuộc: acceptance, committed throughput, latency và chi phí adaptation.
+- Biến kiểm soát: target/draft snapshots, tokenizer/template, feature layers,
+  dtype/backend, block 16, generation cap, splits và protocol đo.
+- Phạm vi đầu tiên: greedy, một B200, giữ nguyên năm layers và một anchor +
+  15 proposals. Speculative sampling và thay depth/block thuộc nghiên cứu sau.
+
+Các thăm dò attention chỉ tạo động cơ, không chứng minh causal utility.
+[Báo cáo 10 GovReport](../../experiments/2026-10-06_dflash_attention_10_instances_full_mass.md)
+đo 21,35% full attention mass trên live block tại 16K, trên cohort nhỏ và backend
+instrumented. Không dùng attention coverage hoặc timing đó làm acceptance/speedup.
+
+## 2. Lựa chọn kiến trúc và liên hệ HCA/CSA
+
+| Lựa chọn | Quyết định |
 |---|---|
-| `DFlashDraftModel.forward` dùng `hidden_norm(fc(target_hidden))` rồi cùng context features cho năm layer | AMR chọn/nén trong không gian context đã project, giữ nguyên backbone |
-| `Qwen3DFlashAttention` nối context K/V với live-block K/V và dùng RoPE | Selected raw keys, slot keys và live keys phải có đường vị trí tách rõ |
-| `dflash_generate` dùng `past_key_values_draft.get_seq_length()` để suy đoạn vị trí | Số entry được giữ không còn bằng logical prefix length; AMR không dùng compact cache length để suy absolute position |
-| Dense generator lưu `acceptance_lengths = A + 1` | Không dùng field này như accepted proposals A; canonical AMR ghi riêng A và G |
-| `src/MR_DFlash/inference.py` chạy target `use_cache=False` | Chỉ tham khảo correctness, không làm dense control cho latency production |
-| `common.io_util.throughput` lấy nghịch đảo mean TPOT | Primary AMR dùng `sum(G)/sum(T)` và field riêng, không thay semantics metric chung |
+| Shared memory adapter, frozen DFlash | Phương pháp chính: ít module, gần đầu vào pretrained, index một lần/block |
+| Native HCA/CSA xen kẽ theo layer | Ablation tương lai; thay visibility và query routing sâu hơn |
+| Full draft fine-tuning | Không thuộc phương pháp chính; chi phí và claim khác |
+| LoRA attention nhỏ | Extension khi memory-only chưa đạt yêu cầu, báo riêng params và GPU-hours |
 
-## 3. Sơ đồ dữ liệu
+[DeepSeek-V4](https://arxiv.org/html/2606.19348v1#S2.SS3) dùng
+HCA để nén mạnh và CSA để chọn compressed entries, phân bổ theo layer,
+kèm local window. AMR kế thừa nguyên lý nhiều độ phân giải, nhưng dùng
+target-derived features và memory chung. Nhánh fine chọn **raw features của
+nhóm được index**, thay vì attention trên compressed entries như CSA gốc.
+Không gọi phiên bản này là transplant nguyên bản HCA/CSA.
 
 ~~~mermaid
 flowchart LR
-    T["Target full-context + KV"] --> H["Committed target features"]
-    H --> P["Frozen fc + hidden_norm"]
-    P --> BANK["Raw memory bank + compact index"]
-    P --> CMP["Incremental compressor"]
-    Z["Pre-draft state"] --> SEL["Selector"]
-    BANK --> SEL
-    SEL --> W["Local + selected raw K/V"]
-    CMP --> W
-    W --> D["Same DFlash-5L + full live block"]
-    D --> V["Full-context target verify"]
-    V --> U["Commit / rollback / EOS"]
-    U --> T
-    U --> BANK
-    U --> CMP
+    DATA["Regenerated prompt + response"] --> CACHE["Target features đã audit"]
+    CACHE --> P["Frozen DFlash fc + hidden_norm"]
+    P --> G["Global weighted pooling nhỏ"]
+    P --> F["Fine block index: mean pooling cố định"]
+    P --> L["Exact local features"]
+    Q["Anchor + latest/recent committed features"] --> I["Indexer nhỏ: một lần/block"]
+    F --> I
+    I --> R["Gather raw features của nhóm đã chọn"]
+    G --> M["Working memory chung"]
+    R --> M
+    L --> M
+    M --> D["Frozen DFlash-5L + full live block"]
+    D --> LOSS["Weighted draft CE"]
+    TEACH["Dense DFlash attention trên subset"] --> IDX["Indexer KL"]
+    I --> IDX
 ~~~
 
-Dense bypass dùng checkpoint và target verifier cùng backend. Memory modules không đọc proposal tương lai hoặc current-round verification để quyết định selection hiện tại.
+Training dùng response tokens làm labels. Inference giữ full-context target
+verification, crop rejected prefix và commit đúng EOS/output cap.
 
-## 4. Hợp đồng state và tensor
+## 3. Tham số được học và ngân sách
 
-Các primitive/config nằm trong `src/AMR_DFlash/core.py` và `config.py`; batch 1 ở V0. V0 chưa có một `DraftState` dataclass riêng: index JSONL và bundle tensor giữ state fields.
+Với H = hidden_norm(fc(target_features)) có shape [N,d]:
 
-| Kiểu / field | Shape / nội dung |
+| Thành phần | Trạng thái |
 |---|---|
-| `DraftState.state_id, document_id, split` | Định danh state và document; split khóa theo document |
-| `context_ids` | int64 `[1,N]`; prefix **đã được target xử lý**, trước live anchor |
-| `context_positions` | int64 `[1,N]`; original absolute positions |
-| `target_features` | `[1,N,d_H]`; concat target hidden layers theo manifest |
-| `anchor_id, anchor_position` | Token target đã chọn ở vị trí `N`, chưa thuộc context bank |
-| `prompt_length, emitted_output_ids, max_new_tokens_remaining` | Scope prompt/output và bookkeeping dừng |
-| `MemoryBank.projected_context` | `[1,N,d]` sau frozen fc/norm, tùy storage policy |
-| `MemoryBank.index` | `[1,N,64]` dùng selector; token index gắn absolute position |
-| `WorkingMemory.raw_positions` | `[1,B_raw_actual]`, unique, tăng dần, thuộc context |
-| `WorkingMemory.raw_features` | `[1,B_raw_actual,d]` nếu chế độ feature projection |
-| `WorkingMemory.slots, slot_valid` | `[1,M,d]` và bool `[1,M]` |
-| `DraftOutput.proposal_ids, logits` | `[1,15]` và `[1,15,V]` |
-| `VerifyResult` | accepted proposal count, emitted IDs, processed committed features, pending anchor, EOS, target-cache cursor |
+| Target, token embeddings và output head dùng chung | Frozen |
+| DFlash fc, hidden_norm, năm attention/FFN layers, final norm | Frozen |
+| Fine-block mean pooling | Cố định |
+| Global pooling MLP d → r_C → 1 | Trainable |
+| Indexer key projection d → r_I và query MLP 3d → r_I → r_I | Trainable |
+| Global attention bias dùng chung | Trainable scalar |
 
-**Anchor bookkeeping:** một token đã biết/đã emit có thể chưa được target xử lý trong cache. Vì vậy `emitted_output_ids`, `context_ids` và pending anchor là ba khái niệm riêng. Adapter của generator phải chuẩn hóa snapshot sang hợp đồng này. Không giả định `len(context_ids) = prompt_length + output_tokens` ở mọi boundary.
+Khởi đầu r_C=32, r_I=64. Global values là weighted mean của H; phương pháp
+chính không có full-rank value projection, per-layer adapter hoặc residual
+projection mới. Pooling weights ban đầu uniform bằng final pooling weight
+bằng zero và tầng trước được khởi tạo bình thường. Indexer nhỏ vẫn cần
+khởi tạo và học; không khởi tạo lại DFlash.
 
-**A/G:** `A_raw` là matched-prefix proposals trước stop clipping, `A_committed` là proposals thực sự emit trước EOS/output cap, `G` là số token mới emit ở round. `G` lấy từ emitter, không suy bằng `A+1`. Anchor đã emit không được đếm lại; pending correction/bonus không append features trước khi được xử lý.
+Số tham số chính có bậc 4*d*r_I + r_I² + d*r_C, cộng biases/gate nếu có.
+Trainer phải ghi số thực tế và assert optimizer không chứa frozen params.
+Mục tiêu là module nhỏ; không tự gán tỷ lệ tiết kiệm thời gian theo tỷ lệ params.
 
-**Emitter V0:** emit anchor đầu ngay sau target prefill; sau verification emit accepted proposals rồi correction/bonus nếu còn budget và chưa gặp EOS. Correction/bonus đã emit trở thành pending anchor chưa được xử lý cho round kế. Initial event có `phase=prefill`; round/terminal events có phase riêng. Tổng G của mọi event bằng output tokens; throughput decode chỉ lấy G và thời gian thuộc decode. Nếu anchor đầu là EOS, dừng mà không draft block.
+| Hyperparameter | Điểm bắt đầu pilot, chưa benchmark |
+|---|---:|
+| Fine group size m | 4 tokens |
+| Global group size c | 64 tokens |
+| Selected fine groups K | 256 |
+| Exact local window L | 128 tokens |
+| Global additive logit bias khởi tạo | -4, finite |
+| Query recent window | 16 committed features |
+| Anchor blocks/document mỗi lượt train | 8, tăng sau profile |
+| Optimizer | AdamW, LR 1e-4, weight decay 0,01, clip norm 1 |
+| Seed | 17 |
 
-### Interface lõi
+Các giá trị này chưa phải env/CLI được V0 hỗ trợ. c là số tokens mỗi global
+entry; khác với num_slots=128 cố định của V0.
 
-~~~python
-# Chữ ký dự kiến; dependencies pretrained/config được bind trong constructor.
-def project_context(target_features: Tensor) -> Tensor: ...
-def build_bank(state: DraftState) -> MemoryBank: ...
-def append_processed(bank: MemoryBank, features: Tensor, positions: Tensor) -> MemoryBank: ...
-def select_context(state: DraftState, bank: MemoryBank, raw_budget: int) -> Tensor: ...
-def build_working_memory(state: DraftState, bank: MemoryBank, config: AMRConfig) -> WorkingMemory: ...
-def draft_forward(state: DraftState, memory: WorkingMemory) -> DraftOutput: ...
-def verify_greedy(state: DraftState, draft: DraftOutput, target_cache: TargetCacheState) -> VerifyResult: ...
-def evaluate_model(model: AMRModel, states: Sequence[DraftState], mode: str) -> EvalReport: ...
+## 4. Xây memory, positions và streaming
+
+### 4.1. Global memory
+
+Chia absolute timeline thành nhóm c tokens, luôn căn theo vị trí 0.
+Chỉ xuất global entry khi nhóm đã hoàn tất trong prefix được target xử lý.
+Nhóm đang dở được giữ bằng local window; yêu cầu L >= c trong config.
+
+\[
+a_i=w_2^\top\operatorname{SiLU}(W_1 h_i),\qquad
+g_b=\frac{\sum_{i\in B_b}\exp(a_i)h_i}
+          {\sum_{i\in B_b}\exp(a_i)}.
+\]
+
+Số global entries là floor(N/c), không cố định theo mọi N. Không truncate
+global entries để giữ một trần slots mà bỏ lịch sử xa.
+Dùng FP32 và log-sum-exp ổn định khi pooling; cast về dtype drafter khi attention.
+
+Ở inference, nhóm hoàn tất không đổi và được cache; giữ accumulator cho tail,
+append chỉ features đã xử lý và commit. Sau load/update weights phải rebuild
+memory/index; accumulator cũ không có ý nghĩa với compressor mới.
+Training dựng lại pooling với autograd, không tái sử dụng inference accumulator
+đã detach để thay thế graph.
+
+Global summaries có thể chứa thông tin trùng selected/local raw features.
+Đây là nhiều độ phân giải chồng lấp; không gọi là disjoint complement.
+
+### 4.2. Fine retrieval
+
+Mỗi nhóm m tokens có mean feature cố định u_b; indexer key k_b=W_k u_b.
+Query đọc anchor embedding, latest H và mean recent H của prefix đã biết.
+Score là dot product chuẩn hóa theo sqrt(r_I), có thể thêm một scalar position bias.
+
+Indexer chọn một support cho cả block, dùng chung năm layers. Query có context
+ngay trước layer đầu, tránh dùng 15 mask embeddings giống nhau làm query nội dung.
+Eligible groups phải hoàn tất trước anchor và nằm hoàn toàn ngoài exact local
+window. Chọn min(K, số eligible groups), gather raw features nguyên bản,
+union local, loại trùng và sort theo original absolute positions.
+
+Top-K không truyền gradient qua indices. Key/query scorer học bằng indexer
+loss; raw values không được gọi là một differentiable selector.
+
+### 4.3. DFlash attention và accounting
+
+Mỗi layer dùng Q/K/V/O projections, k_norm và residual/FFN pretrained.
+Context memory chung gồm selected raw, local raw và global entries.
+K/V của toàn bộ live block tiếp tục được thêm như DFlash gốc:
+
+\[
+O_\ell=\operatorname{Attn}
+(Q_\ell,[KV_\ell(R_{\rm fine}\cup R_{\rm local}),
+          KV_\ell(G),KV_\ell(\text{live block})]).
+\]
+
+Raw K giữ original RoPE positions. Global K lấy integer midpoint của nhóm
+hoàn tất, rotate sau pooling/projection; V không rotate. Global bias chỉ đặt
+trên global keys. Quy ước này là lựa chọn cần ablate, không là phép biến đổi
+tương đương dense attention. Live block vẫn bidirectional.
+
+Số context keys tối đa:
+\[
+B_{\rm ctx}\le mK+L+\lfloor N/c\rfloor.
+\]
+Live block 16 nằm ngoài B_ctx. Với N=16384, m=4, K=256, L=128, c=64:
+B_ctx <= 1408, tổng keys <= 1424. So sánh matched-total-budget dùng số entries
+thực tế sau loại trùng; selection-only không được cấp ít keys hơn rồi gọi công bằng.
+
+Dense bypass tắt global branch và giữ mọi raw positions để kiểm tra identity.
+Short-context routing dùng threshold pilot và calibration theo server/backend
+sau cùng; không tự gọi một threshold cố định là cost-optimal.
+Full resident raw feature/KV bank và full target KV vẫn có thể tồn tại.
+Báo storage toàn hệ thống, không suy giảm VRAM từ số keys attention.
+
+## 5. Dữ liệu và tính nhân quả
+
+Một sample có clean prompt p, target-regenerated response y, token IDs/positions,
+source ID, split và cache fingerprint. Giữ response cho prediction labels;
+reference ArXiv gốc chỉ phục vụ ROUGE. Tạo random anchors trong response.
+Với anchor ở position a, block là token đã biết x_a + tối đa 15 masks,
+labels là x_(a+1)...x_(a+15), valid mask kết thúc tại EOS/response end.
+
+Context features chỉ là H[0:a], không gồm feature của anchor chưa được target
+xử lý hoặc proposal positions. Whole clean sequence có thể được chạy qua causal
+target một lần; slice/mask theo anchor vẫn phải áp dụng **trước pooling và selection**.
+Entry có một token ngoài prefix không được dùng, kể cả centroid nằm trong prefix.
+
+Nhiều anchors cùng document dùng chung feature store nhưng không nhìn thấy
+live K/V, anchor token hoặc local memory của block khác. Packing không biến
+training thành attention causal xuyên các blocks. Padding và post-EOS labels
+không vào loss; state không có valid proposals hoặc không có adaptation path
+được skip với reason.
+
+Projected cache dùng lại được khi target, draft fc/norm, layers, token IDs,
+template, positions, truncation và dtype policy khớp. Nếu chỉ có raw target
+features, project bằng frozen fc/norm một lần. Raw target-feature cache 50K
+Qwen3-4B có trên server theo xác nhận ngày 09/10. Audit ngày 05/10 của cache
+run 28/09 ghi mismatch hidden 32/32 train và validation; chưa có report audit
+mới. Vì thế artifact tồn tại nhưng reuse cho thiết kế AMR chưa được xác nhận,
+và importer mới chưa triển khai. Không chấp nhận chỉ vì shape đúng. Không chỉnh
+prompt bằng head/tail truncation rồi dùng cache/greedy labels của prompt khác.
+
+Split theo source document, kiểm tra IDs/full-history content, giữ validation
+và holdout độc lập. Training adapter tập trung long-context anchors; short
+context kiểm tra dense routing/parity. Pilot 2–5K train documents đại diện,
+validation khóa riêng; mở 50K sau runtime và acceptance/cost checks.
+
+Chi tiết schema, audit cache, teacher subset và dữ liệu server:
+[dữ liệu huấn luyện](../../amr_dflash_training_data.md).
+
+## 6. Loss và gradient
+
+### 6.1. Prediction loss chính
+
+\[
+\mathcal L_{\rm draft}=
+\frac{\sum_{b,j}v_{b,j}w_j[-\log q_{b,j}(y^*_{b,j})]}
+     {\sum_{b,j}v_{b,j}w_j},\qquad
+w_j=\exp(-(j-1)/\gamma),\quad j=1,\ldots,15.
+\]
+
+v là valid mask; gamma=7 là điểm bắt đầu theo DFlash block-16.
+[DFlash training](https://arxiv.org/html/2602.06036v1#S4.SS2)
+dùng random anchors và block prediction;
+[phụ lục](https://arxiv.org/html/2602.06036v1#A1.SS1) hỗ trợ cache offline.
+Prediction CE là surrogate cho acceptance; không gọi là trực tiếp tối ưu actual A.
+
+Target/feature extraction được detach. Frozen draft forward và frozen output
+head phải giữ graph khi train compressor/gate; không đặt toàn bộ forward
+trong no_grad/inference_mode. Freezing giảm optimizer state và weight gradients,
+nhưng vẫn cần forward/backward đối với đầu vào qua năm layers.
+
+### 6.2. Indexer supervision nhỏ, không preference dataset
+
+Trên subset **train-only**, chạy frozen dense DFlash cho cùng anchors và
+prefix visibility. Thu attention trên raw context, aggregate qua heads/layers
+và proposal queries với cùng w_j; giữ eligible nonlocal groups rồi chuẩn hóa:
+
+\[
+t_{a,b}=
+\frac{\sum_{\ell,h,j}v_{a,j}w_j
+      \sum_{i\in B_b} A^{\rm dense}_{\ell,h,j,i}}
+     {\sum_{b'\ {\rm eligible}}\sum_{\ell,h,j}v_{a,j}w_j
+      \sum_{i\in B_{b'}} A^{\rm dense}_{\ell,h,j,i}}.
+\]
+
+Loại local/live keys trước normalization, áp đúng eligibility như indexer.
+Teacher denominator bằng zero hoặc không có eligible groups thì skip loss đó
+với reason; không tạo distribution/reward giả. Lưu group IDs và t, không lưu
+full attention matrices/full-vocabulary logits cho toàn 50K.
+Teacher có visibility/backend/fingerprint riêng; collector timing thuộc
+adaptation cost, không dùng cho inference benchmark.
+
+\[
+\mathcal L_{\rm idx}=
+D_{\rm KL}(\operatorname{stopgrad}(t_a)\|
+                  \operatorname{softmax}(s_\phi(a,\cdot))).
+\]
+
+Teacher là attention allocation proxy của drafter, không là acceptance utility
+hay target attention. Khác dense-compressed teacher của native CSA; phải ablate
+learned indexer so với fixed/random selection cùng budget.
+[DSA V3.2](https://arxiv.org/html/2512.02556v1#S2.SS1.SSS1) là tiền lệ
+indexer distillation; không khẳng định cách aggregate mới là recipe DeepSeek-V4.
+
+Một optimizer cập nhật compressor, scorer và gate:
+\[
+\mathcal L_{\rm main}=\mathcal L_{\rm draft}+\beta\mathcal L_{\rm idx}.
+\]
+Indexer nhận gradient từ L_idx; compressor/gate từ L_draft.
+Sampler main trộn teacher-labeled anchors, điểm bắt đầu 25% batch khi đủ dữ liệu,
+để scorer tiếp tục học sau warm-up; anchors khác chỉ có L_draft.
+Phải log số anchors có indexer loss. beta=1 là điểm bắt đầu pilot cần validation.
+
+### 6.3. Các loss bổ sung
+
+Warm-up có thể thử dense-DFlash output/hidden distillation trên subset nhỏ,
+với teacher cố định, cùng prefix/block và coefficient giảm dần. Mặc định không
+đòi thêm loss đó hoặc full-vocabulary teacher store.
+
+Prefix-product loss mặc định tắt, chỉ thêm sau baseline:
+\[
+\mathcal L_{\rm prefix}
+=-\frac{1}{15}\sum_{k=1}^{15}\prod_{j=1}^{k}q_j(y_j^*),
+\]
+với valid-length normalization cho block ngắn. Nó có gradient yếu khi
+probabilities nhỏ, không bằng greedy acceptance và không là novelty riêng.
+[Chain reward đã có](https://arxiv.org/html/2606.11552v1#S5.SS5);
+so cả dense và adapter với cùng objective khi thử loss này.
+
+## 7. Training hai giai đoạn
+
+| Giai đoạn | Trainable | Cách chạy | Điểm chuyển |
+|---|---|---|---|
+| Baseline/audit | Không | Dense DFlash, kiểm tra cache và parity | Có baseline ghép cặp, cache contract hợp lệ |
+| Warm-up ngắn | Compressor, indexer, gate | Pooling uniform; budget rộng; teacher subset; L_draft + beta L_idx | Loss/gradient/checkpoint hợp lệ, kiểm tra retention |
+| Memory training chính | Cùng các module nhỏ | Chuyển budget về cấu hình deploy, prediction blocks từ regenerate | Chọn checkpoint bằng validation acceptance/cost |
+| Calibration/holdout | Không | Force dense/AMR, đo crossover, khóa config | Báo actual acceptance và throughput trên holdout |
+
+Warm-up dùng c=32, tối đa K=1024 groups ở pilot; chuyển K qua 512 tới 256
+và c tới 64. Các mốc kiểm tra theo optimizer steps, không theo số giờ suy đoán.
+Warm-up giới hạn ban đầu 200 optimizer steps, prediction validation mỗi 50
+steps và full rollout validation cuối phase. Nếu không đạt retention,
+ghi nhận và tăng memory budget trong run mới hoặc đơn giản hóa, không lặp
+warm-up vô hạn hoặc tự mở backbone.
+
+Training chính đánh giá prediction trên **toàn validation anchor manifest**
+mỗi 50 steps; actual full-validation rollout mỗi 500 steps và cuối phase.
+Pilot đầu đo 200 steps trước mở run dài. Teacher-label quota, budget schedule,
+phase boundary và metric history nằm trong checkpoint.
+
+Retention 95% mean accepted proposals của dense là **gate pilot đề xuất**,
+không phải kết quả đã có hoặc mục tiêu 100% được bảo đảm. Tính theo từng context
+bin; nếu dense A bằng zero, không tính ratio, báo absolute difference.
+Warm-up budget chưa là deploy budget; cần đánh giá AMR forced ở budget cuối
+và bao gồm toàn bộ memory cost trước khi kết luận.
+Short-context dense bypass và target greedy parity được kiểm tra riêng.
+
+## 8. Validation, reproducibility và chi phí
+
+Một evaluator core hỗ trợ in-memory/checkpoint, với hai scopes rõ:
+prediction blocks và full greedy rollout. Prediction prefix-match chỉ là
+actual greedy A nếu regenerate/target/decoding alignment đã được xác minh;
+nếu response sampled thì báo teacher-token match, không gắn nhãn verifier acceptance.
+
+Checkpoint mới lưu adapter weights, optimizer/scheduler/RNG/sampler,
+phase/step, fingerprints, groups/budgets/query policy, teacher-manifest hash,
+dataset/anchor policy và evaluation results. Không save lại frozen model weights.
+V0 checkpoint có schema khác; không load như checkpoint adapter mới.
+
+Evaluator log phase start/end, progress bar, số samples, metrics và thời gian.
+Missing/corrupt checkpoint, empty validation, non-finite metric, wrong
+fingerprint hoặc partially completed evaluation phải fail; không báo success.
+Record heartbeat ít nhất mỗi 60 giây; lưu partial artifacts và error reason
+nếu evaluator bị gián đoạn, không dùng partial summary như full validation.
+Training logs có CE/indexer loss, valid proposals, teacher quota, gradient norm,
+trainable params, step time, blocks/s, cache I/O và VRAM.
+
+Review criteria pilot, cần đo trên B200:
+~~~yaml
+review_criteria:
+  metrics:
+    - name: target_greedy_token_parity
+      direction: "=="
+      threshold: 1.0
+    - name: accepted_proposal_retention_per_nonzero_dense_bin
+      direction: ">="
+      threshold: 0.95
+    - name: paired_decode_committed_throughput_speedup
+      direction: ">"
+      threshold: 1.0
+  performance:
+    - "Báo end-to-end, draft và memory costs; không đặt ngưỡng giờ train chưa đo."
+    - "Tính tổng GPU-hours cho audit/recompute cần thiết, teacher, train, validation và calibration."
+  observability:
+    - "Log theo step, progress riêng cho evaluation, phase-end summary và failure reasons."
+  stability:
+    - "Loss/gradients hữu hạn; optimizer chỉ cập nhật adapter; frozen weights giữ hash."
+  custom:
+    - "No future-feature leakage, rejected features không append, original raw positions."
 ~~~
 
-`Tensor` là `torch.Tensor`. V0 dùng `MemoryConfig` trong `core.py`, `AMRDFlashDraft` trong `model.py`, target cache trực tiếp trong `inference.py`, và fixed-state evaluator trong `evaluation.py`; CLI có fixed-state và rollout evaluation. Train-time cadence/aggregate `EvalReport` chưa được triển khai.
+Scientific claim dùng paired holdout theo document, đủ samples và confidence
+interval; các thresholds trên chỉ là tiêu chí pilot, không thay kiểm định.
+Đếm A_raw, A_committed và G tách biệt; G không luôn bằng A+1 do correction,
+bonus, EOS/cap. Throughput = sum(G_decode)/sum(T_decode), không reciprocal mean TPOT.
 
-## 5. Selector V0
+L0: static/semantic/gradient tests khi triển khai. L1: assembled training pipeline
+trên một B200 với real data, kiểm tra ngắn khoảng năm phút trước pilot lớn.
+Local chỉ CPU; không sửa driver. Runtimes offline Python 3.12 và dependencies
+có sẵn; không thêm venv từng baseline hoặc installer online.
+Docs-only revision này không thực hiện L1 hoặc báo đã train.
 
-- Input index: `k_i = W_k h'_i`, dim 64, với `h'_i = hidden_norm(fc(h_i))`.
-- Query: concat anchor embedding, projected feature mới nhất và mean của tối đa 16 projected features gần nhất; MLP Linear → SiLU → Linear tới dim 64. Tất cả đều thuộc prefix đã commit; không dùng current DFlash query.
-- Score: dot product / sqrt(64), cộng scalar bias theo normalized absolute position. Prompt/output flag chưa có trong V0.
-- Local guard mặc định 128 recent positions; sink guard mặc định 0. Các guard nằm **trong raw budget**.
-- Loại guard khỏi miền Top-K; chọn phần budget còn lại; sort selected positions theo absolute position sau lựa chọn.
-- Nếu N nhỏ hơn raw budget, giữ tất cả. Padding bị mask; zero valid context hoặc budget nhỏ hơn guards phải có xử lý đã định nghĩa: clamp guards theo budget, không tạo index âm.
-- Preference scorer V0 dùng mean token score của candidate set đã loại padding. Additive scoring không mô hình hóa mọi tương tác; chunk-swap/set-level labels vẫn là nguồn reward.
-- V0 tính lại scores mỗi round, giữ compact selector-key index và append key của feature mới đã commit. Key bị loại ở round trước vẫn có thể quay lại; reuse mỗi 2/4 round chưa triển khai.
+## 9. Paper story và ablations
 
-## 6. Compressor thiết kế: pooling học được với cập nhật chính xác
+**Problem:** pretrained block-parallel drafter phải đọc target context dài,
+nhưng không cần mọi vùng ở cùng độ phân giải mỗi round.
 
-Chọn một baseline nhỏ có thể triển khai và replay streaming; chưa dùng HCA/CSA hoặc recurrent transformer phức tạp.
+**Observation:** DFlash phân bổ attention qua prompt, committed output và live
+block; vùng được ưu tiên thay đổi theo state. Evidence hiện có là diagnostic
+trên cohort nhỏ, cần interventions và rollout để xác minh.
 
-Thiết kế đề xuất chia absolute timeline thành M bucket cố định trong run. `span = ceil((max_input_tokens + max_new_tokens)/M)`; bucket của token i là `floor(position_i/span)`. Đây là allocation toàn lịch sử có vị trí ổn định; nếu vượt capacity, báo lỗi cấu hình, không silently truncate.
+**Hypothesis:** coarse global summaries + state-conditioned fine retrieval +
+exact local features cho một frozen drafter có thể giữ alignment với chi phí thấp.
 
-Trên projected context:
+**Method:** một adapter dùng chung, learned pooling và một block-level indexer;
+fine branch giữ pretrained feature geometry, không thay backbone/depth/block.
 
-~~~text
-a_i = w2 · SiLU(W1 h'_i)                   # hidden dim 64
-v_i = h'_i + U SiLU(V h'_i)                # residual rank 16
-R_b = sum_i exp(a_i) v_i / sum_i exp(a_i)   # i thuộc bucket b
-~~~
+**Training:** dùng target-regenerated tokens và audited cached features;
+weighted draft prediction huấn luyện pooling/gate, compact attention
+distillation huấn luyện scorer. Hai giai đoạn cùng pipeline, không cần
+candidate-preference labeling hoặc RL cho phương pháp chính.
 
-Mặc định M=128. Bucket rỗng có `slot_valid=False` và không tham gia softmax. Accumulator dùng FP32 và log-sum-exp ổn định: giữ max log-weight, scaled numerator/denominator; append chỉ cập nhật bucket chứa token mới. Không nén lại complement mỗi round. Khi weights compressor thay đổi, accumulator cũ không hợp lệ; rebuild từ feature store cho training/evaluation checkpoint mới.
+**Outcome cần chứng minh:** measured committed throughput tốt hơn dense trên
+long context, với acceptance retention và short-context/target parity được báo rõ.
+Không hứa tăng chất lượng tóm tắt vượt target; full-context verifier giữ output
+theo target nếu implementation đúng.
 
-Global slots chứa cả information trùng selected raw states. Vai trò bổ trợ được học qua loss khi raw selection cùng hiện diện; không gọi đây là phân hoạch disjoint hoặc trừ attention mass bằng heuristic.
-
-### Slot adapter và vị trí
-
-Mỗi layer dùng pretrained k_proj/v_proj với residual adapter rank 16 cho slots; giữ k_norm của layer. Raw keys dùng nguyên RoPE tại absolute position.
-
-V0 chọn slot position là integer midpoint của span các **token thực sự đã xử lý** trong bucket, không dùng vị trí token tương lai trong bucket. Slot K dùng cùng RoPE tại midpoint; V không rotate. Đây là convention phải ablate, không bảo đảm đại diện tương đương nhiều raw keys.
-
-Thêm logit bias `log(sigmoid(g_layer))` trên slot keys, khởi tạo `g_layer=-4`, để hạn chế distribution shift khi bắt đầu. Bias không đặt trên raw/live keys. Khi compressor disabled, bỏ hẳn slot entries/bias; dense parity không dựa vào gate gần zero.
-
-Compressor/adapter được train bằng target alignment qua frozen DFlash. Không bọc draft forward trong `no_grad` khi train compressor; chỉ frozen feature extraction được detach.
-
-**Phần hiện thực V0:** `ComplementaryCompressor` dùng learned soft assignment trên toàn bộ projected context và weighted-mean slot values, cập nhật bằng running sums. Slot positions là weighted centroid của feature positions đã quan sát. V0 chưa hiện thực fixed timeline buckets, residual rank-16 projection hoặc per-layer slot K/V adapters; DFlash gốc chiếu cùng slot feature qua K/V projections của từng layer. Đây là scope rút gọn cần ghi khi báo cáo.
-
-## 7. Memory interface của DFlash
-
-`AMRDFlashDraft` trong `model.py` giữ reference tới backbone pretrained; không copy/giảm layer và không thay parameter names để load weights.
-
-Trên mỗi draft layer:
-
-1. Tính Q từ live hidden states bằng projections/norm pretrained.
-2. Lấy raw context K/V từ bank hoặc project selected features; K đã rotate theo absolute positions.
-3. Tạo slot K/V theo mục 6; tạo đủ live-block K/V theo DFlash gốc.
-4. Attention không causal giữa các live positions, giữ visibility gốc; concat raw + valid slots + live block.
-5. Dùng o_proj, residual, MLP, layer norms và final norm gốc.
-
-**Dense identity test:** với mode dense hoặc all-context raw selection, slots disabled, cùng dtype/backend/mask, logits phải khớp original DFlash trong tolerance số học và argmax phải khớp. Test bao gồm positions không liên tiếp để bắt lỗi compact renumbering. `fc/hidden_norm` không được chạy hai lần.
-
-## 8. Verifier và lifecycle
-
-V0 verifier chỉ greedy. Không dùng equality với target sampled tokens để claim exact speculative sampling.
-
-Đường V0 hiện có:
-
-- Labeling dùng target DynamicCache có prefix copy/crop về cùng state sau mỗi candidate.
-- Rollout inference dùng target KV cache full prefix, verify block và crop sau rejection; dense và AMR đi qua **cùng** engine. Prefix cursor dùng logical absolute position, độc lập compact draft memory.
-
-Fixed-state evaluation command hiện có trong `evaluation.py`; timing của nó là correctness-oriented và chưa được dùng làm production latency. Target verify candidate proposals trên history tương ứng; chỉ accepted-prefix target features được persist. Correction/bonus có thể còn pending: xử lý token đó trước khi đưa feature vào context bank. Crop cache sau rejection; prune emitter theo EOS và remaining output cap; không giữ rejected hidden features.
-
-Bootstrap/build bank, first draft, switching gate, compression update và terminal work đều nằm trong timing. Target prefill tách khỏi decode, nhưng cả hai thuộc E2E.
-
-## 9. Storage và gate
-
-V0 quality path lưu projected features rồi project selected keys; production prototype thử full per-layer raw KV bank + compact selector index. Cả hai vẫn có full resident bank để retrieval; không claim giảm tổng resident VRAM chỉ vì attention đọc ít key.
-
-Đo bytes cho target KV, full draft bank, index, projected feature bank nếu giữ, slots, temporary gathers và peak toàn hệ thống. Mọi storage variant báo rõ có giữ đồng thời features và KV không.
-
-Gate `dense|amr|auto`: ban đầu benchmark force dense/amr. Auto dùng bảng crossover theo hardware × backend × dtype × batch × context cap từ calibration; ngoài vùng đã đo quay dense. Nếu chưa có calibration artifact, auto báo rõ dense fallback; artifact có checkpoint/config fingerprint sai phải fail. Mode đã force không được gate thay đổi. Short dense bypass không build index/slots; lazy switching phải đo cả build cost.
-
-## 10. Config V0 và extension
-
-Default pilot: raw budget 4096, slots 128, local 128, sink 0, index dim 64, compressor hidden 64, residual rank 16, rescore mỗi round, temperature 0, batch 1.
-
-Raw+slot budget accounting: `B_total = B_raw + M`; live block 16 nằm ngoài budget. Heuristic/selection-only matched-budget dùng `B_total` raw entries; thêm so fixed raw budget để cô lập lợi ích slots. Không so hybrid raw 4K + 128 slots với selection-only raw 4K rồi gọi matched-total-budget.
-
-Config/manifest từ chối checkpoint khác depth/block/feature metadata, sampling, per-layer routing hoặc batch>1 chưa hỗ trợ. Không âm thầm rơi về một engine khác.
-
-Extension chỉ sau full pilot: layer-specific support, advanced compressor, differentiable selector estimator, adaptive budgets, batched cache executor và sampling đúng phân phối.
-
-## 11. File dự kiến và trách nhiệm
-
-| File mới | Trách nhiệm |
+| Ablation | Câu hỏi |
 |---|---|
-| `core.py`, `config.py` | Memory config, selector/compressor, loss và primitive validation |
-| `model.py`, `memory.py` | Pretrained DFlash adapter, projected-feature memory interface |
-| `inference.py` | Cached greedy verifier, cache crop, pending anchor và rollout trace |
-| `pipeline.py`, `candidates.py`, `artifacts.py` | Capture, candidate labels/preferences, train phases và artifacts |
-| `checkpoint.py`, `runtime.py`, `budget.py` | Local model loading, strict fingerprints, checkpoint và GPU-hour ledger |
-| `tests/test_amr_dflash_*.py` | Semantic/gradient/launcher CPU synthetic tests |
-| `scripts/amr_dflash/cli.py`, `scripts/runners/run_amr_dflash.sh` | Preflight, capture, label, train và inference CLI |
+| Dense pretrained DFlash | Baseline cùng checkpoint, backend, workload |
+| Local + fine, không global | Global information có ích ngoài retrieval |
+| Local + global, không learned fine | State-conditioned retrieval có ích |
+| Full adapter | Ba mức có bổ trợ |
+| Mean vs learned global pooling | Pooling học được có đáng chi phí |
+| Fixed/random vs learned indexer | Scorer học được có giá trị ngoài budget |
+| Raw selected groups vs compressed fine entries | Geometry pretrained có giúp retention |
+| Có/không warm-up, cùng training compute | Warm-up có giúp adaptation |
+| Có/không prefix loss | Đóng góp objective, kiểm soát dense tương ứng |
 
-Fixed-state evaluation hiện có; full validation cadence, checkpoint resume, profiling CLI, calibrated gate và B200 experiment runner chưa có trong V0.
+Matched-total-key và matched-compute comparisons báo riêng; không đồng nhất
+key count với FLOPs. Bao gồm cache build/update, gathers, full-bank storage và
+target verification. Bootstrap theo document, không theo anchors tương quan.
+Khóa config/checkpoint/crossover trước holdout; no-gain là outcome hợp lệ.
 
-Chữ ký, artifact và criteria chi tiết: [dữ liệu/train](../../../src/ARMdflash/AMR_DFlash_Implementation/data_training_contract.md), [protocol](../../../src/ARMdflash/AMR_DFlash_Implementation/experiment_protocol.md), [kế hoạch](../plans/2026-10-08-amr-dflash-implementation.md).
+## 10. Code hiện có và tác động lên kế hoạch
+
+| Hiện có V0 | Đối với thiết kế mới |
+|---|---|
+| Frozen five-layer adapter, raw positions, live block | Tái sử dụng sau parity checks |
+| Cached greedy verifier, output A/G, fingerprints | Tái sử dụng và mở rộng contracts |
+| Prompt-only prepare-data, trajectory capture | Giữ cho V0; cần converter giữ response và cache importer mới |
+| Token selector preference training | Thay bằng block indexer + compact attention teacher |
+| Learned fixed global slots với d→d projections | Thay bằng local grouped scalar weighted pooling |
+| Candidate-verifier-logit compressor KL | Thay main objective bằng weighted prediction CE |
+| Batch-1 state trainer, memory-only checkpoint | Thêm multi-anchor packing, unified adapter optimizer/resume |
+
+### Impact on Plan
+
+- T1–T3: giữ frozen model/verifier, sửa config/accounting sang m/c/K/L và kiểm tra causal groups.
+- T4: chuyển capture training sang response/token/cache/anchor contract; V0 capture là legacy.
+- T5–T6: thay candidates/preferences bằng compact dense-attention teacher và block indexer.
+- T7: grouped pooling không full-rank value projection; thêm incremental completed-group lifecycle.
+- T8–T9: weighted CE + indexer KL, joint **adapter-only** trainer, checkpoint/resume và hai scopes evaluation.
+- T10–T11: cache/grouped retrieval, profiling và CLI mới có schema tách V0.
+- T12: retention/throughput/compute ablations; không yêu cầu full-backbone fine-tune cho phương pháp chính.
+
+Chi tiết tasks nằm trong [kế hoạch đã cập nhật](../plans/2026-10-08-amr-dflash-implementation.md).
+Các tài liệu V0 trong src/ARMdflash và [review V0](../../reviews/2026-10-08_amr_dflash_implementation_review.md)
+giữ giá trị truy vết; chúng không mô tả trainer mới đã triển khai.

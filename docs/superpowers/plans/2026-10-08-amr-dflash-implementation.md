@@ -1,377 +1,290 @@
-# Kế hoạch triển khai AMR-DFlash
+# Kế hoạch triển khai AMR-DFlash — memory adapter nhẹ
 
-> **Trạng thái 08/10/2026:** đã triển khai một V0 rút gọn cho T1–T11 và có CPU contract tests. Các checkbox dưới đây là acceptance gate đầy đủ; chưa đánh dấu chỉ vì code path tồn tại. T12 và mọi kiểm chứng bằng model thật/B200 còn pending.
+Ngày tạo: **08/10/2026**. Revision: **09/10/2026**.
 
-**Mục tiêu:** xây AMR memory interface trên pretrained DFlash-5L, train theo acceptance preferences, chạy full integrated pilot với full-context target verifier và measured cost.
+**Mục tiêu:** triển khai thiết kế memory adapter nhẹ đã thống nhất:
+frozen target + frozen pretrained DFlash-5L, global grouped pooling nhỏ,
+fine block retrieval và exact local context. Train bằng weighted draft
+prediction CE + compact attention indexer KL từ regenerate/cache.
 
-**Kiến trúc:** core riêng `src/AMR_DFlash`, giữ nguyên weights/depth/block. Selection và incremental slots đi qua memory adapter; dense và AMR dùng shared evaluator/verifier. Reference executor phục vụ labels/correctness; cached executor phục vụ latency.
+**Trạng thái:** các tasks dưới đây là phần chuyển đổi cần làm, chưa được
+nghiệm thu chỉ vì V0 có file cùng tên. Code V0 vẫn chạy
+capture → candidates → label → train-selector → train-compressor.
+Đợt cập nhật này thay tài liệu, chưa hiện thực trainer mới.
 
-**Stack:** Python 3.12, PyTorch, Transformers, PyYAML và các dependency đã có.
+Nguồn ý tưởng/paper story: [tài liệu chính](../../amr_dflash_paper_story.md).
+Contracts triển khai: [đặc tả](../specs/2026-10-08-amr-dflash-design.md),
+[dữ liệu/training](../../amr_dflash_training_data.md),
+[CLI V0](../../baselines/amr_dflash.md).
+[Review V0](../../reviews/2026-10-08_amr_dflash_implementation_review.md)
+giữ bằng chứng sửa lỗi/CPU của pipeline cũ.
 
-**Đặc tả:** [thiết kế](../specs/2026-10-08-amr-dflash-design.md), [data/train](../../../src/ARMdflash/AMR_DFlash_Implementation/data_training_contract.md), [protocol](../../../src/ARMdflash/AMR_DFlash_Implementation/experiment_protocol.md).
+## 1. Phạm vi và những phần tái sử dụng
 
-**Evaluation:** mỗi 50 optimizer steps và cuối phase, toàn validation manifest; một evaluator cho checkpoint/in-memory và fixed-state/rollout. CPU synthetic override cadence=1; smoke không là scientific evidence.
+Giữ target verifier full-context, pretrained depth/block/weights, projected
+feature space, original positions, A/G accounting, local model loading,
+offline Python 3.12 và output qua JsonlWriter/ROUGE. Không sửa vendored DFlash
+hoặc default dense baseline. Local chỉ CPU; L1/pilot chạy server B200.
 
-## Kết quả implementation V0
+Tái sử dụng sau regression checks:
 
-Đã có `src/AMR_DFlash/` cho selector/compressor, DFlash adapter, sparse memory, cached greedy verifier, candidate generation/labels/preferences, selector/compressor training, fingerprinted checkpoints và GPU-hour ledger. CLI tại `scripts/amr_dflash/cli.py` nối `preflight`, `capture`, `candidates`, `label`, `train-selector`, `train-compressor`, `infer`; launcher được nối vào `scripts/run.sh amr_dflash`.
+- model.py: frozen projection và five-layer compact-context forward.
+- inference.py/evaluation.py: greedy verifier, pending anchor, cache crop và parity.
+- artifacts.py/checkpoint.py: atomic artifacts, identity/fingerprints, mở schema mới.
+- common runtime/config/schema và AMR dispatcher: giữ V0 compatibility.
 
-CPU synthetic tests đã xác nhận dense forward parity và token parity với target greedy cho dense/hybrid/compressor modes, gồm rejection/EOS/output cap; fixed-state evaluator có tiny-model test. V0 chưa tự chạy full validation theo cadence, optimizer/RNG resume, measured crossover gate, genuine GPU performance results hay B200 model run. Vì vậy các checklist bên dưới vẫn là acceptance gates còn mở, không phải todo cho các file chưa được tạo.
+Phần thay: prompt-only training preparation, candidate/preference teacher,
+token-level selector fit, full-rank fixed slots, candidate-logit KL main loss,
+unbounded in-RAM state/teacher cache và phase-specific V0 trainer.
 
-Một số đường dẫn test/entrypoint trong checklist chi tiết bên dưới là mục tiêu ban đầu của thiết kế. Lệnh CPU hiện chạy được là `.venv/bin/python -m pytest -q tests/test_amr_dflash_contracts.py tests/test_amr_dflash_launcher.py`; launcher B200 dùng `bash scripts/run.sh amr_dflash ...`.
+LoRA, full backbone fine-tuning, native layer-alternating HCA/CSA,
+adaptive block size và speculative sampling không thuộc triển khai chính.
 
-## Ràng buộc toàn cục
-
-- Tài liệu tiếng Việt; Python **3.12**; server dùng `python3` hệ thống.
-- Local chỉ CPU qua `.venv/bin/python`; không sửa GPU/driver local.
-- Không thêm dependency mới, installer online hoặc venv từng baseline.
-- Snapshot local, offline flags, `local_files_only=True`.
-- DFlash **5 layer**, **16 live positions = 1 anchor + 15 proposals**; feature metadata từ checkpoint.
-- Target/backbone frozen; không giảm depth hoặc đổi block trong pilot.
-- Raw keys giữ original positions/RoPE; live block không prune.
-- V0 greedy/batch 1; sampling và batch>1 phải fail nếu chưa có executor.
-- Generation qua `JsonlWriter` + summary, ROUGE qua helper chung.
-- Không sửa `externals/dflash`; không đổi default dense baseline.
-- Artifact/tensors/checkpoints không commit.
-- Dense mask/reference collector timing không chứng minh acceleration.
-
-## 1. Hạ tầng và dependency
-
-Đọc `externals/dflash/dflash/model.py`, `scripts/infer_dflash.py`, `scripts/common/io_util.py`, `scripts/common/rouge.py`, `scripts/common/config.sh` và `scripts/common/runtime.sh` trước task liên quan.
-
-Tham khảo feature-store atomic/lazy patterns trong `src/Finetuning/features.py` và `src/MR_DFlash/offline_features.py`. Không import MR two-stage model làm pretrained backbone.
+## 2. Task graph và nguyên tắc kiểm chứng
 
 ~~~mermaid
 flowchart LR
-    T1["T1 contracts/config/metrics"] --> T2["T2 backbone"]
-    T2 --> T3["T3 sparse reference"]
-    T3 --> T4["T4 state store"]
-    T4 --> T5["T5 labels"]
-    T5 --> T6["T6 selector"]
-    T2 --> T7["T7 compressor"]
-    T6 --> T8["T8 evaluator/loss"]
+    T1["T1 contracts/config"] --> T2["T2 frozen backbone"]
+    T1 --> T4["T4 response + cache + anchors"]
+    T2 --> T3["T3 memory interface"]
+    T4 --> T5["T5 compact teacher"]
+    T5 --> T6["T6 block indexer"]
+    T3 --> T7["T7 grouped pooling"]
+    T6 --> T8["T8 loss + evaluator"]
     T7 --> T8
-    T8 --> T9["T9 train integration"]
-    T9 --> T10["T10 cached execution"]
-    T10 --> T11["T11 launcher"]
-    T11 --> T12["T12 pilot/ablation"]
+    T4 --> T9["T9 adapter trainer: integration"]
+    T8 --> T9
+    T9 --> T10["T10 cache + profiling"]
+    T10 --> T11["T11 CLI/runtime"]
+    T11 --> T12["T12 B200 pilot + ablations"]
 ~~~
 
-T9 là task integration training duy nhất. T12 là thực nghiệm, không thêm training pipeline thứ hai.
+Các semantic tests phải kiểm tra causal visibility, label shift, optimizer
+freeze và checkpoint consistency. Không viết test chỉ xác nhận một flag/config
+được gán đúng. T9 là assembled training integration duy nhất chạy L0/L1;
+T12 là scientific validation, không là một trainer khác.
+
+Các filenames bổ sung dưới đây là **dự kiến**, không phải module/CLI đã tồn tại.
+Giữ tests hiện có trong tests/; không hướng dẫn chạy src/AMR_DFlash/tests
+khi thư mục đó chưa được tạo.
+
+## T1. Config, versions và accounting
+
+Sửa core.py/config.py, thêm adapter schema và các semantic contracts.
 
-## 2. Kiểm thử khi code đã có
+- [ ] Config m=4, c=64, K=256, L=128, index dim 64, pooling hidden 32.
+- [ ] Assert L>=c, valid group sizes, supported depth/block/dtype/mode.
+- [ ] Context budget tính actual unique raw + completed global entries;
+      live block 16 ngoài budget.
+- [ ] Schema tách adapter-data/teacher/checkpoint khỏi V0; không implicit conversion.
+- [ ] Check config serializable, fingerprint stable, selected groups/positions
+      unique và padding/future groups bị từ chối.
+- [ ] Log actual trainable params; optimizer whitelist là pooling/indexer/gate.
+
+Nghiệm thu: config mới không được V0 hiểu nhầm; no-future và budget tests pass.
 
-Từ repo root, local:
+## T2. Frozen backbone và dense identity
 
-~~~bash
-export CUDA_VISIBLE_DEVICES=""
-export PYTHONPATH="$PWD/src:$PWD/scripts:$PWD/externals/dflash"
-.venv/bin/python -m pytest src/AMR_DFlash/tests -q
-~~~
+Sửa model.py/runtime.py, giữ local pretrained loading.
 
-Mỗi task viết semantic tests, chạy trước implementation để thấy failure đúng behavior còn thiếu, rồi chạy lại. Các paths/lệnh AMR trong kế hoạch **chưa tồn tại** cho đến task tương ứng.
-
-Fixture `src/AMR_DFlash/tests/fixtures.py`: tiny Qwen3 target 8 layer, hidden 64, intermediate 128, vocab 128, 4 Q heads/2 KV heads; DFlash 5 layer, feature IDs `[1,2,3,4,5]`, block 16. Seed 17, CPU FP32, eval mode; tạo từ config, không download. Core không import test modules.
-
-## Task T1: Config, contracts và accounting
-
-**Tạo:** `src/AMR_DFlash/__init__.py`, `config.py`, `contracts.py`, `metrics.py`, `tests/test_contracts.py`, `tests/test_metrics.py`.
-
-**Input:** tensor/state spec.
-**Output:** `AMRConfig`, `DraftState`, `MemoryBank`, `WorkingMemory`, `DraftOutput`, `VerifyResult`; `accepted_prefix_length`, `clip_emitted_ids`, `aggregate_decode`.
-
-~~~python
-def accepted_prefix_length(proposals, target_choices):
-    equal = proposals.eq(target_choices)
-    return int(equal.long().cumprod(dim=-1).sum().item())
-
-def aggregate_decode(committed_counts, decode_seconds):
-    seconds = sum(decode_seconds)
-    return sum(committed_counts) / seconds if seconds > 0 else None
-~~~
-
-- [ ] Test đúng 3 proposals đầu, sai vị trí 4, đúng phần sau → A=3.
-- [ ] Test `aggregate_decode([8,4], [2,4]) == 2`; không reciprocal mean TPOT.
-- [ ] Test EOS/cap clipping, unique selected positions, future rejection, raw+slot budgets và invalid config.
-- [ ] Implement fail-fast contracts; explicit unsupported sampling/batch errors.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_contracts.py src/AMR_DFlash/tests/test_metrics.py -q`.
-
-**Nghiệm thu:** emitter sum G bằng output tokens; A raw/committed có semantics rõ.
-
-## Task T2: Load backbone và dense identity
-
-**Tạo:** `backbone.py`, `model.py`, `tests/fixtures.py`, `tests/test_backbone.py`.
-
-**Input:** AMRConfig, local target/draft snapshots.
-**Output:** `AMRDFlashBackbone`, `AMRModel`; `project_context`, `original_forward`, `draft_forward`. Giữ reference tới pretrained modules; memory attach riêng.
-
-~~~python
-projected = draft.hidden_norm(draft.fc(state.target_features))
-live_ids = torch.full((1, 16), mask_token_id, dtype=torch.long)
-live_ids[:, 0] = state.anchor_id
-live_positions = state.anchor_position + torch.arange(16).unsqueeze(0)
-# original_forward dùng target embedding/head, lấy proposal rows 1:16.
-~~~
-
-- [ ] Tạo tiny fixtures, strict load/save test; thiếu pretrained key phải fail.
-- [ ] Freeze target/draft; validate depth/block/feature fingerprint; không converter MR two-stage.
-- [ ] Implement frozen projection/dense forward; không fc/norm hai lần.
-- [ ] Test bypass logits/argmax khớp original và weights không đổi khi attach memory.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_backbone.py -q`.
-
-**Nghiệm thu:** tiny dense identity; kiểm tra checkpoint thật trên server khi thực thi GPU.
-
-## Task T3: Sparse raw interface và reference verifier
-
-**Tạo:** `memory.py`, `verifier.py`, `inference.py`, `tests/test_raw_memory.py`, `tests/test_reference_verifier.py`.
-
-**Input:** projected context, original positions, target state.
-**Output:** `build_bank`, `build_working_memory`, `ReferenceGreedyVerifier`, `verify_greedy` và emitter. `TargetCacheState` định nghĩa trong verifier.
-
-~~~python
-k_raw = layer.k_norm(layer.k_proj(raw_features).view(1, -1, kv_heads, head_dim))
-v_raw = layer.v_proj(raw_features).view(1, -1, kv_heads, head_dim)
-# Rotate raw K tại raw_positions; Q/live K tại live_positions riêng.
-# Attention raw + toàn live block; giữ pretrained o_proj/residual/MLP/norm.
-~~~
-
-- [ ] Test all-context raw path khớp original dense khi slots off.
-- [ ] Test positions `[0,3,7]` khớp dense-masked diagnostic cùng visibility trên năm layer; fixture phát hiện compact renumbering.
-- [ ] Implement reference target greedy verify và context-before-anchor normalization.
-- [ ] Test reject đầu/giữa/full acceptance, EOS anchor/proposal/correction, remaining=1 và target AR parity.
-- [ ] Test rejected features không append; anchor đã emit không đếm lại.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_raw_memory.py src/AMR_DFlash/tests/test_reference_verifier.py -q`.
-
-**Nghiệm thu:** sparse semantics đúng; reference timing gắn instrumented.
-
-## Task T4: State store, split và capture
-
-**Tạo:** `data.py`, `scripts/amr_dflash/capture_states.py`, `tests/test_data.py`.
-
-**Input:** document manifest, target trajectories, checkpoint fingerprints.
-**Output:** `StateStore`, `capture_states`, document feature shards và states.jsonl.
-
-~~~python
-prefix_features = document_features[:, :state.context_length]
-prefix_positions = document_positions[:, :state.context_length]
-assert prefix_positions.max().item() < state.anchor_position
-~~~
-
-- [ ] Test ID/content hash split overlap rejection.
-- [ ] Test future suffix không ảnh hưởng replay; summary không tăng dataset length.
-- [ ] Implement document sharding/lazy slices, atomic COMPLETE và fingerprint resume.
-- [ ] Capture pre-anchor state với emitter/cursor/remaining; phase log và failure counts.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_data.py -q`.
-
-**Nghiệm thu:** replay deterministic; không nhân bản full features theo candidates.
-
-## Task T5: Candidate search và preferences
-
-**Tạo:** `candidates.py`, `preferences.py`, `scripts/amr_dflash/label_candidates.py`, `tests/test_preferences.py`.
-
-**Input:** immutable states, reference verifier, seeds/budgets.
-**Output:** `generate_candidates`, `label_candidates`, `build_preferences`.
-
-~~~python
-gap = positive.accepted_proposals_committed - negative.accepted_proposals_committed
-if gap >= 1 and not positive.censored and not negative.censored:
-    pair = (positive.candidate_id, negative.candidate_id)
-~~~
-
-- [ ] Test cardinality/guards/seeds, oracle labels và dedup.
-- [ ] Implement position/random candidates và 32-token swaps; tối đa 12 candidates/8 pairs mỗi state.
-- [ ] Verify từ target state sạch mỗi candidate; record A/G/survival/ties/censoring/failures.
-- [ ] Test iteration order không đổi labels; fixture bắt cache contamination.
-- [ ] Empty preference dataset dừng với headroom report.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_preferences.py -q`.
-
-**Nghiệm thu:** labels có provenance; current-round teacher không vào inference inputs.
-
-## Task T6: State-conditioned selector
-
-**Tạo:** `selector.py`, `losses.py` phần preference, `tests/test_selector.py`.
-
-**Input:** pre-draft query, compact index, preferences.
-**Output:** `AcceptanceSelector`, `select_context`, `preference_loss`, hard Top-K support.
-
-~~~python
-scores = (query.unsqueeze(1) * index).sum(-1) / (index.shape[-1] ** 0.5)
-remaining = max(raw_budget - len(guard_positions), 0)
-# Top-K valid non-guard positions, union guards, sort absolute positions.
-~~~
-
-- [ ] Implement index/query dim 64, distance/prompt-output biases và ranking loss.
-- [ ] Test future labels/target choices không đổi query inputs.
-- [ ] Test guards trong budget, padding excluded và permutation-consistent positions.
-- [ ] Fit toy preferences: hai query cần hai vùng khác nhau; đánh giá hard selected-set utility.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_selector.py -q`.
-
-**Nghiệm thu:** preference gradient tới scorer; plain gather không bị gọi là differentiable index.
-
-## Task T7: Incremental compressor và slots
-
-**Tạo:** `compressor.py`, `tests/test_compressor.py`; mở slot branch trong backbone/memory.
-
-**Input:** projected context, positions, capacity/M.
-**Output:** `StreamingBucketCompressor`, `SlotAdapter`, accumulator/slot positions/valid mask.
-
-~~~python
-m_new = torch.maximum(m_old, a_new)
-old_scale = torch.exp(m_old - m_new)
-new_scale = torch.exp(a_new - m_new)
-numerator_new = numerator_old * old_scale + value_new * new_scale
-denominator_new = denominator_old * old_scale + new_scale
-slot = numerator_new / denominator_new.clamp_min(1e-8)
-~~~
-
-- [ ] Test full build == token/chunk append FP32 tolerance 1e-5.
-- [ ] Implement learned pooling/residual rank 16, capacity errors và valid midpoint.
-- [ ] Test no unseen bucket position, no rejected-token accumulator change.
-- [ ] Implement slot adapters/k_norm/RoPE/log-sigmoid gate -4; disabled slots bỏ thật.
-- [ ] Test nonzero memory gradient qua frozen draft; target/backbone grads None.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_compressor.py -q`.
-
-**Nghiệm thu:** streaming equivalence; invalidate state khi weights đổi; chưa claim complementarity.
-
-## Task T8: Shared evaluator và alignment loss
-
-**Tạo:** `evaluation.py`, `checkpoint.py`, `scripts/amr_dflash/evaluate.py`, `tests/test_evaluation.py`; thêm alignment loss ở `losses.py`.
-
-**Input:** in-memory AMRModel hoặc restored checkpoint, validation store/documents.
-**Output:** `EvalReport` và `evaluate_model(model, states, mode)`, checkpoint CLI gọi cùng core.
-
-~~~python
-draft = model.draft_forward(state, working_memory)
-candidate_ids = draft.logits.detach().argmax(-1)
-# Target rows đúng position/candidate prefix, detached.
-loss = alignment_loss(draft.logits, aligned_target_logits, proposal_valid)
-~~~
-
-- [ ] Implement fixed_state/rollout, full validation, logs/progress/error status.
-- [ ] Test target row mapping: shift một token fail fixture; giữ block semantics.
-- [ ] Test checkpoint/in-memory metrics/output đồng nhất; total tokens/time aggregation.
-- [ ] Test empty validation, partial/missing checkpoint, fingerprint mismatch, NaN.
-- [ ] Per-state/per-document JSONL + summary và ROUGE khi có reference.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_evaluation.py -q`.
-
-**Nghiệm thu:** shared evaluator; surrogate/actual acceptance báo riêng.
-
-## Task T9: Pipeline huấn luyện hoàn chỉnh [INTEGRATION]
-
-**Tạo:** `training.py`, `run_train.py`, `configs/pilot.yaml`, `configs/synthetic.yaml`, `tests/test_training_integration.py`.
-
-**Input:** T1–T8 và data/label contract.
-**Output:** phase-specific training, checkpoint/resume và step-based full evaluation.
-
-~~~python
-optimizer.zero_grad(set_to_none=True)
-loss.backward()
-torch.nn.utils.clip_grad_norm_(trainable_parameters, config.max_grad_norm)
-optimizer.step()
-# Theo optimizer step cadence: evaluate shared core trên full validation.
-~~~
-
-- [ ] CPU data→selection/slots→draft→loss→backward→step fixture, 2 steps/phase.
-- [ ] Phase selector/compressor có optimizer groups đúng; assert frozen params excluded.
-- [ ] Implement seeds/accumulation/LR/grad norm/progress/human log/JSONL/GPU-hours.
-- [ ] Atomic COMPLETE checkpoint, RNG/sampler/optimizer restore; resume khớp uninterrupted CPU run.
-- [ ] Full eval mỗi 50 steps/cuối phase, checkpoint/in-memory modes và failure handling.
-- [ ] Log memory/step throughput; MFU null+reason nếu chưa có FLOPs denominator.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_training_integration.py -q`.
-- [ ] Chạy `.venv/bin/python -m AMR_DFlash.run_train --config src/AMR_DFlash/configs/synthetic.yaml --phase selector --device cpu` và lặp `--phase compressor`.
-- [ ] Review static/gradient/row mapping; runtime validation server ngắn ≤5 phút trước mở pilot GPU.
-
-**Nghiệm thu:** train/eval/freeze/resume evidence; CPU loss giảm không chứng minh long-context gain.
-
-## Task T10: Cached target và physical execution
-
-**Tạo:** `tests/test_cached_inference.py`, `scripts/amr_dflash/profile.py`; sửa verifier/memory/inference trong AMR package.
-
-**Input:** reference parity, trained memory, target KV/full positions.
-**Output:** `CachedGreedyVerifier`, shared dense/AMR cached executor, stage profile.
-
-~~~python
-verified = target(block_ids, past_key_values=target_cache, use_cache=True)
-# Crop processed accepted prefix, giữ pending anchor riêng.
-# Chỉ persist target features của processed committed positions.
-~~~
-
-- [ ] Cached/reference/target AR parity qua nhiều rejection rounds trên tiny target.
-- [ ] Cache crop/rollback, pending anchor, EOS/cap và emitter invariants.
-- [ ] Genuine gathered K/V: attention đọc raw+valid slots+16, không N-key mask.
-- [ ] Full raw-KV bank storage option; bytes index/features/slots/temporary/logical cursor.
-- [ ] Auto gate trong `inference.py` đọc crossover artifact khóa theo hardware/backend/dtype/batch/checkpoint fingerprint. Chưa có calibration hoặc ngoài vùng đã đo → dense với reason; artifact sai fingerprint → fail.
-- [ ] Test force dense/amr không bị gate đổi; short dense bypass không build AMR index/slots; lazy switching tính đủ build time.
-- [ ] Spy test sau prefill không recompute growing target prefix; dense/AMR cùng verifier.
-- [ ] CUDA events + CPU/wall time, bootstrap/refresh/gather/update; tránh sync mọi kernel.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_cached_inference.py -q`.
-
-**Nghiệm thu:** physical execution sẵn sàng profile; full resident bank được ghi rõ.
-
-## Task T11: Launcher và schema chung
-
-**Tạo:** `scripts/infer_amr_dflash.py`, `scripts/runners/run_amr_dflash.sh`, `docs/baselines/amr_dflash.md`, `tests/test_amr_dflash_launcher.py`.
-
-**Sửa:** `scripts/run.sh` dispatch; `scripts/common/config.sh` mapping/env defaults; `docs/model_baseline_matrix.md` experimental entry khi có code.
-
-**Input:** cached executor/evaluator, master-env.
-**Output:** `bash scripts/run.sh amr_dflash`, CPU synthetic smoke mặc định; full explicit.
-
-~~~bash
-source "$ROOT/scripts/common/config.sh"
-fast_infer_load_config amr_dflash
-source "$ROOT/scripts/common/runtime.sh"
-export PYTHONPATH="$ROOT/src:$ROOT/scripts:$ROOT/externals/dflash"
-exec "$FAST_INFER_PYTHON" "$ROOT/scripts/infer_amr_dflash.py" --config "$AMR_CONFIG" "$@"
-~~~
-
-- [ ] Test dispatcher/master DATA_INPUT/RUN_SAMPLES mapping, Python 3.12 và offline errors.
-- [ ] YAML qua env `AMR_CONFIG`; target/data/output/device từ master; không sửa master.path.
-- [ ] Base/spec schema, accept-length semantics, A/G, stages, summary và ROUGE.
-- [ ] `--smoke` tiny CPU, `--mode dense|amr|auto`, unsupported batch/sampling errors.
-- [ ] Regression default DFlash launcher.
-- [ ] Chạy `.venv/bin/python -m pytest tests/test_amr_dflash_launcher.py tests/test_dflash_wrapper_contract.py tests/test_master_config_contract.py -q`.
-
-**Nghiệm thu:** experimental baseline đúng master/runtime; chưa gọi paper-ready.
-
-## Task T12: Pilot, ablation và gói kết quả
-
-**Tạo:** `scripts/amr_dflash/run_matrix.py`, `scripts/amr_dflash/collect_results.py`, `src/AMR_DFlash/tests/test_experiment_matrix.py` và runbook trong `docs/experiments/`.
-
-**Input:** locked splits/config/gates, T1–T11 và measured compute cap.
-**Output:** deployable/oracle matrix, paired document results, decision.json/report.
-
-~~~python
-document_ratio = dense_decode_seconds / amr_decode_seconds
-# Cluster bootstrap theo document, primary throughput sum(tokens)/sum(time).
-~~~
-
-- [ ] CPU test oracle/reference exclusion, matched raw+slot budgets, failed samples.
-- [ ] P0 sanity 3 dev docs; capture/label mới theo split đã khóa.
-- [ ] Full AMR train trong cap; force dense/AMR eval rồi calibrate gate.
-- [ ] Ablation selection/compression/attention imitation/reuse và fine-tune cùng compute.
-- [ ] Khóa variant trước holdout; parity/paired timing/bootstrap 2000 document resamples.
-- [ ] Report prefill/decode/E2E/A/G/survival/resident memory/GPU-hours/limitations.
-- [ ] Chạy `.venv/bin/python -m pytest src/AMR_DFlash/tests/test_experiment_matrix.py -q` trước server matrix.
-- [ ] Điền [checklist](../../../src/ARMdflash/AMR_DFlash_Implementation/acceptance_checklist.md) bằng artifact, quyết định go/simplify/no-go.
-
-**Nghiệm thu:** scientific claim có measured holdout evidence; no-gain là outcome hợp lệ.
-
-## 3. Đóng task và truy vết proposal
-
-Ghi files thay đổi, commands/exit codes, artifact và limitations. Nếu commit, stage đúng files của task; không `git add .` hoặc commit working-tree changes khác của người dùng.
-
-| Yêu cầu | Task |
+- [ ] Freeze target, embedding/head, fc/norm và toàn bộ năm draft layers.
+- [ ] All-raw, global-off forward khớp dense baseline với cùng backend/dtype,
+      gồm logits tolerance và argmax.
+- [ ] Projected features không chạy fc/norm lần thứ hai.
+- [ ] Pooling gradient xuyên frozen draft/head khác zero và hữu hạn;
+      backbone gradients None và hash weights không đổi sau optimizer step.
+- [ ] Bypass không khởi tạo memory/index hoặc thêm teacher branch vào timing.
+
+Nghiệm thu: attach adapter không đổi baseline; test không download model.
+
+## T3. Position-safe shared memory interface
+
+Sửa memory.py và DFlash adapter interface.
+
+- [ ] Fine selection trả groups rồi gather raw features; không dùng mean value
+      làm raw feature.
+- [ ] Raw/local union, loại trùng/sort, giữ absolute positions.
+- [ ] Global entries midpoint/RoPE riêng; finite shared additive bias.
+- [ ] Giữ full live-block K/V và bidirectional attention; không prune anchor/masks.
+- [ ] Test completed-group visibility cho anchors gần boundaries;
+      perturb future features không đổi working memory.
+- [ ] Multi-anchor packing giữ mỗi block memory/positions/mask độc lập.
+
+Nghiệm thu: compact bank được thực sự gather; dense N-key mask không là sparse executor.
+
+## T4. Regenerate converter, cache audit và anchor store
+
+Thêm adapter-specific data preparation/cache importer; V0 prepare-data giữ
+semantics prompt-only.
+
+- [ ] Giữ final regenerated response, tokenize prompt/response boundary đúng.
+- [ ] Lock source/full-history split trên toàn corpus; không lấy validation để train.
+- [ ] Cache import so token IDs/positions/template/truncation, target/layers và
+      frozen projection fingerprint; mismatch fail có report.
+- [ ] Raw features project offline một lần; audit recompute subset trước import.
+- [ ] Manifest lưu response EOS/decoding metadata và references ArXiv riêng.
+- [ ] Random anchors train, fixed anchors validation; valid labels sau anchor,
+      không dùng features của anchor pending hoặc proposal suffix.
+- [ ] Lazy per-document loading, bounded cache/LRU/prefetch; không clone whole bank
+      cho từng anchor.
+- [ ] Atomic shard/index checkpoint; interrupted preparation resume từ artifact
+      đã hoàn tất và cùng contract.
+
+Nghiệm thu: token/cache audit pass; converter không làm response biến thành
+conditioning future; V0 prompt manifests bị từ chối cho main prediction training.
+
+## T5. Compact dense-attention teacher
+
+Thay vai trò candidate labeling trong phương pháp chính bằng teacher collector
+train-only; giữ V0 candidates/label làm legacy.
+
+- [ ] Dense DFlash cùng prefix/anchor/masks, collect theo anchor chunks.
+- [ ] Aggregate heads/layers/valid proposal queries với early-position weights,
+      group raw attention mass và loại local/live/ineligible groups.
+- [ ] Normalize đúng domain; zero mass/empty domain skip có reason.
+- [ ] Save compact group distribution + teacher/visibility/anchor fingerprints,
+      không save full attention matrices hoặc full-vocabulary teachers toàn corpus.
+- [ ] Collector backend/timing được ghi; không dùng instrumentation cho speedup.
+- [ ] Teacher anchors thuộc train; mọi overlap/duplicate/fingerprint mismatch fail.
+- [ ] Report teacher coverage theo source/length; collector resumable per shard.
+
+Nghiệm thu: ranking supervision có provenance, không được gọi là verifier utility.
+
+## T6. Indexer nhỏ theo draft block
+
+Sửa/reuse query scorer trong core.py, thêm group indexing.
+
+- [ ] Fine keys từ mean pooling cố định d→64; query từ anchor/latest/recent H.
+- [ ] Một score/support mỗi block, dùng chung năm layers.
+- [ ] Eligible groups wholly outside local guard và trước anchor;
+      min(K,valid groups), stable tie order.
+- [ ] KL vào scores truyền gradient; hard gather không được gán gradient giả.
+- [ ] Main sampler giữ teacher-labeled anchors, quota pilot 25% khi đủ;
+      log actual quota và skip reasons.
+- [ ] Toy two-state ranking học hai supports khác nhau; compare fixed/random
+      cùng memory budget.
+
+Nghiệm thu: scorer tiếp tục được supervision trong main training.
+
+## T7. Grouped scalar weighted pooling
+
+Thay learned fixed slots/full-rank value projection trong recipe chính.
+
+- [ ] MLP d→32→1 tạo scalar scores, values dùng nguyên projected H.
+- [ ] Uniform init, completed groups căn absolute position 0, L>=c.
+- [ ] FP32 log-sum-exp pooling, completed-entry cache + incomplete-tail accumulator.
+- [ ] Streaming/full-build parity qua chunks, group boundaries và varying N.
+- [ ] Chỉ append processed committed features; rejected proposals không cập nhật.
+- [ ] Invalidate cached memory khi model weights đổi; training rebuild có graph.
+- [ ] Learned global bias finite -4; global-off bỏ branch thật cho dense identity.
+
+Nghiệm thu: gradient nonzero, memory growth N/c đúng, không resident-bank reduction claim.
+
+## T8. Prediction loss và shared evaluator
+
+Thêm loss/evaluation core dùng cả checkpoint/in-memory.
+
+- [ ] Weighted CE trên tối đa 15 valid labels, gamma=7, đúng label shift/EOS/padding.
+- [ ] Indexer KL trên eligible groups và samples có teacher; frozen teacher.
+- [ ] Prefix loss mặc định off; teacher-output distillation optional subset
+      không là bắt buộc của pipeline.
+- [ ] Prediction eval toàn fixed validation anchors mỗi 50 optimizer steps.
+- [ ] Actual full-validation greedy rollout mỗi 500 steps và cuối phase.
+- [ ] Teacher-token prefix match có label riêng khi chưa xác minh greedy alignment.
+- [ ] Checkpoint/in-memory cùng metrics; aggregate sum(G)/sum(T), tách A_raw/A_committed.
+- [ ] Missing/corrupt checkpoint, empty validation, NaN, fingerprint mismatch
+      hoặc partial run fail; progress/phase/heartbeat/error artifact rõ.
+- [ ] Output schema và ROUGE reference đúng policy.
+
+Nghiệm thu: loss giảm không thay actual acceptance; evaluator không im lặng
+suốt một phase dài hoặc báo partial evaluation là complete.
+
+## T9. Unified adapter trainer [INTEGRATION]
+
+Thêm một trainer warm-up/main; optimizer chỉ cập nhật adapter.
+
+- [ ] Warm-up pilot <=200 steps: c=32, K<=1024; main c=64, K=256,
+      chuyển budget có validation.
+- [ ] Một optimizer cho pooling/indexer/gate; CE + beta*indexer KL, beta pilot 1.
+- [ ] Packing ban đầu tám anchors/document, nhiều blocks/forward; chunk logits
+      theo VRAM, gradient accumulation không đổi loss normalization.
+- [ ] Deterministic train sampling, teacher quota và fixed val anchors.
+- [ ] Checkpoint adapter/optimizer/scheduler/RNG/sampler/phase/budget/eval history;
+      atomic completion và resume khớp uninterrupted tiny CPU run.
+- [ ] Log losses, gradient norm, params, blocks/s, step/cache times, VRAM, GPU-hours.
+- [ ] Full validation theo T8; không tự mở backbone khi retention kém.
+- [ ] L0 static + meaningful CPU integration tests.
+- [ ] L1 trên B200 real-data trong khoảng năm phút, profile forward/backward/I/O;
+      không chạy GPU local.
+
+Nghiệm thu: frozen-weight hash giữ nguyên, cached data đi xuyên tới loss/backward/
+step/eval/save/restore. L1 pass chưa là scientific success.
+
+## T10. Inference cache, profiling và calibration
+
+Sửa/reuse cached inference engine, thêm grouped memory lifecycle/profile.
+
+- [ ] Cache fine index keys/completed global entries; update committed tail.
+- [ ] Original positions không lấy từ compact bank length.
+- [ ] Pending anchor, reject crop, EOS/cap và target AR parity qua nhiều rounds.
+- [ ] Force dense/AMR cùng backend/verifier/workload; đo build/gather/update/indexer/
+      draft/verification/TTFT/E2E và memory breakdown.
+- [ ] Full resident raw/KV/features bank được báo; không đồng nhất keys với VRAM.
+- [ ] Short-context crossover đo sau model training; fingerprint calibration.
+- [ ] Force mode không bị auto gate đổi; ngoài vùng calibration có fallback reason.
+
+Nghiệm thu: measured physical execution, không claim attention-key ratio là speedup.
+
+## T11. CLI, config và docs migration
+
+Mở CLI adapter mới sau khi T4–T10 có code; giữ V0 subcommands.
+
+- [ ] Names/schema/version tách V0, help rõ method/training recipe.
+- [ ] Master env/offline Python 3.12, selected interpreter và allocation được tôn trọng.
+- [ ] Preflight kiểm cache contract/teacher coverage/optimizer freeze/data splits.
+- [ ] Không nhận V0 checkpoint như adapter checkpoint; budget mới không đổi
+      num_slots/raw_budget âm thầm.
+- [ ] Document lệnh **chạy được** sau khi launcher tồn tại, cập nhật readiness.
+- [ ] Regression V0/DFlash dispatcher/output schema/runtime.
+
+Nghiệm thu: smoke/full flags đúng scope; không thêm fake commands vào docs
+trước implementation. Batch-1 V0 config không tự trở thành multi-anchor trainer.
+
+## T12. B200 pilot và paper evidence
+
+- [ ] Audit/baseline trước; train pilot 2–5K documents nếu eligible đủ,
+      validation 50–100 docs khóa riêng; báo source/context coverage thật.
+- [ ] Actual acceptance retention gate đề xuất 95% ở bins có dense A>0;
+      nếu không đạt, tăng budget/đơn giản hóa trong run mới hoặc no-go.
+- [ ] Force AMR ở final budget; total decode throughput > dense là pilot goal,
+      short dense routing giữ parity; không dựa warm-up dense-like budget.
+- [ ] Local+fine, local+global, full adapter, mean/learned pooling,
+      fixed/random/learned indexer, raw/compressed fine entries, warm-up/no-warm-up.
+- [ ] Matched-total-key và matched-adaptation-compute comparisons riêng;
+      prefix objective so dense tương ứng nếu mở extension.
+- [ ] Tổng adaptation cost gồm cache audit/recompute cần thiết, teacher,
+      train, validation/calibration; report wall time và GPU-hours.
+- [ ] Khóa config/checkpoint/gate trước holdout; paired document IDs/prompt hashes,
+      failed samples và document-bootstrap CI.
+- [ ] Expand 50K sau pilot/runtime checks; no-gain là kết luận hợp lệ.
+
+Nghiệm thu: throughput, acceptance, parity và chi phí có raw server artifacts.
+Không hứa thời gian train/speedup trước profile.
+
+## 3. Tác động so với kế hoạch V0
+
+| Phần cũ | Revision hiện tại |
 |---|---|
-| Pretrained/frozen 5L, block 16 | T1–T3 |
-| Position-safe local/dynamic selection | T3,T6 |
-| Incremental complementary slots | T7 |
-| Actual acceptance preferences | T4–T6 |
-| Surrogate/gradient/train integration | T7–T9 |
-| Shared eval/checkpoint/resume | T8–T9 |
-| Cached full-context verification | T3,T10 |
-| Cost gate/short-context protection | T10–T12 |
-| Matched budget/compute/holdout | T12 và protocol |
-| Offline runtime/schema/ROUGE | T1,T4,T11 |
+| T4 trajectory capture training | Response/cache/anchor preparation |
+| T5 candidate search/preferences | Compact dense-DFlash attention teacher |
+| T6 token preference selector | Block indexer + auxiliary KL |
+| T7 fixed slots/full-rank transforms | Grouped scalar weighted pooling |
+| T8 candidate-verifier-logit KL | Weighted prediction CE + explicit indexer KL |
+| T9 selector/compressor train riêng | Unified adapter-only optimizer, multi-anchor/resume |
+| T12 acceptance-first interventions | Retention/cost trade-off và lightweight adaptation evidence |
 
-T9 complete kỹ thuật không đồng nghĩa T12 scientific success. GPU chưa chạy phải ghi chưa chạy.
+Các artifacts V0 không bị xóa và có thể replay theo
+[phụ lục dữ liệu](../../amr_dflash_training_data.md#phụ-lục-pipeline-v0-hiện-chạy-được).
+Các CPU/B200 kết quả cũ chỉ được gắn với schema/model thật của run đó.
+Khi đóng task, ghi files/commands/exit codes/artifact/limitations; chỉ stage
+đúng files nếu được thực hiện commit, không gom working-tree changes khác.

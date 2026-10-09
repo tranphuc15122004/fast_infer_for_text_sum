@@ -67,6 +67,9 @@ class FeatureManifest:
     input_ids_dtype: str = "torch.int64"
     loss_mask_dtype: str = "torch.float32"
     hidden_states_dtype: str = "torch.float32"
+    capture_backend: str = "hf"
+    capture_method: str | None = None
+    capture_metadata: dict[str, Any] | None = None
     schema_version: str = FEATURE_SCHEMA_VERSION
     generation_dir: str | None = None
 
@@ -99,6 +102,18 @@ class FeatureManifest:
         self.input_ids_dtype = _dtype_name(self.input_ids_dtype)
         self.loss_mask_dtype = _dtype_name(self.loss_mask_dtype)
         self.hidden_states_dtype = _dtype_name(self.hidden_states_dtype)
+        if self.capture_backend not in {"hf", "sglang"}:
+            raise ValueError("feature manifest capture_backend must be 'hf' or 'sglang'")
+        if self.capture_method is not None and self.capture_method not in {
+            "eagle3",
+            "dflash",
+            "dspark",
+        }:
+            raise ValueError("feature manifest capture_method is unsupported")
+        if self.capture_metadata is not None:
+            if not isinstance(self.capture_metadata, Mapping):
+                raise ValueError("feature manifest capture_metadata must be an object")
+            self.capture_metadata = dict(self.capture_metadata)
         for dtype_name in (
             self.input_ids_dtype,
             self.loss_mask_dtype,
@@ -139,6 +154,9 @@ class FeatureManifest:
             "input_ids_dtype": self.input_ids_dtype,
             "loss_mask_dtype": self.loss_mask_dtype,
             "hidden_states_dtype": self.hidden_states_dtype,
+            "capture_backend": self.capture_backend,
+            "capture_method": self.capture_method,
+            "capture_metadata": self.capture_metadata,
             "generation_dir": self.generation_dir,
         }
 
@@ -171,6 +189,17 @@ class FeatureManifest:
             loss_mask_dtype=str(payload.get("loss_mask_dtype", "torch.float32")),
             hidden_states_dtype=str(
                 payload.get("hidden_states_dtype", payload.get("dtype", "torch.float32"))
+            ),
+            capture_backend=str(payload.get("capture_backend", "hf")),
+            capture_method=(
+                str(payload["capture_method"])
+                if payload.get("capture_method") is not None
+                else None
+            ),
+            capture_metadata=(
+                dict(payload["capture_metadata"])
+                if payload.get("capture_metadata") is not None
+                else None
             ),
             schema_version=str(payload.get("schema_version", FEATURE_SCHEMA_VERSION)),
             generation_dir=(

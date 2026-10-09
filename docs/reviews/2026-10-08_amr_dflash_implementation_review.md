@@ -1,5 +1,15 @@
 # Review triển khai AMR-DFlash — 08/10/2026
 
+**Phạm vi lịch sử:** báo cáo này review code V0 preference-selector + fixed
+global slots và các sửa lỗi đến 09/10. Những tests/readiness phía dưới không
+nghiệm thu thiết kế memory adapter nhẹ mới. Xem
+[tài liệu chính về ý tưởng/paper story/training](../amr_dflash_paper_story.md),
+[đặc tả kỹ thuật](../superpowers/specs/2026-10-08-amr-dflash-design.md),
+[dữ liệu/cache](../amr_dflash_training_data.md) và
+[kế hoạch chuyển đổi](../superpowers/plans/2026-10-08-amr-dflash-implementation.md).
+Thiết kế mới giữ backbone frozen, dùng response prediction + indexer KL;
+trainer và compact teacher collector vẫn cần triển khai.
+
 Phạm vi: working tree hiện hành của `src/AMR_DFlash/`, CLI/launcher AMR,
 config chung, output và các contract tests. Review này không sửa mã nguồn.
 
@@ -279,7 +289,7 @@ và rollout bốn modes ở cả FP32/BF16. Selector training dùng preference f
 được kiểm soát; compressor dùng logits teacher từ verifier thật. Chưa có
 bằng chứng preference signal tự nhiên trên corpus production.
 
-**Mức sẵn sàng:** code V0 đủ cho train pilot. Trước khi mở run dài trên B200,
+**Mức sẵn sàng V0:** code V0 đủ cho train pilot của pipeline lịch sử. Trước khi mở run dài trên B200,
 cần preflight đúng target/drafter/data, capture/label với hợp đồng mới, xác
 nhận có train preferences không tie/censor và train teacher hợp lệ, rồi chạy
 20 bước mỗi phase để kiểm tra loss/gradient, VRAM và checkpoint trên server.

@@ -1,12 +1,54 @@
 # AMR-DFlash
 
-AMR-DFlash đặt một bộ nhớ đa phân giải trước pretrained DFlash-5L: giữ một
-ngân sách raw gồm recent guard và các vị trí do selector xếp hạng, thêm global
-slots tùy chọn, rồi dùng nguyên DFlash 16 vị trí để draft. Target vẫn xác minh
-trên toàn bộ prefix bằng KV cache. Bản V0 chỉ hỗ trợ greedy, batch 1 và cần
-checkpoint AMR đã fingerprint khi bật selector/compressor.
+Cập nhật phương pháp: **09/10/2026**. AMR-DFlash (cũng được gọi ARM-DFlash
+trong trao đổi) là **memory adapter nhẹ cho pretrained DFlash-5L**:
+global grouped pooling học được, fine block retrieval và exact local features,
+dùng chung giữa năm layers. Target và toàn bộ DFlash, gồm fc/norm, đều frozen.
 
-## Chuẩn bị trên B200
+**Trạng thái code:** launcher hiện có là V0 preference-selector + learned
+fixed slots, greedy/batch 1. Thiết kế adapter mới đã thống nhất nhưng
+response/cache importer, compact attention teacher và unified prediction
+trainer chưa được triển khai. Các lệnh dưới đây chạy **V0**, không train
+thiết kế mới bằng cách đổi tên loss/config.
+
+## Phương pháp và training hiện tại trong thiết kế
+
+- Indexer nhỏ chọn nhóm context một lần/draft block; fine branch giữ raw
+  features của nhóm, cùng original positions.
+- Global compressor dùng scalar weighted pooling theo nhóm, giữ feature
+  geometry của frozen drafter; không thêm full-rank value transforms.
+- Optimizer chỉ chứa compressor, indexer và global gate.
+- Prediction labels lấy từ response regenerate; target/projected features
+  chỉ dùng lại sau token/model/projection audit.
+- Warm-up ngắn với budget rộng, rồi adapter-only training ở budget triển khai.
+  Loss chính là weighted DFlash CE + indexer KL trên teacher-labeled anchors.
+- Compact dense-DFlash attention teacher thu trên subset train; hard Top-K
+  không truyền prediction gradient vào indices. Không cần preference dataset/RL.
+- Full-context target verification và live block 16 giữ nguyên; benchmark
+  đo actual acceptance cùng toàn bộ memory/draft/verification cost.
+
+Kiến trúc lấy cảm hứng HCA/CSA nhưng **không thay attention layers theo kiểu
+DeepSeek-V4**: memory chung được đưa vào pretrained attention gốc.
+Bộ raw/local/global chồng lấp về thông tin, không là disjoint complement.
+Freeze backbone giảm optimizer state; compressor vẫn backprop xuyên drafter.
+
+Đọc theo thứ tự:
+
+1. [Tài liệu chính: ý tưởng, dàn ý paper, training và sổ quyết định](../amr_dflash_paper_story.md).
+2. [Đặc tả kiến trúc, loss và contracts](../superpowers/specs/2026-10-08-amr-dflash-design.md).
+3. [Dữ liệu 50K/cache, warm-up và readiness](../amr_dflash_training_data.md).
+4. [Các tasks triển khai](../superpowers/plans/2026-10-08-amr-dflash-implementation.md).
+
+Các budgets mới m/c/K/L chưa được V0 YAML hỗ trợ. Không dùng num_slots=128
+của V0 để biểu diễn global compression ratio 128.
+
+## Phụ lục: vận hành code V0 đã có
+
+Phần này giữ lệnh để replay/debug/control pipeline cũ.
+Corpus regenerate ở V0 chỉ cung cấp **prompt**; response cuối bị loại,
+rồi capture/verifier tạo supervision riêng. Nó khác prediction dataset mới.
+
+### Chuẩn bị V0 trên B200
 
 Nếu đã có corpus ShareGPT/ArXiv regenerate, dùng `prepare-data` để tạo manifest
 giữ hội thoại nhiều lượt và split gốc, rồi capture/label supervision AMR mới.
@@ -29,7 +71,7 @@ bash scripts/run.sh amr_dflash preflight --require-b200
 Lệnh kiểm tra Python/package, B200, target/draft config và weights, tokenizer
 local, cùng input JSONL; nó không load model weights.
 
-## Tạo state và acceptance labels
+### Tạo state và acceptance labels
 
 Chọn corpus huấn luyện JSONL đã cố định split theo document. Mỗi record cần có
 `prompt` hoặc field mà `scripts/common/data_loader.py` hỗ trợ; có thể thêm
@@ -46,7 +88,7 @@ export AMR_RUN_ID=pilot_2026_10_08
 export AMR_RUN_ROOT="$PWD/outputs/amr_dflash/$AMR_RUN_ID"
 export AMR_DATA_MANIFEST=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/amr_train.jsonl
 
-bash scripts/run.sh amr_dflash capture --max-samples 200 --max-new-tokens 256 \
+bash scripts/run.sh amr_dflash capture --max-new-tokens 256 \
   --max-states-per-document 6
 bash scripts/run.sh amr_dflash candidates
 bash scripts/run.sh amr_dflash label
@@ -75,7 +117,7 @@ manifest gốc được giữ nguyên. Artifact thiếu hợp đồng mới ph�
 trong run root mới, rồi candidates/label/train lại; không thêm hash thủ công
 để hợp thức hóa feature cũ.
 
-## Train và đánh giá
+### Train và đánh giá
 
 ```bash
 bash scripts/run.sh amr_dflash train-selector --steps 200
@@ -131,7 +173,7 @@ Summary tính `decode_committed_tok_s` bằng tổng decode tokens chia tổng d
 time; các `mean_*` là thống kê mô tả từng sample.
 Chỉ số latency được đo trên server B200 mới có ý nghĩa cho paper.
 
-## Hợp đồng và giới hạn V0
+### Hợp đồng và giới hạn V0
 
 - `dense`: full-context DFlash control, checkpoint AMR không cần.
 - `selection`: selector raw memory, không có slots.
@@ -159,6 +201,7 @@ Checkpoint fingerprint khóa toàn bộ memory config. Muốn so raw/slot budget
 khác nhau cần capture/label/train một run riêng cho từng config; các mode ở ví
 dụ trên chỉ so cùng raw budget và chưa phải matched-total-budget ablation.
 
-Xem [proposal](../../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md),
+Các tài liệu sau là lịch sử V0, không thay đặc tả mới ở đầu trang:
+[proposal V0](../../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md),
 [data contract](../../src/ARMdflash/AMR_DFlash_Implementation/data_training_contract.md)
 và [acceptance checklist](../../src/ARMdflash/AMR_DFlash_Implementation/acceptance_checklist.md).

@@ -44,7 +44,7 @@ của phương pháp chưa chạy**, nên trạng thái vẫn experimental. Xem
 | EAGLE-3 | `python3` server / `.venv` mô phỏng | `docs/baselines/eagle3.md` |
 | DFlash | `python3` server / `.venv` mô phỏng | `docs/baselines/dflash.md` |
 | Context-Adaptive DFlash (experimental, unvalidated) | `python3` server GPU | `docs/baselines/context_adaptive_dflash.md` |
-| AMR-DFlash (experimental) | `python3` server / `.venv` mô phỏng | `docs/baselines/amr_dflash.md` |
+| AMR-DFlash (experimental; thiết kế adapter nhẹ) | `python3` server / `.venv` mô phỏng | `docs/baselines/amr_dflash.md` |
 | SSSD | `python3` server / `.venv` mô phỏng | `docs/baselines/sssd.md` |
 | FAFO | `python3` server / `.venv` mô phỏng | `docs/baselines/fafo.md` |
 | LLMLingua | `python3` server / `.venv` mô phỏng | `docs/baselines/llmlingua.md` |
@@ -72,12 +72,21 @@ insight, mẫu số attention, liên hệ Training-Free/MASW, giới hạn bằn
 các phép kiểm chứng còn cần thực hiện:
 [hồ sơ phân tích nghiên cứu](experiments/2026-10-06_dflash_context_memory_paper_analysis.md).
 
-Hướng AMR-DFlash acceptance-first cập nhật ngày 08/10/2026:
-[proposal và paper story](../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md)
-và [bộ tài liệu triển khai](../src/ARMdflash/AMR_DFlash_Implementation/README.md).
-Implementation V0 và CPU synthetic contract tests đã có; Qwen3-4B/DFlash thật,
-B200 training/evaluation và pilot chưa chạy, nên chưa có kết quả khoa học hay
-claim speedup.
+Hướng **AMR-DFlash memory adapter nhẹ**, thống nhất ngày 09/10/2026:
+[tài liệu chính kiểm soát ý tưởng và dàn ý paper](amr_dflash_paper_story.md),
+[đặc tả kiến trúc và training](superpowers/specs/2026-10-08-amr-dflash-design.md),
+[dữ liệu regenerate/cache 50K và warm-up](amr_dflash_training_data.md),
+[kế hoạch triển khai](superpowers/plans/2026-10-08-amr-dflash-implementation.md).
+Tài liệu chính nối paper story, method, loss/gradient, warm-up, thí nghiệm,
+claim/evidence và sổ quyết định để theo dõi ý tưởng xuyên suốt.
+Giữ nguyên target và pretrained DFlash-5L; chỉ train grouped pooling,
+block indexer và gate bằng draft prediction + auxiliary indexer loss.
+V0 preference-selector/slots đã có code và CPU contracts; trainer adapter mới
+chưa triển khai, chưa có B200 acceptance/throughput evidence cho thiết kế mới.
+[Proposal 08/10](../src/ARMdflash/AMR_DFlash_Research_Proposal_and_Paper_Story_2026-10-08.md)
+và [bộ tài liệu src/ARMdflash](../src/ARMdflash/AMR_DFlash_Implementation/README.md)
+là lịch sử V0. [Hướng dẫn launcher](baselines/amr_dflash.md) phân biệt rõ
+thiết kế hiện tại với các lệnh V0 vẫn chạy được.
 
 Đề xuất cơ chế điều phối context tận dụng DFlash đã train: giữ block 16,
 chọn key bằng attention của chính drafter, tái sử dụng và dense refresh:

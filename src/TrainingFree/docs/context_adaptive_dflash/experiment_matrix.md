@@ -1,6 +1,6 @@
 # Kế hoạch và ma trận thực nghiệm Context-Adaptive DFlash
 
-Ngày: **2026-10-09**. Đây là kế hoạch thu bằng chứng; **G0–G6 chưa được xác nhận trên GPU**. Định nghĩa thuật toán ở [design](design.md), tiêu chí nghiên cứu ở [protocol](experiment_protocol.md), lệnh chạy ở [runbook](runbook.md), kiểm chứng GPU ở [gpu_validation](gpu_validation.md). Dùng [mẫu báo cáo](results_template.md) để ghi quyết định và sai lệch protocol.
+Ngày: **2026-10-09**. Đây là kế hoạch thu bằng chứng; **G0–G6 chưa được xác nhận trên GPU**. Bước data-only prepare/exposure audit cục bộ đã hoàn tất; xem [tiến độ thực nghiệm](experiment_progress_2026-10-09.md). Định nghĩa thuật toán ở [design](design.md), tiêu chí nghiên cứu ở [protocol](experiment_protocol.md), lệnh chạy ở [runbook](runbook.md), kiểm chứng GPU ở [gpu_validation](gpu_validation.md). Dùng [mẫu báo cáo](results_template.md) để ghi quyết định và sai lệch protocol.
 
 ## 1. Giả thuyết, đối chứng và phạm vi kết luận
 
@@ -38,7 +38,7 @@ Metadata đã kiểm tra: primary pool có 300 records, 220 source groups trư�
 | Multi-News | 20 | 20 | 60 | Cụm bài nguồn |
 | QMSum | 4 | 4 | 12 | Conversation; giữ mọi query cùng split |
 
-Counts cuối lấy từ `split_manifest.json`; số query records QMSum tùy nhóm. Bản prepare CPU ngày 2026-10-08 trên cả năm datasets có 500 records/420 groups và **10 exposure IDs chưa resolve**; đây chưa phải split primary đã được audit. Xem [báo cáo khắc phục](implementation_review_2026-10-08.md).
+Counts cuối lấy từ `split_manifest.json`; số query records QMSum tùy nhóm. Prepare CPU ngày 2026-10-08 trên năm datasets có 500 records/420 groups và 10 exposure IDs chưa resolve; đây không phải primary split. Audit primary-only ngày 2026-10-09 gồm 300 records/220 groups, split `complete`; cả 10 IDs được tìm trong LongBench-200 nhưng không khớp ID/source provenance/hash ở ba primary files. CLI vẫn giữ 10 IDs trong unresolved list; audit lưu bằng chứng `absent_verified` cạnh split. Server cần lặp audit/prepare với cùng data hashes; xem [tiến độ](experiment_progress_2026-10-09.md) và [báo cáo khắc phục](implementation_review_2026-10-08.md).
 
 ### Hồ sơ đối soát 10 IDs
 

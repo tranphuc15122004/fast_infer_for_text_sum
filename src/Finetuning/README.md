@@ -4,6 +4,9 @@
 `src/MR_DFlash`; target Qwen luôn frozen, còn optimizer chỉ cập nhật
 `DFlashDraftModel`.
 
+Hướng dẫn Phase 1 chạy trên B200 (regenerate → validate → cache, không train):
+[`docs/finetuning_phase1.md`](../../docs/finetuning_phase1.md).
+
 Điều cần phân biệt: DFlash học để tăng tốc chính target, không làm target có
 chất lượng tóm tắt cao hơn. Vì vậy pipeline train trên **summary do chính
 target sinh**, nhưng giữ gold summary của người viết để đo ROUGE sau cùng.

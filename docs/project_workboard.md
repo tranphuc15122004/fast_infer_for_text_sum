@@ -9,6 +9,8 @@ Benchmark reference để đối chiếu Training-Free: [Modal reference](experi
 và [metadata/config JSON](experiments/2026-09-21_modal_trainingfree_reference.json).
 
 **Ngày snapshot:** 2026-10-08
+
+**Cập nhật riêng AMR-DFlash (A2):** 2026-10-09, thiết kế adapter nhẹ đã thống nhất.
 **Commit nền:** `ffe40fc` (`cap nhat quá trình Eval`)  
 **Lưu ý trạng thái:** working tree hiện có thay đổi chưa commit ở các nhánh
 `MR_DFlash`, `TrainingFree` và các tài liệu/runtime liên quan. Những phần này
@@ -42,9 +44,26 @@ Nhãn dùng trong tài liệu:
 | `M1` | MR-DFlash: memory-aware learned drafter | `src/MR_DFlash/`, `scripts/mr_dflash/` | **Fine-tune và GrowMTP loss from scratch trên B200 đã chạy xong theo báo cáo; audit hidden cache và đánh giá chất lượng/acceptance còn mở** |
 | `T1` | Training-Free RECAP-KV | `src/TrainingFree/`, `scripts/modal_trainingfree.py` | **E41 xác nhận head heterogeneity; E42 oracle hybrid-head không đạt đồng thời các gate; dừng trước E43/router/physical KV** |
 | `T2` | Context-Adaptive DFlash training-free | `src/TrainingFree/docs/context_adaptive_dflash/` | **Đặc tả và protocol đã có; executor/launcher và G0–G6 đang pending** |
-| `A2` | AMR-DFlash acceptance-aware adaptive memory | `src/AMR_DFlash/`, `scripts/amr_dflash/`, `docs/baselines/amr_dflash.md` | **V0 code + launcher đã có; CPU contracts pass; checkpoint thật/B200 train/eval và scientific gates pending** |
+| `A2` | AMR-DFlash memory adapter nhẹ, frozen DFlash | `src/AMR_DFlash/`, `scripts/amr_dflash/`, `docs/baselines/amr_dflash.md` | **Regenerate + target cache 50K Qwen3-4B đã có theo xác nhận 09/10; audit reuse pending. Code vẫn V0 preference/slots, trainer mới và B200 evidence pending** |
 | `Y1` | SyncSpec-v1 speculative decoding | `src/SyncSpec/`, `docs/baselines/syncspec.md` | **Core, test và smoke đã có; chưa có full benchmark canonical để claim** |
 | `A1` | Phân tích chẩn đoán và quyết định nghiên cứu | `src/analyze/`, `outputs/dflash_residual/`, `outputs/safe_budget_sum/`, `outputs/specextend_*` | **Nhiều thí nghiệm đã chạy; kết quả dùng để lọc giả thuyết, không tự động là baseline** |
+
+### A2 — Quyết định phương pháp ngày 09/10/2026
+
+Nguồn chính kiểm soát ý tưởng: [paper story và toàn bộ quy trình training](amr_dflash_paper_story.md).
+Tài liệu đi kèm: [đặc tả kỹ thuật](superpowers/specs/2026-10-08-amr-dflash-design.md),
+[dữ liệu/train](amr_dflash_training_data.md) và
+[kế hoạch triển khai](superpowers/plans/2026-10-08-amr-dflash-implementation.md).
+Chỉ train global grouped pooling, một indexer theo block và gate; giữ raw
+features ở fine/local branch và dùng cùng memory cho năm DFlash layers.
+Warm-up ngắn → main adapter-only training từ response regenerate và cache
+target 50K đã có sau khi xác nhận audit compatibility.
+Primary goal là acceptance retention với measured committed throughput tốt hơn
+dense, không là train lại toàn bộ drafter hoặc tạo preference dataset mới.
+
+Các CPU V0 tests/review và report prepare 250 samples do người vận hành cung
+cấp không nghiệm thu adapter mới. Bước tiếp theo là triển khai importer,
+teacher subset và trainer theo kế hoạch; chưa có actual B200 gain cho thiết kế này.
 
 ## Thứ tự ưu tiên hiện tại
 
@@ -56,10 +75,12 @@ Nhãn dùng trong tài liệu:
    triển khai physical KV executor khi expansion vẫn gần 100%.
 4. Đưa SyncSpec và Finetuning qua target/model snapshot thật theo đúng gate của
    từng nhánh trước khi đưa vào bảng claim chung.
-5. Trên B200, preflight model/data; chạy AMR capture → candidate labels →
-   selector/compressor train → fixed-state dense/selection/compressor/hybrid
-   evaluation → paired rollout smoke. Chỉ sau exactness và matched-cost gate
-   mới mở pilot/holdout.
+5. Với AMR-DFlash, triển khai response/cache audit → compact attention teacher
+   → grouped memory → unified adapter-only trainer/evaluator. Giữ target và
+   pretrained DFlash frozen; warm-up ngắn rồi main memory training. Chạy B200
+   runtime/pilot 2–5K trước mở 50K, đo acceptance retention và tổng throughput.
+   V0 capture/candidates/label/train còn dùng để replay/control, không là
+   training chính của thiết kế mới.
 
 Các mục trên là định hướng kỹ thuật rút ra từ trạng thái repo. Khi có giao việc
 cụ thể mới, ghi giao việc đó vào trường **Việc tiếp theo được giao** của
@@ -372,6 +393,10 @@ loss và ngân sách tham số hay không.
   dtype/backend được khai báo, nhưng `target_revision=None` và không có
   fingerprint weights lịch sử, nên chưa xác nhận cache được tạo từ đúng snapshot
   model hiện tại.
+- Cập nhật người vận hành ngày 2026-10-09: regenerated train/val và cache
+  `target_features_qwen3_4b_full/{train,val}` của run 50K vẫn có trên server,
+  dùng target Qwen3-4B. Đây là xác nhận artifact hiện diện; chưa có report mới
+  chứng minh cache đã được tạo lại hoặc vượt audit parity sau kết quả fail 05/10.
 - Có tài liệu/protocol cho pilot train/eval, nhưng trong artifact hiện thấy
   chưa có một output MR-DFlash final được đóng cùng report speed/quality để
   gọi là benchmark result hoàn chỉnh.

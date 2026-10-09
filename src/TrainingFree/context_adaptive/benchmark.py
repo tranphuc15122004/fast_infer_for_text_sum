@@ -209,6 +209,55 @@ def validate_rotary_compatibility(target_config: Any, draft_config: Any) -> None
         raise ValueError("dynamic RoPE is unsupported because cached draft context keys would become stale")
 
 
+def _resolve_attention_backend(torch: Any, automatic_backend: str) -> str:
+    """Resolve an optional, explicitly requested backend for this benchmark.
+
+    The DFlash adapter selects FA4 automatically on Blackwell and FA2 on
+    Hopper/Ada.  An explicit override lets us reproduce a server FA4 runtime
+    on Hopper for controlled backend comparisons.  Never silently downgrade
+    an explicit FA4 request to SDPA or FA2.
+    """
+    requested = os.environ.get("CAD_ATTENTION_BACKEND", "auto").strip().lower()
+    if requested in {"", "auto"}:
+        return automatic_backend
+    if requested not in {"sdpa", "flash_attention_2", "flash_attention_4"}:
+        raise ValueError(
+            "CAD_ATTENTION_BACKEND must be auto, sdpa, flash_attention_2, "
+            "or flash_attention_4"
+        )
+    if requested == "sdpa":
+        return requested
+
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(0))
+    if requested == "flash_attention_4":
+        # FA4 supports Hopper (SM90) and Blackwell (SM100/SM110).
+        if capability[0] < 9:
+            raise RuntimeError(
+                f"FlashAttention-4 requires Hopper/Blackwell; got capability {capability}"
+            )
+        from common.vanilla_inference import (
+            _install_flash_attention_4_cutlass_compat,
+            _probe_flash_attention_4,
+        )
+
+        _install_flash_attention_4_cutlass_compat()
+        available, reason = _probe_flash_attention_4()
+        if not available:
+            raise RuntimeError(
+                "CAD_ATTENTION_BACKEND=flash_attention_4 was requested, but "
+                f"its runtime probe failed: {reason}"
+            )
+        return requested
+
+    if capability[0] >= 10:
+        raise RuntimeError("FlashAttention-2 is unsupported on Blackwell; request FA4 or SDPA")
+    try:
+        import flash_attn  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(f"FlashAttention-2 was requested but could not be imported: {exc}") from exc
+    return requested
+
+
 def load_runtime(target_path: str, draft_path: str | None, *, load_draft: bool = True) -> dict[str, Any]:
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -227,6 +276,7 @@ def load_runtime(target_path: str, draft_path: str | None, *, load_draft: bool =
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     dtype, attention_backend = _dtype_and_attention()
+    attention_backend = _resolve_attention_backend(torch, attention_backend)
     tokenizer = AutoTokenizer.from_pretrained(target_path, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -292,6 +342,7 @@ def load_runtime(target_path: str, draft_path: str | None, *, load_draft: bool =
         "transformers": __import__("transformers").__version__,
         "dtype": str(dtype),
         "attention_backend": attention_backend,
+        "requested_attention_backend": os.environ.get("CAD_ATTENTION_BACKEND", "auto"),
         "gpu_name": torch.cuda.get_device_name(device),
         "gpu_capability": list(torch.cuda.get_device_capability(device)),
         # Runtime identity is compared between AR and speculative variants.
