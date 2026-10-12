@@ -400,6 +400,7 @@ def _prepare_samples(
     max_input_tokens: int,
     max_total_tokens: int,
     max_samples: int,
+    length_spread_samples: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     samples: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -436,7 +437,13 @@ def _prepare_samples(
         samples.append(
             {
                 "sample_id": sample_id,
-                "dataset": str(row.get("dataset") or "unknown"),
+                "dataset": str(
+                    row.get("length_bin_name") or row.get("dataset") or "unknown"
+                ),
+                "source_dataset": str(row.get("dataset") or "unknown"),
+                "task_type": row.get("task_type"),
+                "length_bin": row.get("length_bin"),
+                "length_bin_name": row.get("length_bin_name"),
                 "prompt": prompt,
                 "prompt_token_ids": token_ids,
                 "reference": _reference_text(row),
@@ -445,8 +452,20 @@ def _prepare_samples(
                 "source_record": _jsonable(row),
             }
         )
+    if length_spread_samples:
+        samples.sort(key=lambda sample: (sample["input_tokens"], sample["sample_id"]))
     if max_samples > 0:
-        samples = samples[:max_samples]
+        if length_spread_samples and max_samples < len(samples):
+            if max_samples == 1:
+                indices = [(len(samples) - 1) // 2]
+            else:
+                indices = [
+                    round(index * (len(samples) - 1) / (max_samples - 1))
+                    for index in range(max_samples)
+                ]
+            samples = [samples[index] for index in indices]
+        else:
+            samples = samples[:max_samples]
     if not samples:
         raise ValueError("no samples remain after applying the common input limits")
     return samples, excluded
@@ -476,6 +495,10 @@ def _base_record(method: str, sample: dict[str, Any], model: str) -> dict[str, A
     record: dict[str, Any] = {
         "method": method,
         "dataset": sample["dataset"],
+        "source_dataset": sample.get("source_dataset"),
+        "task_type": sample.get("task_type"),
+        "length_bin": sample.get("length_bin"),
+        "length_bin_name": sample.get("length_bin_name"),
         "model": model,
         "sample_id": sample["sample_id"],
         "input_tokens": sample["input_tokens"],
@@ -855,9 +878,20 @@ def _evaluate(args: argparse.Namespace) -> int:
     import vllm
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM, SamplingParams
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+
+        supports_per_request_spec_metrics = (
+            "per_request_spec_decode_metrics"
+            in getattr(EngineArgs, "__dataclass_fields__", {})
+        )
+    except (ImportError, AttributeError, TypeError):
+        supports_per_request_spec_metrics = False
 
     if not torch.cuda.is_available():
         raise RuntimeError("vLLM unified evaluation requires an available CUDA GPU")
+    if args.require_blackwell and torch.cuda.get_device_capability(0)[0] < 10:
+        raise RuntimeError("this benchmark mode requires a Blackwell GPU (compute capability 10.x)")
     target_config = AutoConfig.from_pretrained(paths["vanilla_vllm"], local_files_only=True)
     target_layers = int(getattr(target_config, "num_hidden_layers", 0) or 0)
     tokenizer = AutoTokenizer.from_pretrained(paths["vanilla_vllm"], local_files_only=True)
@@ -884,6 +918,7 @@ def _evaluate(args: argparse.Namespace) -> int:
         max_input_tokens=args.max_input_tokens,
         max_total_tokens=args.max_model_len - args.max_new_tokens,
         max_samples=max_samples,
+        length_spread_samples=args.length_spread_samples,
     )
 
     common_config = {
@@ -904,6 +939,12 @@ def _evaluate(args: argparse.Namespace) -> int:
         "enforce_eager": args.enforce_eager,
         "enable_prefix_caching": False,
         "warmup_per_sample": True,
+        "sample_selection": "length_spread" if args.length_spread_samples else "input_order",
+        "speculative_metric_capture": (
+            "detailed"
+            if supports_per_request_spec_metrics
+            else "unavailable_in_installed_vllm_engine_args"
+        ),
     }
     run_id = args.run_id or (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -1017,6 +1058,11 @@ def _evaluate(args: argparse.Namespace) -> int:
                 **method_metadata,
                 "target_model": paths["vanilla_vllm"],
                 "status": "loading",
+                "speculative_metric_capture": (
+                    "detailed"
+                    if supports_per_request_spec_metrics
+                    else "unavailable_in_installed_vllm_engine_args"
+                ),
                 "started_at_utc": datetime.now(timezone.utc).isoformat(),
                 "gpu_memory_before_load": _gpu_memory_snapshot(torch),
                 "system_gpu_before_load": _nvidia_smi_snapshot()
@@ -1039,7 +1085,8 @@ def _evaluate(args: argparse.Namespace) -> int:
                 "speculative_config": speculative_config,
             }
             if speculative_config is not None:
-                engine_kwargs["per_request_spec_decode_metrics"] = "detailed"
+                if supports_per_request_spec_metrics:
+                    engine_kwargs["per_request_spec_decode_metrics"] = "detailed"
             model_configs[method]["engine_kwargs"] = _jsonable(engine_kwargs)
             _append_event(
                 events_path,
@@ -1584,6 +1631,16 @@ def _parser() -> argparse.ArgumentParser:
         help="Process every eligible row, overriding smoke mode and sample caps",
     )
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--require-blackwell",
+        action="store_true",
+        help="Reject GPUs below Blackwell / compute capability 10.x.",
+    )
+    parser.add_argument(
+        "--length-spread-samples",
+        action="store_true",
+        help="Select a deterministic token-length spread instead of the first N rows.",
+    )
     parser.add_argument("--preflight-only", action="store_true")
     return parser
 
@@ -1632,7 +1689,16 @@ def main(argv: list[str] | None = None) -> int:
             install_domino_vllm_compat()
 
         cuda_available = bool(torch.cuda.is_available())
+        blackwell_gpu = (
+            cuda_available and torch.cuda.get_device_capability(0)[0] >= 10
+        )
+        if args.require_blackwell and cuda_available and not blackwell_gpu:
+            raise SystemExit(
+                "this benchmark mode requires a Blackwell GPU (compute capability 10.x)"
+            )
         status = "preflight_passed" if cuda_available else "preflight_failed"
+        if args.require_blackwell and not blackwell_gpu:
+            status = "preflight_failed"
         print(
             json.dumps(
                 {
@@ -1643,6 +1709,7 @@ def main(argv: list[str] | None = None) -> int:
                     "transformers": getattr(transformers, "__version__", "unknown"),
                     "cuda_available": cuda_available,
                     "gpu": torch.cuda.get_device_name(0) if cuda_available else None,
+                    "gpu_capability": list(torch.cuda.get_device_capability(0)) if cuda_available else None,
                     "target_model": paths["vanilla_vllm"],
                     "tokenizer_class": type(tokenizer).__name__,
                     "target_num_hidden_layers": target_layers,
@@ -1653,7 +1720,7 @@ def main(argv: list[str] | None = None) -> int:
                 indent=2,
             )
         )
-        return 0 if cuda_available else 1
+        return 0 if cuda_available and (blackwell_gpu or not args.require_blackwell) else 1
     return _evaluate(args)
 
 

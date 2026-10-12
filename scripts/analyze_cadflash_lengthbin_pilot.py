@@ -108,6 +108,15 @@ def analyze(root: Path, run_id: str) -> dict[str, Any]:
         "variant_order": hardware.get("variant_order", preregistration.get("variant_order", [])),
         "fa4_kernel_probe_ms": hardware.get("fa4_kernel_probe_ms"),
     }
+    output_counts = Counter(
+        int(row["output_tokens"])
+        for row in requests.values()
+        if row.get("output_tokens") is not None
+    )
+    cap = int(summary_metadata["max_new_tokens"])
+    summary_metadata["observed_output_token_counts"] = dict(sorted(output_counts.items()))
+    summary_metadata["cap_hit_requests"] = output_counts.get(cap, 0)
+    summary_metadata["successful_requests"] = sum(output_counts.values())
     bins = [f"bin{i}_{label}" for i, label in enumerate(("00k_02k", "02k_04k", "04k_08k", "08k_12k", "12k_16k"), start=1)]
     variants = [AR, *VARIANTS]
     baseline_rows_by_bin: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -271,6 +280,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"max-new-tokens {metadata.get('max_new_tokens')}, `{metadata.get('output_scope')}`, "
         f"{metadata.get('repetitions')} repetitions and {metadata.get('warmup_runs')} warmups"
     )
+    cap_hit_requests = metadata.get("cap_hit_requests")
+    successful_requests = metadata.get("successful_requests")
+    cap_hit_text = (
+        f"{cap_hit_requests}/{successful_requests} request thành công chạm trần {metadata.get('max_new_tokens')} token."
+        if successful_requests
+        else "Không có dữ liệu output length."
+    )
     schedule_text = metadata.get("variant_order")
     schedule_text = ", ".join(schedule_text) if schedule_text else "thứ tự không được ghi trong metadata"
     lines = [
@@ -282,7 +298,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         f"- Chạy trên Modal {gpu_text}; Qwen3-4B target + Qwen3-4B-DFlash-b16 draft, BF16. Runtime: {runtime_text}.",
         f"- Dữ liệu từ `data/length_bins/`, chỉ gồm summarization (`gov_report`, `multi_news`, `qmsum`); loại code-completion. Split: {metadata.get('calibration_documents')} calibration và {metadata.get('dev_documents')} dev documents, chia theo source group; seed 42.",
-        f"- Dev: 3 documents/bin × 3 repetitions = 9 request/variant/bin; greedy, {output_text}. Calibration dùng checkpoints output 0/64, context budget 1024/full và gamma 3/7/15.",
+        f"- Dev: 3 documents/bin × 3 repetitions = 9 request/variant/bin; greedy, {output_text}. {cap_hit_text} Calibration dùng checkpoints output 0/64, context budget 1024/full và gamma 3/7/15.",
         "- Variants: AR, DFlash full-context gamma 15, `a_only`, hai B-only (history/entropy), `independent_ab`, `joint_no_entropy`, `joint_no_source_relevance`, và `joint`.",
         f"- Tổng cộng {summary['report_gates'].get('expected_requests')} request dev theo manifest; variant-block order: {schedule_text}. Các variant chạy tuần tự nên timing vẫn có thể chịu ảnh hưởng clock/order.",
         f"- Mỗi bin chỉ có 3 document độc lập và output cap {metadata.get('max_new_tokens')} token; đây là pilot, chưa phải heldout/natural-EOS benchmark.",
@@ -341,9 +357,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Diễn giải và giới hạn",
         "",
-        "- Mỗi bin có 3 dev documents × 3 repetitions; output cố định 128 token. Đây là pilot để so sánh theo độ dài, không phải heldout/natural-EOS headline.",
-        "- Exact-token columns đối chiếu trực tiếp output IDs. Reporter đánh dấu `headline_valid=false` với AR khi output mismatch; speedup so AR chỉ mang tính mô tả.",
-        "- Nếu một ablation khớp token IDs với DFlash nhưng DFlash không khớp AR, nó giữ nguyên output của DFlash; correctness của shared DFlash path vẫn cần được sửa/audit.",
+        f"- Mỗi bin có 3 dev documents × 3 repetitions; {cap_hit_text} Dù EOS stopping được bật, run này bị giới hạn bởi cap nên chưa đánh giá output dài tự nhiên hoặc heldout.",
+        "- Exact-token columns đối chiếu trực tiếp output IDs. DFlash full fixed chỉ khớp AR trên 6/45 request; các speedup so AR vì vậy chỉ mô tả throughput, chưa qua correctness gate.",
+        "- Một số ablation khớp token IDs với DFlash hơn các ablation khác; correctness của shared DFlash path so với AR vẫn cần được sửa/audit trước khi coi đây là headline chất lượng.",
         "- Acceptance length cao hơn không tự đảm bảo throughput speedup; xem đồng thời tok/s, E2E latency và overhead/action usage.",
         "",
     ])

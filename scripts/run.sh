@@ -15,6 +15,7 @@ shift || true
 
 case "$BASELINE" in
   longbench_200) WRAPPER="scripts/run_longbench_200.sh" ;;
+  length_bins) WRAPPER="scripts/run_length_bins_benchmark.sh" ;;
   vanilla_hf)   WRAPPER="scripts/runners/run_vanilla_hf.sh" ;;
   vanilla_fa)   WRAPPER="scripts/runners/run_vanilla_fa.sh" ;;
   eagle3)      WRAPPER="scripts/runners/run_eagle3_qwen3.sh" ;;
@@ -41,7 +42,7 @@ case "$BASELINE" in
   fa4_native)      WRAPPER="scripts/run_fa4_benchmark.sh" ;;
   *)
     echo "Unknown baseline: $BASELINE" >&2
-    echo "Available: vllm_all fa4_native longbench_200 vanilla_hf vanilla_fa eagle3 dflash context_adaptive_dflash amr_dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
+    echo "Available: length_bins vllm_all fa4_native longbench_200 vanilla_hf vanilla_fa eagle3 dflash context_adaptive_dflash amr_dflash domino sssd fafo llmlingua fastkv rocketkv gemfilter specprefill minference magicdec longspec specextend higoe semantic_selection flexprefill syncspec" >&2
     exit 1
     ;;
 esac

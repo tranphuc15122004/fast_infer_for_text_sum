@@ -20,7 +20,14 @@ REMOTE_ROOT = PROJECT_ROOT
 REMOTE_SRC = PROJECT_ROOT / "src"
 LONGBENCH_DATASETS = ("gov_report", "qmsum", "multi_news", "lcc", "repobench-p")
 VIETNAMESE_DATASETS = ("vietnews", "wikilingua", "vims", "vlsp")
-DATASETS = LONGBENCH_DATASETS + VIETNAMESE_DATASETS
+LENGTH_BIN_DATASETS = (
+    "bin1_00k_02k",
+    "bin2_02k_04k",
+    "bin3_04k_08k",
+    "bin4_08k_12k",
+    "bin5_12k_16k",
+)
+DATASETS = LONGBENCH_DATASETS + VIETNAMESE_DATASETS + LENGTH_BIN_DATASETS
 DATA_ROOT = Path(os.environ.get("FA4_DATA_DIR", PROJECT_ROOT / "data" / "longbench_100_14k")).expanduser()
 if not DATA_ROOT.is_absolute():
     DATA_ROOT = PROJECT_ROOT / DATA_ROOT
@@ -50,11 +57,15 @@ def resolve_dataset_file(data_root: Path, dataset: str) -> Path:
 
 
 def detect_default_datasets(data_root: Path) -> tuple[str, ...]:
-    """Auto-detect whether data_root contains Vietnamese eval_100 or LongBench datasets."""
+    """Auto-detect which supported benchmark dataset layout data_root contains."""
     manifest_path = data_root / "manifest.json"
     if manifest_path.is_file():
         try:
             m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(m.get("bins"), dict):
+                found_bins = [name for name in LENGTH_BIN_DATASETS if name in m["bins"]]
+                if found_bins:
+                    return tuple(found_bins)
             if "datasets" in m:
                 found_vn = [d for d in VIETNAMESE_DATASETS if d in m["datasets"]]
                 if found_vn:
@@ -422,6 +433,8 @@ def _prepare_samples(
             candidates.append(
                 {
                     "dataset": dataset,
+                    "source_dataset": str(row.get("dataset", "")),
+                    "task_type": str(row.get("task_type", "")),
                     "sample_id": str(row.get("id", row.get("source_index", ""))),
                     "input_tokens": int(input_ids.shape[1]),
                     "source_input_tokens": source_input_tokens,
@@ -431,6 +444,7 @@ def _prepare_samples(
                     "prompt": prompt,
                     "source_index": row.get("source_index"),
                     "length_bin": row.get("length_bin"),
+                    "length_bin_name": row.get("length_bin_name"),
                     "source_sha256": hashlib.sha256(
                         json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")
                     ).hexdigest(),
@@ -456,6 +470,12 @@ def _prepare_samples(
         selected,
         key=lambda row: (DATASETS.index(row["dataset"]), row["input_tokens"], row["sample_id"]),
     ), excluded
+
+
+def _sample_record_id(sample: dict[str, Any]) -> str:
+    if sample.get("length_bin_name"):
+        return str(sample["sample_id"])
+    return f"{sample['dataset']}:{sample['sample_id']}"
 
 
 def _target_model(model_name: str, *, dtype, device):
@@ -527,7 +547,7 @@ def _warm_method(
             {
                 "method": method,
                 "dataset": sample["dataset"],
-                "sample_id": f"{sample['dataset']}:{sample['sample_id']}",
+                "sample_id": _sample_record_id(sample),
                 "warmup_tokens_requested": min(warmup_tokens, max_new_tokens),
                 "warmup_tokens_generated": len(payload["output_ids"]),
                 "warmup_e2e_ms": round(elapsed_ms, 3),
@@ -1199,7 +1219,7 @@ def _safe_mean(values: list[float]) -> float | None:
 
 
 def _validate_longbench_data(datasets: tuple[str, ...], data_root: Path | None = None) -> dict[str, Any]:
-    """Verify selected canonical LongBench or Vietnamese eval_100 files against manifest."""
+    """Verify selected LongBench, Vietnamese, or length-bin files against manifest."""
     from Benchmark.common.benchmark_data import read_jsonl
 
     root = data_root or DATA_ROOT
@@ -1211,6 +1231,68 @@ def _validate_longbench_data(datasets: tuple[str, ...], data_root: Path | None =
 
     checked: dict[str, Any] = {}
     schema_version = manifest.get("schema_version")
+
+    # Length-bin manifest. Each bin is a mixed-source LongBench JSONL, so its
+    # bin name is the benchmark grouping while row["dataset"] still controls
+    # the dataset-specific prompt template.
+    bins = manifest.get("bins")
+    if isinstance(bins, dict) and any(dataset in bins for dataset in datasets):
+        if any(dataset not in LENGTH_BIN_DATASETS for dataset in datasets):
+            raise ValueError("length-bin data root only accepts length-bin dataset names")
+        for dataset in datasets:
+            meta = bins.get(dataset)
+            if not isinstance(meta, dict):
+                raise ValueError(f"length-bin manifest is missing {dataset}")
+            filename = str(meta.get("file", ""))
+            if not filename or Path(filename).name != filename:
+                raise ValueError(f"invalid file entry for length bin {dataset}: {filename!r}")
+            path = root / filename
+            if not path.is_file():
+                raise FileNotFoundError(f"length-bin dataset not found: {path}")
+            rows = read_jsonl(path)
+            expected_count = int(meta.get("count", 0))
+            if expected_count <= 0 or len(rows) != expected_count:
+                raise ValueError(
+                    f"{dataset} sample count differs from manifest: "
+                    f"expected={expected_count}, actual={len(rows)}"
+                )
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest != meta.get("sha256"):
+                raise ValueError(f"{dataset} file SHA-256 differs from manifest")
+            lower, upper = (int(value) for value in meta.get("range", (0, 0)))
+            for row in rows:
+                source_dataset = str(row.get("dataset", ""))
+                if source_dataset not in LONGBENCH_DATASETS:
+                    raise ValueError(
+                        f"{dataset} contains unsupported source dataset {source_dataset!r}"
+                    )
+                if str(row.get("length_bin_name", "")) != dataset:
+                    raise ValueError(f"{dataset} contains a row with a mismatched length_bin_name")
+                input_tokens = int(row.get("input_tokens", 0) or 0)
+                if not lower <= input_tokens < upper:
+                    raise ValueError(
+                        f"{dataset} contains input_tokens={input_tokens} outside [{lower}, {upper})"
+                    )
+            manifest_ids = meta.get("sample_ids")
+            actual_ids = [str(row.get("id", "")) for row in rows]
+            if isinstance(manifest_ids, list) and (
+                len(actual_ids) != len(manifest_ids)
+                or set(actual_ids) != {str(sample_id) for sample_id in manifest_ids}
+            ):
+                raise ValueError(f"{dataset} sample IDs differ from manifest")
+            checked[dataset] = {
+                "path": str(path.resolve()),
+                "sample_count": len(rows),
+                "sha256": digest,
+                "range": [lower, upper],
+                "dataset_distribution": meta.get("dataset_distribution", {}),
+            }
+        return {
+            "data_dir": str(root.resolve()),
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "schema_version": "length-bins-v1",
+            "datasets": checked,
+        }
 
     # Vietnamese eval_100 manifest
     if "datasets" in manifest and isinstance(manifest["datasets"], dict) and any(d in manifest["datasets"] for d in VIETNAMESE_DATASETS):
@@ -1375,7 +1457,13 @@ def run_flashattn_benchmark(
     else:
         selected_datasets = parse_selection(datasets, DATASETS, "dataset")
     selected_methods = resolve_flashattn_methods(methods)
-    sample_limit = resolve_sample_limit(mode, samples_per_dataset, available=100)
+    available_per_dataset = (
+        50 if selected_datasets and all(dataset in LENGTH_BIN_DATASETS for dataset in selected_datasets)
+        else 100
+    )
+    sample_limit = resolve_sample_limit(
+        mode, samples_per_dataset, available=available_per_dataset
+    )
     if not run_id:
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + os.urandom(3).hex()
     if not run_id.replace("-", "").replace("_", "").isalnum():
@@ -1431,6 +1519,9 @@ def run_flashattn_benchmark(
     runtime["selected_samples"] = [
         {
             "dataset": row["dataset"],
+            "source_dataset": row.get("source_dataset"),
+            "task_type": row.get("task_type"),
+            "length_bin_name": row.get("length_bin_name"),
             "sample_id": row["sample_id"],
             "input_tokens": row["input_tokens"],
             "source_input_tokens": row["source_input_tokens"],
@@ -1443,6 +1534,8 @@ def run_flashattn_benchmark(
     selected_sample_manifest = [
         {
             "dataset": row["dataset"],
+            "source_dataset": row.get("source_dataset"),
+            "length_bin_name": row.get("length_bin_name"),
             "sample_id": row["sample_id"],
             "source_sha256": row["source_sha256"],
             "input_tokens": row["input_tokens"],
@@ -1705,7 +1798,7 @@ def run_flashattn_benchmark(
                 )
             print(f"[FA4] warmup complete: {method}", flush=True)
             for sample in samples:
-                sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                sample_id = _sample_record_id(sample)
                 for repeat_index in range(repetitions):
                     raw_key = (method, sample_id, repeat_index)
                     previous = next(
@@ -1878,6 +1971,15 @@ def run_flashattn_benchmark(
                             record.update(
                                 {
                                     "repeat_index": repeat_index,
+                                    "sample_id": (
+                                        sample["sample_id"]
+                                        if sample.get("length_bin_name")
+                                        else sample_id
+                                    ),
+                                    "source_dataset": sample.get("source_dataset"),
+                                    "task_type": sample.get("task_type"),
+                                    "length_bin": sample.get("length_bin"),
+                                    "length_bin_name": sample.get("length_bin_name"),
                                     "source_input_tokens": sample["source_input_tokens"],
                                     "input_was_truncated": sample["was_truncated"],
                                     "output_token_ids": generated_ids,
@@ -1985,7 +2087,7 @@ def run_flashattn_benchmark(
                     break
             if method != "vanilla_hf" and not gpu_context_lost:
                 for sample in samples:
-                    sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                    sample_id = _sample_record_id(sample)
                     if direct_target_audit:
                         target_only_raw[(method, sample_id, 0)] = _direct_target_greedy(
                             torch,
@@ -2022,7 +2124,7 @@ def run_flashattn_benchmark(
             print(f"[FA4] ERROR {method}: {failures[method]}", flush=True)
             print(traceback.format_exc(), flush=True)
             for sample in samples:
-                sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                sample_id = _sample_record_id(sample)
                 for repeat_index in range(repetitions):
                     existing_success = any(
                         row.get("method") == method
@@ -2083,7 +2185,7 @@ def run_flashattn_benchmark(
             for skipped_method in selected_methods[selected_methods.index(method) + 1 :]:
                 failures[skipped_method] = reason
                 for sample in samples:
-                    sample_id = f"{sample['dataset']}:{sample['sample_id']}"
+                    sample_id = _sample_record_id(sample)
                     for repeat_index in range(repetitions):
                         if any(
                             row.get("method") == skipped_method

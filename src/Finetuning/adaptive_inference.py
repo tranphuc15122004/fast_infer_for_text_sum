@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Iterable, Iterator, TypeVar
+from typing import Any, Callable, Generic, Iterable, Iterator, Sequence, TypeVar
 
 import torch
 
@@ -54,6 +54,49 @@ class BackoffResult(Generic[T]):
     value: T
     batch_size: int
     oom_retries: int
+
+
+def probe_batch_limit(
+    examples: Sequence[PreparedExample],
+    *,
+    configured_maximum: int,
+    max_tokens_per_batch: int,
+) -> int:
+    """Bound memory-probe sizes by the token cap and longest probe example."""
+
+    if configured_maximum <= 0:
+        raise ValueError("configured_maximum must be positive")
+    if max_tokens_per_batch < 0:
+        raise ValueError("max_tokens_per_batch must be non-negative")
+    if not examples:
+        raise ValueError("probe examples must not be empty")
+    available = min(configured_maximum, len(examples))
+    if max_tokens_per_batch == 0:
+        return available
+    longest = max(example.length for example in examples)
+    if longest > max_tokens_per_batch:
+        raise ValueError(
+            "one prepared example exceeds max_tokens_per_batch: "
+            f"estimated_tokens={longest}, limit={max_tokens_per_batch}"
+        )
+    return min(available, max_tokens_per_batch // longest)
+
+
+def runtime_batch_size_after_probe(
+    selection: AdaptiveBatchSelection,
+    *,
+    configured_maximum: int,
+    probed_maximum: int,
+) -> int:
+    """Keep the configured cap when token budgeting, rather than VRAM, capped probes."""
+
+    if configured_maximum <= 0 or probed_maximum <= 0:
+        raise ValueError("batch-size limits must be positive")
+    if probed_maximum > configured_maximum:
+        raise ValueError("probed_maximum cannot exceed configured_maximum")
+    if selection.hit_maximum and probed_maximum < configured_maximum:
+        return configured_maximum
+    return selection.batch_size
 
 
 def validate_adaptive_inference_settings(
@@ -335,7 +378,9 @@ __all__ = [
     "adaptive_settings_from_args",
     "add_adaptive_cli_args",
     "length_bucket_batches",
+    "probe_batch_limit",
     "run_with_oom_backoff",
+    "runtime_batch_size_after_probe",
     "select_cuda_batch_size",
     "validate_adaptive_inference_settings",
 ]

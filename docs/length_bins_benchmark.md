@@ -114,7 +114,63 @@ for bin_file in ${DATA_DIR}/bin*.jsonl; do
 done
 ```
 
-### 6.3 Tái lập (Reproducibility)
+### 6.3 Benchmark hai backend đã khóa cho server B200: FA4 và vLLM
+
+Dispatcher `scripts/run.sh length_bins` chạy bộ phương pháp speculative đã có
+trong hai pipeline B200:
+
+- `fa4`: `vanilla_hf`, `dflash`, `eagle3`, `domino`, `dspark`, qua runner
+  Transformers native + FA4. Runner xác minh dispatch FA4 và dừng nếu runtime
+  không đạt điều kiện FA4.
+- `vllm`: `vanilla_vllm`, `dflash`, `eagle3`, `domino`, `dspark`, qua runner
+  vLLM thống nhất. Mỗi bin là một run riêng để report giữ được độ phân giải
+  theo khoảng token.
+- `both`: chạy FA4 rồi vLLM tuần tự trên cùng 5 tệp dữ liệu.
+
+Chạy preflight và smoke trên server:
+
+```bash
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+bash scripts/run.sh length_bins both --config "$MASTER" --mode preflight
+bash scripts/run.sh length_bins both --config "$MASTER" --mode smoke
+```
+
+Chạy benchmark đủ 50 mẫu mỗi bin, mỗi phương pháp:
+
+```bash
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+bash scripts/run.sh length_bins both --config "$MASTER" \
+  --mode full --max-new-tokens 512 \
+  --max-model-len 18432 --run-id lengthbins-b200-full-001
+```
+
+Hai runner giữ nguyên prompt, không truncate đầu vào, để mẫu không đổi bin.
+vLLM dùng context 18.432 tokens để chứa prompt dài nhất của bin 5 cùng phần
+output mặc định 512 tokens. Smoke chọn 2 mẫu trải đều theo token length; representative mặc định
+20 mẫu cũng dùng cùng quy tắc chọn mẫu ở cả hai backend. Full chạy toàn bộ mẫu
+của từng bin. So sánh tốc độ chính thức nên dùng full và xác nhận run report
+ghi đủ sample IDs, không bị loại do giới hạn context. Dispatcher yêu cầu
+`--max-model-len` tối thiểu bằng 16.384 cộng `--max-new-tokens`; nếu tăng output
+limit thì tăng context tương ứng.
+
+Có thể chỉ chạy một backend hoặc đổi thư mục dữ liệu/kết quả:
+
+```bash
+bash scripts/run.sh length_bins fa4 --mode full
+bash scripts/run.sh length_bins vllm --mode full
+bash scripts/run.sh length_bins both \
+  --data-dir /path/to/length_bins \
+  --output-root outputs/length_bins_benchmark \
+  --run-id lengthbins-b200-full-002
+```
+
+Artifacts được nhóm theo run ID dưới `outputs/length_bins_benchmark/<run-id>`:
+FA4 tạo một native run bao phủ đủ 5 bin; vLLM tạo một run cho mỗi bin. Có thể
+đổi danh sách phương pháp bằng `--fa4-methods` và `--vllm-methods`. Runner ghi
+backend thực tế, model, prompt/sample IDs, timing, quality metric và trạng thái
+dispatch vào manifest/report tương ứng.
+
+### 6.4 Tái lập (Reproducibility)
 
 Để tạo lại tập dữ liệu này từ dữ liệu nguồn với cùng seed:
 

@@ -5,7 +5,7 @@ import json
 import torch
 
 
-def test_teacher_generation_writes_target_trajectory_and_keeps_reference(tmp_path) -> None:
+def test_teacher_generation_writes_target_trajectory_and_keeps_reference(tmp_path, capsys) -> None:
     from Finetuning.generate_targets import generate_teacher_jsonl
 
     class Tokenizer:
@@ -55,3 +55,4 @@ def test_teacher_generation_writes_target_trajectory_and_keeps_reference(tmp_pat
     assert row["reference_summary"] == "gold"
     assert row["teacher"]["target_model_path"] == "/models/qwen3"
     assert row["teacher"]["do_sample"] is False
+    assert "GENERATION_BATCH_DONE rank=0 window=1 generated=1/1" in capsys.readouterr().out

@@ -1,5 +1,7 @@
 # Kết quả pilot Context-Adaptive DFlash trên Modal
 
+> Cập nhật: lần benchmark sau trên Modal H100/FlashAttention-4, đủ 9 variants và lưu artifacts để query, được ghi riêng trong [kết quả FA4/H100](modal_fa4_h100_results_2026-10-09.md). Nội dung dưới đây vẫn là pilot ban đầu trên L40S/SDPA.
+
 Ngày chạy: **2026-10-09**. Đây là pilot kỹ thuật và performance trên dev; không phải heldout result. Report tự sinh đặt `headline_valid=false` vì không đạt exact greedy parity.
 
 ## Kết luận

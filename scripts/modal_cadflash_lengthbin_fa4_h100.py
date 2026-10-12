@@ -469,7 +469,9 @@ def run_experiment() -> str:
         bundle.add(RUN_ROOT, arcname=f"runs/{RUN_ID}")
         bundle.add(RUN_ROOT / "evidence/preregistration.md", arcname="preregistration.md")
         for filename in ("sample_manifest.json", "split_manifest.json"):
-            path = STAGE_ROOT / filename
+            # The remote worker does not receive local outputs/; use the
+            # input volume mounted at /assets so the bundle remains standalone.
+            path = ASSET_ROOT / filename
             if path.is_file():
                 bundle.add(path, arcname=filename)
     asset_volume.commit()

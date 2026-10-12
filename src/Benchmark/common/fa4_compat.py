@@ -1,4 +1,4 @@
-"""Process-local compatibility helpers for this repo's FA4 b15/CUTLASS stack."""
+"""Process-local compatibility helpers for the repo's FA4/CUTLASS stack."""
 
 from __future__ import annotations
 
@@ -184,6 +184,23 @@ def _install_flash_attention_4_cutlass_compat() -> bool:
     except Exception:
         # The import probe below remains authoritative for unsupported or
         # otherwise incomplete CUTLASS installations.
+        pass
+
+    # FA4 releases that still call this Quack helper need an alias after
+    # Quack stopped exporting it. Upstream FA4 replaced these calls with the
+    # CuTe primitive directly; expose that same primitive under the old name
+    # for the lifetime of this process without editing site-packages.
+    try:
+        quack_activation = importlib.import_module("quack.activation")
+        if not hasattr(quack_activation, "sub_packed_f32x2"):
+            cute_arch = importlib.import_module("cutlass.cute.arch")
+            replacement = getattr(cute_arch, "sub_packed_f32x2", None)
+            if replacement is not None:
+                quack_activation.sub_packed_f32x2 = replacement
+                changed = True
+    except Exception:
+        # Older combinations may keep the Quack helper or not expose a
+        # compatible CuTe primitive; the FA4 kernel probe remains authoritative.
         pass
 
     return changed

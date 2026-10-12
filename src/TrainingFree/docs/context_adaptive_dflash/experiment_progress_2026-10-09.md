@@ -9,16 +9,16 @@ Ngày: **2026-10-09**. Đây là trạng thái của lần chạy pilot; chưa p
 | R0: protocol/metric | pass | [Ma trận](experiment_matrix.md): paired geometric macro E2E speedup; thresholds G3–G5 đã đăng ký trong protocol |
 | R1: interpreter/config/CLI | pass | Local Python 3.12.13; CLI/import/preflight; `evidence/r1_cpu_preflight.json` |
 | Corpus primary/exposure/split | pass cục bộ | 300 records, 220 source groups; split complete; calibration/dev/test = 44/44/132 records. Exposure audit ghi 10 probe IDs `absent_verified` trong primary local; cần giữ audit cùng run khi đổi server/code snapshot. |
-| G0: asset/config/runtime | pass một phần | Modal preflight đọc config; 36 target layers, 5 draft target layers, vocab/hidden size khớp; 10 file target từ snapshot ghim khớp SHA-256 với Modal volume. Runtime thật là L40S/BF16/SDPA. Collector/kernel và parity chưa được chứng nhận. |
+| G0: asset/config/runtime | pass cho pilot FA4 | Modal H100 80 GB; checkpoint target khớp SHA-256; FA4 import/kernel probe qua; cả 9 dev manifests ghi `flash_attention_4`. Runtime chi tiết và artifact ở [kết quả FA4/H100](modal_fa4_h100_results_2026-10-09.md). |
 | R2: forward thật | pass | Smoke AR và DFlash fixed chạy đủ 6 dev requests, không lỗi runtime |
-| R4: GPU smoke | pass | Qwen3-4B + Qwen3-4B-DFlash-b16 trên Modal L40S; Python 3.12.10, Torch 2.13.0+cu130, Transformers 5.12.1; backend SDPA |
-| R5: calibration/dev pilot | đã chạy, exploratory | 6 calibration records, 72 replay action rows; paired dev pilot 12 records × AR/DFlash fixed/joint. Cap 128 token, 1 repetition. Xem [kết quả pilot Modal](modal_pilot_results_2026-10-09.md). |
-| G1/G2: exactness/cache/boundary | **fail/pending** | Report thấy 5/12 output token-ID mismatches ở cả DFlash fixed và `joint` so với AR. Harness tensor/cache/boundary đầy đủ chưa chạy; chưa biết mismatch đến từ verifier/cache hay numerical backend. |
-| G3–G6, heldout, R7 | pending | Pilot report `headline_valid=false`; chưa lock config hoặc chạy test split. |
+| R4: GPU smoke | pass | Qwen3-4B + Qwen3-4B-DFlash-b16 đã smoke trên Modal L40S/SDPA và Modal H100/FA4; run FA4 đủ AR/DFlash smoke, calibration và dev. |
+| R5: calibration/dev performance | đã chạy, exploratory | Run FA4: 30 calibration docs, 15 dev docs; 9 variants × 45 request, 3 repetitions; 405/405 chạm cap 2048 token. DFlash đạt 2.49× AR; `joint` đạt 1.10× DFlash; `a_only` đạt 1.19× DFlash. Xem [kết quả FA4/H100](modal_fa4_h100_results_2026-10-09.md). |
+| G1/G2: exactness/cache/boundary | **fail/pending** | L40S pilot mismatch 5/12. Trong run FA4, DFlash full fixed chỉ khớp AR 6/45; `joint` khớp AR 3/45. Harness tensor/cache/boundary đầy đủ chưa chạy; chưa xác định root cause. |
+| G3–G6, heldout, R7 | pending | Đã chạy các ablation hiệu năng nhưng report `headline_valid=false`; chưa lock config, chưa đánh giá quality, chưa chạy test split. |
 
 ## Artifact local
 
-Artifacts dữ liệu/split local nằm ở `.gitignore` tại `outputs/context_adaptive_dflash/m0_local_primary_cpu_20261009/`. Modal pilot và kết quả tải về nằm ở `.gitignore` tại `outputs/modal_cadflash_pilot_20261009/`, gồm bundle JSONL/model/runtime evidence và report. Entrypoint chạy lại pilot là [modal_context_adaptive_pilot.py](../../../../scripts/modal_context_adaptive_pilot.py).
+Artifacts dữ liệu/split local nằm ở `.gitignore` tại `outputs/context_adaptive_dflash/m0_local_primary_cpu_20261009/`. Modal pilot L40S ban đầu ở `outputs/modal_cadflash_pilot_20261009/`; FA4/H100 raw JSONL, report, metrics và self-contained bundle ở `.gitignore` tại `outputs/cadflash_lengthbins_modal_fa4_h100_20261009/`. Bundle cũng được lưu trong Modal volume `cadflash-lengthbins-20261009` tại `assets/fa4_complete_results_bundle.tar.gz`. Chi tiết run ID, SHA-256 và lệnh query nằm trong [artifact record FA4/H100](modal_fa4_h100_results_2026-10-09.md) và `outputs/cadflash_lengthbins_modal_fa4_h100_20261009/artifact_manifest.json`.
 
 Primary file SHA-256 dùng trong pilot vẫn khớp corpus đã chuẩn bị:
 
@@ -30,9 +30,9 @@ Primary file SHA-256 dùng trong pilot vẫn khớp corpus đã chuẩn bị:
 
 ## Bước tiếp theo
 
-1. Dừng tuning performance và chạy checkpoint-level G1/G2 harness trên các mismatch: so logits AR với verifier tại cùng prefix/position, kiểm cache commit/crop và branch reject; lưu first divergence và top-1 margin. DFlash fixed cũng mismatch nên cần kiểm shared verifier/cache/backend path trước khi kết luận lỗi riêng của controller.
-2. Khi greedy output đạt exactness, tăng calibration support theo [runbook](runbook.md): tối thiểu cohort đã đăng ký, 3 repetitions, ghi coverage theo state/cost bucket; xử lý fallback `full_fallback_uncalibrated_cost`.
-3. Chạy lại performance trên cùng GPU/backend với output cap dài/natural EOS, đủ warmup theo shape và 3 paired repetitions. Dùng đầy đủ dev; chọn cấu hình rồi lock trước khi chạm test.
-4. Ghi rõ khác biệt runtime so với server mục tiêu. L40S pilot dùng SDPA; nếu mục tiêu dùng Blackwell/FA4 thì cần lặp lại G0/G1/G2 và đo chính trên backend đó.
+1. Ưu tiên checkpoint-level G1/G2 harness trên H100/FA4: so logits AR với verifier tại cùng prefix/position, kiểm cache commit/crop và reject branch; lưu first divergence và top-1 margin. DFlash fixed cũng mismatch nên kiểm shared verifier/cache path trước khi quy lỗi cho controller.
+2. Điều tra vì sao cả 405 dev request đều chạm cap 2048; xác nhận EOS token và dừng sinh tự nhiên trước khi benchmark dài hơn.
+3. Sau khi parity đạt, chạy lại performance với nhiều source groups, context/output dài tự nhiên, đủ warmup theo shape và paired repetitions; chọn config rồi lock trước test.
+4. Chỉ dùng H100/FA4 result làm performance pilot. Không tuyên bố quality hoặc exact acceleration khi chưa qua correctness gate và heldout.
 
-Kết luận hiện tại: **đã xác nhận đường chạy GPU và có tín hiệu acceptance thuận lợi khi chọn context 1024 trong calibration replay nhỏ; phương pháp chưa khả thi để claim inference speedup vì exact output parity chưa đạt và controller fallback phần lớn về full context.**
+Kết luận hiện tại: **đường chạy FA4/H100 hoạt động và pilot cho thấy `a_only`/`joint` có throughput cao hơn DFlash ở nhiều bin dài; tuy nhiên parity với AR chưa đạt, toàn bộ output chạm cap, và `a_only` vượt `joint` pooled. Vì vậy chưa đủ điều kiện claim tăng tốc suy luận giữ nguyên output hoặc kết luận quality.**

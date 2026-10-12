@@ -25,7 +25,9 @@ from .adaptive_inference import (
     adaptive_settings_from_args,
     add_adaptive_cli_args,
     length_bucket_batches,
+    probe_batch_limit,
     run_with_oom_backoff,
+    runtime_batch_size_after_probe,
     select_cuda_batch_size,
     validate_adaptive_inference_settings,
 )
@@ -207,37 +209,77 @@ def generate_teacher_jsonl(
     handle = part_path.open("a", encoding="utf-8")
     try:
         window: list[PreparedExample] = []
+        window_counter = 0
 
         def flush_window(items: list[PreparedExample]) -> None:
             nonlocal written, rejected, processed_tokens, oom_retries
-            nonlocal current_batch_size, selection, observed_peak_reserved
+            nonlocal current_batch_size, selection, observed_peak_reserved, window_counter
             if not items:
                 return
+            window_counter += 1
             if selection is None:
                 probe_items = sorted(items, key=lambda item: (-item.length, item.index))
+                configured_maximum = min(settings.max_batch_size, len(probe_items))
+                probe_maximum = probe_batch_limit(
+                    probe_items,
+                    configured_maximum=configured_maximum,
+                    max_tokens_per_batch=settings.max_tokens_per_batch,
+                )
+                print(
+                    f"ADAPTIVE_PROBE_LIMIT rank={rank} configured_max={configured_maximum} "
+                    f"token_limited_max={probe_maximum}",
+                    flush=True,
+                )
 
                 def probe(batch_size: int) -> None:
                     selected = probe_items[:batch_size]
-                    for _ in range(settings.probe_batches):
-                        _generate_batch(
-                            selected,
-                            tokenizer=tokenizer,
-                            target=target,
-                            max_summary_tokens=max_summary_tokens,
-                            device=device_obj,
+                    probe_started = time.perf_counter()
+                    print(
+                        f"ADAPTIVE_PROBE_START rank={rank} batch_size={batch_size} "
+                        f"repetitions={settings.probe_batches}",
+                        flush=True,
+                    )
+                    try:
+                        for _ in range(settings.probe_batches):
+                            _generate_batch(
+                                selected,
+                                tokenizer=tokenizer,
+                                target=target,
+                                max_summary_tokens=max_summary_tokens,
+                                device=device_obj,
+                            )
+                    except BaseException as error:
+                        elapsed = time.perf_counter() - probe_started
+                        print(
+                            f"ADAPTIVE_PROBE_END rank={rank} batch_size={batch_size} "
+                            f"status=error elapsed_sec={elapsed:.1f} "
+                            f"error={type(error).__name__}",
+                            flush=True,
                         )
+                        raise
+                    elapsed = time.perf_counter() - probe_started
+                    print(
+                        f"ADAPTIVE_PROBE_END rank={rank} batch_size={batch_size} "
+                        f"status=ok elapsed_sec={elapsed:.1f}",
+                        flush=True,
+                    )
                     return None
 
                 selection = select_cuda_batch_size(
                     probe,
                     settings=settings,
                     device=device_obj,
-                    maximum=min(settings.max_batch_size, len(probe_items)),
+                    maximum=probe_maximum,
                 )
-                current_batch_size = selection.batch_size
+                current_batch_size = runtime_batch_size_after_probe(
+                    selection,
+                    configured_maximum=configured_maximum,
+                    probed_maximum=probe_maximum,
+                )
                 if device_obj.type == "cuda" and torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats(device_obj)
             results: dict[int, list[int]] = {}
+            generated_in_window = 0
             for batch in length_bucket_batches(
                 items,
                 batch_size=current_batch_size,
@@ -269,6 +311,13 @@ def generate_teacher_jsonl(
                     ):
                         results[example.index] = token_ids
                         processed_tokens += example.length
+                    generated_in_window += result.batch_size
+                    print(
+                        f"GENERATION_BATCH_DONE rank={rank} window={window_counter} "
+                        f"generated={generated_in_window}/{len(items)} "
+                        f"batch_size={result.batch_size}",
+                        flush=True,
+                    )
                     oom_retries += result.oom_retries
                     if device_obj.type == "cuda" and torch.cuda.is_available():
                         observed_peak_reserved = max(
