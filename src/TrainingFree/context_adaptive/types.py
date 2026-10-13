@@ -78,6 +78,12 @@ class LayerContext:
 @dataclass
 class DraftProposal:
     token_ids: Any
+    draft_entropy: tuple[float, ...] | None = None
+    draft_normalized_entropy: tuple[float, ...] | None = None
+    draft_confidence: tuple[float, ...] | None = None
+    draft_probability_margin: tuple[float, ...] | None = None
+    draft_logit_margin: tuple[float, ...] | None = None
+    signal_extraction_ms: float = 0.0
     attention_scores_by_layer: dict[int, dict[int, float]] = field(default_factory=dict)
     draft_latency_ms: float = 0.0
     gather_latency_ms: float = 0.0

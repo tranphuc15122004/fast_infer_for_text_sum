@@ -4,6 +4,17 @@ Ngày: **2026-10-09**. Trạng thái: **protocol cho executor đã có; G0–G6 
 
 ## 1. Research questions và evidence
 
+**Cập nhật phần B ngày 13/10/2026:**
+[kế hoạch B](../../plans/experiment_plan_B_13_10_26.md) là protocol nghiên cứu
+chi tiết cho B1/B2/B1-V/B3/B4: đo opportunity trước controller, phân tích
+DFlash candidate uncertainty, tách draft length và verification length, rồi
+đánh giá E2E với best fixed controls. Khi lập campaign B mới, dùng metrics,
+causality, cohort audit và decision gates trong kế hoạch đó. M2 bên dưới lưu
+protocol của executor V1 dùng parent entropy/history; không là bằng chứng rằng
+candidate collector hoặc `verify_prefix` đã được triển khai. Các phần chung
+runtime/fairness/grouping vẫn áp dụng; ngưỡng cụ thể của campaign B phải khóa
+trước khi chạy theo kế hoạch mới.
+
 | Mã | Câu hỏi | Bằng chứng cần thu |
 |---|---|---|
 | RQ-A | Selective context có giảm cost và giữ/tăng acceptance trên DFlash không? | Counterfactual prefix replay và real rollout, cùng checkpoint/budget |

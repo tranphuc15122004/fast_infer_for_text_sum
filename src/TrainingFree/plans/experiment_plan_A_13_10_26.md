@@ -2,12 +2,12 @@
 
 Ngày cập nhật: **2026-10-13**.
 
-**Trạng thái:** hoàn thiện kế hoạch; chưa triển khai harness mới hoặc chạy các
-thực nghiệm trong kế hoạch này. Người dùng yêu cầu chỉ lập kế hoạch ở giai đoạn
-hiện tại. **B200 là môi trường chính cho cả pilot, khám phá và xác nhận**;
-Modal chỉ là tùy chọn diagnostic, không nằm trên đường chạy bắt buộc. Ngân
-sách Modal nếu sử dụng còn **20 USD**. Các ngưỡng và cấu hình ở phần II là
-đề xuất đăng ký trước khi chạy, chưa phải kết quả đo.
+**Trạng thái ngày 13/10/2026:** harness A1–A3 đã được triển khai. B200
+preflight/prepare thành công; lần validate đầu dừng do gate cũ đòi exact match
+với AR. Trên 6 mẫu, native DFlash và full adapter khớp nhau 6/6, nhưng cả hai
+khác AR. Protocol amendment bên dưới đổi gate A sang native/full-adapter
+parity; A1/A2/A3 vẫn chưa chạy. B200 là môi trường chính; Modal là diagnostic
+tùy chọn, với ngân sách còn 20 USD.
 
 ## Phần I — Câu hỏi và yêu cầu nghiên cứu
 
@@ -98,7 +98,7 @@ Sau đó mới kiểm tra context ranking có thể được tái sử dụng tr
 
 Nên bắt đầu với khoảng 20–30 documents thuộc GovReport, Multi-News và QMSum, lấy các prefix ở đầu/giữa/cuối quá trình generation. Sau giai đoạn khám phá, xác nhận trên tập document độc lập và báo confidence intervals theo document.
 
-Một điều kiện tiên quyết: phải kiểm tra parity của target verifier, vì pilot GPU hiện vẫn có mismatch với target-only AR. Không nên coi một gain về acceptance hoặc throughput là lossless speedup khi chưa đạt điều kiện này.
+Điều kiện tiên quyết cho A là full adapter tái tạo native full DFlash trên cùng prompt/runtime. Output DFlash có thể khác target-only AR; ghi nhận first-divergence như diagnostic nhưng không chặn nghiên cứu A. Kết luận A nói về giảm context so với native full DFlash, không gọi đó là lossless speedup so với AR.
 
 ## Kết quả cuối cùng chúng ta cần
 
@@ -150,8 +150,13 @@ collector, stopping, paired replay và phép đo GPU.
   ghi parent Top-1K giữ 38,0% DFlash cache-attention mass tại 16K. Đây là phép
   đo phân phối attention, chưa là bằng chứng về acceptance sau loại KV.
 - [Pilot GPU 09/10](../docs/context_adaptive_dflash/modal_fa4_h100_results_2026-10-09.md)
-  có mismatch giữa full DFlash và AR, và toàn bộ outputs chạm cap. Parity và
-  EOS là hai việc phải giải quyết trước khi mở ma trận nghiên cứu.
+  có mismatch giữa full DFlash và AR, và toàn bộ outputs chạm cap. Với protocol
+  A đã sửa, AR divergence là diagnostic; cần bảo đảm native/full-adapter parity
+  và báo rõ dừng EOS hay chạm output cap trong các phase.
+- B200 validate ngày 13/10, run `dflash_context_A_b200_20261013T163438Z`:
+  native DFlash = full adapter trên 6/6 mẫu; cả hai khác AR, first mismatch
+  lần lượt tại token 103, 544, 89, 44, 69 và 96. Mỗi output dài đúng cap
+  1024; các rollout phải phân biệt dừng EOS với dừng do cap.
 - Corpus đã chuẩn bị nằm tại
   outputs/context_adaptive_dflash/m0_local_primary_cpu_20261009/inputs/primary/.
   Ba files GovReport, Multi-News, QMSum có 300 records nhưng 220 source groups.
@@ -189,9 +194,13 @@ biệt không có ý nghĩa thống kê chưa đủ để kết luận preservat
 improvement yêu cầu CI của ΔL nằm trên 0; báo thêm liệu effect đạt 0,25 hay không.
 
 Ngưỡng 0,25 và speedup 1,05 là mức thực tiễn đề xuất, không được chọn lại sau
-khi xem heldout. Các guardrails bắt buộc: exact greedy output với AR, target
-full KV, protected tokens, số KV thực, vị trí gốc, không rò thông tin tương lai
-và không bỏ error/missing rows để tạo gain.
+khi xem heldout. Các guardrails bắt buộc: native full DFlash và full adapter
+phải khớp output IDs; AR mismatch được báo cáo nhưng không chặn. A3 báo paired
+ROUGE deltas của reduced so với native full DFlash và acceptance non-inferiority.
+Do chưa đăng ký biên non-inferiority cho ROUGE, chỉ mô tả điểm số và không tuyên
+bố chất lượng tóm tắt được bảo toàn dựa trên ROUGE. Các guardrails khác gồm
+target full KV, protected tokens, số KV thực, vị trí gốc, không rò thông tin
+tương lai và không bỏ error/missing rows để tạo gain.
 
 Không đòi A1 hoặc A2 phải có gain để coi nghiên cứu hoàn tất. Kết quả âm hợp lệ
 cũng trả lời câu hỏi. Nếu previous attention không vượt selector đơn giản,
@@ -320,15 +329,18 @@ R3 phải có:
 5. Bật/tắt collector không thay backend hoặc output. Attention future-key
    mass bằng 0; normalization, GQA, scale và sliding mask đúng.
 
-Greedy output IDs yêu cầu **100% trùng AR** trên cohort validation. Tensor
-tolerance BF16 đề xuất atol=1e-2, rtol=1e-2 chỉ để chẩn đoán; đăng ký trước
-chạy, lưu max errors và top-1/top-2 margin. Tolerance không cho phép bỏ qua
-token mismatch hoặc tăng ngưỡng sau nhìn kết quả.
+Full adapter yêu cầu **100% trùng native full DFlash** trên cohort validation.
+Greedy output mismatch với AR được lưu cùng vị trí/token divergence nhưng không
+chặn A; pilot hiện tại cho thấy native DFlash và full adapter cùng khác AR.
+So sánh target verifier logits tại cùng prefix/absolute positions vẫn dùng để
+chẩn đoán correctness số học; tolerance BF16 đề xuất atol=1e-2, rtol=1e-2,
+lưu max errors và top-1/top-2 margin.
 
-Nếu parity fail: dừng A1–A3 và ghi diagnostic report. Nếu dùng Modal, chỉ dành
+Nếu native full DFlash và full adapter không khớp: dừng A1–A3 và ghi diagnostic
+report. AR mismatch đơn lẻ không làm parity gate fail. Nếu dùng Modal, chỉ dành
 tối đa 45 phút GPU cho gate này trong lượt pilot; không tiêu hết 20 USD để đuổi lỗi.
 Điều tra tiếp trên CPU hoặc B200 bằng harness sau khi được triển khai.
-Pilot cũ không tự qua gate vì a_only khớp full DFlash nhưng full DFlash khác AR.
+Pilot cũ cần đánh giá theo gate native-DFlash/full-adapter; mismatch với AR được lưu riêng.
 
 ### 7. A1 — Vùng context và độ quan trọng của attention
 

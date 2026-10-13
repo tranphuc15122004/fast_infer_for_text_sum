@@ -46,7 +46,9 @@ def _eos_ids(target: Any) -> set[int]:
     return {int(value)} if isinstance(value, int) else {int(item) for item in value}
 
 
-def _native_full_dflash(runtime: Mapping[str, Any], input_ids: torch.Tensor, max_new_tokens: int):
+def _native_full_dflash(
+    runtime: Mapping[str, Any], input_ids: torch.Tensor, max_new_tokens: int, *, gamma: int = 15
+):
     from dflash.model import dflash_generate
 
     eos_ids = sorted(_eos_ids(runtime["target"])) or [-1]
@@ -58,7 +60,7 @@ def _native_full_dflash(runtime: Mapping[str, Any], input_ids: torch.Tensor, max
             max_new_tokens=int(max_new_tokens),
             stop_token_ids=eos_ids,
             temperature=0.0,
-            block_size=16,
+            block_size=int(gamma) + 1,
             return_stats=True,
         )
 
@@ -84,6 +86,9 @@ def run_reference_pair(
     max_new_tokens: int,
     source_anchors: int = 64,
     recent_output: int = 256,
+    gamma: int = 15,
+    reference_ar_ids: Sequence[int] | None = None,
+    require_ar_match: bool = True,
 ) -> dict[str, Any]:
     """Run AR/native DFlash/adapter Full on the exact same tokenized prompt."""
     ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
@@ -92,24 +97,28 @@ def run_reference_pair(
         object.__setattr__(layout, "source_group_id", str(sample.get("_cad_source_group_id", "")))
     if not layout.source_available:
         raise RuntimeError(f"source span mapping is unavailable: {layout.source_reason}")
-    torch.cuda.synchronize(ids.device)
-    ar_started = time.perf_counter()
-    with torch.inference_mode():
-        ar = generate_target_only(runtime["target"], ids, max_new_tokens=max_new_tokens, temperature=0.0)
-    torch.cuda.synchronize(ids.device)
-    ar_ms = (time.perf_counter() - ar_started) * 1000.0
-    ar_ids = [int(value) for value in ar.output_ids.detach().cpu().tolist()]
+    if reference_ar_ids is None:
+        torch.cuda.synchronize(ids.device)
+        ar_started = time.perf_counter()
+        with torch.inference_mode():
+            ar = generate_target_only(runtime["target"], ids, max_new_tokens=max_new_tokens, temperature=0.0)
+        torch.cuda.synchronize(ids.device)
+        ar_ms: float | None = (time.perf_counter() - ar_started) * 1000.0
+        ar_ids = [int(value) for value in ar.output_ids.detach().cpu().tolist()]
+    else:
+        ar_ms = None
+        ar_ids = [int(value) for value in reference_ar_ids[:max_new_tokens]]
 
     torch.cuda.synchronize(ids.device)
     native_started = time.perf_counter()
-    native = _native_full_dflash(runtime, ids, max_new_tokens)
+    native = _native_full_dflash(runtime, ids, max_new_tokens, gamma=gamma)
     torch.cuda.synchronize(ids.device)
     native_ms = (time.perf_counter() - native_started) * 1000.0
     native_ids = _ids(native, ids.shape[1], max_new_tokens)
 
     config = AdaptiveConfig(
         budgets=("full",),
-        gammas=(15,),
+        gammas=(int(gamma),),
         selector="target_parent",
         target_layer=TARGET_PARENT_LAYER,
         source_anchors=source_anchors,
@@ -131,8 +140,8 @@ def run_reference_pair(
             temperature=0.0,
             variant="dflash_full_fixed",
             fixed_budget="full",
-            fixed_gamma=15,
-            gamma_reference=15,
+            fixed_gamma=int(gamma),
+            gamma_reference=int(gamma),
             sample_id=str(sample["id"]),
             dataset=str(sample["dataset"]),
             split=str(sample.get("_cad_split", "unknown")),
@@ -154,7 +163,12 @@ def run_reference_pair(
         "adapter_rounds": adapter.rounds,
         "eos_ids": _eos_ids(runtime["target"]),
         "parity": {
-            "status": "pass" if native_matches_ar and adapter_matches_ar and native_adapter_match else "fail",
+            "gamma": int(gamma),
+            "status": "pass" if native_adapter_match and (
+                not require_ar_match or (native_matches_ar and adapter_matches_ar)
+            ) else "fail",
+            "gate_basis": "ar_and_native_adapter" if require_ar_match else "native_equals_adapter",
+            "ar_exact_match_required": bool(require_ar_match),
             "native_equals_ar": native_matches_ar,
             "adapter_equals_ar": adapter_matches_ar,
             "native_equals_adapter": native_adapter_match,
@@ -864,6 +878,10 @@ def run_a3_comparison(
             "repetition": int(repetition),
             "matches_ar": outputs[variant] == ar_output,
             "first_mismatch": _first_mismatch(outputs[variant], ar_output),
+            "matches_native_full_dflash": outputs[variant] == outputs["native_full_dflash"],
+            "first_mismatch_native_full_dflash": _first_mismatch(
+                outputs[variant], outputs["native_full_dflash"]
+            ),
             "stopped_by": "eos" if any(token in _eos_ids(runtime["target"]) for token in outputs[variant]) else "max_new_tokens",
             "generated_text": generated_text,
             "reference_text": reference_text or None,

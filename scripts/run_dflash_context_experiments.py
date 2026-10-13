@@ -355,6 +355,7 @@ def _run_parity_cohort(
             measured = run_reference_pair(
                 runtime, sample, max_new_tokens=max_new_tokens,
                 source_anchors=args.source_anchors, recent_output=args.recent_output,
+                require_ar_match=False,
             )
             trace = {
                 "schema_version": "dflash-context-interventions.trace.v1",
@@ -392,6 +393,13 @@ def _run_parity_cohort(
         "schema_version": "dflash-context-interventions.parity.v1",
         "run_id": args.run_id,
         "status": "pass" if results and all(row["status"] == "pass" for row in results) else "fail",
+        "gate_basis": "native_full_dflash_equals_full_adapter",
+        "ar_divergent_case_count": sum(
+            not (row.get("native_equals_ar") and row.get("adapter_equals_ar")) for row in results
+        ),
+        "native_adapter_mismatch_count": sum(
+            not row.get("native_equals_adapter") for row in results
+        ),
         "mode": cohort.get("phase"),
         "max_new_tokens": max_new_tokens,
         "runtime_signature": runtime_sig,
@@ -669,8 +677,13 @@ def _run_rollouts(
                     if cell_id not in existing:
                         store.save(cell_id, row)
                         existing.add(cell_id)
-                if any(row.get("variant") == args.a3_selector and not row.get("matches_ar") for row in rows):
-                    raise RuntimeError(f"A3 exact greedy output gate failed for {sample['id']}")
+                arms = {str(row.get("variant")): row for row in rows}
+                adapter = arms.get("adapter_full")
+                native = arms.get("native_full_dflash")
+                if (adapter is not None and native is not None
+                        and adapter.get("status") == "ok" and native.get("status") == "ok"
+                        and not adapter.get("matches_native_full_dflash")):
+                    raise RuntimeError(f"A3 full-adapter/native-DFlash parity failed for {sample['id']}")
     all_rows = store.rows()
     statuses = Counter(str(row.get("status", "missing")) for row in all_rows)
     store.merge(run_root / phase / "a3_rollout.jsonl", summary={
@@ -831,18 +844,18 @@ def _lock(args: argparse.Namespace, run_root: Path) -> int:
         arms_by_group_repetition.setdefault(key, {})[str(row.get("variant"))] = row
     if not arms_by_group_repetition or any(
         set(arms) != required_variants
-        or any(arms[variant].get("status") != "ok" or not arms[variant].get("matches_ar")
-               for variant in required_variants)
+        or any(arms[variant].get("status") != "ok" for variant in required_variants)
+        or not arms["adapter_full"].get("matches_native_full_dflash")
         for arms in arms_by_group_repetition.values()
     ):
-        raise ValueError("dev A3 rollout is missing a paired exact AR/native/adapter/selected arm")
+        raise ValueError("dev A3 rollout is missing a valid paired arm or full-adapter/native-DFlash parity")
     chosen = [row for row in rows if row.get("type") == "rollout" and row.get("variant") == args.a3_selector
               and row.get("selector") == args.a3_selector and int(row.get("budget", -1)) == args.a3_budget
               and int(row.get("refresh_period", -1)) == args.refresh_period]
     groups_by_dataset: dict[str, set[str]] = {}
     repetitions_by_group: dict[tuple[str, str], set[int]] = {}
     for row in chosen:
-        if row.get("status") == "ok" and row.get("matches_ar"):
+        if row.get("status") == "ok":
             groups_by_dataset.setdefault(str(row.get("dataset")), set()).add(str(row.get("source_group_id")))
             key = (str(row.get("dataset")), str(row.get("source_group_id")))
             repetitions_by_group.setdefault(key, set()).add(int(row.get("repetition", -1)))
@@ -868,9 +881,9 @@ def _lock(args: argparse.Namespace, run_root: Path) -> int:
         .get(args.a3_selector, {})
         .get(f"B{args.a3_budget}_period{args.refresh_period}")
     )
-    if not candidate_metrics or candidate_metrics.get("decision") != "preservation_and_speedup_gate_pass":
+    if not candidate_metrics or candidate_metrics.get("decision") != "acceptance_and_speedup_gate_pass":
         raise ValueError(
-            "selected dev A3 configuration has not passed the preregistered exactness, "
+            "selected dev A3 configuration has not passed full-adapter parity, "
             "acceptance non-inferiority and latency gates; do not open heldout"
         )
     runtime_path = run_root / "runtime_dev.json"

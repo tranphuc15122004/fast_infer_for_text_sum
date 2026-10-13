@@ -1,6 +1,6 @@
 # Training-Free: Context-Adaptive DFlash
 
-Ngày cập nhật: **2026-10-13**. Trạng thái: **đã sửa 10 lỗi rà soát; 45/45 ca hồi quy CPU đạt; đã đóng gói exposure audit và lệnh chạy campaign B200; parity GPU và benchmark vẫn pending**.
+Ngày cập nhật: **2026-10-13**. Trạng thái: **45/45 ca hồi quy Context-Adaptive DFlash và 117/117 test `src/TrainingFree/tests` đạt trên CPU; harness B0/B1/B2/B1-V đã có CLI B200; parity/cache-prefix/timing GPU vẫn pending**.
 
 Mục tiêu là cùng thích nghi context budget của drafter và số speculative tokens trên DFlash đã train, cho long-context summarization. Target giữ full context và thực hiện exact verification. Trọng số target, DFlash, embedding và LM head không thay đổi.
 
@@ -14,6 +14,8 @@ Mục tiêu là cùng thích nghi context budget của drafter và số speculat
 | [Hợp đồng đo lường](docs/context_adaptive_dflash/measurement_contract.md) | Manifest, request/round schema, timing, correctness và aggregation |
 | [Protocol thực nghiệm](docs/context_adaptive_dflash/experiment_protocol.md) | Split, calibration, ablation, fairness và các gate |
 | [Ma trận và kế hoạch thực nghiệm](docs/context_adaptive_dflash/experiment_matrix.md) | Preregistration, exposure audit, tuning/controls, lịch chạy, gate và artifact paper |
+| [Kế hoạch phần B — 13/10/2026](plans/experiment_plan_B_13_10_26.md) | B1 oracle opportunity, B2 candidate uncertainty/survival, B1-V verification cost, B3/B4 có điều kiện; metrics, CI và bảng quyết định |
+| [Runbook B200 cho phần B](docs/dflash_speculation_B_b200.md) | CLI `run_dflash_speculation_B_b200.sh`, phases B0/B1/B2/B1-V, artifacts và cách đọc verdict |
 | [Kiểm chứng GPU](docs/context_adaptive_dflash/gpu_validation.md) | G0/G1/G2 trên checkpoint thật, cases parity/cache/positions/EOS và harness còn cần |
 | [Runbook](docs/context_adaptive_dflash/runbook.md) | Runtime offline và các lệnh chạy prepare→preflight→calibrate→dev→lock→test→report |
 | [Mẫu báo cáo và bàn giao](docs/context_adaptive_dflash/results_template.md) | Coverage/exactness, calibration support, paired CI, latency/quality/memory và verdict G0–G6 |
@@ -27,6 +29,14 @@ Ghi chép ban đầu `plans/RECENT_idea.md` hiện không có trong checkout nà
 - **A:** chọn context có ích cho drafter; giữ instructions, source anchors, recent output và các source chunks được xếp hạng.
 - **B:** chọn số speculative tokens bằng uncertainty, acceptance history và chi phí.
 - **C:** chọn cặp `(draft_context_budget, draft_tokens)` theo estimated milliseconds trên mỗi token mới được commit.
+
+Hướng nghiên cứu B trong [kế hoạch 13/10/2026](plans/experiment_plan_B_13_10_26.md)
+bắt đầu bằng same-prefix gamma sweep và kiểm predictive value của entropy/confidence
+từng DFlash candidate. Harness riêng cho B0/B1/B2/B1-V đã được viết và có test
+CPU; cách chạy nằm trong [runbook B200](docs/dflash_speculation_B_b200.md).
+Parity/cost thật trên B200 vẫn pending. Executor Context-Adaptive DFlash V1 vẫn
+chưa có adaptive `verify_prefix` controller; B1-V hiện chỉ là phép đo/replay
+chẩn đoán, chưa là đường generation end-to-end.
 
 Selective context có cơ sở thực nghiệm từ SpecExtend. Chuyển cơ chế sang DFlash, giá trị của entropy có sẵn trước round và lợi ích của joint adaptation cần được đo theo protocol.
 
@@ -42,10 +52,12 @@ dùng hai lệnh `bash scripts/run_dflash_context_A_b200.sh check` rồi
 trong `data/dflash_context_A_audit/`. Corpus hiện tại chỉ còn 3 QMSum groups
 sạch cho confirm thay vì quota 12, nên report cuối sẽ đánh dấu confirm partial.
 Harness này
-không thay CLI Context-Adaptive DFlash bên dưới; nó thêm replay masks, paired
-AR/native/adapter parity, A1/A2/A3, resume theo cell và lock-before-confirm.
-Chưa có kết quả GPU; chạy `check` trên server trước khi treo campaign để kiểm
-assets, hash dữ liệu và số nhóm thực tế.
+không thay CLI Context-Adaptive DFlash bên dưới; nó thêm replay masks, kiểm tra
+native/full-adapter parity (AR divergence chỉ ghi diagnostic), A1/A2/A3, resume
+theo cell và lock-before-confirm. B200 preflight/prepare và validate 6 mẫu đã
+chạy; native DFlash khớp full adapter 6/6 nhưng khác target-only AR. Ma trận
+A1/A2/A3 chưa chạy; lần validate đầu dừng ở gate exact-AR cũ. Xem amendment và
+đồng bộ runner mới lên server trước khi chạy lại.
 
 Các module hiện tại như `policy.py`, `collector.py`, `run.py`, `lease*.py`, `hierarchy*.py`, `temporal*.py` và `fidelity*.py` thuộc **RECAP-KV và các nghiên cứu chẩn đoán trước đó**. `python -m TrainingFree.run` chạy pipeline RECAP-KV, không chạy phương pháp mới.
 

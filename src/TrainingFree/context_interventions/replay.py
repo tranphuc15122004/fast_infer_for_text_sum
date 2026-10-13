@@ -49,6 +49,11 @@ class ReplayState:
     processed_output_tokens: int
     prefix_hash: str
     bank_build_ms: float
+    parent_entropy: float | None = None
+    parent_normalized_entropy: float | None = None
+    parent_confidence: float | None = None
+    parent_probability_margin: float | None = None
+    parent_logit_margin: float | None = None
 
 
 def choose_reference_prefixes(
@@ -152,11 +157,17 @@ def rebuild_replay_state(
             )
         queries = capture.disable()
         bank = DraftContextBank(draft, int(all_ids.shape[1]) + int(max_new_tokens) + int(draft.block_size))
-        features = _feature_rows(output.hidden_states, draft.target_layer_ids)
-        bank_start = time.perf_counter()
-        bank.append(features, torch.arange(all_ids.shape[1], dtype=torch.long, device=all_ids.device))
-        bank_ms = (time.perf_counter() - bank_start) * 1000.0
+        with torch.inference_mode():
+            features = _feature_rows(output.hidden_states, draft.target_layer_ids)
+            bank_start = time.perf_counter()
+            bank.append(features, torch.arange(all_ids.shape[1], dtype=torch.long, device=all_ids.device))
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(all_ids.device)
+            bank_ms = (time.perf_counter() - bank_start) * 1000.0
         next_token = int(torch.argmax(output.logits[:, -1, :], dim=-1).item())
+        from TrainingFree.speculation_experiments.signals import summarize_draft_logits
+
+        parent_signal = summarize_draft_logits(output.logits[:, -1:, :])
         if next_token != prefix.pending_anchor:
             raise RuntimeError(
                 "reference prefix anchor differs from full target greedy output: "
@@ -188,6 +199,11 @@ def rebuild_replay_state(
             processed_output_tokens=processed,
             prefix_hash=prompt_hash,
             bank_build_ms=bank_ms,
+            parent_entropy=parent_signal["raw_entropy"][0],
+            parent_normalized_entropy=parent_signal["normalized_entropy"][0],
+            parent_confidence=parent_signal["confidence"][0],
+            parent_probability_margin=parent_signal["probability_margin"][0],
+            parent_logit_margin=parent_signal["logit_margin"][0],
         )
     finally:
         capture.close()
@@ -264,6 +280,8 @@ def evaluate_replay_action(
     gamma: int = 15,
     ranking_origin_round: int | None = None,
     collect_attention_scores: bool = False,
+    collect_uncertainty: bool = False,
+    cleanup_after_action: bool = True,
 ) -> dict[str, Any]:
     """Evaluate a single action with a fresh target-cache fork."""
     if remaining_output_tokens < gamma + 1:
@@ -292,28 +310,71 @@ def evaluate_replay_action(
     device = input_ids.device
     if torch.cuda.is_available():
         torch.cuda.synchronize(device)
-    action_started = time.perf_counter()
-    outcome = _draft_and_verify_action(
-        target=runtime["target"],
-        draft=draft,
-        bank=state.bank,
-        cache=_clone_dynamic_cache(state.cache),
-        layout=layout,
-        input_ids=input_ids.to(device),
-        anchor=state.pending_anchor,
-        logical_length=state.bank.length,
-        action=action,
-        selection=selection,
-        temperature=0.0,
-        mask_token_id=int(mask_token_id),
-        collect_refresh_scores=collect_attention_scores,
-        collect_full_context_scores=collect_attention_scores,
-        query_capture=None,
-    )
+    replay_setup_started = time.perf_counter()
+    forked_cache = _clone_dynamic_cache(state.cache)
     if torch.cuda.is_available():
         torch.cuda.synchronize(device)
+    replay_setup_ms = (time.perf_counter() - replay_setup_started) * 1000.0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    action_started = time.perf_counter()
+    with torch.inference_mode():
+        outcome = _draft_and_verify_action(
+            target=runtime["target"],
+            draft=draft,
+            bank=state.bank,
+            cache=forked_cache,
+            layout=layout,
+            input_ids=input_ids.to(device),
+            anchor=state.pending_anchor,
+            logical_length=state.bank.length,
+            action=action,
+            selection=selection,
+            temperature=0.0,
+            mask_token_id=int(mask_token_id),
+            collect_refresh_scores=collect_attention_scores,
+            collect_full_context_scores=collect_attention_scores,
+            collect_uncertainty=collect_uncertainty,
+            query_capture=None,
+        )
+        (
+            block,
+            target_output,
+            accepted,
+            _posterior,
+            scores,
+            draft_ms,
+            gather_host_ms,
+            gathered_bytes,
+            _target_query,
+            draft_events,
+            verify_event,
+            gather_events,
+            uncertainty,
+        ) = outcome
+        bank_update_started = time.perf_counter()
+        committed = 1 + int(accepted)
+        retained = _feature_rows(target_output.hidden_states, list(draft.target_layer_ids))[:, :committed, :]
+        original_bank_length = state.bank.length
+        forked_cache.crop(original_bank_length + committed)
+        cache_length_after_crop = int(forked_cache.get_seq_length())
+        if cache_length_after_crop != original_bank_length + committed:
+            raise RuntimeError(
+                f"replay target cache crop mismatch: {cache_length_after_crop} != {original_bank_length + committed}"
+            )
+        state.bank.append(
+            retained,
+            torch.arange(original_bank_length, original_bank_length + committed, device=device),
+        )
+        # This is a diagnostic fork. Reuse the immutable state while keeping the
+        # appended storage beyond the active prefix unreachable to later actions.
+        state.bank.length = original_bank_length
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+    bank_update_ms = (time.perf_counter() - bank_update_started) * 1000.0
+    if state.bank.length != original_bank_length:
+        raise RuntimeError("replay draft-bank logical length changed after diagnostic action")
     action_wall_ms = (time.perf_counter() - action_started) * 1000.0
-    block, _, accepted, _, scores, draft_ms, gather_host_ms, gathered_bytes, _, draft_events, verify_event, gather_events = outcome
     gather_ms = (
         float(gather_events[0].elapsed_time(gather_events[1]))
         if gather_events is not None and torch.cuda.is_available()
@@ -344,13 +405,31 @@ def evaluate_replay_action(
         "draft_ms": draft_component_ms,
         "gather_ms": gather_ms,
         "verify_ms": verify_component_ms,
+        "bank_update_ms": bank_update_ms,
+        "cache_length_after_crop": cache_length_after_crop,
         "action_wall_ms": action_wall_ms,
+        "replay_setup_ms": replay_setup_ms,
         "gather_bytes": int(gathered_bytes),
         "proposed_token_ids": [int(token) for token in block[0, 1:].detach().cpu().tolist()],
         "attention_scores_by_layer": scores,
+        "draft_uncertainty": (
+            {key: list(value) for key, value in uncertainty.items() if key != "signal_extraction_ms"}
+            if uncertainty is not None else None
+        ),
+        "signal_extraction_ms": (
+            float(uncertainty["signal_extraction_ms"]) if uncertainty is not None else None
+        ),
+        "parent_signal": {
+            "entropy": state.parent_entropy,
+            "normalized_entropy": state.parent_normalized_entropy,
+            "confidence": state.parent_confidence,
+            "probability_margin": state.parent_probability_margin,
+            "logit_margin": state.parent_logit_margin,
+        },
     }
-    del block, outcome
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    del retained, target_output, block, outcome
+    if cleanup_after_action:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return row

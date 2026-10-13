@@ -204,8 +204,9 @@ def _draft_and_verify_action(
     mask_token_id: int,
     collect_refresh_scores: bool,
     collect_full_context_scores: bool,
+    collect_uncertainty: bool = False,
     query_capture: TargetQueryCapture | None,
-) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, float, torch.Tensor | None, Any, Any, Any]:
+) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, float, torch.Tensor | None, Any, Any, Any, dict[str, Any] | None]:
     device = input_ids.device
     block = torch.full((1, action.block_size), mask_token_id, dtype=input_ids.dtype, device=device)
     block[0, 0] = int(anchor)
@@ -225,6 +226,7 @@ def _draft_and_verify_action(
         layout=layout,
         collect_refresh_scores=collect_refresh_scores,
         collect_full_context_scores=collect_full_context_scores,
+        collect_uncertainty=collect_uncertainty,
     )
     block[0, 1:] = proposal.token_ids[0]
     if draft_end is not None:
@@ -257,6 +259,14 @@ def _draft_and_verify_action(
         (draft_start, draft_end),
         (verify_start, verify_end, verify_wall_ms),
         proposal.gather_events,
+        ({
+            "raw_entropy": proposal.draft_entropy,
+            "normalized_entropy": proposal.draft_normalized_entropy,
+            "confidence": proposal.draft_confidence,
+            "probability_margin": proposal.draft_probability_margin,
+            "logit_margin": proposal.draft_logit_margin,
+            "signal_extraction_ms": proposal.signal_extraction_ms,
+        } if proposal.draft_entropy is not None else None),
     )
 
 
@@ -353,7 +363,7 @@ def _replay_calibration_actions(
         if config.timing_mode == "diagnostic" and torch.cuda.is_available():
             torch.cuda.synchronize(input_ids.device)
         started = time.perf_counter()
-        block, output, accepted, posterior, draft_scores, _, gather_ms, gather_bytes, query, _, _, _ = _draft_and_verify_action(
+        block, output, accepted, posterior, draft_scores, _, gather_ms, gather_bytes, query, _, _, _, _ = _draft_and_verify_action(
             target=target,
             draft=draft,
             bank=bank,
@@ -834,6 +844,7 @@ def generate_adaptive(
                 draft_event_pair,
                 verify_event_data,
                 gather_event_pair,
+                _draft_uncertainty,
             ) = _draft_and_verify_action(
                 target=target,
                 draft=draft,

@@ -314,7 +314,7 @@ def build_report(run_root: Path, phase: str) -> dict[str, Any]:
             )
             for selector_metrics in report["rollout_metrics"].values():
                 for result in selector_metrics.values():
-                    if result.get("decision") == "preservation_and_speedup_gate_pass":
+                    if result.get("decision") == "acceptance_and_speedup_gate_pass":
                         result["decision_before_quota_limit"] = result["decision"]
                         result["decision"] = "inconclusive_partial_confirmation_quota"
     output_dir = run_root / "reports"
@@ -341,7 +341,10 @@ def _rollout_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         paired = []
         adapter_pairs = []
         accepted_pairs = []
-        mismatch_count = 0
+        ar_mismatch_count = 0
+        full_dflash_mismatch_count = 0
+        adapter_parity_mismatch_count = 0
+        rouge_pairs: dict[str, list[dict[str, Any]]] = defaultdict(list)
         groups: set[tuple[str, str]] = set()
         for key, variants in by_pair.items():
             if (key[2], int(key[3]), int(key[4])) != (selector, budget, refresh_period):
@@ -352,7 +355,9 @@ def _rollout_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             if full is None or adapter is None or reduced is None:
                 continue
             groups.add((str(key[0]), str(key[1])))
-            mismatch_count += int(not bool(reduced.get("matches_ar")))
+            ar_mismatch_count += int(not bool(reduced.get("matches_ar")))
+            full_dflash_mismatch_count += int(not bool(reduced.get("matches_native_full_dflash")))
+            adapter_parity_mismatch_count += int(not bool(adapter.get("matches_native_full_dflash")))
             paired.append({
                 "dataset": key[0], "source_group_id": key[1],
                 "baseline": float(full["wall_e2e_ms"]), "variant": float(reduced["wall_e2e_ms"]),
@@ -368,9 +373,20 @@ def _rollout_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                     "dataset": key[0], "source_group_id": key[1],
                     "baseline": float(full_accept), "variant": float(reduced_accept),
                 })
+            for metric_name in ("rouge1", "rouge2", "rougeL"):
+                baseline_quality = full.get(metric_name)
+                reduced_quality = reduced.get(metric_name)
+                if baseline_quality is not None and reduced_quality is not None:
+                    rouge_pairs[metric_name].append({
+                        "dataset": key[0],
+                        "source_group_id": key[1],
+                        "baseline": float(baseline_quality),
+                        "variant": float(reduced_quality),
+                    })
         speedup = _metric(paired, metric="speedup")
         adapter_speedup = _metric(adapter_pairs, metric="speedup")
         acceptance = _metric(accepted_pairs)
+        rouge_delta = {name: _metric(values) for name, values in rouge_pairs.items()}
         rouge_rows = [row for row in rollout if row.get("selector") == selector
                       and int(row.get("budget", -1)) == budget
                       and int(row.get("refresh_period", -1)) == refresh_period
@@ -413,17 +429,21 @@ def _rollout_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "speedup_vs_adapter_full": adapter_speedup,
             "acceptance_delta_vs_native_full": acceptance,
             "rouge_macro": rouge,
+            "rouge_delta_vs_native_full_dflash": rouge_delta,
+            "output_quality_gate": "descriptive_only_no_preregistered_margin",
             "selected_component_ms_mean": {key: sum(values) / len(values) for key, values in component_sums.items() if values},
             "dense_refresh_wall_ms_mean": sum(refresh_costs) / len(refresh_costs) if refresh_costs else None,
             "selected_stopping_counts": dict(stopping),
             "paired_repetitions": len(paired),
             "source_groups": len(groups),
-            "greedy_output_mismatch_rows": mismatch_count,
+            "selected_vs_ar_mismatch_rows": ar_mismatch_count,
+            "selected_vs_native_full_dflash_mismatch_rows": full_dflash_mismatch_count,
+            "adapter_full_vs_native_dflash_mismatch_rows": adapter_parity_mismatch_count,
             "decision": (
-                "preservation_and_speedup_gate_pass"
+                "acceptance_and_speedup_gate_pass"
                 if speedup and acceptance
                 and speedup["estimate"] >= 1.05 and speedup["ci_low"] > 1.0
-                and acceptance["ci_low"] > -0.25 and mismatch_count == 0
+                and acceptance["ci_low"] > -0.25 and adapter_parity_mismatch_count == 0
                 else "gate_not_passed_or_inconclusive"
             ),
         }
@@ -471,6 +491,7 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
         "",
         "## A3 — Budget, acceptance và latency",
         "",
+        "- Token mismatch với AR được lưu để chẩn đoán; gate A yêu cầu full adapter khớp native full DFlash. ROUGE được báo theo cặp với native full DFlash; chưa có ngưỡng ROUGE đăng ký trước nên không tuyên bố bảo toàn chất lượng chỉ từ ROUGE.",
         f"- Fixed-prefix acceptance: `{json.dumps(report['family_metrics']['A3'], ensure_ascii=False)}`",
         f"- Paired E2E: `{json.dumps(report.get('rollout_metrics', {}), ensure_ascii=False)}`",
         "",

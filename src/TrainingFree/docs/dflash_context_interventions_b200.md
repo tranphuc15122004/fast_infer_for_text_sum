@@ -17,6 +17,12 @@ exposure audit và số source groups. Lệnh này không chạy generation.
 và cấu hình B200 đã đăng ký trong kế hoạch. Master config được đọc qua
 `config/master.path`; không cần truyền run ID, đường dẫn manifest hay config.
 
+Gate correctness yêu cầu full adapter khớp native full DFlash. Khác biệt token
+giữa DFlash và AR được ghi làm diagnostic, không chặn A; A3 báo ROUGE theo cặp
+với native full DFlash và acceptance. Vì chưa đăng ký biên ROUGE, không dùng
+ROUGE để tuyên bố chất lượng được bảo toàn. Protocol amendment này được ghi
+nhận ngày 13/10/2026, trước khi chạy ma trận A1/A2/A3 và mở heldout.
+
 Sau khi `start` trả về, theo dõi log bằng lệnh `tail -f` mà nó in ra. Kết quả
 nằm ở `outputs/dflash_context_interventions/<run_id>/`; báo cáo cuối là
 `reports/confirm_decision.md` và `reports/confirm_coverage.json`.

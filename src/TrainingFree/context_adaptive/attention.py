@@ -127,6 +127,7 @@ def draft_block(
     layout: PromptLayout,
     collect_refresh_scores: bool = False,
     collect_full_context_scores: bool = False,
+    collect_uncertainty: bool = False,
 ) -> DraftProposal:
     if anchor_and_masks.shape[1] != action.block_size:
         raise ValueError("draft input shape must equal gamma + 1")
@@ -171,8 +172,22 @@ def draft_block(
     hidden_states = draft_model.norm(hidden_states)
     logits = target_model.lm_head(hidden_states[:, 1:, :])
     candidates = torch.argmax(logits, dim=-1)
+    uncertainty = None
+    signal_extraction_ms = 0.0
+    if collect_uncertainty:
+        from TrainingFree.speculation_experiments.signals import summarize_draft_logits
+
+        uncertainty_started = time.perf_counter()
+        uncertainty = summarize_draft_logits(logits)
+        signal_extraction_ms = (time.perf_counter() - uncertainty_started) * 1000.0
     return DraftProposal(
         token_ids=candidates,
+        draft_entropy=(tuple(uncertainty["raw_entropy"]) if uncertainty else None),
+        draft_normalized_entropy=(tuple(uncertainty["normalized_entropy"]) if uncertainty else None),
+        draft_confidence=(tuple(uncertainty["confidence"]) if uncertainty else None),
+        draft_probability_margin=(tuple(uncertainty["probability_margin"]) if uncertainty else None),
+        draft_logit_margin=(tuple(uncertainty["logit_margin"]) if uncertainty else None),
+        signal_extraction_ms=signal_extraction_ms,
         attention_scores_by_layer=per_layer_scores,
         draft_latency_ms=(time.perf_counter() - started) * 1000.0,
         gather_latency_ms=gather_latency_ms,
