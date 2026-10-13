@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from transformers import DynamicCache
@@ -18,6 +18,9 @@ from .selection import rank_chunks, select_context
 from .signals import TargetQueryCapture, normalized_entropy, refresh_concentration, target_parent_scores
 from .statistics import AdaptiveStatistics, state_bucket
 from .types import Action, GenerationResult, PromptLayout, RoundState, Selection
+
+
+SelectionPolicy = Callable[..., Selection | None]
 
 
 def _sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -200,8 +203,9 @@ def _draft_and_verify_action(
     temperature: float,
     mask_token_id: int,
     collect_refresh_scores: bool,
+    collect_full_context_scores: bool,
     query_capture: TargetQueryCapture | None,
-) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, torch.Tensor | None, Any, Any]:
+) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, float, torch.Tensor | None, Any, Any, Any]:
     device = input_ids.device
     block = torch.full((1, action.block_size), mask_token_id, dtype=input_ids.dtype, device=device)
     block[0, 0] = int(anchor)
@@ -220,6 +224,7 @@ def _draft_and_verify_action(
         action,
         layout=layout,
         collect_refresh_scores=collect_refresh_scores,
+        collect_full_context_scores=collect_full_context_scores,
     )
     block[0, 1:] = proposal.token_ids[0]
     if draft_end is not None:
@@ -246,10 +251,12 @@ def _draft_and_verify_action(
         posterior,
         proposal.attention_scores_by_layer,
         proposal.draft_latency_ms,
+        proposal.gather_latency_ms,
         proposal.gather_bytes,
         target_query,
         (draft_start, draft_end),
         (verify_start, verify_end, verify_wall_ms),
+        proposal.gather_events,
     )
 
 
@@ -346,7 +353,7 @@ def _replay_calibration_actions(
         if config.timing_mode == "diagnostic" and torch.cuda.is_available():
             torch.cuda.synchronize(input_ids.device)
         started = time.perf_counter()
-        block, output, accepted, posterior, draft_scores, _, gather_bytes, query, _, _ = _draft_and_verify_action(
+        block, output, accepted, posterior, draft_scores, _, gather_ms, gather_bytes, query, _, _, _ = _draft_and_verify_action(
             target=target,
             draft=draft,
             bank=bank,
@@ -360,6 +367,7 @@ def _replay_calibration_actions(
             temperature=temperature,
             mask_token_id=mask_token_id,
             collect_refresh_scores=state.refresh_required and config.selector == "draft_refresh",
+            collect_full_context_scores=False,
             query_capture=query_capture,
         )
         eos_offset = next(
@@ -410,6 +418,7 @@ def _replay_calibration_actions(
             "prefix_right_censored": accepted == action.gamma and eos_offset is None,
             "eos_offset": eos_offset,
             "selected_context_tokens_by_layer": [len(item) for item in selection.positions_by_layer],
+            "gather_ms": gather_ms,
             "gather_bytes": gather_bytes,
             "action_cost_ms": elapsed_ms,
             "round_total_ms": elapsed_ms,
@@ -450,6 +459,9 @@ def generate_adaptive(
     stop_token_ids: Sequence[int] | None = None,
     calibration_action_rows: list[dict[str, Any]] | None = None,
     calibration_checkpoints: Sequence[int] = (0, 512, 1024, 1536),
+    selection_policy: SelectionPolicy | None = None,
+    collect_full_target_scores: bool = False,
+    collect_full_draft_scores: bool = False,
 ) -> GenerationResult:
     """Generate one sequence; target sees full context on every verification."""
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -477,7 +489,11 @@ def generate_adaptive(
     if fixed_gamma > int(draft.block_size) - 1 or gamma_reference > int(draft.block_size) - 1:
         raise ValueError("fixed_gamma/gamma_reference exceeds DFlash checkpoint capability")
     bank = DraftContextBank(draft, max_length)
-    query_capture = TargetQueryCapture(target, target_layer) if config.selector == "target_parent" else None
+    query_capture = (
+        TargetQueryCapture(target, target_layer)
+        if config.selector == "target_parent" or collect_full_target_scores
+        else None
+    )
     capture_cleanup = query_capture.close if query_capture is not None else (lambda: None)
     controller = AdaptiveController(
         config,
@@ -518,6 +534,7 @@ def generate_adaptive(
 
     ranking_by_layer: tuple[tuple[int, ...], ...] = ()
     target_scores: dict[int, float] | None = None
+    target_parent_scores_full: dict[int, float] | None = None
     source_concentration: float | None = None
     source_origin_round: int | None = None
     ranking_origin_round: int | None = None
@@ -549,6 +566,12 @@ def generate_adaptive(
             target_scores, source_concentration = _capture_parent(
                 initial_query, target_cache, target_layer, 0, prompt_length - 1, layout, target_attention
             )
+            if collect_full_target_scores:
+                from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                target_parent_scores_full = target_full_key_scores(
+                    initial_query, target_cache, target_layer, 0, prompt_length - 1, target_attention
+                )
             if target_scores:
                 ranking_by_layer = rank_chunks(
                     layout,
@@ -607,6 +630,12 @@ def generate_adaptive(
                     target_scores, source_concentration = _capture_parent(
                         ar_query, target_cache, target_layer, 0, logical_length, layout, target_attention
                     )
+                    if collect_full_target_scores:
+                        from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                        target_parent_scores_full = target_full_key_scores(
+                            ar_query, target_cache, target_layer, 0, logical_length, target_attention
+                        )
                     if target_scores:
                         ranking_by_layer = rank_chunks(layout, selector="target_parent", scores_by_layer=[target_scores], num_draft_layers=len(draft.layers))
                         source_origin_round = round_index
@@ -700,18 +729,36 @@ def generate_adaptive(
                 action = Action("full", action.gamma, action.length_mode)
                 action_reason += ":missing_target_signal_full"
             selection_started = time.perf_counter()
-            selection = select_context(
-                state,
-                layout,
-                rankings,
-                action.budget,
-                processed_output_start=prompt_length,
-                bank_length=bank.length,
-                source_anchors=config.source_anchors,
-                recent_output=config.recent_output,
-                selector_id=config.selector,
-                ranking_origin_round=(ranking_origin_round if config.selector == "draft_refresh" else source_origin_round),
-            )
+            if selection_policy is not None:
+                selection = selection_policy(
+                    state=state,
+                    layout=layout,
+                    bank_length=bank.length,
+                    processed_output_start=prompt_length,
+                    requested_budget=action.budget,
+                    round_index=round_index,
+                    refresh_required=refresh_required,
+                    target_parent_scores=target_parent_scores_full,
+                    previous_dflash_scores=ranking_scores_by_layer,
+                    num_draft_layers=len(draft.layers),
+                )
+                if selection is None:
+                    raise RuntimeError(
+                        f"campaign selection policy returned no mask at round {round_index}; refusing fallback"
+                    )
+            else:
+                selection = select_context(
+                    state,
+                    layout,
+                    rankings,
+                    action.budget,
+                    processed_output_start=prompt_length,
+                    bank_length=bank.length,
+                    source_anchors=config.source_anchors,
+                    recent_output=config.recent_output,
+                    selector_id=config.selector,
+                    ranking_origin_round=(ranking_origin_round if config.selector == "draft_refresh" else source_origin_round),
+                )
             if selection is None:
                 fallback = Action("full", action.gamma, action.length_mode)
                 selection = select_context(
@@ -781,10 +828,12 @@ def generate_adaptive(
                 posterior,
                 draft_scores,
                 draft_ms,
+                gather_ms,
                 gathered_bytes,
                 target_query,
                 draft_event_pair,
                 verify_event_data,
+                gather_event_pair,
             ) = _draft_and_verify_action(
                 target=target,
                 draft=draft,
@@ -799,6 +848,7 @@ def generate_adaptive(
                 temperature=temperature,
                 mask_token_id=int(mask_token_id),
                 collect_refresh_scores=refresh_required and config.selector == "draft_refresh",
+                collect_full_context_scores=collect_full_draft_scores and refresh_required,
                 query_capture=query_capture if collect_target_signal else None,
             )
             proposed_total += action.gamma
@@ -855,6 +905,17 @@ def generate_adaptive(
                     # do not keep an older ranking and present it as current.
                     ranking_by_layer = ()
                     source_origin_round = None
+                if collect_full_target_scores:
+                    from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                    target_parent_scores_full = target_full_key_scores(
+                        target_query,
+                        target_cache,
+                        target_layer,
+                        accepted,
+                        logical_length + accepted,
+                        target_attention,
+                    )
             signal_ms = (time.perf_counter() - signal_started) * 1000.0
             bank_started = time.perf_counter()
             retained = _feature_rows(target_output.hidden_states, layer_ids)[:, :commits_for_output, :]
@@ -946,6 +1007,7 @@ def generate_adaptive(
                 "trimmed_commits": trimmed, "signal_ms": signal_ms,
                 "controller_ms": controller_ms, "selection_ms": selection_ms,
                 "bank_update_ms": bank_update_ms, "draft_ms": draft_ms,
+                "gather_ms": gather_ms,
                 "verify_ms": verify_event_data[2], "round_gpu_span_ms": None,
                 "round_host_ms": host_elapsed,
                 "gather_bytes": gathered_bytes, "cost_observation_ready": action_cost_ms is not None,
@@ -968,6 +1030,8 @@ def generate_adaptive(
                 rounds[-1]["_draft_events"] = draft_event_pair
             if verify_event_data[0] is not None:
                 rounds[-1]["_verify_events"] = (verify_event_data[0], verify_event_data[1])
+            if gather_event_pair is not None:
+                rounds[-1]["_gather_events"] = gather_event_pair
             del target_output, parent_logits, target_query, draft_scores
             del block, posterior
             round_index += 1
@@ -993,6 +1057,9 @@ def generate_adaptive(
         span = row.pop("_gpu_span_events", None)
         if span is not None:
             row["round_gpu_span_ms"] = float(span[0].elapsed_time(span[1]))
+        gather_events = row.pop("_gather_events", None)
+        if gather_events is not None:
+            row["gather_ms"] = float(gather_events[0].elapsed_time(gather_events[1]))
     output_tokens = min(len(generated), max_new_tokens)
     generated = generated[:output_tokens]
     if not generated:
@@ -1029,6 +1096,7 @@ def generate_adaptive(
         "verification_latency_ms": verify_ms,
         "signal_latency_ms": signal_ms_total,
         "selection_latency_ms": selection_ms_total,
+        "gather_latency_ms": sum(float(row.get("gather_ms") or 0.0) for row in rounds),
         "bank_update_latency_ms": bank_update_ms_total,
         "controller_latency_ms": controller.choose_ms_total,
     }

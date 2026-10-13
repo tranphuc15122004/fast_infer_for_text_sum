@@ -34,6 +34,12 @@ và runbook. CLI/launcher đã có trong dispatcher; **GPU parity và kết qu�
 của phương pháp chưa chạy**, nên trạng thái vẫn experimental. Xem
 [baseline guide](baselines/context_adaptive_dflash.md).
 
+Kế hoạch can thiệp DFlash A1–A3 ngày 13/10 có launcher riêng
+[`scripts/run_dflash_context_experiments.sh`](../scripts/run_dflash_context_experiments.sh)
+và [runbook B200](../src/TrainingFree/docs/dflash_context_interventions_b200.md).
+Đây là harness mới, chưa chạy benchmark thật; phải qua parity gate trên server
+trước khi dùng kết quả hoặc mở heldout.
+
 ## Nội dung
 
 - **Chung** — chuẩn bị venv Python 3.12 offline, định dạng dữ liệu, lệnh chạy

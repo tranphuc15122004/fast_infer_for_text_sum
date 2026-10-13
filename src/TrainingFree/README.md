@@ -32,6 +32,16 @@ Selective context có cơ sở thực nghiệm từ SpecExtend. Chuyển cơ ch�
 
 ## Phạm vi code
 
+Campaign can thiệp A1–A3 ở
+[kế hoạch 13/10/2026](plans/experiment_plan_A_13_10_26.md) có harness riêng:
+[`scripts/run_dflash_context_experiments.py`](../../scripts/run_dflash_context_experiments.py),
+wrapper [`run_dflash_context_experiments.sh`](../../scripts/run_dflash_context_experiments.sh)
+và [runbook B200](docs/dflash_context_interventions_b200.md). Harness này
+không thay CLI Context-Adaptive DFlash bên dưới; nó thêm replay masks, paired
+AR/native/adapter parity, A1/A2/A3, resume theo cell và lock-before-confirm.
+Chưa có kết quả GPU; cần stage split/exposure manifests đã kiểm toán và chạy
+preflight trên server trước khi chạy pilot.
+
 Các module hiện tại như `policy.py`, `collector.py`, `run.py`, `lease*.py`, `hierarchy*.py`, `temporal*.py` và `fidelity*.py` thuộc **RECAP-KV và các nghiên cứu chẩn đoán trước đó**. `python -m TrainingFree.run` chạy pipeline RECAP-KV, không chạy phương pháp mới.
 
 Executor mới nằm trong [`src/TrainingFree/context_adaptive/`](context_adaptive/), CLI tại [`scripts/infer_context_adaptive_dflash.py`](../../scripts/infer_context_adaptive_dflash.py), runner tại [`scripts/runners/run_context_adaptive_dflash.sh`](../../scripts/runners/run_context_adaptive_dflash.sh) và đã nối dispatcher `bash scripts/run.sh context_adaptive_dflash`. Nó có action replay calibration, adaptive generation, target-only AR, output manifests/JSONL và paired report. Không đổi tên schema RECAP-KV hoặc nhập core inference từ test/probe.

@@ -80,6 +80,8 @@ class DraftProposal:
     token_ids: Any
     attention_scores_by_layer: dict[int, dict[int, float]] = field(default_factory=dict)
     draft_latency_ms: float = 0.0
+    gather_latency_ms: float = 0.0
+    gather_events: Any = None
     context_tokens_by_layer: tuple[int, ...] = ()
     gather_bytes: int = 0
     draft_tokens_proposed: int = 0

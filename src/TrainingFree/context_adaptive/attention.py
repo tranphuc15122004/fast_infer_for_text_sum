@@ -29,6 +29,7 @@ def _draft_attention(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     *,
     collect_source_scores: bool,
+    collect_full_context_scores: bool,
     source_chunks: Sequence[Sequence[int]],
 ) -> tuple[torch.Tensor, dict[int, float]]:
     module = layer.self_attn
@@ -46,6 +47,7 @@ def _draft_attention(
     context_key = context.key
     context_value = context.value
     context_positions = context.positions
+    all_context_positions = context_positions
     if module.sliding_window is not None:
         query_positions = position_ids.reshape(-1)
         radius = int(module.sliding_window) - 1
@@ -78,7 +80,7 @@ def _draft_attention(
         attention_output = torch.matmul(probabilities.to(expanded_value.dtype), expanded_value)
         attention_output = attention_output.transpose(1, 2).contiguous()
     else:
-        if collect_source_scores and source_chunks:
+        if (collect_source_scores and source_chunks) or collect_full_context_scores:
             groups = int(module.num_key_value_groups)
             expanded_key = key.float().repeat_interleave(groups, dim=1)
             raw_scores = torch.matmul(query.float(), expanded_key.transpose(-1, -2)) * float(module.scaling)
@@ -95,14 +97,20 @@ def _draft_attention(
             sliding_window=None,
         )
 
-    if collect_source_scores and source_chunks:
+    if (collect_source_scores and source_chunks) or collect_full_context_scores:
         probs = probabilities.mean(dim=(0, 1))[1:, :].mean(dim=0)
         context_probabilities = probs[: context_positions.numel()].detach().cpu().tolist()
         lookup = {int(position): index for index, position in enumerate(context_positions.tolist())}
-        for chunk in source_chunks:
-            for position in chunk:
-                if position in lookup:
-                    attention_weights[position] = float(context_probabilities[lookup[position]])
+        if collect_full_context_scores:
+            attention_weights.update({int(position): 0.0 for position in all_context_positions.tolist()})
+        selected_positions = (
+            lookup.keys()
+            if collect_full_context_scores
+            else (position for chunk in source_chunks for position in chunk)
+        )
+        for position in selected_positions:
+            if position in lookup:
+                attention_weights[position] = float(context_probabilities[lookup[position]])
     attention_output = attention_output.reshape(batch, query_length, -1).contiguous()
     return module.o_proj(attention_output), attention_weights
 
@@ -118,13 +126,24 @@ def draft_block(
     *,
     layout: PromptLayout,
     collect_refresh_scores: bool = False,
+    collect_full_context_scores: bool = False,
 ) -> DraftProposal:
     if anchor_and_masks.shape[1] != action.block_size:
         raise ValueError("draft input shape must equal gamma + 1")
     if position_ids.numel() != action.block_size:
         raise ValueError("absolute position ids must match the draft block")
     started = time.perf_counter()
+    gather_events = (
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        if torch.cuda.is_available() else None
+    )
+    if gather_events:
+        gather_events[0].record()
+    gather_started = time.perf_counter()
     contexts = bank.gather(selection)
+    gather_latency_ms = (time.perf_counter() - gather_started) * 1000.0
+    if gather_events:
+        gather_events[1].record()
     gather_bytes = sum(ctx.key.numel() * ctx.key.element_size() + ctx.value.numel() * ctx.value.element_size() for ctx in contexts)
     hidden_states = target_model.model.embed_tokens(anchor_and_masks)
     position_embeddings = draft_model.rotary_emb(hidden_states, position_ids.reshape(1, -1))
@@ -141,6 +160,7 @@ def draft_block(
             context,
             position_embeddings,
             collect_source_scores=collect_refresh_scores,
+            collect_full_context_scores=collect_full_context_scores,
             source_chunks=layout.source_chunks,
         )
         hidden_states = residual + attended
@@ -155,6 +175,8 @@ def draft_block(
         token_ids=candidates,
         attention_scores_by_layer=per_layer_scores,
         draft_latency_ms=(time.perf_counter() - started) * 1000.0,
+        gather_latency_ms=gather_latency_ms,
+        gather_events=gather_events,
         context_tokens_by_layer=tuple(len(positions) for positions in selection.positions_by_layer),
         gather_bytes=gather_bytes,
         draft_tokens_proposed=action.gamma,
