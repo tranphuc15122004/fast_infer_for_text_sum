@@ -289,6 +289,34 @@ def build_report(run_root: Path, phase: str) -> dict[str, Any]:
             phase_rows.extend(read_jsonl(path))
     report = summarize_phase(phase_rows, phase=phase)
     report["rollout_metrics"] = _rollout_metrics(phase_rows)
+    cohort_path = run_root / "cohorts" / f"{phase}.json"
+    if cohort_path.is_file():
+        cohort = json.loads(cohort_path.read_text(encoding="utf-8"))
+        planned = cohort.get("planned_quotas", cohort.get("quotas", {}))
+        actual = cohort.get("actual_quotas") or {
+            dataset: sum(1 for row in cohort.get("groups", []) if row.get("dataset") == dataset)
+            for dataset in planned
+        }
+        report["cohort_summary"] = {
+            "status": cohort.get("status"),
+            "split": cohort.get("split"),
+            "planned_groups_by_dataset": planned,
+            "actual_groups_by_dataset": actual,
+            "available_groups_by_dataset": cohort.get("available_groups", {}),
+            "shortages": cohort.get("shortages", {}),
+            "scope_note": cohort.get("scope_note"),
+        }
+        report["partial_confirmation"] = cohort.get("status") == "partial_confirmation"
+        if report["partial_confirmation"]:
+            report["interpretation_limit"] = (
+                "Confirm used fewer untouched source groups than preregistered. "
+                "Treat all confirm effects as limited/inconclusive for the planned population."
+            )
+            for selector_metrics in report["rollout_metrics"].values():
+                for result in selector_metrics.values():
+                    if result.get("decision") == "preservation_and_speedup_gate_pass":
+                        result["decision_before_quota_limit"] = result["decision"]
+                        result["decision"] = "inconclusive_partial_confirmation_quota"
     output_dir = run_root / "reports"
     output_dir.mkdir(parents=True, exist_ok=True)
     atomic_json(output_dir / f"{phase}_coverage.json", report)
@@ -412,6 +440,23 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
         f"- Source groups độc lập: {report.get('unique_source_groups')}",
         f"- Trạng thái: `{json.dumps(report.get('status_counts', {}), ensure_ascii=False)}`",
         "",
+    ]
+    cohort = report.get("cohort_summary")
+    if cohort:
+        lines.extend([
+            "## Cohort và giới hạn kết luận",
+            "",
+            f"- Trạng thái cohort: `{cohort.get('status')}`; split: `{cohort.get('split')}`",
+            f"- Mục tiêu theo dataset: `{json.dumps(cohort.get('planned_groups_by_dataset', {}), ensure_ascii=False)}`",
+            f"- Đã chạy theo dataset: `{json.dumps(cohort.get('actual_groups_by_dataset', {}), ensure_ascii=False)}`",
+            f"- Nhóm còn khả dụng: `{json.dumps(cohort.get('available_groups_by_dataset', {}), ensure_ascii=False)}`",
+        ])
+        if cohort.get("scope_note"):
+            lines.extend([f"- Giới hạn: {cohort['scope_note']}"])
+        if report.get("interpretation_limit"):
+            lines.extend([f"- Diễn giải: {report['interpretation_limit']}"])
+        lines.append("")
+    lines.extend([
         "## A1 — Attention và vùng context",
         "",
         f"- Region contrasts: `{json.dumps(report['family_metrics']['A1'].get('region_contrasts', {}), ensure_ascii=False)}`",
@@ -431,5 +476,5 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
         "",
         "Errors, infeasible cells và thiếu coverage được giữ riêng; các hàng thiếu không được tính thành gain bằng không.",
         "",
-    ]
+    ])
     return "\n".join(lines)

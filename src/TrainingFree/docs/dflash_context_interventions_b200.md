@@ -1,108 +1,41 @@
 # Chạy campaign A1–A3 trên B200
 
-Launcher của kế hoạch [A 13/10/2026](../plans/experiment_plan_A_13_10_26.md)
-đã được nối vào runtime dùng chung của repo. Campaign chạy offline trên một
-B200, một worker, batch 1, BF16, DFlash b16, gamma 15, block 16 và FA4. Không
-cần Modal hoặc package Python mới.
+## Chỉ cần hai lệnh
 
-## Điều kiện đầu vào
-
-Trên server phải có:
-
-- Repo ở `/workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum`
-  và master env ở `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env`.
-- Python hệ thống 3.12, CUDA/Torch/Transformers và FA4/CUTLASS tương thích với
-  image B200; runtime đã cài các package theo `requirements.txt`.
-- Target Qwen3-4B, DFlash Qwen3-4B-b16, LongBench ba dataset `gov_report`,
-  `multi_news`, `qmsum`; mọi asset phải là snapshot local hoàn chỉnh.
-- Split manifest hiện có và một exposure manifest đã rà soát bao gồm probe
-  trước đây cùng các pilot đã chạy. Exposure manifest dùng cấu trúc
-  `{"samples": [{"sample_id": ..., "dataset": ..., "source_sha256": ...}]}`
-  hoặc danh sách `source_fingerprints`/`context_fingerprints` mà helper split
-  hiện có hỗ trợ. Không dùng audit một phần làm bằng chứng rằng heldout sạch.
-
-Repo local có [exposure audit của probe](../../../outputs/context_adaptive_dflash/m0_local_primary_cpu_20261009/evidence/exposure_audit.json)
-và split manifest đi kèm. Audit đó ghi probe absent-verified so với corpus
-primary, nhưng chưa thay thế exposure audit của các pilot trước và còn ghi
-đường dẫn local `/home/tuantb`. Hãy chuyển các manifests lên server, kiểm tra
-hash/data identity và gộp đủ exposure của probe + pilot; sau đó dùng manifest
-đã rebase sang server. Launcher từ chối tạo cohort nếu không có exposure
-manifest, và kiểm tra group đã lộ không bị đặt vào test.
-
-Không có Python dependency bổ sung cho harness: bootstrap dùng thư viện chuẩn,
-ROUGE và JSONL dùng helper của repo. FA4 kernel phải qua probe ngay trên server;
-không tự fallback sang SDPA trong primary results.
-
-## Lệnh trên B200
-
-Điền thư mục đã staging hai manifest audit trước khi bắt đầu. Ví dụ dưới đây
-giữ nguyên một `RUN_ID` xuyên suốt pilot/dev/lock/confirm:
+Chạy từ thư mục repo trên server B200:
 
 ```bash
-cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
-
-RUN_ID=dflash_context_A_20261013
-AUDIT_DIR=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/dflash_context_A_audit
-SPLIT_MANIFEST="$AUDIT_DIR/split_manifest.json"
-EXPOSURE_MANIFEST="$AUDIT_DIR/combined_exposure_manifest.json"
-COMMON=(--config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
-  --run-id "$RUN_ID" --split-manifest "$SPLIT_MANIFEST" \
-  --exposure-manifest "$EXPOSURE_MANIFEST" --gpu-ids 0)
-
-# In kế hoạch, chưa load model hoặc chạy generation.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode preflight --plan-only
-
-# Kiểm asset, Python, B200/SM100 và FA4 shim/kernel. Chưa load target/draft.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode preflight
-
-# Chuẩn bị source groups/split/cohort manifests; không load model.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode prepare
-
-# Parity gate nhỏ trước ma trận.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode validate
-
-# Pilot 2 groups mỗi dataset, tối đa 6 prefix/group, cap 1024 token.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode pilot
-
-# Dev gồm 24 groups, cap 2048; mặc định chọn previous_dflash, B=2048.
-# Có thể chọn selector/B/period khác trước khi chạy dev.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode dev \
-  --a3-selector previous_dflash --a3-budget 2048 --refresh-period 4
-
-# Lock lựa chọn sau khi đọc reports/dev_decision.md.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode lock \
-  --a3-selector previous_dflash --a3-budget 2048 --refresh-period 4
-
-# Chỉ chạy heldout sau khi lock; confirm yêu cầu đúng run-id, source code,
-# runtime, model/tokenizer và split signatures của dev.
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode confirm \
-  --locked-config "outputs/dflash_context_interventions/$RUN_ID/locked_config.json"
-
-bash scripts/run_dflash_context_experiments.sh "${COMMON[@]}" --mode report \
-  --report-phase confirm
+bash scripts/run_dflash_context_A_b200.sh check
+bash scripts/run_dflash_context_A_b200.sh start
 ```
 
-Nếu job bị ngắt, chạy lại đúng lệnh pha đó và thêm `--resume`. Không sửa code,
-model, split, seed, selector, budget hoặc backend giữa resume; signature không
-khớp sẽ dừng. Sau khi code hoặc input thay đổi, dùng `RUN_ID` mới. `validate`
-chỉ qua khi native Full DFlash và adapter Full có output token IDs bằng greedy
-AR trên toàn bộ cohort validate. Parity fail thì pilot/dev/confirm không mở
-ma trận hoặc ghi nhận speedup.
+`check` kiểm tra Python/packages, GPU/FA4, models, dữ liệu, hash corpus,
+exposure audit và số source groups. Lệnh này không chạy generation.
 
-## Artifact và giới hạn triển khai hiện tại
+`start` treo campaign dưới nền. Nó tự chạy preflight → prepare → parity/validate
+→ pilot → dev → lock → confirm → report. Campaign dùng GPU 0, FA4, seed 42,
+và cấu hình B200 đã đăng ký trong kế hoạch. Master config được đọc qua
+`config/master.path`; không cần truyền run ID, đường dẫn manifest hay config.
 
-Mỗi cell được checkpoint nguyên tử dưới `outputs/dflash_context_interventions/<run_id>/`;
-JSONL pha được ghép qua `JsonlWriter` dùng chung. Report giữ cell infeasible,
-not-eligible và error thay vì tính chúng thành zero. Confirm dùng test split,
-kiểm hash split/asset/runtime/code đã khóa, rồi mới sinh report cuối.
+Sau khi `start` trả về, theo dõi log bằng lệnh `tail -f` mà nó in ra. Kết quả
+nằm ở `outputs/dflash_context_interventions/<run_id>/`; báo cáo cuối là
+`reports/confirm_decision.md` và `reports/confirm_coverage.json`.
 
-Launcher hiện cho phép một `--a3-selector` và một `--a3-budget` cho mỗi lần
-chạy dev. Replay A3 vẫn chạy budget curve của selector đó; rollout latency
-đo budget/selector được truyền vào, và refresh periods 2/4/8/16 được đo riêng.
-Nếu cần so sánh nhiều policy end-to-end trước lock, chạy các cấu hình dev ở
-các `run-id` riêng rồi tổng hợp chọn thủ công trên dev; không gộp records khác
-signature. Confirm chỉ được chạy một cấu hình đã lock. Campaign này cố ý chỉ
-dùng một GPU; data-parallel nhiều B200 chưa được triển khai.
+## Exposure và quota
 
-Đây mới là code và runbook. Chưa chạy trên B200; các lệnh thực nghiệm cần được
-chạy trên server sau khi hoàn thành preflight và xác nhận exposure manifests.
+Probe và pilot cũ đã được tổng hợp trong
+`data/dflash_context_A_audit/combined_exposure_manifest.json`; bằng chứng đối
+soát nằm trong `exposure_audit.json`. `prepare` tự tạo split mới trong output,
+không cần file split bên ngoài. Lệnh `check` so hash ba dataset với corpus đã
+audit và dừng nếu dữ liệu khác.
+
+Với corpus `longbench_100_14k` hiện tại, audit để lại 37 GovReport, 33 Multi-News
+và **3 QMSum** groups trong test; kế hoạch ban đầu cần 18/18/12. Vì vậy runner
+dùng toàn bộ nhóm chưa xem còn lại: confirm thực tế là **18/18/3 = 39 groups**.
+Báo cáo đánh dấu confirm là partial và giới hạn kết luận; không được diễn giải
+như đã đạt quota 48. Đây là thu hẹp theo quy tắc exposure trong kế hoạch, tránh
+đưa dữ liệu đã xem vào heldout.
+
+Nếu parity hoặc gate lock không đạt, runner dừng ở gate đó và không mở confirm.
+Khi ấy vẫn giữ report của phase đã hoàn tất trong cùng thư mục run. Không có
+Modal job hoặc package mới trong quy trình này.

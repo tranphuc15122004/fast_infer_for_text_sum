@@ -36,3 +36,17 @@ Primary file SHA-256 dùng trong pilot vẫn khớp corpus đã chuẩn bị:
 4. Chỉ dùng H100/FA4 result làm performance pilot. Không tuyên bố quality hoặc exact acceleration khi chưa qua correctness gate và heldout.
 
 Kết luận hiện tại: **đường chạy FA4/H100 hoạt động và pilot cho thấy `a_only`/`joint` có throughput cao hơn DFlash ở nhiều bin dài; tuy nhiên parity với AR chưa đạt, toàn bộ output chạm cap, và `a_only` vượt `joint` pooled. Vì vậy chưa đủ điều kiện claim tăng tốc suy luận giữ nguyên output hoặc kết luận quality.**
+
+## Bổ sung 2026-10-13: exposure cho campaign A trên B200
+
+Đã gộp probe, split exploration cũ và các Modal pilot vào
+[`data/dflash_context_A_audit/combined_exposure_manifest.json`](../../../../data/dflash_context_A_audit/combined_exposure_manifest.json),
+kèm [`exposure_audit.json`](../../../../data/dflash_context_A_audit/exposure_audit.json).
+Đối soát theo ID/hash/fingerprint cho kết quả 135 sample identities khớp corpus
+campaign và 29 identities được xác minh thuộc LongBench-200 nhưng không thuộc
+corpus `longbench_100_14k`. Kết quả này chỉ tạo cohort; chưa chạy GPU B200.
+
+Sau khi loại toàn bộ nhóm calibration/dev cũ và mọi pilot exposure, test còn
+37 GovReport, 33 Multi-News, 3 QMSum groups. Vì thế campaign B200 tự chạy confirm
+trên 18/18/3 groups và ghi partial quota; không claim đạt mục tiêu ban đầu
+18/18/12. Runbook B200 hiện có hai lệnh `check` và `start`.

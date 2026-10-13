@@ -1,6 +1,6 @@
 # Training-Free: Context-Adaptive DFlash
 
-Ngày cập nhật: **2026-10-09**. Trạng thái: **đã sửa 10 lỗi rà soát; 45/45 ca hồi quy CPU đạt; đã bổ sung tài liệu thực nghiệm, parity GPU và benchmark vẫn pending**.
+Ngày cập nhật: **2026-10-13**. Trạng thái: **đã sửa 10 lỗi rà soát; 45/45 ca hồi quy CPU đạt; đã đóng gói exposure audit và lệnh chạy campaign B200; parity GPU và benchmark vẫn pending**.
 
 Mục tiêu là cùng thích nghi context budget của drafter và số speculative tokens trên DFlash đã train, cho long-context summarization. Target giữ full context và thực hiện exact verification. Trọng số target, DFlash, embedding và LM head không thay đổi.
 
@@ -36,11 +36,16 @@ Campaign can thiệp A1–A3 ở
 [kế hoạch 13/10/2026](plans/experiment_plan_A_13_10_26.md) có harness riêng:
 [`scripts/run_dflash_context_experiments.py`](../../scripts/run_dflash_context_experiments.py),
 wrapper [`run_dflash_context_experiments.sh`](../../scripts/run_dflash_context_experiments.sh)
-và [runbook B200](docs/dflash_context_interventions_b200.md). Harness này
+và [runbook B200](docs/dflash_context_interventions_b200.md). Đường chạy gọn
+dùng hai lệnh `bash scripts/run_dflash_context_A_b200.sh check` rồi
+`bash scripts/run_dflash_context_A_b200.sh start`; exposure audit đã được gói
+trong `data/dflash_context_A_audit/`. Corpus hiện tại chỉ còn 3 QMSum groups
+sạch cho confirm thay vì quota 12, nên report cuối sẽ đánh dấu confirm partial.
+Harness này
 không thay CLI Context-Adaptive DFlash bên dưới; nó thêm replay masks, paired
 AR/native/adapter parity, A1/A2/A3, resume theo cell và lock-before-confirm.
-Chưa có kết quả GPU; cần stage split/exposure manifests đã kiểm toán và chạy
-preflight trên server trước khi chạy pilot.
+Chưa có kết quả GPU; chạy `check` trên server trước khi treo campaign để kiểm
+assets, hash dữ liệu và số nhóm thực tế.
 
 Các module hiện tại như `policy.py`, `collector.py`, `run.py`, `lease*.py`, `hierarchy*.py`, `temporal*.py` và `fidelity*.py` thuộc **RECAP-KV và các nghiên cứu chẩn đoán trước đó**. `python -m TrainingFree.run` chạy pipeline RECAP-KV, không chạy phương pháp mới.
 

@@ -48,6 +48,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-backend", choices=("flash_attention_4", "sdpa"), default="flash_attention_4")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-partial-confirm",
+        action="store_true",
+        help=(
+            "run confirm on every available untouched group when exposure leaves "
+            "fewer groups than the preregistered quota; report the reduced cohort"
+        ),
+    )
     parser.add_argument("--report-phase", choices=("pilot", "dev", "confirm"), default="dev")
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--max-prefixes", type=int, default=6)
@@ -137,6 +145,9 @@ def _code_signature() -> dict[str, Any]:
         *sorted((ROOT / "src/TrainingFree/context_adaptive").glob("*.py")),
         ROOT / "scripts/run_dflash_context_experiments.py",
         ROOT / "scripts/run_dflash_context_experiments.sh",
+        ROOT / "scripts/run_dflash_context_A_b200.sh",
+        ROOT / "data/dflash_context_A_audit/combined_exposure_manifest.json",
+        ROOT / "data/dflash_context_A_audit/exposure_audit.json",
         ROOT / "scripts/common/runtime.sh",
         ROOT / "scripts/common/config.sh",
         ROOT / "scripts/common/vanilla_inference.py",
@@ -677,7 +688,29 @@ def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
     saved_split = run_root / "cohorts" / "split_manifest.json"
     if not args.split_manifest and saved_split.is_file():
         args.split_manifest = str(saved_split)
-    selected, split_manifest, cohort = _cohort(args, samples, phase, require_quota=True)
+    partial_confirm = phase == "confirm" and args.allow_partial_confirm
+    selected, split_manifest, cohort = _cohort(
+        args, samples, phase, require_quota=not partial_confirm,
+    )
+    if partial_confirm:
+        planned_quotas = dict(cohort.get("quotas", {}))
+        actual_quotas = {
+            dataset: sum(1 for row in cohort.get("groups", []) if row.get("dataset") == dataset)
+            for dataset in planned_quotas
+        }
+        if any(count < 1 for count in actual_quotas.values()):
+            raise ValueError(
+                "partial confirm still requires at least one untouched source group per dataset; "
+                f"available={cohort.get('available_groups')}"
+            )
+        cohort["planned_quotas"] = planned_quotas
+        cohort["actual_quotas"] = actual_quotas
+        cohort["status"] = "partial_confirmation" if cohort.get("shortages") else "complete"
+        if cohort.get("shortages"):
+            cohort["scope_note"] = (
+                "Exposure audit reduced the untouched test cohort below the preregistered quota. "
+                "Use the observed group counts and treat confirm conclusions as limited."
+            )
     _save_cohort(run_root, cohort, split_manifest)
     locked: dict[str, Any] | None = None
     dev_runtime: dict[str, Any] = {}
