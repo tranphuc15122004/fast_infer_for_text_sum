@@ -62,11 +62,21 @@ vị tiếp theo. Reference thiếu, prefix bị loại, timing/acceptance khôn
 `null` kèm tên trường lỗi để checkpoint vẫn là JSON hợp lệ. Cache prefix được
 giải phóng trước khi dựng prefix kế tiếp, tránh giữ hai cache lớn cùng lúc.
 
+Cell A1/A2/A3 replay có exception hoặc số không hữu hạn được thử tối đa hai
+lần tại chính cell đó. Nếu vẫn lỗi, cell được lưu `status=error` và các cell
+còn lại tiếp tục. Runner không đo lại toàn bộ prefix khi cell đã hết retry.
+Nếu một action làm đổi logical length của draft bank, runner dừng vì các cell
+tiếp theo có nguy cơ dùng cache sai. NaN/Inf trong trace round cũng được phát
+hiện trước khi lưu JSON, để reference lỗi được retry/bỏ qua như sample lỗi.
+
 Chỉ các trường hợp nghiêm trọng dừng ngay: native/full-adapter mất parity,
 invariant KV cache sai, CUDA device-side assert/illegal memory access, thiếu
 dependency hoặc lỗi filesystem. Ba đơn vị tính toán liên tiếp thất bại sau
-retry được coi là lỗi hệ thống và cũng dừng; với A3, ngưỡng này tính trên ba
-mẫu liên tiếp không có bộ arm hợp lệ ở bất kỳ cấu hình nào. Lỗi liên tiếp chỉ
+retry được coi là lỗi hệ thống và cũng dừng; với replay, ngưỡng tính trên ba
+mẫu liên tiếp không có prefix tái lập được baseline. Nhiều prefix lỗi trong
+cùng mẫu chỉ tính là một mẫu lỗi; output ngắn không có prefix đủ điều kiện
+không tính là lỗi compute. Với A3, ngưỡng tính trên ba mẫu liên tiếp không có
+bộ arm hợp lệ ở bất kỳ cấu hình nào. Lỗi liên tiếp chỉ
 ở các refresh period phụ không kích hoạt ngưỡng dừng toàn campaign. Ctrl-C không bị nuốt. Dev lock
 vẫn yêu cầu đầy đủ các arm/repetition của cấu hình được chọn và đạt các gate
 acceptance/speedup trước khi mở heldout.
@@ -76,17 +86,33 @@ Bốn arm A3 của một lượt đo được lưu chung trong một checkpoint 
 summary theo schema cũ. Retry đo lại cả bộ bốn arm, không trộn arm từ các lượt
 đo khác nhau. Lỗi ở cấu hình refresh phụ chỉ hạ kết luận của cấu hình đó; không
 chặn cấu hình được chọn nếu cấu hình được chọn vẫn có đầy đủ dữ liệu hợp lệ.
+Lượt đo đầu tiên của mỗi cấu hình trong tiến trình hiện tại phải warmup đầy
+đủ. Retry không bỏ warmup khi lượt trước chưa thành công; resume warmup lại
+trước repetition còn thiếu dù repetition trước đã được lưu bởi tiến trình
+cũ. Record ghi `warmups_per_attempt` để truy vết việc này.
 
 Trace được tách theo phase dưới `traces/<phase>/`. Pilot tái sử dụng trace đã
 validate nếu chữ ký đầy đủ khớp, còn dev/confirm có trace riêng theo horizon
 của phase. Chữ ký model bỏ qua metadata download, notebook checkpoint và
 bytecode; thay đổi weights/config/tokenizer thực vẫn làm chữ ký đổi.
+Chữ ký cell bao gồm số prefix, warmup, repetition và seed. Confirm kiểm tra
+lại hash parity, rollout và cohort dev đã ghi vào locked config trước khi dùng
+GPU; không tiếp tục với artifact dev bị sửa hoặc thiếu sau lock.
 
 Sau khi `start` trả về, theo dõi log bằng lệnh `tail -f` mà nó in ra. Kết quả
 nằm ở `outputs/dflash_context_interventions/<run_id>/`; báo cáo cuối là
 `reports/confirm_decision.md` và `reports/confirm_coverage.json`.
 
-Nguồn dữ liệu được chọn theo thứ tự: `--data-dir`/`--data-file`, rồi
+Launcher `run_dflash_context_A_b200.sh` luôn truyền `--data-dir` tới corpus
+đã audit `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k`
+cho mọi phase, kể cả resume. Không kế thừa `DATA_INPUT` của master vì biến
+này có thể đang chọn XSum/representative cho baseline khác. Nếu chuyển corpus
+sang nơi lưu khác, đặt `DCE_DATA_DIR` trong master hoặc môi trường; corpus vẫn
+phải khớp hash đã audit. Launcher ghi đường dẫn vào log và kiểm tra thư mục
+tồn tại trước khi khởi chạy.
+
+Khi gọi trực tiếp `run_dflash_context_experiments.sh`, nguồn dữ liệu được chọn
+theo thứ tự: `--data-dir`/`--data-file`, rồi
 `DATA_INPUT`/`DATA_FILE` của master, rồi các alias `LONG_BENCH_DATA_*`.
 Loader chung có thể tự đặt `DATA_FILE=DATA_INPUT`; hai tên cùng trỏ tới một
 nguồn được gộp lại và runner nhận diện thư mục/file theo filesystem, nên

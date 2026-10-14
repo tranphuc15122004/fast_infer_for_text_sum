@@ -394,7 +394,9 @@ def _replay_reference_ids(trace: Mapping[str, Any]) -> list[int]:
 def _reference_result_error(measured) -> str | None:
     from TrainingFree.context_adaptive.schema import _check_finite
 
-    invalid = _check_finite(measured["parity"])
+    invalid = _check_finite({
+        "parity": measured["parity"], "adapter_rounds": measured.get("adapter_rounds", []),
+    })
     return f"nonfinite reference values: {invalid}" if invalid else None
 
 
@@ -606,6 +608,10 @@ def _cell_signature(runtime: Mapping[str, Any], args: argparse.Namespace, phase:
         "tokenizer": runtime.get("tokenizer_signature"),
         "code": _code_signature()["sha256"],
         "max_new_tokens": args.max_new_tokens,
+        "max_prefixes": getattr(args, "max_prefixes", 6),
+        "warmups": getattr(args, "warmups", None),
+        "repetitions": getattr(args, "repetitions", None),
+        "seed": getattr(args, "seed", 42),
         "source_anchors": args.source_anchors,
         "recent_output": args.recent_output,
         "a3_selector": args.a3_selector,
@@ -704,6 +710,8 @@ def _replay_result_error(result) -> str | None:
             if row.get("status") == "error":
                 reason = str(row.get("reason") or "replay cell failed")
                 _check_compute_reason(reason)
+                if row.get("compute_error"):
+                    continue  # This cell already exhausted its own two attempts.
                 return reason
     nonfinite = _check_finite(result)
     if nonfinite:
@@ -739,6 +747,7 @@ def _run_replay(
     }
     for sample_index, trace in enumerate(traces, start=1):
         sample = sample_map[str(trace["sample_id"])]
+        sample_has_success = False
         sample["_campaign_run_id"] = args.run_id
         reference_output_ids = _replay_reference_ids(trace)
         ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
@@ -766,7 +775,6 @@ def _run_replay(
                 marker_status = marker.get("status", "complete")
                 if marker_status == "baseline_mismatch":
                     if marker.get("diagnostic_cell_id") in existing["prefix_diagnostics"]:
-                        failures.observe(failed=True, label=prefix_key)
                         continue
                 elif marker_status in {"error", "baseline_error"}:
                     pass  # A resumed phase retries failed computation.
@@ -774,13 +782,14 @@ def _run_replay(
                     marker_cells = marker.get("cell_ids")
                     if marker_cells is None:
                         # Older markers were written only after all cells completed.
+                        sample_has_success = True
                         continue
                     if all(
                         cell_id in existing[kind] and existing[kind][cell_id].get("status") != "error"
                         for kind, cell_ids in marker_cells.items()
                         for cell_id in cell_ids
                     ):
-                        failures.observe(failed=False, label=prefix_key)
+                        sample_has_success = True
                         continue
                 else:
                     raise ValueError(f"unknown prefix checkpoint status {marker_status!r}: {prefix_marker}")
@@ -836,7 +845,6 @@ def _run_replay(
                     f"round={prefix.round_index} status={failure_status} {reason}; continuing",
                     file=sys.stderr, flush=True,
                 )
-                failures.observe(failed=True, label=label)
                 continue
             prefix_cell_ids = {}
             for kind in ("a1", "a2", "a3_replay"):
@@ -865,8 +873,12 @@ def _run_replay(
                 "status": "complete", "cell_ids": prefix_cell_ids,
                 "a1_rows": len(computed["a1"]), "a2_rows": len(computed["a2"]), "a3_replay": run_a3,
             })
-            failures.observe(failed=False, label=label)
+            sample_has_success = True
             del computed
+        # Several bad prefixes belonging to one source are one failed sample,
+        # not evidence of three independent/systemic failures. Short outputs
+        # with no eligible replay prefix are not compute failures.
+        failures.observe(failed=bool(prefixes) and not sample_has_success, label=str(sample["id"]))
     for kind, store in stores.items():
         rows = store.rows()
         statuses = Counter(str(row.get("status", "missing")) for row in rows)
@@ -952,6 +964,7 @@ def _run_rollouts(
         sample = sample_map[str(trace["sample_id"])]
         sample_has_success = False
         for period in periods:
+            configuration_warmed = False
             for repetition in range(repetitions):
                 pair_id = "|".join((
                     str(sample["dataset"]), str(sample["_cad_source_group_id"]),
@@ -976,6 +989,7 @@ def _run_rollouts(
                     flush=True,
                 )
                 attempt_count = 0
+                warmups_for_pair = warmups if not configuration_warmed else 0
 
                 def measure_pair():
                     nonlocal attempt_count
@@ -984,7 +998,7 @@ def _run_rollouts(
                         runtime, sample, max_new_tokens=max_new_tokens,
                         selector=args.a3_selector, budget=args.a3_budget,
                         refresh_period=period, repetition=repetition,
-                        warmups=warmups if repetition == 0 and attempt_count == 1 else 0,
+                        warmups=warmups_for_pair,
                         source_anchors=args.source_anchors, recent_output=args.recent_output,
                     )
 
@@ -1005,6 +1019,7 @@ def _run_rollouts(
                         "refresh_period": period, "repetition": repetition,
                         "cell_id": f"{pair_id}|{row['variant']}", "pair_id": pair_id,
                         "run_id": args.run_id, "compute_attempts": attempt_count,
+                        "warmups_per_attempt": warmups_for_pair,
                     })
                     if compute_error is not None:
                         row["attempt_status"] = row.get("status")
@@ -1025,6 +1040,7 @@ def _run_rollouts(
                 if parity_failed:
                     raise CampaignIntegrityError(f"A3 full-adapter/native-DFlash parity failed for {sample['id']}")
                 sample_has_success = sample_has_success or compute_error is None
+                configuration_warmed = configuration_warmed or compute_error is None
         # Optional grid failures must not declare the whole GPU unusable while
         # other configurations still produce valid paired evidence for a sample.
         failures.observe(failed=not sample_has_success, label=str(sample["id"]))
@@ -1051,7 +1067,7 @@ def _run_rollouts(
 
 
 def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
-    from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.context_adaptive.schema import atomic_json, sha256_file
     from TrainingFree.context_interventions.environment import run_preflight
 
     samples, _ = _load_samples(args)
@@ -1096,6 +1112,14 @@ def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
         split_path = run_root / "cohorts" / "split_manifest.json"
         if not split_path.is_file() or locked.get("split_manifest_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
             raise ValueError("heldout confirmation split differs from the locked dev split")
+        for relative_path, signature_key in (
+            ("evidence/parity_dev.json", "dev_parity_sha256"),
+            ("dev/a3_rollout.jsonl", "dev_rollout_sha256"),
+            ("cohorts/dev.json", "dev_cohort_sha256"),
+        ):
+            artifact = run_root / relative_path
+            if not artifact.is_file() or locked.get(signature_key) != sha256_file(artifact):
+                raise CampaignIntegrityError(f"locked dev artifact changed or is missing: {artifact}; heldout has not been opened")
         dev_runtime_path = run_root / "runtime_dev.json"
         if not dev_runtime_path.is_file():
             raise FileNotFoundError("locked dev runtime signature is missing")

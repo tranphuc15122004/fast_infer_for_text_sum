@@ -109,6 +109,26 @@ def test_full_key_attention_scores_are_causal_and_handle_gqa() -> None:
     assert scores[1] > scores[0]
 
 
+def test_attention_finite_check_does_not_sync_once_per_context_token(monkeypatch):
+    # Tensor.item() on CUDA synchronizes the host with a device scalar. The
+    # number of such operations must remain constant as context grows.
+    original_item = torch.Tensor.item
+    scalar_reads = []
+
+    def count_item(tensor, *args):
+        scalar_reads.append(tensor.numel())
+        return original_item(tensor, *args)
+
+    monkeypatch.setattr(torch.Tensor, "item", count_item)
+    scores = full_key_attention_scores(
+        torch.ones(1, 1, 1, 2), torch.zeros(1, 1, 128, 2),
+        query_index=0, query_position=127, head_groups=1, scaling=1.0,
+    )
+    assert len(scores) == 128
+    assert sum(scores.values()) == pytest.approx(1.0)
+    assert len(scalar_reads) <= 2
+
+
 def test_b200_matrix_contains_registered_primary_cells() -> None:
     assert len(a1_matrix("pilot")["attention_scoring"]) == 7
     assert a1_matrix("dev")["attention_deletions"] == (1024, 2048, 4096)

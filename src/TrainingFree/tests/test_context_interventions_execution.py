@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import TrainingFree.context_interventions.execution as execution
 from TrainingFree.context_interventions.execution import _action_row, _previous_dflash_evidence
 from TrainingFree.context_interventions.replay import ReferencePrefix
@@ -176,3 +178,82 @@ def test_a3_continues_and_records_previous_acceptance_mismatch(monkeypatch) -> N
     assert rows
     assert all(row["status"] == "ok" for row in rows)
     assert all(row["previous_replay_check"]["status"] == "acceptance_mismatch" for row in rows)
+
+
+@pytest.mark.parametrize("family", ("A2", "A3"))
+@pytest.mark.parametrize("transient", (False, True))
+def test_selector_cell_failure_is_retried_without_losing_other_budgets(monkeypatch, family, transient):
+    state = SimpleNamespace(bank=SimpleNamespace(length=4096))
+    runtime = {"draft": SimpleNamespace(layers=[object(), object()])}
+    sample = {"id": "sample-1", "dataset": "gov_report", "_cad_source_group_id": "group-1"}
+    prefix = ReferencePrefix(4, 48, 123, 976, "current-prefix", None)
+    monkeypatch.setattr(execution, "global_protected_positions", lambda *args, **kwargs: ())
+    monkeypatch.setattr(execution, "a2_matrix", lambda phase: {
+        "budgets": (1024, 2048), "selectors": ("recency",), "random_seeds": (17,),
+    })
+    attempts = []
+
+    def evaluate(*args, **kwargs):
+        budget = kwargs["requested_budget"]
+        attempts.append(budget)
+        if budget == 1024 and (not transient or attempts.count(1024) == 1):
+            raise RuntimeError("temporary cell computation failure")
+        return {"status": "ok", "accepted_candidates": 1}
+
+    monkeypatch.setattr(execution, "evaluate_replay_action", evaluate)
+    kwargs = dict(phase="pilot", max_new_tokens=1024, state=state,
+                  full_outcome={"status": "ok", "accepted_candidates": 1,
+                                "attention_scores_by_layer": {0: {0: 1.0}, 1: {0: 1.0}}})
+    if family == "A2":
+        rows = execution.run_a2_prefix(runtime, sample, None, SimpleNamespace(prompt_tokens=4), prefix, [], **kwargs)
+    else:
+        rows = execution.run_a3_prefix(runtime, sample, None, SimpleNamespace(prompt_tokens=4), prefix, [],
+                                       selector="recency", **kwargs)
+    first = next(row for row in rows if row["nominal_budget"] == 1024)
+    second = next(row for row in rows if row["nominal_budget"] == 2048)
+    assert first["status"] == ("ok" if transient else "error")
+    assert first["L_action"] == (1 if transient else None)
+    assert second["status"] == "ok"
+    assert attempts == [1024, 1024, 2048]
+
+
+def test_evaluate_mask_retries_local_failure(monkeypatch):
+    prefix = ReferencePrefix(4, 48, 123, 976, "prefix", None)
+    attempts = []
+
+    def evaluate(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary cell failure")
+        return {"status": "ok", "accepted_candidates": 2}
+
+    monkeypatch.setattr(execution, "evaluate_replay_action", evaluate)
+    row = execution._evaluate_mask(
+        {}, None, SimpleNamespace(bank=SimpleNamespace(length=4)), None,
+        {"id": "sample-1", "dataset": "gov_report", "_cad_source_group_id": "group-1"}, prefix,
+        phase="pilot", experiment="A1_region", label="source_only", nominal_budget=4,
+        masks=[(0, 1, 2, 3)], baseline_accepted=1,
+    )
+    assert row["status"] == "ok"
+    assert row["L_action"] == 2
+    assert len(attempts) == 2
+
+
+def test_replay_cell_cannot_continue_after_bank_mutation(monkeypatch):
+    from TrainingFree.context_interventions.resilience import CampaignIntegrityError
+
+    state = SimpleNamespace(bank=SimpleNamespace(length=4))
+
+    def mutate_then_fail(*args, **kwargs):
+        state.bank.length = 5
+        raise RuntimeError("temporary computation failure")
+
+    monkeypatch.setattr(execution, "evaluate_replay_action", mutate_then_fail)
+    with pytest.raises(CampaignIntegrityError, match="draft-bank"):
+        execution._evaluate_mask(
+            {}, None, state, None,
+            {"id": "sample-1", "dataset": "gov_report", "_cad_source_group_id": "group-1"},
+            ReferencePrefix(4, 48, 123, 976, "prefix", None),
+            phase="pilot", experiment="A1_region", label="source_only", nominal_budget=4,
+            masks=[(0, 1, 2, 3)], baseline_accepted=1,
+        )

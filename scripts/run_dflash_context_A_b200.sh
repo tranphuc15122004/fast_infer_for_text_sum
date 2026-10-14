@@ -16,6 +16,10 @@ GPU_ID="0"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/common/config.sh"
 fast_infer_load_config dflash || exit 1
+# Campaign A uses the audited LongBench corpus. The shared DATA_INPUT may
+# point to XSum/representative data for another baseline.
+CAMPAIGN_DATA_DIR="$(fast_infer__resolve_path "${DCE_DATA_DIR:-/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k}")"
+export DCE_DATA_DIR="$CAMPAIGN_DATA_DIR"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/common/runtime.sh" || exit 1
 
@@ -33,6 +37,7 @@ require_inputs() {
   [[ -f "$CORE" ]] || { echo "Thiếu campaign runner: $CORE" >&2; return 2; }
   [[ -s "$EXPOSURE_MANIFEST" ]] || { echo "Thiếu gói exposure đi kèm repo: $EXPOSURE_MANIFEST" >&2; return 2; }
   [[ -s "$EXPOSURE_AUDIT" ]] || { echo "Thiếu audit exposure đi kèm repo: $EXPOSURE_AUDIT" >&2; return 2; }
+  [[ -d "$CAMPAIGN_DATA_DIR" ]] || { echo "Thiếu corpus đã audit cho campaign A: $CAMPAIGN_DATA_DIR (đặt DCE_DATA_DIR nếu chuyển nơi lưu)." >&2; return 2; }
 }
 
 run_phase() {
@@ -40,6 +45,7 @@ run_phase() {
   local mode="$2"
   local -a phase_args=(
     --run-id "$run_id"
+    --data-dir "$CAMPAIGN_DATA_DIR"
     --exposure-manifest "$EXPOSURE_MANIFEST"
     --gpu-ids "$GPU_ID"
     --attention-backend flash_attention_4
@@ -50,7 +56,7 @@ run_phase() {
     phase_args+=(--resume)
   fi
   shift 2
-  echo "[$(date -u +%FT%TZ)] phase=$mode run_id=$run_id"
+  echo "[$(date -u +%FT%TZ)] phase=$mode run_id=$run_id data_dir=$CAMPAIGN_DATA_DIR"
   bash "$CORE" "${phase_args[@]}" "$@"
 }
 
@@ -192,28 +198,34 @@ campaign_command() {
 campaign_is_running() {
   local run_root="$1"
   local run_id="$2"
-  local pid cmdline proc_cmd
-  if [[ -s "$run_root/campaign.pid" ]]; then
-    pid="$(<"$run_root/campaign.pid")"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
-        && [[ -r "/proc/$pid/cmdline" ]]; then
-      cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" || true)"
-      if [[ "$cmdline" == *"$SELF"* && "$cmdline" == *"_campaign"* && "$cmdline" == *"$run_id"* ]]; then
-        return 0
-      fi
-    fi
-  fi
+  local proc_cmd index argument worker_seen worker_run
+  local -a command_args=()
   # The launcher can die while its Python child is still writing. Scan Linux
-  # command lines as well as the PID file so resume cannot start a second
-  # writer against the same checkpoint directory.
+  # argv so resume cannot start a second writer. Compare complete arguments:
+  # a worker for run-10 must never be mistaken for run-1.
   for proc_cmd in /proc/[0-9]*/cmdline; do
     [[ -r "$proc_cmd" ]] || continue
-    pid="${proc_cmd#/proc/}"
-    pid="${pid%/cmdline}"
-    cmdline="$(tr '\0' ' ' <"$proc_cmd" 2>/dev/null || true)"
-    if [[ "$cmdline" == *"$SELF _campaign $run_id"* \
-        || "$cmdline" == *"run_dflash_context_experiments.sh --run-id $run_id"* \
-        || "$cmdline" == *"run_dflash_context_experiments.py --run-id $run_id"* ]]; then
+    command_args=()
+    if ! mapfile -d '' -t command_args <"$proc_cmd" 2>/dev/null; then
+      continue
+    fi
+    worker_seen=0
+    worker_run=""
+    for index in "${!command_args[@]}"; do
+      argument="${command_args[$index]}"
+      if [[ "$argument" == "$SELF" && "${command_args[index+1]:-}" == "_campaign" \
+          && "${command_args[index+2]:-}" == "$run_id" ]]; then
+        return 0
+      fi
+      case "${argument##*/}" in
+        run_dflash_context_experiments.sh|run_dflash_context_experiments.py) worker_seen=1 ;;
+      esac
+      case "$argument" in
+        --run-id) worker_run="${command_args[index+1]:-}" ;;
+        --run-id=*) worker_run="${argument#--run-id=}" ;;
+      esac
+    done
+    if [[ "$worker_seen" == "1" && "$worker_run" == "$run_id" ]]; then
       return 0
     fi
   done
@@ -231,7 +243,9 @@ launch_campaign() {
     return 2
   }
   if campaign_is_running "$run_root" "$run_id"; then
-    echo "Campaign $run_id is already running (PID $(<"$run_root/campaign.pid"))." >&2
+    local recorded_pid="unknown"
+    [[ ! -s "$run_root/campaign.pid" ]] || recorded_pid="$(<"$run_root/campaign.pid")"
+    echo "Campaign $run_id is already running (recorded PID $recorded_pid)." >&2
     return 2
   fi
   local lock_fd

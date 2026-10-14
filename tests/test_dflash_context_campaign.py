@@ -15,6 +15,137 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_dflash_context_experiments as campaign
 
 
+@pytest.mark.parametrize("field,value", (("max_prefixes", 3), ("repetitions", 5), ("warmups", 7), ("seed", 123)))
+def test_resume_signature_rejects_changed_measurement_protocol(monkeypatch, field, value):
+    monkeypatch.setattr(campaign, "_code_signature", lambda: {"sha256": "fixed-code"})
+    args = campaign._parser().parse_args([])
+    runtime = {"runtime_signature": {"signature": "runtime"}}
+    before = campaign._cell_signature(runtime, args, "dev", "a3_rollout_pairs")
+    setattr(args, field, value)
+    assert campaign._cell_signature(runtime, args, "dev", "a3_rollout_pairs") != before
+
+
+def test_prefix_does_not_repeat_cells_that_already_exhausted_local_retries():
+    result = {"status": "ok", "a1": [], "a3_replay": [], "a2": [{
+        "status": "error", "reason": "temporary cell failure",
+        "compute_error": {"status": "error", "attempts": 2},
+    }]}
+    assert campaign._replay_result_error(result) is None
+
+
+@pytest.mark.parametrize("worker_run,expected", (("run-10", 1), ("run-1", 0)))
+def test_worker_detection_matches_run_id_as_an_argument(tmp_path, worker_run, expected):
+    launcher = (ROOT / "scripts/run_dflash_context_A_b200.sh").read_text()
+    function = launcher.split("campaign_is_running() {", 1)[1].split("launch_campaign() {", 1)[0]
+    harness = 'set -Eeuo pipefail\nSELF="$3"\ncampaign_is_running() {' + function + '\ncampaign_is_running "$1" "$2"\n'
+    # A live worker exposes a NUL-separated argv through /proc. Its compute
+    # body is a short sleep so this regression does not import a GPU model.
+    worker = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(30)",
+        str(ROOT / "scripts/run_dflash_context_experiments.py"), "--run-id", worker_run,
+    ])
+    try:
+        result = subprocess.run([
+            "bash", "-s", "--", str(tmp_path), "run-1", str(ROOT / "scripts/run_dflash_context_A_b200.sh"),
+        ], input=harness, text=True, capture_output=True, timeout=10)
+        assert result.returncode == expected, result.stderr
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
+
+
+def test_nonfinite_reference_round_is_retried_before_json_checkpoint():
+    assert campaign._reference_result_error({
+        "parity": {"status": "pass"}, "adapter_rounds": [{"draft_ms": float("nan")}],
+    }) is not None
+
+
+@pytest.mark.parametrize("changed", ("parity", "rollout", "cohort"))
+def test_confirm_rejects_changed_locked_dev_artifacts_before_gpu(tmp_path, monkeypatch, changed):
+    import json
+    import hashlib
+    from TrainingFree.context_interventions import environment
+
+    args = campaign._parser().parse_args(["--mode", "confirm", "--run-id", "run-1", "--allow-partial-confirm"])
+    monkeypatch.setattr(campaign, "_load_samples", lambda args: ([], []))
+    split = {"status": "complete"}
+    monkeypatch.setattr(campaign, "_cohort", lambda *args, **kwargs: ([], split, {
+        "phase": "confirm", "quotas": {"gov_report": 1}, "groups": [{"dataset": "gov_report"}],
+    }))
+    monkeypatch.setattr(campaign, "_code_signature", lambda: {"sha256": "code"})
+    monkeypatch.setattr(environment, "run_preflight", lambda **kwargs: pytest.fail("GPU preflight must not be reached"))
+    artifacts = {
+        "parity": (tmp_path / "evidence/parity_dev.json", "dev_parity_sha256"),
+        "rollout": (tmp_path / "dev/a3_rollout.jsonl", "dev_rollout_sha256"),
+        "cohort": (tmp_path / "cohorts/dev.json", "dev_cohort_sha256"),
+    }
+    lock = {"status": "locked_for_heldout", "run_id": "run-1", "code_signature": "code",
+            "selector": "previous_dflash", "budget": 2048, "refresh_period": 4}
+    split_path = tmp_path / "cohorts/split_manifest.json"
+    split_path.parent.mkdir(parents=True)
+    split_path.write_text(json.dumps(split))
+    lock["split_manifest_sha256"] = hashlib.sha256(split_path.read_bytes()).hexdigest()
+    for path, field in artifacts.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}\n')
+        lock[field] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (tmp_path / "locked_config.json").write_text(json.dumps(lock))
+    (tmp_path / "runtime_dev.json").write_text('{}')
+    artifacts[changed][0].write_text('{"changed": true}\n')
+    with pytest.raises(campaign.CampaignIntegrityError, match="locked dev"):
+        campaign._run_phase(args, tmp_path, "confirm")
+
+
+def test_one_bad_sample_with_many_prefixes_does_not_stop_next_sample(tmp_path, monkeypatch):
+    from TrainingFree.context_adaptive import prompt
+    from TrainingFree.context_adaptive.schema import read_jsonl
+    from TrainingFree.context_interventions import replay
+
+    class Ids:
+        def to(self, device):
+            return self
+
+        def contiguous(self):
+            return self
+
+    monkeypatch.setattr(prompt, "prepare_prompt", lambda *args, **kwargs: (
+        Ids(), SimpleNamespace(prompt_hash="hash", source_available=True),
+    ))
+    prefixes = [SimpleNamespace(
+        round_index=i, processed_output_tokens=i * 16, prefix_hash=f"prefix-{i}",
+        previous_dense_round_index=None, remaining_output_tokens=1024 - i * 16,
+    ) for i in range(6)]
+    monkeypatch.setattr(replay, "choose_reference_prefixes", lambda *args, **kwargs: prefixes)
+    monkeypatch.setattr(campaign, "_prefix_pair", lambda *args: None)
+    monkeypatch.setattr(campaign, "_code_signature", lambda: {"sha256": "code"})
+    samples = [{"id": f"sample-{i}", "dataset": "gov_report", "_cad_source_group_id": f"group-{i}"}
+               for i in (1, 2)]
+    traces = [{
+        "sample_id": sample["id"], "native_ids": [1], "adapter_ids": [1],
+        "parity": {"status": "pass", "native_equals_adapter": True},
+        "prompt_hash": "hash", "prompt_tokens": 4,
+        "adapter_rounds": [{"type": "round", "gamma_executed": 15, "round_index": i, "accepted_candidates": 1}
+                           for i in range(6)],
+    } for sample in samples]
+    measured = []
+
+    def compute(args, runtime, sample, *other, **kwargs):
+        measured.append(sample["id"])
+        return ({"status": "baseline_mismatch", "reason": "local numerical mismatch"}
+                if sample["id"] == "sample-1"
+                else {"status": "ok", "a1": [], "a2": [], "a3_replay": []})
+
+    monkeypatch.setattr(campaign, "_compute_replay_prefix", compute)
+    args = campaign._parser().parse_args(["--run-id", "run-1", "--max-new-tokens", "1024"])
+    campaign._run_replay(
+        args, tmp_path, {"runtime_signature": {"signature": "runtime"}, "tokenizer": None,
+                         "target": SimpleNamespace(device="cpu")},
+        samples, traces, phase="pilot", max_new_tokens=1024, run_a3=True,
+    )
+    assert measured == ["sample-1"] * 6 + ["sample-2"] * 6
+    assert sum(row.get("type") == "prefix_diagnostic" for row in read_jsonl(tmp_path / "pilot/prefix_diagnostics.jsonl")) == 6
+
+
 def test_replay_uses_full_dflash_ids_when_ar_trajectory_diverges() -> None:
     trace = {
         "ar_ids": [10, 99, 30],
@@ -54,7 +185,6 @@ def test_b200_campaign_launcher_uses_shared_config_and_python_runtime() -> None:
     assert 'resume)' in launcher
     assert 'phase_args+=(--resume)' in launcher
     assert 'run_phase_resumable "$run_id" pilot' in launcher
-    assert 'run_dflash_context_experiments.py --run-id $run_id' in launcher
     assert "campaign.status" in launcher
     assert 'flock -n "$lock_fd"' in launcher
 
@@ -328,7 +458,7 @@ def test_rollout_retries_returned_error_rows_once(tmp_path, monkeypatch) -> None
         warmups=1,
     )
 
-    assert calls == [1, 0]
+    assert calls == [1, 1]
     assert len(store.rows()) == 1
     rows = store.rows()[0]["rows"]
     assert len(rows) == 4
@@ -375,6 +505,57 @@ def _successful_rollout_rows(attempt=1):
          "wall_e2e_ms": 1.0, "counters": {"mean_accepted_candidates": 4.0}}
         for variant in ("ar", "native_full_dflash", "adapter_full", "previous_dflash")
     ]
+
+
+def test_rollout_rewarms_after_first_repetition_failed_before_all_arms(rollout_case, monkeypatch, tmp_path):
+    from TrainingFree.context_interventions import execution
+
+    args, samples, stores, _ = rollout_case
+    calls = []
+
+    def measure(_runtime, sample, **kwargs):
+        calls.append((kwargs["repetition"], kwargs["warmups"]))
+        if kwargs["repetition"] == 0:
+            raise RuntimeError("allocation failed before every arm warmed")
+        return _successful_rollout_rows()
+
+    monkeypatch.setattr(execution, "run_a3_comparison", measure)
+    campaign._run_rollouts(
+        args, tmp_path, {}, samples[:1], [{"sample_id": samples[0]["id"]}],
+        phase="pilot", max_new_tokens=32, periods=(4,), repetitions=2, warmups=1,
+    )
+    assert calls == [(0, 1), (0, 1), (1, 1)]
+    assert sorted(row["status"] for row in stores[-1].rows()) == ["error", "ok"]
+
+
+def test_resumed_missing_rollout_repetition_warms_current_process(rollout_case, monkeypatch, tmp_path):
+    from TrainingFree.context_interventions import execution
+    from TrainingFree.context_interventions.artifacts import CellStore
+
+    args, samples, _, _ = rollout_case
+    warmups = []
+    monkeypatch.setattr(execution, "run_a3_comparison", lambda *pos, **kwargs: (
+        warmups.append(kwargs["warmups"]) or _successful_rollout_rows()
+    ))
+    save = CellStore.save
+
+    def interrupted_save(self, cell_id, bundle):
+        save(self, cell_id, bundle)
+        raise OSError("interrupted after committing first repetition")
+
+    def run():
+        campaign._run_rollouts(
+            args, tmp_path, {}, samples[:1], [{"sample_id": samples[0]["id"]}],
+            phase="pilot", max_new_tokens=32, periods=(4,), repetitions=2, warmups=1,
+        )
+
+    monkeypatch.setattr(CellStore, "save", interrupted_save)
+    with pytest.raises(OSError):
+        run()
+    monkeypatch.setattr(CellStore, "save", save)
+    args.resume = True
+    run()
+    assert warmups == [1, 1]
 
 
 def test_rollout_exception_does_not_stop_next_sample_and_resume_recovers_pair(rollout_case, monkeypatch):

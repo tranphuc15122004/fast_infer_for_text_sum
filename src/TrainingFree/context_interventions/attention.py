@@ -37,9 +37,9 @@ def full_key_attention_scores(
         valid = positions >= max(0, int(query_position) - int(sliding_window) + 1)
         logits = logits.masked_fill(~valid.view(1, 1, 1, -1), torch.finfo(logits.dtype).min)
     probabilities = torch.softmax(logits, dim=-1).mean(dim=(0, 1, 2))
-    values = probabilities.detach().cpu().tolist()
-    if any(not torch.isfinite(probability).item() for probability in probabilities):
+    if not torch.isfinite(probabilities).all().item():
         raise ValueError("target attention scores contain non-finite values")
+    values = probabilities.detach().cpu().tolist()
     return {position: float(value) for position, value in enumerate(values)}
 
 

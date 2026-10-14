@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -115,3 +116,64 @@ print(json.dumps({"rows": len(samples), "paths": [str(p) for p in paths],
     assert payload["legacy_alias"] == str(corpus)
     assert payload["rows"] == 3
     assert payload["paths"] == [str(p) for p in sorted(corpus.glob("*.jsonl"))]
+
+
+def test_campaign_routes_every_phase_to_audited_corpus_despite_xsum_master(tmp_path):
+    replica = tmp_path / "repo"
+    (replica / "scripts/common").mkdir(parents=True)
+    for name in (
+        "scripts/run_dflash_context_A_b200.sh", "scripts/run_dflash_context_experiments.sh",
+        "scripts/common/config.sh", "scripts/common/runtime.sh",
+    ):
+        shutil.copy2(ROOT / name, replica / name)
+    (replica / "data").symlink_to(ROOT / "data", target_is_directory=True)
+    selected = ROOT / "data/longbench_100_14k"
+    xsum = tmp_path / "xsum.jsonl"
+    xsum.write_text(json.dumps({"id": "xsum-1", "context": "wrong corpus"}) + "\n")
+    master = tmp_path / "master.env"
+    master.write_text(
+        f"DATA_INPUT={shlex.quote(str(xsum))}\n"
+        f"DCE_DATA_DIR={shlex.quote(str(selected))}\n"
+    )
+    capture = tmp_path / "phase_paths.jsonl"
+    probe = tmp_path / "python-probe"
+    probe.write_text(f"#!{sys.executable}\n" + f'''
+import json, os, sys
+from pathlib import Path
+if sys.argv[1:2] in (["-c"], ["-"]):
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+sys.path.insert(0, {str(ROOT / "scripts")!r})
+import run_dflash_context_experiments as campaign
+sys.argv.extend(["--output-root", {str(replica / "outputs/dflash_context_interventions")!r}])
+args = campaign._parser().parse_args(sys.argv[2:])
+directory, file = campaign._paths(args)
+sys.argv = [sys.argv[1], *sys.argv[2:]]
+with Path({str(capture)!r}).open("a") as handle:
+    handle.write(json.dumps({{"mode": args.mode, "directory": str(directory), "file": str(file)}}) + "\\n")
+if args.mode == "preflight":
+    # Only GPU/package checks are substituted; corpus loading is real.
+    from TrainingFree.context_interventions import environment
+    def cpu_preflight(**kwargs):
+        samples, _ = campaign._load_samples(args)
+        return {{"status": "ready", "data": {{"record_count": len(samples)}}}}
+    environment.run_preflight = cpu_preflight
+    raise SystemExit(campaign.main())
+if args.mode == "prepare":
+    raise SystemExit(campaign.main())
+# GPU phases and gates are substituted: this test checks data routing only.
+''')
+    probe.chmod(0o755)
+    environment = dict(os.environ)
+    for name in (*DATA_VARIABLES, "FAST_INFER_MASTER_LOADED", "DCE_DATA_DIR", "DCE_RESUME"):
+        environment.pop(name, None)
+    environment.update(FAST_INFER_MASTER_CONFIG=str(master), FAST_INFER_PYTHON=str(probe))
+    result = subprocess.run([
+        "bash", str(replica / "scripts/run_dflash_context_A_b200.sh"), "_campaign", "test-routing",
+    ], env=environment, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert [row["mode"] for row in observed] == [
+        "preflight", "prepare", "validate", "pilot", "dev", "lock", "confirm", "report",
+    ]
+    assert all(row["directory"] == str(selected) and row["file"] == "None" for row in observed)
+    assert "campaign complete" in result.stdout

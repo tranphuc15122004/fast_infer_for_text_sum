@@ -35,7 +35,7 @@ from TrainingFree.context_interventions.replay import (
     mean_target_scoring_vectors,
     rebuild_replay_state,
 )
-from TrainingFree.context_interventions.resilience import CampaignIntegrityError, is_fatal_compute_error
+from TrainingFree.context_interventions.resilience import CampaignIntegrityError, is_fatal_compute_error, run_compute_unit
 
 
 def _eos_ids(target: Any) -> set[int]:
@@ -244,6 +244,7 @@ def _action_row(
         ),
         "status": outcome.get("status", "error"),
         "reason": outcome.get("reason"),
+        "compute_error": outcome.get("compute_error"),
         "actual_context_tokens_by_layer": outcome.get("actual_context_tokens_by_layer"),
         "positions_sha256_by_layer": outcome.get("positions_sha256_by_layer"),
         "ranking_origin_round": (
@@ -378,6 +379,38 @@ def _replay_previous_dflash_round(
         state = None
 
 
+def _safe_replay_action(runtime, input_ids, state, layout, masks, **kwargs) -> dict[str, Any]:
+    """Retry one diagnostic fork; a bad cell must not discard its neighbors."""
+    from TrainingFree.context_adaptive.schema import _check_finite
+
+    bank_length = state.bank.length
+
+    def evaluate():
+        try:
+            return evaluate_replay_action(runtime, input_ids, state, layout, masks, **kwargs)
+        finally:
+            if state.bank.length != bank_length:
+                raise CampaignIntegrityError("replay draft-bank logical length changed after diagnostic action")
+
+    def result_error(outcome):
+        if outcome.get("status") == "error":
+            return str(outcome.get("reason") or "replay action failed")
+        invalid = _check_finite(outcome)
+        return f"nonfinite replay action values: {invalid}" if invalid else None
+
+    outcome, error = run_compute_unit(
+        evaluate, label=f"replay cell {kwargs.get('selector_id')} B={kwargs.get('requested_budget')}",
+        result_error=result_error,
+    )
+    if error is not None:
+        return {
+            "status": "error", "reason": error["reason"], "accepted_candidates": None,
+            "actual_context_tokens_by_layer": [len(mask) for mask in masks],
+            "compute_error": error,
+        }
+    return outcome
+
+
 def _evaluate_mask(
     runtime: Mapping[str, Any],
     input_ids: torch.Tensor,
@@ -399,26 +432,12 @@ def _evaluate_mask(
     ranking_origin_round: int | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    try:
-        outcome = evaluate_replay_action(
-            runtime,
-            input_ids,
-            state,
-            layout,
-            masks,
-            requested_budget=nominal_budget,
-            selector_id=label,
-            remaining_output_tokens=prefix.remaining_output_tokens,
-            ranking_origin_round=ranking_origin_round,
-        )
-    except torch.cuda.OutOfMemoryError as exc:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        outcome = {"status": "error", "reason": f"out_of_memory:{str(exc)[:300]}", "accepted_candidates": None}
-    except Exception as exc:
-        if is_fatal_compute_error(exc):
-            raise CampaignIntegrityError(f"replay action {label}: {exc}") from exc
-        outcome = {"status": "error", "reason": f"{type(exc).__name__}:{str(exc)[:500]}", "accepted_candidates": None}
+    outcome = _safe_replay_action(
+        runtime, input_ids, state, layout, masks,
+        requested_budget=nominal_budget, selector_id=label,
+        remaining_output_tokens=prefix.remaining_output_tokens,
+        ranking_origin_round=ranking_origin_round,
+    )
     return _action_row(
         experiment=experiment,
         phase=phase,
@@ -744,7 +763,7 @@ def run_a2_prefix(
                             ))
                     else:
                         raise ValueError(f"unsupported selector {selector}")
-                    outcome = evaluate_replay_action(
+                    outcome = _safe_replay_action(
                         runtime, input_ids, state, layout, masks,
                         requested_budget=effective_budget, selector_id=selector,
                         remaining_output_tokens=prefix.remaining_output_tokens,
@@ -1182,7 +1201,7 @@ def run_a3_prefix(
                         bank_length=bank_length, budget=int(budget), protected_positions=protected,
                         scores=carried, strategy="score_high",
                     ))
-            outcome = evaluate_replay_action(
+            outcome = _safe_replay_action(
                 runtime, input_ids, state, layout, masks,
                 requested_budget=requested, selector_id=selector,
                 remaining_output_tokens=prefix.remaining_output_tokens,
