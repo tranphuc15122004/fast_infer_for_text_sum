@@ -210,6 +210,19 @@ def test_no_usable_b0_stops_without_collecting_invalid_replays(full_workflow, mo
     assert status["stages"]["B0"]["status"] == "failed"
 
 
+def test_empty_b1v_is_not_reported_as_complete_or_open_gates(full_workflow, monkeypatch):
+    args, calls, _, status_path = full_workflow
+    monkeypatch.setattr(campaign, "_b1v", lambda *a: {
+        "status": "failed", "reason": "no_current_paired_b1_cells",
+    })
+    assert campaign._run_all(args) == 0
+    status = json.loads(status_path.read_text())
+    assert status["stages"]["B1-V"]["status"] == "failed"
+    assert status["stages"]["B3-dev"]["status"] == "prerequisites_incomplete"
+    assert "B3:dev" not in calls
+    assert status["collection_status"] == "partial"
+
+
 def test_all_resume_loads_both_saved_campaigns(full_workflow, monkeypatch):
     args, calls, _, status_path = full_workflow
     args.resume = True

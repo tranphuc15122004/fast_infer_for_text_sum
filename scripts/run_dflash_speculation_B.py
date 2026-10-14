@@ -1077,6 +1077,13 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
         "failed_state_count": failed_count,
     })
     print(f"[B1] collected states={len(cells)} failed={failed_count}; continuing", flush=True)
+    return {
+        "status": "partial" if failed_count else "complete",
+        "state_count": len(cells),
+        "failed_state_count": failed_count,
+        "action_count": len(actions),
+        "signal_count": len(signals),
+    }
 
 
 def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: Path, runtime: Mapping[str, Any]) -> None:
@@ -1122,8 +1129,14 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
     b1_signature = _hash_json({"code": code, "runtime": runtime_sig, "campaign": b1_params})
     if any(cell.get("campaign_signature") != b1_signature for cell in b1_cells):
         stale_count = sum(cell.get("campaign_signature") != b1_signature for cell in b1_cells)
+        observed_signatures = sorted({
+            str(cell.get("campaign_signature", "missing"))[:12]
+            for cell in b1_cells
+            if cell.get("campaign_signature") != b1_signature
+        })[:5]
         print(
-            f"[B1-V] ignoring {stale_count} B1 cells from another code/runtime/protocol signature",
+            f"[B1-V] ignoring {stale_count} B1 cells from another code/runtime/protocol signature; "
+            f"expected={b1_signature[:12]} observed={observed_signatures}",
             file=sys.stderr,
             flush=True,
         )
@@ -1141,8 +1154,13 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
             "type": "summary", "status": "skipped_no_current_paired_b1_cells",
             "state_count": 0, "failed_state_count": 0, "action_count": 0,
         })
-        print("[B1-V] no current paired B1 cells; saved empty coverage artifact and continuing", flush=True)
-        return
+        print("[B1-V] no current paired B1 cells; saved empty coverage artifact", flush=True)
+        return {
+            "status": "failed",
+            "reason": "no_current_paired_b1_cells",
+            "expected_b1_signature": b1_signature[:12],
+            "current_paired_state_count": 0,
+        }
     params = {
         "verify_prefixes": (3, 7, 11, 15),
         "repetitions": args.repetitions,
@@ -1356,6 +1374,12 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         "action_count": len(actions),
     })
     print(f"[B1-V] collected states={len(valid_cells)} failed={failed_count}; continuing", flush=True)
+    return {
+        "status": "partial" if failed_count else "complete",
+        "state_count": len(valid_cells),
+        "failed_state_count": failed_count,
+        "action_count": len(actions),
+    }
 
 
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]) -> None:
@@ -3179,7 +3203,8 @@ def _run_all(args: argparse.Namespace) -> int:
         reported = result.get("status") if isinstance(result, dict) else None
         outcome = (
             "not_applicable" if reported == "b1v_overhead_gate_closed"
-            else "failed" if reported in {"unavailable", "generation_error", "warmup_incomplete", "no_valid_requests"}
+            else "partial" if reported == "partial"
+            else "failed" if reported in {"failed", "unavailable", "generation_error", "warmup_incomplete", "no_valid_requests"}
             else "complete"
         )
         record(name, outcome, reported_status=reported)
@@ -3273,7 +3298,7 @@ def _run_all(args: argparse.Namespace) -> int:
 
         partial = (
             not core_ready
-            or any(stage["status"] in {"failed", "prerequisites_incomplete"} for stage in status["stages"].values())
+            or any(stage["status"] in {"partial", "failed", "prerequisites_incomplete"} for stage in status["stages"].values())
         )
         status["workflow_status"] = "finished"
         status["collection_status"] = "partial" if partial else "complete"
