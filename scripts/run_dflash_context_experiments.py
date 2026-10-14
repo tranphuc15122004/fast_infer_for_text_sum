@@ -323,6 +323,28 @@ def _reference_trace_path(run_root: Path, sample_id: str) -> Path:
     return run_root / "traces" / f"{key}.json"
 
 
+def _replay_reference_ids(trace: Mapping[str, Any]) -> list[int]:
+    """Return the full-DFlash trajectory paired with the saved adapter rounds.
+
+    The adapter trace owns round indices and accepted-candidate counts. AR is a
+    diagnostic trajectory and may diverge from native/full-adapter DFlash.
+    """
+    native_ids = trace.get("native_ids")
+    adapter_ids = trace.get("adapter_ids")
+    if native_ids is None or adapter_ids is None:
+        raise ValueError("reference trace is missing native or adapter output IDs")
+    native_ids = [int(token) for token in native_ids]
+    adapter_ids = [int(token) for token in adapter_ids]
+    if native_ids != adapter_ids:
+        raise ValueError("native full DFlash and adapter IDs differ")
+    parity = trace.get("parity")
+    if not isinstance(parity, Mapping) or parity.get("status") != "pass" or not parity.get("native_equals_adapter"):
+        raise ValueError("reference trace does not contain passing native/full-adapter parity evidence")
+    if trace.get("replay_reference_trajectory", "adapter_ids") != "adapter_ids":
+        raise ValueError("reference trace names an unsupported replay trajectory")
+    return adapter_ids
+
+
 def _run_parity_cohort(
     args: argparse.Namespace,
     run_root: Path,
@@ -371,6 +393,7 @@ def _run_parity_cohort(
                 "ar_ids": measured["ar_ids"],
                 "native_ids": measured["native_ids"],
                 "adapter_ids": measured["adapter_ids"],
+                "replay_reference_trajectory": "adapter_ids",
                 "adapter_rounds": measured["adapter_rounds"],
                 "eos_ids": sorted(measured["eos_ids"]),
                 "parity": measured["parity"],
@@ -423,6 +446,7 @@ def _trace_index(traces: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, 
 
 def _prefix_pair(trace: Mapping[str, Any], prefix, max_new_tokens: int):
     from TrainingFree.context_interventions.execution import _prefix_from_trace
+    reference_ids = _replay_reference_ids(trace)
     round_map = {int(row["round_index"]): row for row in trace.get("adapter_rounds", [])
                  if row.get("type") == "round" and int(row.get("gamma_executed", 0)) >= 15}
     previous = None
@@ -430,7 +454,7 @@ def _prefix_pair(trace: Mapping[str, Any], prefix, max_new_tokens: int):
         row = round_map.get(int(prefix.previous_dense_round_index))
         if row is not None:
             previous = _prefix_from_trace(
-                row, output_ids=trace["ar_ids"], max_new_tokens=max_new_tokens,
+                row, output_ids=reference_ids, max_new_tokens=max_new_tokens,
                 previous_round_index=None,
             )
     return previous
@@ -438,6 +462,7 @@ def _prefix_pair(trace: Mapping[str, Any], prefix, max_new_tokens: int):
 
 def _prefix_at_age(trace: Mapping[str, Any], prefix, age: int, max_new_tokens: int):
     from TrainingFree.context_interventions.execution import _prefix_from_trace
+    reference_ids = _replay_reference_ids(trace)
 
     prior_rounds = sorted(
         (row for row in trace.get("adapter_rounds", [])
@@ -449,7 +474,7 @@ def _prefix_at_age(trace: Mapping[str, Any], prefix, age: int, max_new_tokens: i
         return None
     row = prior_rounds[-age]
     return _prefix_from_trace(
-        row, output_ids=trace["ar_ids"], max_new_tokens=max_new_tokens,
+        row, output_ids=reference_ids, max_new_tokens=max_new_tokens,
         previous_round_index=None,
     )
 
@@ -513,6 +538,7 @@ def _run_replay(
     for sample_index, trace in enumerate(traces, start=1):
         sample = sample_map[str(trace["sample_id"])]
         sample["_campaign_run_id"] = args.run_id
+        reference_output_ids = _replay_reference_ids(trace)
         ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
         ids = ids.to(runtime["target"].device).contiguous()
         if layout.prompt_hash != trace["prompt_hash"]:
@@ -520,7 +546,7 @@ def _run_replay(
         if not layout.source_available:
             raise ValueError(f"source span became unavailable during replay: {sample['id']} {layout.source_reason}")
         prefixes = choose_reference_prefixes(
-            trace["adapter_rounds"], trace["ar_ids"], prompt_length=int(trace["prompt_tokens"]),
+            trace["adapter_rounds"], reference_output_ids, prompt_length=int(trace["prompt_tokens"]),
             max_new_tokens=max_new_tokens, eos_ids={int(value) for value in trace.get("eos_ids", [])},
             max_prefixes=args.max_prefixes,
         )
@@ -550,7 +576,7 @@ def _run_replay(
                 f"{sample['dataset']}:{sample['id']} round={prefix.round_index}", flush=True,
             )
             replay_state = rebuild_replay_state(
-                runtime, ids, trace["ar_ids"], prefix, layout, max_new_tokens=max_new_tokens,
+                runtime, ids, reference_output_ids, prefix, layout, max_new_tokens=max_new_tokens,
             )
             full_positions = tuple(range(replay_state.bank.length))
             full_outcome = evaluate_replay_action(
@@ -563,18 +589,21 @@ def _run_replay(
             replay_cache: dict[int, Mapping[str, Any]] = {}
             if full_outcome.get("status") != "ok" or int(full_outcome.get("accepted_candidates", -1)) != reference_accepted:
                 raise RuntimeError(
-                    f"full replay did not reproduce reference acceptance at round {prefix.round_index}: "
+                    f"full replay did not reproduce reference acceptance for "
+                    f"{sample['dataset']}:{sample['id']} at round {prefix.round_index} "
+                    f"(processed_output_tokens={prefix.processed_output_tokens}, "
+                    f"prefix_hash={prefix.prefix_hash}): "
                     f"{full_outcome.get('reason') or full_outcome.get('accepted_candidates')} != {reference_accepted}"
                 )
             a1_rows = run_a1_prefix(
-                runtime, sample, ids, layout, prefix, trace["ar_ids"], phase=phase,
+                runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
                 max_new_tokens=max_new_tokens, state=replay_state, full_outcome=full_outcome,
                 source_anchors=args.source_anchors,
                 recent_output=args.recent_output, reference_accepted=reference_accepted,
             )
             _save_rows(stores["a1"], a1_rows, existing["a1"])
             a2_rows = run_a2_prefix(
-                runtime, sample, ids, layout, prefix, trace["ar_ids"], phase=phase,
+                runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
                 max_new_tokens=max_new_tokens, state=replay_state, full_outcome=full_outcome,
                 replay_cache=replay_cache, previous_prefix=previous,
                 reference_accepted=reference_accepted, previous_reference_accepted=previous_accepted,
@@ -590,7 +619,7 @@ def _run_replay(
                         age_row = round_rows.get(age_prefix.round_index)
                         age_accepted = int(age_row.get("accepted_candidates", 0)) if age_row else None
                     a3_rows = run_a3_prefix(
-                        runtime, sample, ids, layout, prefix, trace["ar_ids"], phase=phase,
+                        runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
                         selector=args.a3_selector, max_new_tokens=max_new_tokens,
                         state=replay_state, full_outcome=full_outcome,
                         replay_cache=replay_cache,

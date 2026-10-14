@@ -11,6 +11,14 @@ OUTPUT_ROOT="$ROOT/outputs/dflash_context_interventions"
 RUN_ID_PREFIX="dflash_context_A_b200"
 GPU_ID="0"
 
+# Use the same external master config and Python 3.12 runtime as the phase
+# runner. This also keeps the inline cohort validator on the selected runtime.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/config.sh"
+fast_infer_load_config dflash || exit 1
+# shellcheck disable=SC1091
+source "$ROOT/scripts/common/runtime.sh" || exit 1
+
 usage() {
   cat <<'EOF'
 Chạy campaign A1–A3 trên một GPU B200, không cần truyền config hoặc manifest.
@@ -43,7 +51,7 @@ run_phase() {
 verify_prepare() {
   local run_id="$1"
   local run_root="$OUTPUT_ROOT/$run_id"
-  python3 - "$run_root" "$EXPOSURE_MANIFEST" "$EXPOSURE_AUDIT" <<'PY'
+  "$FAST_INFER_PYTHON" - "$run_root" "$EXPOSURE_MANIFEST" "$EXPOSURE_AUDIT" <<'PY'
 import json
 import sys
 from collections import Counter

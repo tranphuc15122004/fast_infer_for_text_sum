@@ -23,6 +23,11 @@ với native full DFlash và acceptance. Vì chưa đăng ký biên ROUGE, khôn
 ROUGE để tuyên bố chất lượng được bảo toàn. Protocol amendment này được ghi
 nhận ngày 13/10/2026, trước khi chạy ma trận A1/A2/A3 và mở heldout.
 
+Round index và accepted-candidate count được ghi trên trajectory của full
+adapter, nên prefix replay cũng phải dựng từ `adapter_ids`; trace chỉ được replay
+khi `native_ids == adapter_ids` và parity status là `pass`. `ar_ids` chỉ dùng
+để chẩn đoán first divergence, không được dùng để dựng prefix hay pending anchor.
+
 Sau khi `start` trả về, theo dõi log bằng lệnh `tail -f` mà nó in ra. Kết quả
 nằm ở `outputs/dflash_context_interventions/<run_id>/`; báo cáo cuối là
 `reports/confirm_decision.md` và `reports/confirm_coverage.json`.
