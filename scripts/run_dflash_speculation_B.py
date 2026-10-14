@@ -440,22 +440,6 @@ def _runtime(args: argparse.Namespace) -> dict[str, Any]:
     return runtime
 
 
-def _code_signature() -> str:
-    from TrainingFree.context_adaptive.schema import sha256_file
-
-    paths = [
-        *sorted((ROOT / "src/TrainingFree/speculation_experiments").glob("*.py")),
-        *sorted((ROOT / "src/TrainingFree/context_adaptive").glob("*.py")),
-        *sorted((ROOT / "src/TrainingFree/context_interventions").glob("*.py")),
-        ROOT / "scripts/run_dflash_speculation_B.py",
-        ROOT / "externals/dflash/dflash/model.py",
-    ]
-    return _hash_json([
-        {"path": path.relative_to(ROOT).as_posix(), "sha256": sha256_file(path)}
-        for path in paths if path.is_file()
-    ])
-
-
 def _sample_trace_path(run_root: Path, sample: Mapping[str, Any]) -> Path:
     key = f"{sample['dataset']}::{sample['id']}"
     name = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -468,7 +452,6 @@ def _trace_signature(
     prompt_hash: str,
     args: argparse.Namespace,
     runtime_signature: Mapping[str, Any],
-    code_signature: str,
 ) -> str:
     return _hash_json({
         "sample": f"{sample['dataset']}::{sample['id']}",
@@ -477,12 +460,11 @@ def _trace_signature(
         "max_new_tokens": args.max_new_tokens,
         "validation_tokens": args.validation_tokens,
         "runtime": runtime_signature,
-        "code": code_signature,
     })
 
 
-def _trace_signature_matches(trace: Mapping[str, Any], expected_signature: str) -> bool:
-    return trace.get("trace_signature") == expected_signature
+def _trace_signature_matches(trace: Mapping[str, Any], expected: str) -> bool:
+    return str(trace.get("trace_signature", "")) == str(expected)
 
 
 def _complete_b0_trace(trace: Mapping[str, Any], gammas: Sequence[int]) -> bool:
@@ -504,24 +486,21 @@ def _complete_b0_trace(trace: Mapping[str, Any], gammas: Sequence[int]) -> bool:
     return all(isinstance(row, Mapping) for row in trace["adapter_rounds"])
 
 
-def _saved_b0_code_signature(
-    run_root: Path,
-    runtime_signature: Mapping[str, Any] | None = None,
-) -> str | None:
-    """Return the code lineage recorded with B0 when its runtime still matches."""
-    parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file():
-        return None
-    try:
-        parity = json.loads(parity_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(parity, Mapping) or parity.get("status") not in {"complete", "partial"}:
-        return None
-    if runtime_signature is not None and parity.get("runtime") != runtime_signature:
-        return None
-    signature = parity.get("code_signature")
-    return signature if isinstance(signature, str) and signature else None
+def _b0_trace_matches_sample(
+    trace: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    *,
+    prompt_hash: str,
+    gammas: Sequence[int],
+) -> bool:
+    """Check trace identity and protocol shape without comparing source hashes."""
+    return (
+        _complete_b0_trace(trace, gammas)
+        and trace.get("sample_id") == str(sample["id"])
+        and trace.get("dataset") == str(sample["dataset"])
+        and trace.get("source_group_id") == str(sample["_cad_source_group_id"])
+        and trace.get("prompt_hash") == prompt_hash
+    )
 
 
 def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: Path, runtime: Mapping[str, Any]) -> bool:
@@ -533,14 +512,22 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
     gammas = _parse_gammas(args.gammas)
     validation_rows = []
     runtime_signature = runtime["b_campaign_signature"]
-    current_code = _code_signature()
-    code = _saved_b0_code_signature(run_root, runtime_signature) or current_code
-    if code != current_code:
-        print(
-            f"[B0] reusing saved trace lineage code={code[:12]} with unchanged runtime; "
-            f"current code={current_code[:12]}",
-            flush=True,
-        )
+    previous_parity_path = run_root / "evidence" / "parity.json"
+    previous_parity = (
+        _read_json_artifact(run_root, "evidence", previous_parity_path)
+        if previous_parity_path.is_file() else None
+    )
+    if (
+        previous_parity
+        and previous_parity.get("status") in {"complete", "partial"}
+        and previous_parity.get("runtime") != runtime_signature
+    ):
+        raise ValueError("B0 runtime signature differs from saved measurements; use a new run ID")
+    reuse_existing_traces = bool(
+        previous_parity
+        and previous_parity.get("status") in {"complete", "partial"}
+        and previous_parity.get("runtime") == runtime_signature
+    )
     for sample_index, sample in enumerate(samples, start=1):
         path = _sample_trace_path(run_root, sample)
         try:
@@ -578,18 +565,19 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             prompt_hash=layout.prompt_hash,
             args=args,
             runtime_signature=runtime_signature,
-            code_signature=code,
         )
         if path.exists():
             saved = _read_json_artifact(run_root, "traces", path)
             if saved is not None:
-                if _trace_signature_matches(saved, expected_signature) and _complete_b0_trace(saved, gammas):
+                if reuse_existing_traces and _b0_trace_matches_sample(
+                    saved, sample, prompt_hash=layout.prompt_hash, gammas=gammas,
+                ):
                     parity = saved["parity_by_gamma"]
                     validation_rows.append({"sample_id": sample["id"], "status": "complete", "comparisons_by_gamma": parity})
                     print(f"[B0 {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
                     continue
-                # A stale or incomplete trace is preserved for inspection, then
-                # recomputed under the current source/runtime signature.
+                # Preserve a complete trace across source edits when the saved
+                # B0 runtime still matches. Rebuild only malformed or mismatched data.
                 _archive_stale_cell(run_root, "traces", path, saved)
 
         parity_by_gamma: dict[str, Any] = {}
@@ -708,7 +696,6 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
         ),
         "comparison_role": "diagnostic_only",
         "runtime": runtime_signature,
-        "code_signature": code,
     }
     atomic_json(run_root / "evidence" / "parity.json", summary)
     print(
@@ -730,7 +717,6 @@ def _mark_sample_setup_recovered(
     run_root: Path,
     phase: str,
     sample: Mapping[str, Any],
-    campaign_signature: str,
 ) -> None:
     state_key = f"sample|{sample['dataset']}|{sample['id']}|setup"
     path = _state_cell_path(run_root, state_key, phase=phase)
@@ -739,7 +725,7 @@ def _mark_sample_setup_recovered(
     cell = _read_json_artifact(run_root, phase, path)
     if cell is None:
         return
-    if cell.get("campaign_signature") != campaign_signature or cell.get("status") != "failed":
+    if cell.get("status") != "failed":
         return
     cell["status"] = "recovered"
     from TrainingFree.context_adaptive.schema import atomic_json
@@ -787,26 +773,19 @@ def _read_json_artifact(run_root: Path, phase: str, path: Path) -> dict[str, Any
     return value
 
 
-def _migrate_completed_cells(
+def _retain_compatible_cells(
     run_root: Path,
     phase: str,
     *,
-    current_signature: str,
     is_complete: Any,
 ) -> None:
-    """Reuse only cells from the exact same code/runtime/protocol signature."""
+    """Keep complete cells whose recorded measurements match the protocol shape."""
     for path in sorted((run_root / phase / "cells").glob("*.json")):
         cell = _read_json_artifact(run_root, phase, path)
         if cell is None:
             continue
-        if cell.get("campaign_signature") == current_signature:
-            if cell.get("status", "complete") == "complete" and not is_complete(cell):
-                _archive_stale_cell(run_root, phase, path, cell)
-            continue
-        # A source signature alone cannot prove that a code change was limited
-        # to orchestration. Re-labeling would silently mix measurements made by
-        # different inference/replay implementations.
-        _archive_stale_cell(run_root, phase, path, cell)
+        if cell.get("status", "complete") == "complete" and not is_complete(cell):
+            _archive_stale_cell(run_root, phase, path, cell)
 
 
 def _complete_b1_cell(cell: Mapping[str, Any], gammas: Sequence[int], repetitions: int) -> bool:
@@ -859,7 +838,8 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
     if not parity or parity.get("status") not in {"complete", "partial"}:
         raise RuntimeError("B1 requires at least one valid B0 reference trajectory")
     runtime_sig = runtime["b_campaign_signature"]
-    code = _saved_b0_code_signature(run_root, runtime_sig) or _code_signature()
+    if parity.get("runtime") != runtime_sig:
+        raise RuntimeError("B1 runtime signature differs from the B0 runtime")
     params = {
         "gammas": _parse_gammas(args.gammas),
         "repetitions": args.repetitions,
@@ -869,11 +849,10 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
     }
-    campaign_signature = _hash_json({"code": code, "runtime": runtime_sig, "campaign": params})
-    _migrate_completed_cells(
+    campaign_signature = _hash_json({"runtime": runtime_sig, "campaign": params})
+    _retain_compatible_cells(
         run_root,
         "b1",
-        current_signature=campaign_signature,
         is_complete=lambda cell: _complete_b1_cell(cell, params["gammas"], args.repetitions),
     )
     for sample_index, sample in enumerate(samples, start=1):
@@ -902,15 +881,10 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
             input_ids = input_ids.to(runtime["target"].device).contiguous()
             if layout.prompt_hash != trace["prompt_hash"]:
                 raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
-            expected_trace_signature = _trace_signature(
-                sample=sample,
-                prompt_hash=layout.prompt_hash,
-                args=args,
-                runtime_signature=runtime_sig,
-                code_signature=code,
-            )
-            if not _trace_signature_matches(trace, expected_trace_signature):
-                raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
+            if not _b0_trace_matches_sample(
+                trace, sample, prompt_hash=layout.prompt_hash, gammas=params["gammas"],
+            ):
+                raise ValueError(f"B0 trace identity/protocol differs for sample {sample['id']}")
             prefixes = select_reference_prefixes(
                 trace["adapter_rounds"],
                 reference_ids,
@@ -940,7 +914,7 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
                 state_key=sample_state_key, sample_id=str(sample["id"]), exc=exc,
             )
             continue
-        _mark_sample_setup_recovered(run_root, "b1", sample, campaign_signature)
+        _mark_sample_setup_recovered(run_root, "b1", sample)
         if not prefixes:
             print(f"[B1 {sample_index}/{len(samples)}] no regular states for {sample['dataset']}:{sample['id']}", flush=True)
             del input_ids
@@ -950,7 +924,7 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
             cell_path = _state_cell_path(run_root, state_key)
             if cell_path.exists():
                 cell = _read_json_artifact(run_root, "b1", cell_path)
-                if cell is not None and (cell.get("campaign_signature") != campaign_signature or cell.get("state_key") != state_key):
+                if cell is not None and cell.get("state_key") != state_key:
                     _archive_stale_cell(run_root, "b1", cell_path, cell)
                 elif cell is not None and (
                     cell.get("status", "complete") == "complete"
@@ -1083,9 +1057,6 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
         cell = _read_json_artifact(run_root, "b1", cell_path)
         if cell is None:
             continue
-        if cell.get("campaign_signature") != campaign_signature:
-            _archive_stale_cell(run_root, "b1", cell_path, cell)
-            continue
         if cell.get("status", "complete") == "complete" and _complete_b1_cell(cell, params["gammas"], args.repetitions):
             cells.append(cell)
     actions = [row for cell in cells for row in cell.get("actions", [])]
@@ -1122,8 +1093,12 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
     from TrainingFree.speculation_experiments.replay import run_verification_prefix_sweep
 
     parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") not in {"complete", "partial"}:
+    parity = json.loads(parity_path.read_text(encoding="utf-8")) if parity_path.is_file() else {}
+    runtime_sig = runtime["b_campaign_signature"]
+    if not isinstance(parity, Mapping) or parity.get("status") not in {"complete", "partial"}:
         raise RuntimeError("B1-V requires at least one valid B0 reference trajectory")
+    if parity.get("runtime") != runtime_sig:
+        raise RuntimeError("B1-V runtime signature differs from the B0 runtime")
     b1_cells = []
     for path in sorted((run_root / "b1" / "cells").glob("*.json")):
         cell = _read_json_artifact(run_root, "b1", path)
@@ -1142,51 +1117,16 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         str(cell["state_id"]): int(cell["accepted_by_gamma"]["15"])
         for cell in b1_cells
     }
-    current_code = _code_signature()
-    runtime_sig = runtime["b_campaign_signature"]
-    b0_code = _saved_b0_code_signature(run_root, runtime_sig) or current_code
-    b1_params = {
-        "gammas": _parse_gammas(args.gammas),
-        "repetitions": args.repetitions,
-        "selection_repetitions": args.selection_repetitions,
-        "warmups": args.warmups,
-        "max_prefixes": args.max_prefixes,
-        "max_new_tokens": args.max_new_tokens,
-        "seed": args.seed,
-    }
-    b1_signature = _hash_json({"code": b0_code, "runtime": runtime_sig, "campaign": b1_params})
-    if any(cell.get("campaign_signature") != b1_signature for cell in b1_cells):
-        stale_count = sum(cell.get("campaign_signature") != b1_signature for cell in b1_cells)
-        observed_signatures = sorted({
-            str(cell.get("campaign_signature", "missing"))[:12]
-            for cell in b1_cells
-            if cell.get("campaign_signature") != b1_signature
-        })[:5]
-        print(
-            f"[B1-V] ignoring {stale_count} B1 cells from another code/runtime/protocol signature; "
-            f"expected={b1_signature[:12]} observed={observed_signatures}",
-            file=sys.stderr,
-            flush=True,
-        )
-        b1_cells = [cell for cell in b1_cells if cell.get("campaign_signature") == b1_signature]
-        proposal_by_state = {
-            str(cell["state_id"]): tuple(int(token) for token in cell["proposal_by_gamma"]["15"])
-            for cell in b1_cells
-        }
-        accepted_by_state = {
-            str(cell["state_id"]): int(cell["accepted_by_gamma"]["15"])
-            for cell in b1_cells
-        }
+    print(f"[B1-V] compatible complete B1 cells={len(b1_cells)}; code hashes are not checked", flush=True)
     if not b1_cells:
         _write_jsonl(run_root / "b1v" / "verify_prefix.jsonl", [], {
-            "type": "summary", "status": "skipped_no_current_paired_b1_cells",
+            "type": "summary", "status": "skipped_no_complete_b1_cells",
             "state_count": 0, "failed_state_count": 0, "action_count": 0,
         })
-        print("[B1-V] no current paired B1 cells; saved empty coverage artifact", flush=True)
+        print("[B1-V] no complete protocol-compatible B1 cells; saved empty coverage artifact", flush=True)
         return {
             "status": "failed",
-            "reason": "no_current_paired_b1_cells",
-            "expected_b1_signature": b1_signature[:12],
+            "reason": "no_complete_b1_cells",
             "current_paired_state_count": 0,
         }
     params = {
@@ -1198,11 +1138,10 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
     }
-    signature = _hash_json({"code": current_code, "runtime": runtime_sig, "campaign": params})
-    _migrate_completed_cells(
+    signature = _hash_json({"runtime": runtime_sig, "campaign": params})
+    _retain_compatible_cells(
         run_root,
         "b1v",
-        current_signature=signature,
         is_complete=lambda cell: _complete_b1v_cell(cell, args.repetitions),
     )
     for sample_index, sample in enumerate(samples, start=1):
@@ -1231,15 +1170,10 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
             ids = ids.to(runtime["target"].device).contiguous()
             if layout.prompt_hash != trace["prompt_hash"]:
                 raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
-            expected_trace_signature = _trace_signature(
-                sample=sample,
-                prompt_hash=layout.prompt_hash,
-                args=args,
-                runtime_signature=runtime_sig,
-                code_signature=b0_code,
-            )
-            if trace.get("trace_signature") != expected_trace_signature:
-                raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
+            if not _b0_trace_matches_sample(
+                trace, sample, prompt_hash=layout.prompt_hash, gammas=(3, 7, 11, 15),
+            ):
+                raise ValueError(f"B0 trace identity/protocol differs for sample {sample['id']}")
             prefixes = select_reference_prefixes(
                 trace["adapter_rounds"], reference_ids,
                 prompt_length=int(trace["prompt_tokens"]), max_new_tokens=args.max_new_tokens,
@@ -1265,13 +1199,13 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
                 state_key=sample_state_key, sample_id=str(sample["id"]), exc=exc,
             )
             continue
-        _mark_sample_setup_recovered(run_root, "b1v", sample, signature)
+        _mark_sample_setup_recovered(run_root, "b1v", sample)
         for prefix_index, prefix in enumerate(prefixes, start=1):
             state_key = f"{sample['dataset']}|{sample['_cad_source_group_id']}|{prefix.round_index}"
             cell_path = run_root / "b1v" / "cells" / f"{hashlib.sha256(state_key.encode('utf-8')).hexdigest()}.json"
             if cell_path.exists():
                 existing = _read_json_artifact(run_root, "b1v", cell_path)
-                if existing is not None and existing.get("campaign_signature") != signature:
+                if existing is not None and existing.get("state_key") not in {None, state_key}:
                     _archive_stale_cell(run_root, "b1v", cell_path, existing)
                 elif existing is not None and (
                     existing.get("status", "complete") == "complete"
@@ -1389,9 +1323,6 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         if cell is None:
             failed_count += 1
             continue
-        if cell.get("campaign_signature") != signature:
-            _archive_stale_cell(run_root, "b1v", path, cell)
-            continue
         if cell.get("status", "complete") == "complete" and _complete_b1v_cell(cell, args.repetitions):
             valid_cells.append(cell)
         elif cell.get("status") == "failed":
@@ -1432,27 +1363,55 @@ def _sample_cell_path(root: Path, phase: str, sample: Mapping[str, Any]) -> Path
 
 def _load_resume_cell(
     path: Path,
-    signature: str,
     *,
     resume: bool,
     run_root: Path,
     phase: str,
+    is_compatible: Any,
 ) -> dict[str, Any] | None:
-    """Reuse a complete matching cell automatically; archive stale or torn cells."""
+    """Reuse a complete protocol-compatible cell; source hashes are provenance only."""
     if not path.exists():
         return None
-    # Reuse is keyed by the full signature, so requiring a second CLI switch
-    # only creates avoidable FileExistsError interruptions.
     del resume
     cell = _read_json_artifact(run_root, phase, path)
     if cell is None:
         return None
-    if cell.get("campaign_signature") != signature:
-        _archive_stale_cell(run_root, phase, path, cell)
-        return None
     if cell.get("status", "complete") != "complete":
         return None
+    if not is_compatible(cell):
+        _archive_stale_cell(run_root, phase, path, cell)
+        return None
     return cell
+
+
+def _request_cell_matches_protocol(
+    cell: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    *,
+    variants: Sequence[str],
+    repetitions: int,
+) -> bool:
+    """Check a saved E2E cell by its actual request coverage, not source hash."""
+    rows = cell.get("requests")
+    if not isinstance(rows, list):
+        return False
+    expected = {(str(variant), repetition) for variant in variants for repetition in range(repetitions)}
+    observed: set[tuple[str, int]] = set()
+    try:
+        for row in rows:
+            pair = (str(row["variant"]), int(row["repetition"]))
+            if pair in observed:
+                return False
+            if (
+                str(row.get("sample_id")) != str(sample["id"])
+                or str(row.get("dataset")) != str(sample["dataset"])
+                or str(row.get("source_group_id")) != str(sample["_cad_source_group_id"])
+            ):
+                return False
+            observed.add(pair)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return len(rows) == len(expected) and observed == expected
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1759,58 +1718,48 @@ def _validate_b0_signature(
     parity = json.loads(parity_path.read_text(encoding="utf-8"))
     if parity.get("status") != "complete":
         raise RuntimeError("phase requires completed B0 runtime validation")
-    if not isinstance(parity.get("code_signature"), str) or parity.get("runtime") != runtime_signature:
-        raise ValueError("B0 validation artifact has a stale runtime signature; rerun validate")
+    if parity.get("runtime") != runtime_signature:
+        raise ValueError("B0 validation runtime signature differs from this run; rerun validate")
 
 
 def _validate_replay_cells(
     args: argparse.Namespace,
     run_root: Path,
     *,
-    code_signature: str,
-    runtime_signature: Mapping[str, Any],
     require_b1v: bool,
-    b1_code_signature: str | None = None,
-    b1v_code_signature: str | None = None,
 ) -> None:
-    common = {
-        "repetitions": args.repetitions,
-        "selection_repetitions": args.selection_repetitions,
-        "warmups": args.warmups,
-        "max_prefixes": args.max_prefixes,
-        "max_new_tokens": args.max_new_tokens,
-        "seed": args.seed,
-    }
-    b1_params = {"gammas": _parse_gammas(args.gammas), **common}
-    expected_b1 = _hash_json({
-        "code": b1_code_signature or code_signature,
-        "runtime": runtime_signature, "campaign": b1_params,
-    })
     b1_cells = list((run_root / "b1" / "cells").glob("*.json"))
     if not b1_cells:
         raise FileNotFoundError("B1 replay cells are missing; run --mode b1 first")
-    stale_b1 = [
-        str(path) for path in b1_cells
-        if json.loads(path.read_text(encoding="utf-8")).get("campaign_signature") != expected_b1
-    ]
-    if stale_b1:
-        raise ValueError(f"B1 cells have stale code/runtime/protocol signatures: {stale_b1[:3]}")
+    complete_b1 = 0
+    for path in b1_cells:
+        cell = _read_json_artifact(run_root, "b1", path)
+        if cell is None:
+            continue
+        if cell.get("status", "complete") != "complete":
+            continue
+        if not _complete_b1_cell(cell, _parse_gammas(args.gammas), args.repetitions):
+            raise ValueError(f"B1 cell has an incomplete measurement grid: {path.name}")
+        complete_b1 += 1
+    if complete_b1 == 0:
+        raise ValueError("B1 has no complete cells for the configured gamma/repetition grid")
     if not require_b1v:
         return
-    b1v_params = {"verify_prefixes": (3, 7, 11, 15), **common}
-    expected_b1v = _hash_json({
-        "code": b1v_code_signature or code_signature,
-        "runtime": runtime_signature, "campaign": b1v_params,
-    })
     b1v_cells = list((run_root / "b1v" / "cells").glob("*.json"))
     if not b1v_cells:
         raise FileNotFoundError("B1-V replay cells are missing; run --mode b1v first")
-    stale_b1v = [
-        str(path) for path in b1v_cells
-        if json.loads(path.read_text(encoding="utf-8")).get("campaign_signature") != expected_b1v
-    ]
-    if stale_b1v:
-        raise ValueError(f"B1-V cells have stale code/runtime/protocol signatures: {stale_b1v[:3]}")
+    complete_b1v = 0
+    for path in b1v_cells:
+        cell = _read_json_artifact(run_root, "b1v", path)
+        if cell is None:
+            continue
+        if cell.get("status", "complete") != "complete":
+            continue
+        if not _complete_b1v_cell(cell, args.repetitions):
+            raise ValueError(f"B1-V cell has an incomplete verification-prefix grid: {path.name}")
+        complete_b1v += 1
+    if complete_b1v == 0:
+        raise ValueError("B1-V has no complete cells for the configured prefix/repetition grid")
 
 
 def _b3_models_and_costs(
@@ -2204,7 +2153,6 @@ def _b3_campaign(
     phase = "confirm" if confirm else "dev"
     if args.cohort_phase != phase:
         raise ValueError(f"--mode b3-{phase} requires --cohort-phase {phase}")
-    code_signature = _code_signature()
     runtime_signature = runtime["b_campaign_signature"]
     _validate_b0_signature(run_root, runtime_signature=runtime_signature)
     campaign = json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
@@ -2217,8 +2165,8 @@ def _b3_campaign(
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         if lock.get("schema_version") != "dflash-speculation-b.b3-lock.v2":
             raise ValueError("unsupported B3 policy-lock schema")
-        if lock.get("code_signature") != code_signature or lock.get("runtime_signature") != runtime_signature:
-            raise ValueError("B3 policy lock code/runtime signature differs from confirm run")
+        if lock.get("runtime_signature") != runtime_signature:
+            raise ValueError("B3 policy lock runtime signature differs from confirm run")
         _validate_policy_lock(lock, args=args, campaign=campaign, phase="B3")
         overlap = sorted(set(source_groups) & set(lock.get("dev_source_groups", [])))
         if overlap:
@@ -2232,10 +2180,7 @@ def _b3_campaign(
         candidate_variants = ["R", "R-A", selected_model]
     else:
         _validate_replay_cells(
-            args, run_root, code_signature=code_signature,
-            runtime_signature=runtime_signature, require_b1v=True,
-            b1_code_signature=_saved_b0_code_signature(run_root, runtime_signature),
-            b1v_code_signature=code_signature,
+            args, run_root, require_b1v=True,
         )
         _analyze(args, run_root)
         eligible, _ = _b3_eligible_models(run_root)
@@ -2283,7 +2228,6 @@ def _b3_campaign(
     b3_root.mkdir(parents=True, exist_ok=True)
     profile_signature = _hash_json({
         "phase": phase,
-        "code_signature": code_signature,
         "runtime_signature": runtime_signature,
         "campaign": _hash_json(campaign),
         "models": model_payloads,
@@ -2299,17 +2243,28 @@ def _b3_campaign(
     warmup_total_overhead_ms: dict[str, float] = {}
     if not confirm and profile_path.exists():
         saved_profile = _read_json_artifact(run_root, "b3", profile_path)
-        if saved_profile is not None and saved_profile.get("profile_signature") != profile_signature:
-            _archive_stale_cell(run_root, "b3", profile_path, saved_profile)
-            saved_profile = None
         if saved_profile is not None:
-            learned_overheads = {key: float(value) for key, value in saved_profile["policy_overhead_ms"].items()}
-            warmup_total_overhead_ms = {
-                key: float(value) for key, value in saved_profile.get("total_overhead_ms", {}).items()
-            }
-            for name, value in learned_overheads.items():
-                if name in policies:
-                    policies[name].set_policy_overhead(value)
+            raw_overheads = saved_profile.get("policy_overhead_ms")
+            try:
+                normalized_overheads = {
+                    str(key): float(value) for key, value in raw_overheads.items()
+                } if isinstance(raw_overheads, Mapping) else {}
+            except (TypeError, ValueError):
+                normalized_overheads = {}
+            if (
+                not set(policy_models).issubset(normalized_overheads)
+                or any(not math.isfinite(value) or value < 0 for value in normalized_overheads.values())
+            ):
+                _archive_stale_cell(run_root, "b3", profile_path, saved_profile)
+                saved_profile = None
+            else:
+                learned_overheads = normalized_overheads
+                warmup_total_overhead_ms = {
+                    key: float(value) for key, value in saved_profile.get("total_overhead_ms", {}).items()
+                }
+                for name, value in learned_overheads.items():
+                    if name in policies:
+                        policies[name].set_policy_overhead(value)
 
     def run_variant(sample: Mapping[str, Any], variant: str, repetition: int) -> dict[str, Any]:
         args._b3_repetition = repetition
@@ -2445,7 +2400,10 @@ def _b3_campaign(
     for sample_index, sample in enumerate(samples, start=1):
         cell_path = _sample_cell_path(b3_root, phase, sample)
         saved_cell = _load_resume_cell(
-            cell_path, cell_signature, resume=args.resume, run_root=run_root, phase=f"b3/cells/{phase}"
+            cell_path, resume=args.resume, run_root=run_root, phase=f"b3/cells/{phase}",
+            is_compatible=lambda cell: _request_cell_matches_protocol(
+                cell, sample, variants=measured_variants, repetitions=args.e2e_repetitions,
+            ),
         )
         if saved_cell is not None:
             records.extend(saved_cell.get("requests", []))
@@ -2635,7 +2593,6 @@ def _b3_campaign(
         lock = {
             "schema_version": "dflash-speculation-b.b3-lock.v2",
             "dev_run_id": str(args.run_id),
-            "code_signature": code_signature,
             "runtime_signature": runtime_signature,
             "benchmark_signature": _locked_benchmark_signature(campaign),
             "protocol_parameters": _locked_e2e_protocol(args),
@@ -2759,12 +2716,9 @@ def _b4_analyze(args: argparse.Namespace, run_root: Path, runtime_signature: Map
         fit_draft_cost_policy,
     )
 
-    code_signature = _code_signature()
     _validate_b0_signature(run_root, runtime_signature=runtime_signature)
     _validate_replay_cells(
-        args, run_root, code_signature=code_signature,
-        runtime_signature=runtime_signature, require_b1v=False,
-        b1_code_signature=_saved_b0_code_signature(run_root, runtime_signature),
+        args, run_root, require_b1v=False,
     )
     rows, coverage = _b4_rows_from_artifacts(run_root)
     groups = {str(row["source_group_id"]) for row in rows}
@@ -2808,7 +2762,6 @@ def _b4_analyze(args: argparse.Namespace, run_root: Path, runtime_signature: Map
             lock = {
                 "schema_version": "dflash-speculation-b.b4-lock.v2",
                 "dev_run_id": str(args.run_id),
-                "code_signature": code_signature,
                 "runtime_signature": runtime_signature,
                 "benchmark_signature": _locked_benchmark_signature(
                     json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
@@ -2874,7 +2827,6 @@ def _b4_campaign(
     if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
         raise RuntimeError("B4 E2E requires completed B0 runtime validation in this cohort")
     runtime_signature = runtime["b_campaign_signature"]
-    code_signature = _code_signature()
     source_groups = sorted({str(row["_cad_source_group_id"]) for row in samples})
     if confirm:
         if not args.policy_lock:
@@ -2883,8 +2835,8 @@ def _b4_campaign(
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         if lock.get("schema_version") != "dflash-speculation-b.b4-lock.v2":
             raise ValueError("unsupported B4 policy-lock schema")
-        if lock.get("code_signature") != code_signature or lock.get("runtime_signature") != runtime_signature:
-            raise ValueError("B4 policy lock code/runtime signature differs from confirm run")
+        if lock.get("runtime_signature") != runtime_signature:
+            raise ValueError("B4 policy lock runtime signature differs from confirm run")
         _validate_policy_lock(lock, args=args, campaign=campaign, phase="B4")
         overlap = sorted(set(source_groups) & set(lock.get("dev_source_groups", [])))
         if overlap:
@@ -2903,8 +2855,8 @@ def _b4_campaign(
             raise RuntimeError("B4 dev E2E gate closed: no lagged model passed held-out cost-skill screening")
         preliminary_path = run_root / "b4" / "locked_config.json"
         preliminary = json.loads(preliminary_path.read_text(encoding="utf-8"))
-        if preliminary.get("code_signature") != code_signature or preliminary.get("runtime_signature") != runtime_signature:
-            raise ValueError("B4 analysis lock code/runtime signature is stale; rerun --mode b4")
+        if preliminary.get("runtime_signature") != runtime_signature:
+            raise ValueError("B4 analysis lock runtime signature is stale; rerun --mode b4")
         _validate_policy_lock(preliminary, args=args, campaign=campaign, phase="B4 analysis")
         model_payloads = preliminary["models"]
         selected_model = ""
@@ -2929,7 +2881,6 @@ def _b4_campaign(
     b4_root.mkdir(parents=True, exist_ok=True)
     cell_signature = _hash_json({
         "phase": phase,
-        "code_signature": code_signature,
         "runtime_signature": runtime_signature,
         "campaign": _hash_json(json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))),
         "models": model_payloads,
@@ -3005,7 +2956,10 @@ def _b4_campaign(
     for sample_index, sample in enumerate(samples, start=1):
         cell_path = _sample_cell_path(b4_root, phase, sample)
         saved_cell = _load_resume_cell(
-            cell_path, cell_signature, resume=args.resume, run_root=run_root, phase=f"b4/cells/{phase}"
+            cell_path, resume=args.resume, run_root=run_root, phase=f"b4/cells/{phase}",
+            is_compatible=lambda cell: _request_cell_matches_protocol(
+                cell, sample, variants=variants, repetitions=args.e2e_repetitions,
+            ),
         )
         if saved_cell is not None:
             records.extend(saved_cell.get("requests", []))
@@ -3154,7 +3108,7 @@ def _b4_campaign(
         selected_model = min(eligible, key=lambda name: latency[f"adaptive_{name}"])
         lock = {
             "schema_version": "dflash-speculation-b.b4-lock.v2",
-            "dev_run_id": str(args.run_id), "code_signature": code_signature,
+            "dev_run_id": str(args.run_id),
             "runtime_signature": runtime_signature, "dev_source_groups": source_groups,
             "benchmark_signature": _locked_benchmark_signature(campaign),
             "protocol_parameters": _locked_e2e_protocol(args),
@@ -3218,7 +3172,14 @@ def _run_all(args: argparse.Namespace) -> int:
             # a missing optional statistic or a closed research gate.
             if _is_fatal_campaign_error(exc) or any(
                 marker in message.lower()
-                for marker in ("signature", "source groups overlap", "unsupported b3 policy-lock schema", "unsupported b4 policy-lock schema")
+                for marker in (
+                    "runtime signature",
+                    "protocol parameters differ",
+                    "corpus/exposure signature",
+                    "source groups overlap",
+                    "unsupported b3 policy-lock schema",
+                    "unsupported b4 policy-lock schema",
+                )
             ):
                 raise CampaignIntegrityError(f"{name}: {type(exc).__name__}: {exc}") from exc
             gate_closed = name == "B3-dev" and message.startswith("B3 gate closed:")

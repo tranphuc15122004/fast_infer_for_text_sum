@@ -806,3 +806,57 @@ def test_driver_telemetry_timeout_reuses_current_preflight_for_same_gpu(tmp_path
     assert len(calls) == 2
     with pytest.raises(campaign.CampaignIntegrityError, match="cannot establish GPU/driver"):
         campaign._probe_gpu_driver(args, "different-GPU")
+
+
+def test_relaxed_mode_tolerates_signature_mismatch_and_strict_rejects(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from TrainingFree.context_interventions import execution
+
+    run_root = tmp_path / "run-relaxed"
+    evidence_dir = run_root / "evidence"
+    evidence_dir.mkdir(parents=True)
+
+    # 1. Test lineage recovery from previous phase parity artifact
+    (evidence_dir / "parity_validate.json").write_text(json.dumps({
+        "code_signature": "lineage-sig-456", "status": "pass",
+    }), encoding="utf-8")
+    assert campaign._saved_lineage_code_signature(run_root) == "lineage-sig-456"
+
+    # 2. Test trace resume with mismatched signature under relaxed vs strict
+    sample = {"id": "sample-1", "dataset": "gov_report", "_cad_source_group_id": "group-1"}
+    trace_file = campaign._reference_trace_path(run_root, "sample-1", phase="pilot")
+    trace_file.parent.mkdir(parents=True, exist_ok=True)
+    trace_file.write_text(json.dumps({
+        "sample_id": "sample-1",
+        "dataset": "gov_report",
+        "_cad_source_group_id": "group-1",
+        "prompt_tokens": 100,
+        "trace_signature": "old-stale-sig",
+        "parity": {"status": "pass", "native_equals_adapter": True, "ar_output_tokens": 10},
+        "adapter_rounds": [],
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(campaign, "_code_signature", lambda: {"sha256": "current-code"})
+    monkeypatch.setattr(execution, "run_reference_pair", lambda *args, **kwargs: pytest.fail("Should reuse"))
+
+    args = SimpleNamespace(
+        resume=True, run_id="run-relaxed", attention_backend="flash_attention_4",
+        source_anchors=4, recent_output=8, strict_signatures=False,
+    )
+    runtime = {"runtime_signature": {"signature": "runtime"}}
+    cohort = {"phase": "pilot", "selected_group_count": 1}
+
+    # Relaxed mode: trace is reused, no exception
+    passed, traces = campaign._run_parity_cohort(
+        args, run_root, runtime, [sample], cohort, max_new_tokens=1024,
+    )
+    assert passed and len(traces) == 1
+    assert traces[0]["sample_id"] == "sample-1"
+
+    # Strict mode: raises ValueError
+    args.strict_signatures = True
+    with pytest.raises(ValueError, match="resume reference trace signature mismatch"):
+        campaign._run_parity_cohort(
+            args, run_root, runtime, [sample], cohort, max_new_tokens=1024,
+        )

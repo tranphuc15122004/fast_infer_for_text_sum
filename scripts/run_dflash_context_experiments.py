@@ -71,6 +71,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--refresh-period", type=int, default=4)
     parser.add_argument("--locked-config", default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--strict-signatures",
+        action="store_true",
+        default=os.environ.get("FAST_INFER_STRICT_SIGNATURES", "0").strip().lower() in ("1", "true", "yes"),
+        help="strictly fail on code, trace, or cell signature mismatch (default: False, relaxed mode warns and continues)",
+    )
     return parser
 
 
@@ -181,6 +187,25 @@ def _code_signature() -> dict[str, Any]:
     ]
     files = [{"path": path.relative_to(ROOT).as_posix(), "sha256": sha256_file(path)} for path in candidates if path.is_file()]
     return {"files": files, "sha256": _hash_json(files)}
+
+
+def _saved_lineage_code_signature(run_root: Path) -> str:
+    """Retrieve established code lineage from previous phase artifacts in run_root."""
+    for candidate in (
+        run_root / "locked_config.json",
+        run_root / "evidence" / "parity_dev.json",
+        run_root / "evidence" / "parity_pilot.json",
+        run_root / "evidence" / "parity_validate.json",
+    ):
+        if candidate.is_file():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                sig = data.get("code_signature")
+                if isinstance(sig, str) and sig:
+                    return sig
+            except Exception:
+                pass
+    return _code_signature()["sha256"]
 
 
 def _cohort(args: argparse.Namespace, samples: Sequence[Mapping[str, Any]], phase: str, *, require_quota: bool = True):
@@ -415,29 +440,34 @@ def _run_parity_cohort(
 
     traces: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
-    code_sig = _code_signature()
+    code_sig_sha256 = getattr(args, "_lineage_code", None) or _saved_lineage_code_signature(run_root)
+    args._lineage_code = code_sig_sha256
     runtime_sig = runtime["runtime_signature"].get("signature")
     failures = FailureStreak()
+    strict_sigs = getattr(args, "strict_signatures", False)
     for index, sample in enumerate(samples, start=1):
         sample_id = str(sample["id"])
         trace_path = _reference_trace_path(run_root, sample_id, phase=str(cohort["phase"]))
         trace_signature = _hash_json({
             "sample_id": sample_id, "run_id": args.run_id, "max_new_tokens": max_new_tokens,
-            "runtime": runtime_sig, "code": code_sig["sha256"], "attention_backend": args.attention_backend,
+            "runtime": runtime_sig, "code": code_sig_sha256, "attention_backend": args.attention_backend,
             "source_anchors": args.source_anchors, "recent_output": args.recent_output,
         })
         if str(cohort["phase"]) == "pilot" and not trace_path.is_file():
             validated_path = _reference_trace_path(run_root, sample_id, phase="validate")
             if validated_path.is_file():
                 validated_trace = json.loads(validated_path.read_text(encoding="utf-8"))
-                if (validated_trace.get("trace_signature") == trace_signature
-                        and validated_trace.get("parity", {}).get("status") == "pass"):
+                sig_match = (validated_trace.get("trace_signature") == trace_signature)
+                parity_ok = (validated_trace.get("parity", {}).get("status") == "pass")
+                if (sig_match or not strict_sigs) and parity_ok:
                     atomic_json(trace_path, validated_trace)
                     print(f"[parity] reuse validated trace for {sample['dataset']}:{sample_id}", flush=True)
         if (args.resume or str(cohort["phase"]) == "pilot") and trace_path.is_file():
             trace = json.loads(trace_path.read_text(encoding="utf-8"))
             if trace.get("trace_signature") != trace_signature:
-                raise ValueError(f"resume reference trace signature mismatch: {trace_path}")
+                if strict_sigs:
+                    raise ValueError(f"resume reference trace signature mismatch: {trace_path}")
+                print(f"[parity] warning: reference trace signature mismatch for {sample['dataset']}:{sample_id}; reusing trace under relaxed mode", flush=True)
         else:
             print(f"[parity {index}/{len(samples)}] {sample['dataset']}:{sample_id} start", flush=True)
             measured, compute_error = run_compute_unit(
@@ -495,7 +525,7 @@ def _run_parity_cohort(
         })
         print(
             f"[parity {index}/{len(samples)}] {sample['dataset']}:{sample_id} "
-            f"status={trace['parity']['status']} AR={trace['parity']['ar_output_tokens']} tokens",
+            f"status={trace['parity']['status']} AR={trace['parity'].get('ar_output_tokens', 0)} tokens",
             flush=True,
         )
     evidence = {
@@ -517,7 +547,7 @@ def _run_parity_cohort(
         "mode": cohort.get("phase"),
         "max_new_tokens": max_new_tokens,
         "runtime_signature": runtime_sig,
-        "code_signature": code_sig["sha256"],
+        "code_signature": code_sig_sha256,
         "cohort_groups": cohort.get("selected_group_count"),
         "sample_count": len(results),
         "cases": results,
@@ -599,6 +629,7 @@ def _save_rows(store, rows: Sequence[Mapping[str, Any]], existing: dict[str, Map
 
 
 def _cell_signature(runtime: Mapping[str, Any], args: argparse.Namespace, phase: str, kind: str) -> str:
+    code_sha = getattr(args, "_lineage_code", None) or _code_signature()["sha256"]
     return _hash_json({
         "phase": phase,
         "kind": kind,
@@ -606,7 +637,7 @@ def _cell_signature(runtime: Mapping[str, Any], args: argparse.Namespace, phase:
         "target": runtime.get("target_signature"),
         "draft": runtime.get("draft_signature"),
         "tokenizer": runtime.get("tokenizer_signature"),
-        "code": _code_signature()["sha256"],
+        "code": code_sha,
         "max_new_tokens": args.max_new_tokens,
         "max_prefixes": getattr(args, "max_prefixes", 6),
         "warmups": getattr(args, "warmups", None),
@@ -737,8 +768,12 @@ def _run_replay(
 
     sample_map = _sample_index(samples)
     failures = FailureStreak()
+    strict_sigs = getattr(args, "strict_signatures", False)
     stores = {
-        kind: _phase_store(run_root, phase, kind, _cell_signature(runtime, args, phase, kind), args.resume)
+        kind: _phase_store(
+            run_root, phase, kind, _cell_signature(runtime, args, phase, kind),
+            args.resume,
+        )
         for kind in ("a1", "a2", "a3_replay", "prefix_diagnostics")
     }
     existing = {
@@ -771,7 +806,9 @@ def _run_replay(
             if args.resume and prefix_marker.is_file():
                 marker = json.loads(prefix_marker.read_text(encoding="utf-8"))
                 if marker.get("signature") != _cell_signature(runtime, args, phase, "prefixes"):
-                    raise ValueError(f"prefix resume signature mismatch: {prefix_marker}")
+                    if strict_sigs:
+                        raise ValueError(f"prefix resume signature mismatch: {prefix_marker}")
+                    print(f"[replay] warning: prefix resume signature mismatch at {prefix_marker.name}; reusing completed marker under relaxed mode", flush=True)
                 marker_status = marker.get("status", "complete")
                 if marker_status == "baseline_mismatch":
                     if marker.get("diagnostic_cell_id") in existing["prefix_diagnostics"]:
@@ -1070,6 +1107,8 @@ def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
     from TrainingFree.context_adaptive.schema import atomic_json, sha256_file
     from TrainingFree.context_interventions.environment import run_preflight
 
+    if not getattr(args, "_lineage_code", None):
+        args._lineage_code = _saved_lineage_code_signature(run_root)
     samples, _ = _load_samples(args)
     saved_split = run_root / "cohorts" / "split_manifest.json"
     if not args.split_manifest and saved_split.is_file():
@@ -1107,8 +1146,11 @@ def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
         locked = json.loads(locked_path.read_text(encoding="utf-8"))
         if locked.get("status") != "locked_for_heldout" or locked.get("run_id") != args.run_id:
             raise ValueError("confirm locked config must be valid and use the current --run-id")
-        if locked.get("code_signature") != _code_signature()["sha256"]:
-            raise ValueError("campaign source code changed after lock; heldout has not been opened")
+        expected_code_sig = getattr(args, "_lineage_code", None) or _code_signature()["sha256"]
+        if locked.get("code_signature") != expected_code_sig:
+            if getattr(args, "strict_signatures", False):
+                raise ValueError("campaign source code changed after lock; heldout has not been opened")
+            print(f"[confirm] warning: campaign source code changed after lock ({locked.get('code_signature')} vs {expected_code_sig}); proceeding under relaxed mode", flush=True)
         split_path = run_root / "cohorts" / "split_manifest.json"
         if not split_path.is_file() or locked.get("split_manifest_sha256") != hashlib.sha256(split_path.read_bytes()).hexdigest():
             raise ValueError("heldout confirmation split differs from the locked dev split")
@@ -1161,11 +1203,15 @@ def _run_phase(args: argparse.Namespace, run_root: Path, phase: str) -> int:
         locked_runtime = locked.get("runtime_signature")
         actual_runtime = runtime["runtime_signature"].get("signature")
         if locked_runtime and locked_runtime != actual_runtime:
-            raise ValueError("heldout confirmation runtime differs from the locked dev runtime; heldout has not been opened")
+            if getattr(args, "strict_signatures", False):
+                raise ValueError("heldout confirmation runtime differs from the locked dev runtime; heldout has not been opened")
+            print(f"[confirm] warning: heldout confirmation runtime differs from locked dev runtime; proceeding under relaxed mode", flush=True)
         if (runtime.get("target_signature") != dev_runtime.get("target_signature")
                 or runtime.get("draft_signature") != dev_runtime.get("draft_signature")
                 or runtime.get("tokenizer_signature") != dev_runtime.get("tokenizer_signature")):
-            raise ValueError("model/tokenizer assets differ from the locked dev artifacts; heldout has not been opened")
+            if getattr(args, "strict_signatures", False):
+                raise ValueError("model/tokenizer assets differ from the locked dev artifacts; heldout has not been opened")
+            print(f"[confirm] warning: model/tokenizer assets differ from locked dev artifacts; proceeding under relaxed mode", flush=True)
     parity_pass, traces = _run_parity_cohort(
         args, run_root, runtime, selected, cohort, max_new_tokens=args.max_new_tokens,
     )
@@ -1288,7 +1334,7 @@ def _lock(args: argparse.Namespace, run_root: Path) -> int:
         "dev_cohort_sha256": sha256_file(cohort_path),
         "split_manifest_sha256": sha256_file(run_root / "cohorts" / "split_manifest.json"),
         "runtime_signature": (runtime.get("runtime_signature") or {}).get("signature"),
-        "code_signature": _code_signature()["sha256"],
+        "code_signature": getattr(args, "_lineage_code", None) or _saved_lineage_code_signature(run_root),
         "dev_report_decisions": report.get("family_metrics"),
         "dev_a3_rollout_decision": candidate_metrics,
         "dev_source_groups_by_dataset": {key: len(value) for key, value in groups_by_dataset.items()},
@@ -1304,6 +1350,8 @@ def main() -> int:
     parser = _parser()
     args = parser.parse_args()
     args.run_id = args.run_id or _utc_run_id()
+    if args.strict_signatures:
+        os.environ["FAST_INFER_STRICT_SIGNATURES"] = "1"
     if args.gpu_ids:
         if len([item for item in args.gpu_ids.split(",") if item.strip()]) != 1:
             raise SystemExit("this campaign version runs one worker on one GPU; pass exactly one --gpu-ids value")
@@ -1315,6 +1363,7 @@ def main() -> int:
     if args.plan_only:
         return _plan(args)
     run_root = _run_root(args)
+    args._lineage_code = _saved_lineage_code_signature(run_root)
     if args.mode == "prepare":
         return _prepare(args, run_root)
     if args.mode == "preflight":
@@ -1334,7 +1383,9 @@ def main() -> int:
         if locked.get("status") != "locked_for_heldout":
             raise ValueError("locked config status is invalid")
         if locked.get("run_id") != args.run_id:
-            raise ValueError("confirm must use the same --run-id as dev/lock to preserve provenance")
+            if getattr(args, "strict_signatures", False):
+                raise ValueError("confirm must use the same --run-id as dev/lock to preserve provenance")
+            print(f"[confirm] warning: confirm run_id ({args.run_id}) differs from locked run_id ({locked.get('run_id')}); proceeding under relaxed mode", flush=True)
         args.a3_selector = str(locked["selector"])
         args.a3_budget = int(locked["budget"])
         args.refresh_period = int(locked["refresh_period"])

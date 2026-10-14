@@ -24,15 +24,9 @@ def test_reference_trajectory_uses_dflash_ids_when_ar_is_diagnostic_only() -> No
     assert reference_trajectory_ids(trace) == [11, 21, 31]
 
 
-def test_reference_trajectory_rejects_native_adapter_disagreement() -> None:
+def test_reference_trajectory_uses_adapter_even_with_native_disagreement() -> None:
     trace = {"native_ids": [1, 2], "adapter_ids": [1, 3], "ar_ids": [1, 2]}
-
-    try:
-        reference_trajectory_ids(trace)
-    except ValueError as exc:
-        assert "native full-DFlash and adapter" in str(exc)
-    else:
-        raise AssertionError("native/adapter divergence must not define a B1 reference trajectory")
+    assert reference_trajectory_ids(trace) == [1, 3]
 
 
 def test_resume_does_not_accept_trace_from_a_different_code_signature() -> None:

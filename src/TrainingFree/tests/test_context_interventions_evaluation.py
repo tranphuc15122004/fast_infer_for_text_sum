@@ -82,9 +82,11 @@ def test_cell_store_resume_requires_matching_run_signature(tmp_path) -> None:
     store.save("state/action", {"status": "ok", "cell_id": "state/action"})
     resumed = CellStore(tmp_path / "a1", signature="run-hash", resume=True)
     assert resumed.load("state/action")["status"] == "ok"
-    incompatible = CellStore(tmp_path / "a1", signature="changed", resume=True)
+    incompatible = CellStore(tmp_path / "a1", signature="changed", resume=True, strict_signature=True)
     with pytest.raises(ValueError, match="signature"):
         incompatible.load("state/action")
+    relaxed = CellStore(tmp_path / "a1", signature="changed", resume=True, strict_signature=False)
+    assert relaxed.load("state/action")["status"] == "ok"
 
 
 def test_cell_store_resume_replaces_failed_cell_and_keeps_success_immutable(tmp_path) -> None:
@@ -115,5 +117,5 @@ def test_checkpoint_identity_corruption_is_rejected(tmp_path) -> None:
     row["cell_id"] = "another-cell"
     path.write_text(json.dumps(row), encoding="utf-8")
     resumed = CellStore(tmp_path / "a1", signature="run-hash", resume=True)
-    with pytest.raises(ValueError, match="signature"):
+    with pytest.raises(ValueError, match="mismatch"):
         resumed.rows()

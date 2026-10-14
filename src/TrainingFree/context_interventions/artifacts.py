@@ -13,13 +13,20 @@ from TrainingFree.context_adaptive.schema import atomic_json
 
 
 class CellStore:
-    def __init__(self, phase_root: Path, *, signature: str, resume: bool) -> None:
+    def __init__(
+        self, phase_root: Path, *, signature: str, resume: bool,
+        strict_signature: bool | None = None,
+    ) -> None:
         self.root = Path(phase_root)
         self.cells = self.root / "cells"
         self.cells.mkdir(parents=True, exist_ok=True)
         self._had_cells_at_start = any(self.cells.glob("*.json"))
         self.signature = str(signature)
         self.resume = bool(resume)
+        if strict_signature is None:
+            self.strict_signature = os.environ.get("FAST_INFER_STRICT_SIGNATURES", "0").strip().lower() in ("1", "true", "yes")
+        else:
+            self.strict_signature = bool(strict_signature)
 
     @staticmethod
     def key(value: str) -> str:
@@ -35,7 +42,9 @@ class CellStore:
         if not self.resume:
             raise FileExistsError(f"cell checkpoint exists; pass --resume: {path}")
         row = json.loads(path.read_text(encoding="utf-8"))
-        if row.get("cell_id") != cell_id or row.get("run_signature") != self.signature:
+        if row.get("cell_id") != cell_id:
+            raise ValueError(f"resume cell mismatch at {path}")
+        if row.get("run_signature") != self.signature and self.strict_signature:
             raise ValueError(f"resume signature/cell mismatch at {path}")
         return row
 
@@ -48,7 +57,9 @@ class CellStore:
             existing = self.load(cell_id)
             if existing == payload:
                 return
-            if existing.get("status") != "error":
+            if existing and {k: v for k, v in existing.items() if k != "run_signature"} == {k: v for k, v in payload.items() if k != "run_signature"}:
+                return
+            if existing and existing.get("status") != "error":
                 raise ValueError(f"refusing to replace completed cell {cell_id}")
             # Error rows are failed attempts, not completed evidence. Replacing
             # them atomically lets a resumed phase retry transient cell errors.
@@ -64,7 +75,9 @@ class CellStore:
             raise FileExistsError(f"campaign cells already exist; pass --resume or choose a new run id: {self.cells}")
         rows = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
         for path, row in zip(paths, rows):
-            if row.get("run_signature") != self.signature or self.path(str(row.get("cell_id"))) != path:
+            if self.path(str(row.get("cell_id"))) != path:
+                raise ValueError(f"resume cell path mismatch at {path}")
+            if row.get("run_signature") != self.signature and self.strict_signature:
                 raise ValueError(f"resume signature mismatch at {path}")
         return sorted(rows, key=lambda row: str(row.get("cell_id", "")))
 
