@@ -19,6 +19,7 @@ vẫn chặn phase bị ảnh hưởng.
 | `b1v` | Draft gamma 15 rồi verify prefix k=3/7/11/15 trên cache fork riêng; kiểm tra L và pending anchor | Bảng B1-V |
 | `analyze` | Tính oracle/fixed gaps, bootstrap theo source group, grouped OOF survival/Brier và quyết định screening | `reports/*`, không nạp model |
 | `run` | Chạy prepare, B0, B1, B1-V rồi analyze tuần tự | Toàn bộ artifacts trên |
+| `all` | Chạy B0/B1/B2/B1-V, B3/B4 đủ điều kiện rồi tự chuẩn bị và chạy confirm trên cùng runtime | `all_status.json`, artifacts discovery và confirm |
 | `b3-dev` | Chỉ mở khi B1-V và B2 qua gate; chạy AR, fixed gamma/k, regime/history controls và policy signal trên dev; khóa model/cost/fallback | `b3/dev_requests.jsonl`, `b3/locked_config.json` |
 | `b3-confirm` | Chạy lock B3 đã chọn trên cohort confirm riêng; paired E2E, ROUGE và tỉ lệ khớp token AR dạng chẩn đoán | `b3/confirm_requests.jsonl`, `b3/confirm_summary.json` |
 | `b4` | Ghép uncertainty của đúng round liền trước với state B1 hiện tại; grouped CV chọn gamma trên evaluation timing | `b4/analysis.json`, OOF và lock nếu gate đạt |
@@ -43,6 +44,41 @@ shape trước khác. Đây là giới hạn support được ghi vào từng ro
 
 ## Chạy trên server
 
+Để treo toàn bộ phần B, cập nhật `scripts/run_dflash_speculation_B.py` có mode
+`all`, rồi chạy từ thư mục repo hiện tại:
+
+```bash
+B_RUN_ID="B_full_$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p outputs/dflash_speculation_B
+nohup env PYTHONUNBUFFERED=1 bash scripts/run_dflash_speculation_B_b200.sh \
+  --config /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env \
+  --gpu-ids 0 --mode all --run-id "$B_RUN_ID" \
+  --data-dir /workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json \
+  > "outputs/dflash_speculation_B/$B_RUN_ID.log" 2>&1 < /dev/null &
+echo "PID=$!; log=outputs/dflash_speculation_B/$B_RUN_ID.log"
+```
+
+`all` dùng cohort discovery 24 nhóm và, khi có policy lock hợp lệ, cohort
+confirm 48 nhóm với cùng split manifest. Model chỉ nạp một lần. Gate B3/B4
+không đạt được ghi là `not_applicable` và tiến trình đi tiếp; lỗi cục bộ hoặc
+thiếu coverage được ghi là `partial`, nhánh độc lập vẫn được thu thập. Lỗi
+GPU, filesystem, dependency hoặc chữ ký/verifier/cache nghiêm trọng vẫn dừng.
+`all_status.json` phân biệt tiến trình đã kết thúc với dữ liệu có đầy đủ hay
+không; không coi cell lỗi là kết quả hợp lệ. Confirm B0 thiếu coverage sẽ chặn
+nhánh confirm liên quan nhưng không làm mất dữ liệu đã lưu.
+
+Log nằm cạnh thư mục run; artifacts discovery nằm trong `$B_RUN_ID`, confirm
+nằm trong `${B_RUN_ID}_confirm`. Xem tiến độ bằng:
+
+```bash
+tail -f "outputs/dflash_speculation_B/$B_RUN_ID.log"
+```
+
+Ctrl+C thoát `tail` trong terminal vẫn giữ tiến trình `nohup` đang chạy.
+Để tiếp tục đúng cả workflow sau khi hạ tầng bị ngắt, dùng lại cùng lệnh
+`--mode all`, cùng run ID/data/exposure manifest và thêm `--resume`.
+
 Đảm bảo master config trỏ tới Python 3.12, local target/DFlash snapshots, FA4
 và corpus. Mặc định corpus là
 `/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k`;
@@ -50,6 +86,10 @@ có thể truyền `--data-dir` hoặc `--data-file`. Exposure manifest phải �
 chung với campaign A/B. Manifest đã có trong repo để bắt đầu là
 `data/dflash_context_A_audit/combined_exposure_manifest.json`; nếu có audit
 mới hơn, dùng manifest mới đó.
+
+`--data-dir`/`--data-file` tường minh thay thế các đường dẫn dữ liệu cũ trong
+master env; chỉ truyền một trong hai flag. Điều này tránh lỗi khi master đang
+đồng thời export `DATA_INPUT`/`LONG_BENCH_DATA_DIR` và `DATA_FILE`/`LONG_BENCH_DATA_FILE`.
 
 Lệnh pilot một lượt:
 

@@ -86,6 +86,15 @@ Sau khi `start` trả về, theo dõi log bằng lệnh `tail -f` mà nó in ra.
 nằm ở `outputs/dflash_context_interventions/<run_id>/`; báo cáo cuối là
 `reports/confirm_decision.md` và `reports/confirm_coverage.json`.
 
+Nguồn dữ liệu được chọn theo thứ tự: `--data-dir`/`--data-file`, rồi
+`DATA_INPUT`/`DATA_FILE` của master, rồi các alias `LONG_BENCH_DATA_*`.
+Loader chung có thể tự đặt `DATA_FILE=DATA_INPUT`; hai tên cùng trỏ tới một
+nguồn được gộp lại và runner nhận diện thư mục/file theo filesystem, nên
+không cần xóa alias trong master. Hai đường dẫn khác nhau trong cùng nhóm
+biến vẫn bị chặn với thông báo chứa tên biến và đường dẫn; chọn một nguồn
+tường minh bằng CLI hoặc sửa master. Lỗi nguồn dữ liệu ở preflight phải sửa
+trước khi generation, không thuộc loại lỗi sample có thể bỏ qua.
+
 ## Exposure và quota
 
 Probe và pilot cũ đã được tổng hợp trong

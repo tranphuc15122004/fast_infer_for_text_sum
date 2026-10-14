@@ -2,8 +2,8 @@
 """Run the DFlash speculation B0-B4 experiments on the shared B200 runtime.
 
 This entrypoint is offline by design. It does not install packages or download
-models/data. Run ``prepare`` on any machine, then use ``run`` on the B200 server
-or execute ``preflight``, ``validate``, ``b1`` and ``analyze`` separately.
+models/data. Use ``all`` for discovery and eligible confirm branches on B200,
+``run`` for B0/B1/B2/B1-V, or execute individual phases separately.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ for _path in (ROOT / "src", ROOT / "scripts", ROOT / "externals" / "dflash"):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("prepare", "preflight", "validate", "b1", "b1v", "analyze", "b3-dev", "b3-confirm", "b4", "b4-dev", "b4-confirm", "run"), default="prepare")
+    parser.add_argument("--mode", choices=("prepare", "preflight", "validate", "b1", "b1v", "analyze", "b3-dev", "b3-confirm", "b4", "b4-dev", "b4-confirm", "run", "all"), default="prepare")
     parser.add_argument("--config", default=os.environ.get("FAST_INFER_MASTER_CONFIG"))
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-root", default="outputs/dflash_speculation_B")
@@ -188,8 +188,14 @@ def _validate_policy_lock(
 def _load_samples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[Path]]:
     from TrainingFree.context_adaptive.benchmark import load_corpus
 
-    data_dir_value = args.data_dir or os.environ.get("DATA_INPUT") or os.environ.get("LONG_BENCH_DATA_DIR")
-    data_file_value = args.data_file or os.environ.get("DATA_FILE") or os.environ.get("LONG_BENCH_DATA_FILE")
+    if args.data_dir and args.data_file:
+        raise ValueError("provide exactly one --data-dir/--data-file")
+    if args.data_dir or args.data_file:
+        # An explicit source replaces every legacy source from the master env.
+        data_dir_value, data_file_value = args.data_dir, args.data_file
+    else:
+        data_dir_value = os.environ.get("DATA_INPUT") or os.environ.get("LONG_BENCH_DATA_DIR")
+        data_file_value = os.environ.get("DATA_FILE") or os.environ.get("LONG_BENCH_DATA_FILE")
     if data_dir_value and Path(data_dir_value).is_file() and not data_file_value:
         data_file_value, data_dir_value = data_dir_value, None
     data_dir = _resolve(data_dir_value) if data_dir_value else None
@@ -3119,28 +3125,196 @@ def _b4_campaign(
     return summary
 
 
+def _run_all(args: argparse.Namespace) -> int:
+    """Run discovery and eligible confirm branches on one loaded B200 runtime."""
+    from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.context_interventions.resilience import (
+        CampaignIntegrityError,
+        release_compute_memory,
+    )
+
+    dev_args = argparse.Namespace(**vars(args))
+    dev_args.cohort_phase = "dev"
+    dev_root = _run_root(dev_args)
+    dev_root.mkdir(parents=True, exist_ok=True)
+    confirm_id = f"{args.run_id}_confirm"
+    status_path = dev_root / "all_status.json"
+    status: dict[str, Any] = {
+        "schema_version": "dflash-speculation-b.all-status.v1",
+        "run_id": args.run_id,
+        "confirm_run_id": confirm_id,
+        "workflow_status": "running",
+        "collection_status": "pending",
+        "stages": {},
+    }
+
+    def record(name: str, outcome: str, **details: Any) -> None:
+        status["stages"][name] = {"status": outcome, **details}
+        status["updated_utc"] = datetime.now(timezone.utc).isoformat()
+        atomic_json(status_path, status)
+        print(f"[all] {name}: {outcome}", flush=True)
+
+    def collect(name: str, operation: Any) -> Any:
+        record(name, "running")
+        try:
+            result = operation()
+        except Exception as exc:
+            message = str(exc)
+            # Model/protocol identity and cache integrity cannot be treated as
+            # a missing optional statistic or a closed research gate.
+            if _is_fatal_campaign_error(exc) or any(
+                marker in message.lower()
+                for marker in ("signature", "source groups overlap", "unsupported b3 policy-lock schema", "unsupported b4 policy-lock schema")
+            ):
+                raise CampaignIntegrityError(f"{name}: {type(exc).__name__}: {exc}") from exc
+            gate_closed = name == "B3-dev" and message.startswith("B3 gate closed:")
+            record(
+                name, "not_applicable" if gate_closed else "failed",
+                error={"type": type(exc).__name__, "message": message},
+                traceback="".join(traceback.format_exception(exc))[-12000:],
+            )
+            exc.__traceback__ = None
+            release_compute_memory()
+            return None
+        reported = result.get("status") if isinstance(result, dict) else None
+        outcome = (
+            "not_applicable" if reported == "b1v_overhead_gate_closed"
+            else "failed" if reported in {"unavailable", "generation_error", "warmup_incomplete", "no_valid_requests"}
+            else "complete"
+        )
+        record(name, outcome, reported_status=reported)
+        return result
+
+    def skip(name: str, reason: str, *, incomplete: bool = False) -> None:
+        record(name, "prerequisites_incomplete" if incomplete else "not_applicable", reason=reason)
+
+    try:
+        if args.resume:
+            samples, _, dev_root = _load_resume_campaign(dev_args)
+            if dev_args.cohort_phase != "dev":
+                raise ValueError("--mode all requires a dev campaign for its base --run-id")
+        else:
+            samples, _, dev_root = _prepare(dev_args)
+        runtime = _runtime(dev_args)
+        atomic_json(dev_root / "runtime.json", runtime["b_campaign_signature"])
+        if not collect("B0", lambda: _validate(dev_args, samples, dev_root, runtime)):
+            record("B0", "failed", reason="No usable reference trajectories")
+            raise CampaignIntegrityError("B0 produced no usable reference trajectories; later measurements cannot be valid")
+        collect("B1/B2", lambda: _b1(dev_args, samples, dev_root, runtime))
+        collect("B1-V", lambda: _b1v(dev_args, samples, dev_root, runtime))
+        analysis = collect("analysis", lambda: _analyze_without_stopping_collection(dev_args, dev_root))
+        collection = _write_run_status_best_effort(dev_root)
+        core_ready = (
+            collection is not None
+            and collection.get("collection_status") == "complete"
+            and all(status["stages"][name]["status"] == "complete" for name in ("B0", "B1/B2", "B1-V"))
+        )
+
+        b3_result = None
+        b4_result = None
+        if core_ready:
+            if analysis is not None and analysis.get("status") != "unavailable":
+                b3_result = collect("B3-dev", lambda: _b3_campaign(dev_args, samples, dev_root, runtime, confirm=False))
+            else:
+                skip("B3-dev", "B1/B2 analysis is unavailable; raw measurements are retained", incomplete=True)
+            b4_analysis = collect("B4-analysis", lambda: _b4_analyze(dev_args, dev_root, runtime["b_campaign_signature"]))
+            if b4_analysis is not None and b4_analysis.get("decision") == "lagged_signal_supported":
+                b4_result = collect("B4-dev", lambda: _b4_campaign(dev_args, samples, dev_root, runtime, confirm=False))
+            else:
+                skip("B4-dev", "Lagged signal did not pass the preregistered gate", incomplete=b4_analysis is None)
+        else:
+            for name in ("B3-dev", "B4-analysis", "B4-dev"):
+                skip(name, "Core collection is incomplete; E2E policy selection requires complete evidence", incomplete=True)
+
+        b3_ready = b3_result is not None and b3_result.get("status") == "locked_for_confirm"
+        b4_ready = b4_result is not None and b4_result.get("status") == "locked_for_confirm"
+        if b3_ready or b4_ready:
+            confirm_args = argparse.Namespace(**vars(dev_args))
+            confirm_args.run_id = confirm_id
+            confirm_args.cohort_phase = "confirm"
+            confirm_args.split_manifest = str(dev_root / "split_manifest.json")
+            confirm_root = _run_root(confirm_args)
+
+            def prepare_confirm() -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
+                if args.resume and (confirm_root / "campaign.json").is_file():
+                    prepared = _load_resume_campaign(confirm_args)
+                    if confirm_args.cohort_phase != "confirm":
+                        raise CampaignIntegrityError("Confirm run has a different cohort phase")
+                    return prepared
+                return _prepare(confirm_args)
+
+            prepared = collect("confirm-prepare", prepare_confirm)
+            confirm_ready = False
+            if prepared is not None:
+                confirm_samples, _, confirm_root = prepared
+                atomic_json(confirm_root / "runtime.json", runtime["b_campaign_signature"])
+                validated = collect("confirm-B0", lambda: _validate(confirm_args, confirm_samples, confirm_root, runtime))
+                parity_path = confirm_root / "evidence" / "parity.json"
+                parity = json.loads(parity_path.read_text(encoding="utf-8")) if parity_path.is_file() else {}
+                confirm_ready = bool(validated) and parity.get("status") == "complete"
+                if not confirm_ready and status["stages"]["confirm-B0"]["status"] == "complete":
+                    record("confirm-B0", "failed", reason="Confirm runtime validation has incomplete coverage")
+            else:
+                skip("confirm-B0", "Confirm cohort could not be prepared", incomplete=True)
+            for name, eligible, operation, lock_subdir in (
+                ("B3-confirm", b3_ready, _b3_campaign, "b3"),
+                ("B4-confirm", b4_ready, _b4_campaign, "b4"),
+            ):
+                if eligible and confirm_ready:
+                    confirm_args.policy_lock = str(dev_root / lock_subdir / "locked_config.json")
+                    collect(name, lambda operation=operation: operation(confirm_args, confirm_samples, confirm_root, runtime, confirm=True))
+                elif eligible:
+                    skip(name, "Confirm runtime validation is incomplete", incomplete=True)
+                else:
+                    skip(name, "Discovery did not produce a valid policy lock")
+        else:
+            for name in ("confirm-prepare", "confirm-B0", "B3-confirm", "B4-confirm"):
+                skip(name, "No E2E policy was locked during discovery")
+
+        partial = (
+            not core_ready
+            or any(stage["status"] in {"failed", "prerequisites_incomplete"} for stage in status["stages"].values())
+        )
+        status["workflow_status"] = "finished"
+        status["collection_status"] = "partial" if partial else "complete"
+        atomic_json(status_path, status)
+        print(f"[all] finished; collection={status['collection_status']}; status={status_path}", flush=True)
+        return 0
+    except BaseException as exc:
+        status["workflow_status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "stopped_fatal"
+        status["collection_status"] = "partial"
+        status["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        try:
+            atomic_json(status_path, status)
+        except Exception:
+            pass
+        raise
+
+
 def main() -> int:
     parser = _parser()
     args = parser.parse_args()
     if args.gpu_ids is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_ids)
     if args.run_id is None:
-        if args.mode in {"prepare", "run"}:
+        if args.mode in {"prepare", "run", "all"}:
             args.run_id = _utc_run_id()
         else:
-            parser.error("--run-id is required for modes other than prepare/run")
+            parser.error("--run-id is required for modes other than prepare/run/all")
     if args.max_new_tokens < 16 or args.validation_tokens < 1:
         parser.error("--max-new-tokens must be >=16 and --validation-tokens must be positive")
     if args.repetitions < 2 or not 1 <= args.selection_repetitions < args.repetitions:
         parser.error("repetitions must exceed selection repetitions >=1")
     if args.warmups < 0 or args.max_prefixes < 1 or args.n_splits < 2:
         parser.error("warmups must be nonnegative; max-prefixes positive; n-splits at least two")
-    if args.mode in {"b3-dev", "b3-confirm", "b4-dev", "b4-confirm"} and (
+    if args.mode in {"b3-dev", "b3-confirm", "b4-dev", "b4-confirm", "all"} and (
         args.e2e_repetitions < 3 or args.e2e_warmups < 1
     ):
         parser.error("B3/B4 require at least three E2E repetitions and one warmup sample per variant")
     try:
         _parse_gammas(args.gammas)
+        if args.mode == "all":
+            return _run_all(args)
         if args.mode == "prepare":
             _prepare(args, allow_existing=True)
             return 0

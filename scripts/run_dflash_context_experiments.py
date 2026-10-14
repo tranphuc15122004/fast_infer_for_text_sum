@@ -86,16 +86,38 @@ def _resolve(value: str | None) -> Path | None:
 
 
 def _paths(args: argparse.Namespace) -> tuple[Path | None, Path | None]:
-    data_dir_value = args.data_dir or os.environ.get("DATA_INPUT") or os.environ.get("LONG_BENCH_DATA_DIR")
-    data_file_value = args.data_file or os.environ.get("DATA_FILE") or os.environ.get("LONG_BENCH_DATA_FILE")
-    if data_dir_value and Path(data_dir_value).is_file() and not data_file_value:
-        data_file_value, data_dir_value = data_dir_value, None
-    data_dir = _resolve(data_dir_value) if data_dir_value else None
-    data_file = _resolve(data_file_value) if data_file_value else None
-    if data_dir is None and data_file is None:
-        # This is the canonical shared directory, not the local development copy.
-        data_dir = Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k")
-    return data_dir, data_file
+    # CLI selects the entire source, rather than filling one half from CLI
+    # and the other half from a stale environment variable.
+    if args.data_dir and args.data_file:
+        raise ValueError("choose exactly one of --data-dir or --data-file")
+    if args.data_dir:
+        return _resolve(args.data_dir), None
+    if args.data_file:
+        return None, _resolve(args.data_file)
+
+    # The shared DFlash config loader aliases DATA_INPUT to DATA_FILE even
+    # when DATA_INPUT is a directory. Collapse identical paths and inspect
+    # their actual type before passing them to preflight/load_corpus.
+    # LongBench defaults apply only if the shared source is unset.
+    names = ("DATA_INPUT", "DATA_FILE")
+    if not any(os.environ.get(name) for name in names):
+        names = ("LONG_BENCH_DATA_DIR", "LONG_BENCH_DATA_FILE")
+    sources = {
+        name: _resolve(os.environ[name]).resolve()
+        for name in names if os.environ.get(name)
+    }
+    if len(set(sources.values())) > 1:
+        details = ", ".join(f"{name}={path}" for name, path in sources.items())
+        raise ValueError(f"conflicting data sources: {details}; select --data-dir or --data-file explicitly")
+    if sources:
+        name, path = next(iter(sources.items()))
+        if path.is_dir():
+            return path, None
+        if path.is_file() or name.endswith("FILE"):
+            return None, path
+        return path, None  # Preserve the configured path for the missing-asset error.
+    # This is the canonical shared directory, not the local development copy.
+    return Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/longbench_100_14k"), None
 
 
 def _load_samples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[Path]]:
