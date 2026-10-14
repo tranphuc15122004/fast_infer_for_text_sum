@@ -63,4 +63,9 @@ latexmk main.tex
 - Để nộp bản camera-ready/final: sửa thành `\usepackage[final]{acl}`.
 
 ## Định hướng của báo cáo
-
+- Báo cáo này sẽ thực hiện viết trình bày như vừa là một report và paper nghiên cứu khoa học
+- Đề tài thực hiện là "Tăng tốc inference cho tác vụ long context, tóm tắt văn bản". 
+- Mục tiêu là báo cáo về kết quả nghiên cứu , thực hiện được trong 3 tháng qua thực hiện đề tài . Có một số các công việc được thử nghiệm ở /home/tuantb/my_GrowMTP/ và /home/tuantb/fast_infer_text_sum_Viet/ , không nên báo cáo vào phần nội dung chính vì nó chưa có kết quả thực hiện.
+- Method chính của tôi sẽ chọn để báo cáo để bảo cáo là phương pháp Training Free đang thực hiện thực nghiệm
+- Hiện tại đang thực hiện các analysis để điều chỉnh phương pháp cũng như viết vào thành một mục insight trong report
+- Kết quả đã đo được sẽ nằm ở REPORT/results/

@@ -351,6 +351,9 @@ def evaluate_replay_action(
             verify_event,
             gather_events,
             uncertainty,
+            _verification_gamma,
+            _verification_decision,
+            _verification_policy_ms,
         ) = outcome
         bank_update_started = time.perf_counter()
         committed = 1 + int(accepted)

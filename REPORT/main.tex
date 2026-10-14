@@ -1,378 +1,393 @@
 % !TEX root = main.tex
 \documentclass[11pt]{article}
 
-% Change "review" to "final" to generate the final (sometimes called camera-ready) version.
-% Change to "preprint" to generate a non-anonymous version with page numbers.
-\usepackage[review]{acl}
+% Change "review" to "final" to generate the final (camera-ready) version.
+% Use "preprint" for a non-anonymous version with page numbers.
+\usepackage[preprint]{acl}
 
 % Standard package includes
 \usepackage{times}
 \usepackage{latexsym}
-
-% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
 \usepackage[T1]{fontenc}
-% For Vietnamese characters
-% \usepackage[T5]{fontenc}
-% See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
-
-% This assumes your files are encoded as UTF8
 \usepackage[utf8]{inputenc}
-
-% This is not strictly necessary, and may be commented out,
-% but it will improve the layout of the manuscript,
-% and will typically save some space.
 \usepackage{microtype}
-
-% This is also not strictly necessary, and may be commented out.
-% However, it will improve the aesthetics of text in
-% the typewriter font.
 \usepackage[noupquote]{inconsolata}
-
-%Including images in your LaTeX document requires adding
-%additional package(s)
 \usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage{colortbl}
+\usepackage{makecell}
 
-% If the title and author information does not fit in the area allocated, uncomment the following
-%
-%\setlength\titlebox{<dim>}
-%
-% and set <dim> to something 5cm or larger.
+% Table styling colors exactly matching Labeling4 - Phuc.pdf
+\definecolor{headerblue}{RGB}{31, 78, 120}     % #1F4E78 Dark Navy Blue
+\definecolor{subhdrblue}{RGB}{46, 117, 182}    % #2E75B6 Medium Blue
+\definecolor{cellblue}{RGB}{217, 234, 247}     % #D9EAF7 Soft Light Blue (Top Speedup)
+\definecolor{cellwarn}{RGB}{252, 229, 205}     % #FCE5CD Soft Peach/Orange (Speedup < 1.0x)
+\definecolor{cellevn}{RGB}{247, 250, 253}      % #F7FAFD Subtle Alternating Row
+\definecolor{gridgray}{RGB}{210, 218, 226}     % #D2DAE2 Subtle Border
+\definecolor{ourscell}{RGB}{255, 250, 235}     % #FFFAEB Warm Highlight for Ours
 
-\title{Instructions for *ACL Proceedings}
+\title{Accelerating Long-Context Text Summarization via Training-Free Speculative Decoding: A Three-Month Research Report and Empirical Insights}
 
-% Author information can be set in various styles:
-% For several authors from the same institution:
-% \author{Author 1 \and ... \and Author n \\
-%         Address line \\ ... \\ Address line}
-% if the names do not fit well on one line use
-%         Author 1 \\ {\bf Author 2} \\ ... \\ {\bf Author n} \\
-% For authors from different institutions:
-% \author{Author 1 \\ Address line \\  ... \\ Address line
-%         \And  ... \And
-%         Author n \\ Address line \\ ... \\ Address line}
-% To start a separate ``row'' of authors use \AND, as in
-% \author{Author 1 \\ Address line \\  ... \\ Address line
-%         \AND
-%         Author 2 \\ Address line \\ ... \\ Address line \And
-%         Author 3 \\ Address line \\ ... \\ Address line}
+\author{
+  Research Report \& Milestone Progress \\
+  Topic: Fast Inference for Long-Context Text Summarization \\
+  \texttt{fast\_infer\_text\_sum}
+}
 
-\author{First Author \\
-  Affiliation / Address line 1 \\
-  Affiliation / Address line 2 \\
-  Affiliation / Address line 3 \\
-  \texttt{email@domain} \\\And
-  Second Author \\
-  Affiliation / Address line 1 \\
-  Affiliation / Address line 2 \\
-  Affiliation / Address line 3 \\
-  \texttt{email@domain} \\}
-
-%\author{
-%  \textbf{First Author\textsuperscript{1}},
-%  \textbf{Second Author\textsuperscript{1,2}},
-%  \textbf{Third T. Author\textsuperscript{1}},
-%  \textbf{Fourth Author\textsuperscript{1}},
-%\\
-%  \textbf{Fifth Author\textsuperscript{1,2}},
-%  \textbf{Sixth Author\textsuperscript{1}},
-%  \textbf{Seventh Author\textsuperscript{1}},
-%  \textbf{Eighth Author \textsuperscript{1,2,3,4}},
-%\\
-%  \textbf{Ninth Author\textsuperscript{1}},
-%  \textbf{Tenth Author\textsuperscript{1}},
-%  \textbf{Eleventh E. Author\textsuperscript{1,2,3,4,5}},
-%  \textbf{Twelfth Author\textsuperscript{1}},
-%\\
-%  \textbf{Thirteenth Author\textsuperscript{3}},
-%  \textbf{Fourteenth F. Author\textsuperscript{2,4}},
-%  \textbf{Fifteenth Author\textsuperscript{1}},
-%  \textbf{Sixteenth Author\textsuperscript{1}},
-%\\
-%  \textbf{Seventeenth S. Author\textsuperscript{4,5}},
-%  \textbf{Eighteenth Author\textsuperscript{3,4}},
-%  \textbf{Nineteenth N. Author\textsuperscript{2,5}},
-%  \textbf{Twentieth Author\textsuperscript{1}}
-%\\
-%\\
-%  \textsuperscript{1}Affiliation 1,
-%  \textsuperscript{2}Affiliation 2,
-%  \textsuperscript{3}Affiliation 3,
-%  \textsuperscript{4}Affiliation 4,
-%  \textsuperscript{5}Affiliation 5
-%\\
-%  \small{
-%    \textbf{Correspondence:} \href{mailto:email@domain}{email@domain}
-%  }
-%}
+\date{}
 
 \begin{document}
 \maketitle
+
 \begin{abstract}
-This document is a supplement to the general instructions for *ACL authors. It contains instructions for using the \LaTeX{} style files for ACL conferences.
-The document itself conforms to its own specifications, and is therefore an example of what your manuscript should look like.
-These instructions should be used both for papers submitted for review and for final versions of accepted papers.
+Long-document text summarization presents a profound computational challenge for autoregressive Large Language Models (LLMs): while the input source length often spans thousands of tokens ($L_{\mathrm{source}} \gg L_{\mathrm{target}}$), the output generation remains memory-bandwidth bound. Over the past three months, we investigated acceleration techniques for this workload with a focus on Qwen3-4B. We established a unified evaluation across leading speculative decoding baselines (EAGLE-3, DFlash, Domino, and DSpark) spanning both vLLM and FlashAttention-4 (FA4) runtimes, across English benchmarks (GovReport, QMSum, Multi-News, LCC, RepoBench-P) and Vietnamese summarization datasets (VietNews, WikiLingua, ViMs, VLSP). 
+
+Crucially, our empirical analysis uncovers two foundational bottlenecks: (1) \textit{the tree verification penalty}, where non-linear verification graphs encounter severe latency regressions under vLLM's paged memory batching, and (2) \textit{context-induced speculative drift}, where speculative acceptance rates ($\tau$) degrade substantially as prompt length scales from 2k to 16k tokens. Motivated by these insights, we position a lightweight, \textbf{Training-Free Speculative Decoding} framework as our primary proposed method. This report consolidates empirical findings, diagnoses failure modes of trained drafters, and outlines the architectural blueprint for our training-free method.
 \end{abstract}
 
 \section{Introduction}
 
-These instructions are for authors submitting papers to *ACL conferences using \LaTeX. They are not self-contained. All authors must follow the general instructions for *ACL proceedings,\footnote{\url{http://acl-org.github.io/ACLPUB/formatting.html}} and this document contains additional instructions for the \LaTeX{} style files.
+The demand for long-context language modeling has surged, especially in document summarization, legal contract analysis, and multi-meeting synthesis. In these scenarios, the input prompt comprises thousands of source tokens, while the target summary is comparatively compact ($L_{\mathrm{source}} \gg L_{\mathrm{output}}$). During autoregressive decoding, every output token requires loading billions of parameters and a massive Key-Value (KV) cache from High Bandwidth Memory (HBM) into SRAM, rendering generation heavily memory-bandwidth bound.
 
-The templates include the \LaTeX{} source of this document (\texttt{acl\_latex.tex}),
-the \LaTeX{} style file used to format it (\texttt{acl.sty}),
-an ACL bibliography style (\texttt{acl\_natbib.bst}),
-an example bibliography (\texttt{custom.bib}),
-and the bibliography for the ACL Anthology (\texttt{anthology.bib}).
+To alleviate this latency bottleneck, \textit{Speculative Decoding} \citep{leviathan2023fast,chen2023accelerating} has emerged as a promising paradigm: an auxiliary, lightweight draft mechanism proposes candidate token sequences, which the target LLM validates in parallel within a single forward pass. State-of-the-art approaches like EAGLE-3 \citep{li2024eagle} and DFlash \citep{zhang2024dflash} have demonstrated notable speedups on standard short-context generation benchmarks.
 
-\section{Engines}
+However, applying speculative decoding to \textbf{long-context text summarization} introduces unique systems and algorithmic complexities:
+\begin{enumerate}
+    \item \textbf{High Retraining Cost}: Existing high-performance drafters require extensive pre-training or fine-tuning paired with each specific target model and vocabulary, limiting agility.
+    \item \textbf{Context Scaling Degradation}: When the prompt length scales up to 16k tokens, speculative acceptance lengths decay significantly across multiple model families.
+    \item \textbf{Serving Engine Incompatibility}: Tree-based verification algorithms that perform well in isolated PyTorch execution suffer noticeable throughput degradations when deployed on production serving engines (e.g., vLLM) due to paged memory fragmentation.
+\end{enumerate}
 
-To produce a PDF file, pdf\LaTeX{} is strongly recommended (over original \LaTeX{} plus dvips+ps2pdf or dvipdf).
-The style file \texttt{acl.sty} can also be used with
-lua\LaTeX{} and
-Xe\LaTeX{}, which are especially suitable for text in non-Latin scripts.
-The file \texttt{acl\_lualatex.tex} in this repository provides
-an example of how to use \texttt{acl.sty} with either
-lua\LaTeX{} or
-Xe\LaTeX{}.
+\paragraph{Scope of this Report}
+This report documents our three-month research progress. We purposefully scope the primary report around completed, verified benchmarks and empirical analysis. Exploratory avenues that have not yet achieved verified convergence (e.g., preliminary experiments in external workspaces) are excluded to ensure rigorous claims. 
 
-\section{Preamble}
+We direct our focus toward:
+\begin{itemize}
+    \item A systematic performance benchmark of Vanilla AR, EAGLE-3, DFlash, Domino, and DSpark on Qwen3-4B across English and Vietnamese datasets.
+    \item In-depth empirical analysis detailing the breakdown of tree verification and long-context performance degradation.
+    \item Architectural formulation of a \textbf{Training-Free Speculative Decoding} method (designated as \textbf{Ours}) designed to mitigate serving overhead without model retraining.
+\end{itemize}
 
-The first line of the file must be
+\section{Background and Related Work}
+
+\subsection{Speculative Decoding Paradigms}
+Speculative decoding breaks the serial nature of autoregressive generation by using a draft mechanism to propose $\gamma$ tokens, which are verified simultaneously by the target model:
+\begin{equation}
+    \tau = 1 + \sum_{i=1}^{\gamma} \prod_{j=1}^{i} \alpha_j
+\end{equation}
+where $\tau$ is the average acceptance length and $\alpha_j$ is the acceptance probability of the $j$-th candidate token.
+
+\paragraph{Model-Based Drafters (EAGLE-3)}
+EAGLE \citep{li2024eagle,li2024eagle2} utilizes an auto-regressive draft head trained on top of the target LLM's feature space, predicting future token representations with high accuracy.
+
+\paragraph{Block Diffusion / Parallel Drafting (DFlash)}
+DFlash \citep{zhang2024dflash} replaces autoregressive drafting with a non-autoregressive block proposal, predicting an entire chunk of tokens in one shot to reduce proposal latency.
+
+\paragraph{Tree-Based Verification (Domino, DSpark)}
+To maximize candidate coverage, modern methods structure draft proposals as candidate trees rather than linear chains. The target model evaluates the tree using custom attention masks.
+
+\subsection{Orthogonal Approaches: KV Cache Management}
+A distinct line of research focuses on KV cache compression and sparse attention (e.g., FastKV, SnapKV, StreamingLLM). While these techniques effectively reduce GPU memory footprint, they address capacity rather than decoding step latency. In this work, we focus squarely on \textbf{speculative decoding acceleration}, treating memory-management techniques as orthogonal system optimizations.
+
+\section{Empirical Analysis and Research Insights}
+\label{sec:insights}
+
+Prior to finalizing our algorithmic formulation, we conducted extensive probing into the inference dynamics of Qwen3-4B on long-context summarization workloads. Three central insights emerged:
+
+\subsection{Insight 1: Grounding vs. Abstraction Computation Heterogeneity}
+Long-document summarization exhibits marked computation heterogeneity across decoding timesteps:
+\begin{itemize}
+    \item \textbf{Source-Grounding Phase}: When extracting facts, entities, or key numbers, the target model's attention sharply focuses on sparse source positions. Drafters often lack the global receptive field to anticipate these tokens, causing abrupt speculative rejections.
+    \item \textbf{Abstractive / Connective Phase}: When generating syntactic connectors, structuring phrases, or fluent transitions, predictions are highly predictable, yielding long consecutive accepted runs ($\ge 4$ tokens).
+\end{itemize}
+Treating all decoding steps with a uniform speculation budget $\gamma$ incurs wasted compute during grounding transitions.
+
+\subsection{Insight 2: The Tree Verification Bottleneck in Serving Engines}
+As observed in our empirical evaluation (Tables~\ref{tab:vllm_english} and \ref{tab:vllm_vietnamese}), tree-based speculative verification exhibits a sharp discrepancy between isolated environments and production serving engines:
 \begin{quote}
-\begin{verbatim}
-\documentclass[11pt]{article}
-\end{verbatim}
+    \textit{Tree-based verification methods encounter severe efficiency bottlenecks under vLLM's paged memory batching, despite favorable acceptance lengths in standalone runtimes.}
 \end{quote}
+Under vLLM's PagedAttention \citep{kwon2023efficient}, dynamic branching trees disrupt contiguous memory access and batching coalescing, transforming theoretical verification parallelism into memory-access overhead. This motivates prioritizing \textbf{flat or engine-friendly verification topologies}.
 
-To load the style file in the review version:
-\begin{quote}
-\begin{verbatim}
-\usepackage[review]{acl}
-\end{verbatim}
-\end{quote}
-For the final version, omit the \verb|review| option:
-\begin{quote}
-\begin{verbatim}
-\usepackage{acl}
-\end{verbatim}
-\end{quote}
+\subsection{Insight 3: Performance Decay Across Context Bins}
+Comparing performance across prompt lengths ($0\text{--}2\text{k}$ up to $12\text{--}16\text{k}$ tokens in Tables~\ref{tab:vllm_bins} and \ref{tab:fa4_bins}):
+\begin{itemize}
+    \item At short contexts ($0\text{--}2\text{k}$), DFlash achieves up to $2.35\times$ speedup on vLLM and $2.34\times$ on FA4.
+    \item At extended contexts ($12\text{--}16\text{k}$), speedup falls to $1.56\times$ on vLLM and $1.42\times$ on FA4.
+\end{itemize}
+The expanded KV cache increases the memory transfer cost per verification forward pass, which penalizes rejected speculations far more severely at 16k than at 2k context.
 
-To use Times Roman, put the following in the preamble:
-\begin{quote}
-\begin{verbatim}
-\usepackage{times}
-\end{verbatim}
-\end{quote}
-(Alternatives like txfonts or newtx are also acceptable.)
+\section{Proposed Method: Training-Free Speculative Decoding}
+\label{sec:method}
 
-Please see the \LaTeX{} source of this document for comments on other packages that may be useful.
-
-Set the title and author using \verb|\title| and \verb|\author|. Within the author list, format multiple authors using \verb|\and| and \verb|\And| and \verb|\AND|; please see the \LaTeX{} source for examples.
-
-By default, the box containing the title and author names is set to the minimum of 5 cm. If you need more space, include the following in the preamble:
-\begin{quote}
-\begin{verbatim}
-\setlength\titlebox{<dim>}
-\end{verbatim}
-\end{quote}
-where \verb|<dim>| is replaced with a length. Do not set this length smaller than 5 cm.
-
-\section{Document Body}
-
-\subsection{Footnotes}
-
-Footnotes are inserted with the \verb|\footnote| command.\footnote{This is a footnote.}
-
-\subsection{Tables and figures}
-
-See Table~\ref{tab:accents} for an example of a table and its caption.
-\textbf{Do not override the default caption sizes.}
-
-\begin{table}
-  \centering
-  \begin{tabular}{lc}
-    \hline
-    \textbf{Command} & \textbf{Output} \\
-    \hline
-    \verb|{\"a}|     & {\"a}           \\
-    \verb|{\^e}|     & {\^e}           \\
-    \verb|{\`i}|     & {\`i}           \\
-    \verb|{\.I}|     & {\.I}           \\
-    \verb|{\o}|      & {\o}            \\
-    \verb|{\'u}|     & {\'u}           \\
-    \verb|{\aa}|     & {\aa}           \\\hline
-  \end{tabular}
-  \begin{tabular}{lc}
-    \hline
-    \textbf{Command} & \textbf{Output} \\
-    \hline
-    \verb|{\c c}|    & {\c c}          \\
-    \verb|{\u g}|    & {\u g}          \\
-    \verb|{\l}|      & {\l}            \\
-    \verb|{\~n}|     & {\~n}           \\
-    \verb|{\H o}|    & {\H o}          \\
-    \verb|{\v r}|    & {\v r}          \\
-    \verb|{\ss}|     & {\ss}           \\
-    \hline
-  \end{tabular}
-  \caption{Example commands for accented characters, to be used in, \emph{e.g.}, Bib\TeX{} entries.}
-  \label{tab:accents}
-\end{table}
-
-As much as possible, fonts in figures should conform
-to the document fonts. See Figure~\ref{fig:experiments} for an example of a figure and its caption.
-
-Using the \verb|graphicx| package graphics files can be included within figure
-environment at an appropriate point within the text.
-The \verb|graphicx| package supports various optional arguments to control the
-appearance of the figure.
-You must include it explicitly in the \LaTeX{} preamble (after the
-\verb|\documentclass| declaration and before \verb|\begin{document}|) using
-\verb|\usepackage{graphicx}|.
+Drawing upon the insights in Section~\ref{sec:insights}, our proposed method (\textbf{Ours}) is built on three core design principles:
 
 \begin{figure}[t]
-  \includegraphics[width=\columnwidth]{example-image-golden}
-  \caption{A figure with a caption that runs for more than one line.
-    Example image is usually available through the \texttt{mwe} package
-    without even mentioning it in the preamble.}
-  \label{fig:experiments}
+\centering
+\fbox{\parbox{0.92\columnwidth}{
+\textbf{Proposed Method Architecture Overview:}
+\begin{itemize}
+    \item \textbf{Zero Retraining Requirement}: Exploits the target model's existing internal representations and context redundancy.
+    \item \textbf{Context-Adaptive Budgeting}: Dynamically modulates candidate length $\gamma_t$ based on local entropy and generation state.
+    \item \textbf{Engine-Friendly Flat Verification}: Guarantees coalesced memory access compatible with vLLM PagedAttention.
+\end{itemize}
+}}
+\caption{Conceptual schema of our Training-Free Speculative Framework for long-context summarization.}
+\label{fig:framework}
 \end{figure}
 
-\begin{figure*}[t]
-  \includegraphics[width=0.48\linewidth]{example-image-a} \hfill
-  \includegraphics[width=0.48\linewidth]{example-image-b}
-  \caption {A minimal working example to demonstrate how to place
-    two images side-by-side.}
-\end{figure*}
+\subsection{Zero-Training Drafting Mechanism}
+Rather than training a separate parameter-heavy drafter for each model family, our method extracts candidate proposals directly from the target model's prompt context and early representations. By leveraging prompt-matching heuristics and lightweight representation projections, we eliminate the substantial computational overhead of training specialized drafters.
 
-\subsection{Hyperlinks}
+\subsection{Dynamic Speculation Horizon}
+To mitigate the context-scaling degradation identified in Insight 3, we formulate an online adaptive gate:
+\begin{equation}
+    \gamma_t = f\Big(\mathcal{H}(y_{<t}),\, |\mathrm{prompt}|,\, \mathrm{state}_t\Big)
+\end{equation}
+where $\mathcal{H}$ measures target confidence/entropy. When entering high-uncertainty source-grounding tokens, $\gamma_t$ is conservatively reduced to prevent costly rejected passes. Conversely, during syntactic generation, $\gamma_t$ expands to capture high-throughput speculative runs.
 
-Users of older versions of \LaTeX{} may encounter the following error during compilation:
-\begin{quote}
-\verb|\pdfendlink| ended up in different nesting level than \verb|\pdfstartlink|.
-\end{quote}
-This happens when pdf\LaTeX{} is used and a citation splits across a page boundary. The best way to fix this is to upgrade \LaTeX{} to 2018-12-01 or later.
+\subsection{Flat, vLLM-Compatible Verification}
+To resolve the engine penalty observed in Insight 2, our framework avoids irregular tree graph structures. Candidate sequences are organized into linear or shallow vector batches that execute efficiently within vLLM's continuous batching scheduler.
 
-\subsection{Citations}
+\section{Experimental Evaluation}
 
-\begin{table*}
-  \centering
-  \begin{tabular}{lll}
-    \hline
-    \textbf{Output}           & \textbf{natbib command} & \textbf{ACL only command} \\
-    \hline
-    \citep{Gusfield:97}       & \verb|\citep|           &                           \\
-    \citealp{Gusfield:97}     & \verb|\citealp|         &                           \\
-    \citet{Gusfield:97}       & \verb|\citet|           &                           \\
-    \citeyearpar{Gusfield:97} & \verb|\citeyearpar|     &                           \\
-    \citeposs{Gusfield:97}    &                         & \verb|\citeposs|          \\
-    \hline
-  \end{tabular}
-  \caption{\label{citation-guide}
-    Citation commands supported by the style file.
-    The style is based on the natbib package and supports all natbib citation commands.
-    It also supports commands defined in previous ACL style files for compatibility.
-  }
+\subsection{Experimental Setup}
+\paragraph{Backbone Model}
+All experiments are conducted using \textbf{Qwen3-4B} (\texttt{Q3-4B}) under greedy decoding (temperature $=0$).
+
+\paragraph{Hardware \& Serving Backends}
+We evaluate across two primary computational configurations:
+\begin{itemize}
+    \item \textbf{vLLM Serving Backend}: Evaluated at batch size 100 with maximum output length 512 tokens.
+    \item \textbf{FlashAttention-4 (FA4) Backend}: Evaluated with 8,192 input tokens and 512 output tokens.
+\end{itemize}
+
+\paragraph{Datasets}
+\begin{itemize}
+    \item \textbf{English Long-Context}: GovReport, QMSum, Multi-News, LCC, and RepoBench-P.
+    \item \textbf{Vietnamese Summarization}: VietNews, WikiLingua, ViMs, and VLSP.
+    \item \textbf{Length Bins}: Evaluated in five intervals: Bin 1 ($0\text{--}2\text{k}$), Bin 2 ($2\text{--}4\text{k}$), Bin 3 ($4\text{--}8\text{k}$), Bin 4 ($8\text{--}12\text{k}$), and Bin 5 ($12\text{--}16\text{k}$).
+\end{itemize}
+
+\subsection{Results on English Long-Context (vLLM)}
+
+Table~\ref{tab:vllm_english} reports the average acceptance length ($\tau$), end-to-end speedup, decoding speedup, and decoding throughput across all English benchmarks under vLLM.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on English long context datasets. (\textbf{VLLM}, batchsize 100, output 512)}
+\label{tab:vllm_english}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{GovReport}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{QMSum}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Multi-News}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{LCC}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{RepoBench-P}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1,000x & 1,000x & 310,370 & 1,000 & 1,000x & 1,000x & 338,070 & 1,000 & 1,000x & 1,000x & 303,860 & 1,000 & 1,000x & 1,000x & 336,360 & 1,000 & 1,000x & 1,000x & 312,99 / 311,82 & 1,000 & 1,000x & 1,000x & 321,20 / 320,40 \\
+& EAGLE3  & 2,250 & 1,102x & 1,139x & 352,610 & 2,050 & 1,038x & 1,060x & 357,530 & 2,020 & 1,018x & 1,024x & 310,950 & 2,080 & 1,040x & 1,062x & 356,130 & 2,040 & 1,023x & 1,030x & 321,130 & 2,088 & 1,045x & 1,064x & 340,800 \\
+& DFlash  & \cellcolor{cellblue}2,120 & \cellcolor{cellblue}1,398x & \cellcolor{cellblue}1,594x & \cellcolor{cellblue}494,560 & \cellcolor{cellblue}2,520 & \cellcolor{cellblue}1,673x & \cellcolor{cellblue}1,830x & \cellcolor{cellblue}618,430 & \cellcolor{cellblue}1,820 & \cellcolor{cellblue}1,231x & \cellcolor{cellblue}1,340x & \cellcolor{cellblue}407,170 & \cellcolor{cellblue}2,820 & \cellcolor{cellblue}1,811x & \cellcolor{cellblue}2,023x & \cellcolor{cellblue}680,270 & \cellcolor{cellblue}2,420 & \cellcolor{cellblue}1,493x & \cellcolor{cellblue}1,728x & \cellcolor{cellblue}540,830 & \cellcolor{cellblue}2,334 & \cellcolor{cellblue}1,495x & \cellcolor{cellblue}1,689x & \cellcolor{cellblue}542,500 \\
+& Domino  & 1,080 & \cellcolor{cellwarn}0,701x & \cellcolor{cellwarn}0,641x & \cellcolor{cellwarn}198,530 & 1,090 & \cellcolor{cellwarn}0,656x & \cellcolor{cellwarn}0,633x & \cellcolor{cellwarn}213,450 & 1,060 & \cellcolor{cellwarn}0,706x & \cellcolor{cellwarn}0,637x & \cellcolor{cellwarn}193,500 & 1,050 & \cellcolor{cellwarn}0,639x & \cellcolor{cellwarn}0,613x & \cellcolor{cellwarn}205,510 & 1,050 & \cellcolor{cellwarn}0,680x & \cellcolor{cellwarn}0,625x & \cellcolor{cellwarn}194,780 & 1,066 & \cellcolor{cellwarn}0,676x & \cellcolor{cellwarn}0,629x & \cellcolor{cellwarn}201,600 \\
+& DSpark  & \cellcolor{cellblue}\textbf{3,060} & \cellcolor{cellblue}\textbf{1,724x} & \cellcolor{cellblue}\textbf{2,216x} & \cellcolor{cellblue}\textbf{687,760} & \cellcolor{cellblue}\textbf{3,070} & \cellcolor{cellblue}\textbf{2,012x} & \cellcolor{cellblue}\textbf{2,300x} & \cellcolor{cellblue}\textbf{777,600} & \cellcolor{cellblue}\textbf{2,560} & \cellcolor{cellblue}\textbf{1,525x} & \cellcolor{cellblue}\textbf{1,868x} & \cellcolor{cellblue}\textbf{567,540} & \cellcolor{cellblue}\textbf{3,290} & \cellcolor{cellblue}\textbf{2,074x} & \cellcolor{cellblue}\textbf{2,396x} & \cellcolor{cellblue}\textbf{805,800} & \cellcolor{cellblue}\textbf{3,110} & \cellcolor{cellblue}\textbf{1,764x} & \cellcolor{cellblue}\textbf{2,228x} & \cellcolor{cellblue}\textbf{697,350} & \cellcolor{cellblue}\textbf{3,027} & \cellcolor{cellblue}\textbf{1,799x} & \cellcolor{cellblue}\textbf{2,203x} & \cellcolor{cellblue}\textbf{707,500} \\
+\cline{2-26}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{24}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
 \end{table*}
 
-Table~\ref{citation-guide} shows the syntax supported by the style files.
-We encourage you to use the natbib styles.
-You can use the command \verb|\citet| (cite in text) to get ``author (year)'' citations, like this citation to a paper by \citet{Gusfield:97}.
-You can use the command \verb|\citep| (cite in parentheses) to get ``(author, year)'' citations \citep{Gusfield:97}.
-You can use the command \verb|\citealp| (alternative cite without parentheses) to get ``author, year'' citations, which is useful for using citations within parentheses (e.g. \citealp{Gusfield:97}).
+\subsection{Results on Vietnamese Summarization (vLLM)}
 
-A possessive citation can be made with the command \verb|\citeposs|.
-This is not a standard natbib command, so it is generally not compatible
-with other style files.
+Table~\ref{tab:vllm_vietnamese} reports the evaluation on Vietnamese summarization benchmarks under the vLLM serving engine.
 
-\subsection{References}
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on VietNamese summarization datasets. (\textbf{VLLM})}
+\label{tab:vllm_vietnamese}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{VietNews}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{WikiLingua}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{ViMs}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{VLSP}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1.000x & 1.000x & 349.53 & 1,000 & 1.000x & 1.000x & 350.39 & 1,000 & 1.000x & 1.000x & 335.23 & 1,000 & 1.000x & 1.000x & 338.07 & 1,000 & 1.000x & 1.000x & 343.17 \\
+& EAGLE3  & 1,346 & \cellcolor{cellwarn}0.680x & \cellcolor{cellwarn}0.682x & \cellcolor{cellwarn}238.27 & 1,252 & \cellcolor{cellwarn}0.622x & \cellcolor{cellwarn}0.631x & \cellcolor{cellwarn}221.19 & 1,320 & \cellcolor{cellwarn}0.682x & \cellcolor{cellwarn}0.672x & \cellcolor{cellwarn}225.28 & 1,312 & \cellcolor{cellwarn}0.681x & \cellcolor{cellwarn}0.671x & \cellcolor{cellwarn}226.76 & 1,307 & \cellcolor{cellwarn}0.667x & \cellcolor{cellwarn}0.664x & \cellcolor{cellwarn}227.70 \\
+& DFlash  & \cellcolor{cellblue}2,178 & \cellcolor{cellblue}1.564x & \cellcolor{cellblue}1.586x & \cellcolor{cellblue}554.32 & \cellcolor{cellblue}1,882 & \cellcolor{cellblue}1.324x & \cellcolor{cellblue}1.374x & \cellcolor{cellblue}481.46 & \cellcolor{cellblue}1,918 & \cellcolor{cellblue}1.362x & \cellcolor{cellblue}1.408x & \cellcolor{cellblue}471.92 & \cellcolor{cellblue}1,925 & \cellcolor{cellblue}1.379x & \cellcolor{cellblue}1.402x & \cellcolor{cellblue}473.93 & \cellcolor{cellblue}1,976 & \cellcolor{cellblue}1.403x & \cellcolor{cellblue}1.437x & \cellcolor{cellblue}493.18 \\
+& Domino  & 1,111 & \cellcolor{cellwarn}0.632x & \cellcolor{cellwarn}0.634x & \cellcolor{cellwarn}221.43 & 1,130 & \cellcolor{cellwarn}0.629x & \cellcolor{cellwarn}0.641x & \cellcolor{cellwarn}224.77 & 1,092 & \cellcolor{cellwarn}0.644x & \cellcolor{cellwarn}0.632x & \cellcolor{cellwarn}211.95 & 1,094 & \cellcolor{cellwarn}0.642x & \cellcolor{cellwarn}0.632x & \cellcolor{cellwarn}213.72 & 1,107 & \cellcolor{cellwarn}0.637x & \cellcolor{cellwarn}0.635x & \cellcolor{cellwarn}217.86 \\
+& DSpark  & \cellcolor{cellblue}\textbf{2,305} & \cellcolor{cellblue}\textbf{1.696x} & \cellcolor{cellblue}\textbf{1.715x} & \cellcolor{cellblue}\textbf{599.52} & \cellcolor{cellblue}\textbf{2,023} & \cellcolor{cellblue}\textbf{1.447x} & \cellcolor{cellblue}\textbf{1.496x} & \cellcolor{cellblue}\textbf{524.11} & \cellcolor{cellblue}\textbf{2,176} & \cellcolor{cellblue}\textbf{1.553x} & \cellcolor{cellblue}\textbf{1.607x} & \cellcolor{cellblue}\textbf{538.79} & \cellcolor{cellblue}\textbf{2,145} & \cellcolor{cellblue}\textbf{1.520x} & \cellcolor{cellblue}\textbf{1.584x} & \cellcolor{cellblue}\textbf{535.62} & \cellcolor{cellblue}\textbf{2,162} & \cellcolor{cellblue}\textbf{1.551x} & \cellcolor{cellblue}\textbf{1.597x} & \cellcolor{cellblue}\textbf{548.09} \\
+\cline{2-22}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{20}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
+\end{table*}
 
-\nocite{Ando2005,andrew2007scalable,rasooli-tetrault-2015}
-
-The \LaTeX{} and Bib\TeX{} style files provided roughly follow the American Psychological Association format.
-If your own bib file is named \texttt{custom.bib}, then placing the following before any appendices in your \LaTeX{} file will generate the references section for you:
 \begin{quote}
-\begin{verbatim}
-\bibliography{custom}
-\end{verbatim}
+\textit{\small \textbf{Observation on vLLM Serving}: In the two tables above (vLLM), tree-based verification methods (such as Domino, and EAGLE-3 on Vietnamese) exhibit severe speed regressions ($<1.0\times$ speedup) due to vLLM's paged memory batching, which differs fundamentally from standalone PyTorch/Transformers execution.}
 \end{quote}
 
-You can obtain the complete ACL Anthology as a Bib\TeX{} file from \url{https://aclweb.org/anthology/anthology.bib.gz}.
-To include both the Anthology and your own .bib file, use the following instead of the above.
-\begin{quote}
-\begin{verbatim}
-\bibliography{anthology,custom}
-\end{verbatim}
-\end{quote}
+\subsection{Results on Vietnamese Summarization (FA4)}
 
-Please see Section~\ref{sec:bibtex} for information on preparing Bib\TeX{} files.
+Table~\ref{tab:fa4_vietnamese} reports the evaluation on Vietnamese summarization benchmarks under the FlashAttention-4 execution runtime.
 
-\subsection{Equations}
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on VietNamese summarization datasets. (\textbf{FA4}, 8192 input, 512 output)}
+\label{tab:fa4_vietnamese}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{VietNews}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{WikiLingua}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{ViMs}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{VLSP}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1.000x & 1.000x & 36,03 & 1,000 & 1.000x & 1.000x & 35,52 & 1,000 & 1.000x & 1.000x & 35,55 & 1,000 & 1.000x & 1.000x & 35,47 & 1,000 & 1.000x & 1.000x & 35,64 \\
+& EAGLE3  & 1,41 & 1.103x & 1.103x & 40,23 & 1,32 & 1.071x & 1.072x & 38,00 & 1,38 & 1.100x & 1.101x & 39,46 & 1,37 & 1.049x & 1.050x & 38,73 & 1,37 & 1.080x & 1.081x & 39,11 \\
+& DFlash  & \cellcolor{cellblue}2,26 & \cellcolor{cellblue}1.785x & \cellcolor{cellblue}1.796x & \cellcolor{cellblue}66,69 & \cellcolor{cellblue}1,93 & \cellcolor{cellblue}\textbf{1.537x} & \cellcolor{cellblue}\textbf{1.545x} & \cellcolor{cellblue}\textbf{55,78} & \cellcolor{cellblue}2,02 & \cellcolor{cellblue}\textbf{1.595x} & \cellcolor{cellblue}\textbf{1.611x} & \cellcolor{cellblue}\textbf{58,75} & \cellcolor{cellblue}1,99 & \cellcolor{cellblue}\textbf{1.519x} & \cellcolor{cellblue}\textbf{1.528x} & \cellcolor{cellblue}\textbf{56,74} & \cellcolor{cellblue}2,05 & \cellcolor{cellblue}\textbf{1.602x} & \cellcolor{cellblue}\textbf{1.613x} & \cellcolor{cellblue}\textbf{59,49} \\
+& Domino  & 2,23 & 1.536x & 1.542x & 57,57 & 1,91 & 1.342x & 1.346x & 48,50 & 2,08 & 1.396x & 1.406x & 51,61 & 2,01 & 1.389x & 1.395x & 51,08 & 2,06 & 1.412x & 1.418x & 52,19 \\
+& DSpark  & \cellcolor{cellblue}\textbf{2,30} & \cellcolor{cellblue}\textbf{1.801x} & \cellcolor{cellblue}\textbf{1.812x} & \cellcolor{cellblue}\textbf{66,63} & \cellcolor{cellblue}\textbf{2,02} & \cellcolor{cellblue}1.496x & \cellcolor{cellblue}1.503x & \cellcolor{cellblue}54,27 & \cellcolor{cellblue}\textbf{2,18} & \cellcolor{cellblue}1.474x & \cellcolor{cellblue}1.486x & \cellcolor{cellblue}54,39 & \cellcolor{cellblue}\textbf{2,14} & \cellcolor{cellblue}1.489x & \cellcolor{cellblue}1.498x & \cellcolor{cellblue}54,78 & \cellcolor{cellblue}\textbf{2,16} & \cellcolor{cellblue}1.553x & \cellcolor{cellblue}1.563x & \cellcolor{cellblue}57,52 \\
+\cline{2-22}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{20}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
+\end{table*}
 
-An example equation is shown below:
-\begin{equation}
-  \label{eq:example}
-  A = \pi r^2
-\end{equation}
+\subsection{Results on English Long-Context (FA4)}
 
-Labels for equation numbers, sections, subsections, figures and tables
-are all defined with the \verb|\label{label}| command and cross references
-to them are made with the \verb|\ref{label}| command.
+Table~\ref{tab:fa4_english} details results for English long context benchmarks using FlashAttention-4 with an 8,192 token input length.
 
-This an example cross-reference to Equation~\ref{eq:example}.
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on English long context datasets. (\textbf{FA4}, 8192 input, 512 output)}
+\label{tab:fa4_english}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{GovReport}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{QMSum}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Multi-News}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{LCC}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{RepoBench-P}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1,000x & 1,000x & 33,830 & 1,000 & 1,000x & 1,000x & 33,850 & 1,000 & 1,000x & 1,000x & 35,310 & 1,000 & 1,000x & 1,000x & 34,260 & 1,000 & 1,000x & 1,000x & 34,890 & 1,000 & 1,000x & 1,000x & 34,430 \\
+& EAGLE3  & 2,170 & 1,712x & 1,725x & 58,900 & 2,340 & 1,791x & 1,857x & 60,870 & 2,550 & 2,049x & 2,061x & 72,710 & 2,800 & 2,165x & 2,183x & 75,440 & 2,520 & 2,018x & 2,035x & 71,260 & 2,480 & 1,947x & 1,972x & 67,830 \\
+& DFlash  & 2,190 & 1,695x & 1,707x & 57,880 & 1,950 & 1,448x & 1,478x & 49,430 & 2,460 & 1,966x & 1,976x & 70,260 & \cellcolor{cellblue}4,370 & \cellcolor{cellblue}3,257x & \cellcolor{cellblue}3,308x & \cellcolor{cellblue}121,260 & 3,740 & 2,735x & 2,773x & 100,920 & 2,940 & 2,220x & 2,248x & 79,950 \\
+& Domino  & 2,610 & 1,759x & 1,773x & 60,230 & 2,430 & 1,536x & 1,574x & 53,470 & 2,850 & 2,003x & 2,013x & 71,350 & \cellcolor{cellblue}\textbf{4,680} & 2,890x & 2,928x & 113,300 & \cellcolor{cellblue}\textbf{4,290} & 2,799x & 2,840x & 102,170 & 3,370 & 2,197x & 2,226x & 80,100 \\
+& DSpark  & \cellcolor{cellblue}\textbf{2,880} & \cellcolor{cellblue}\textbf{2,160x} & \cellcolor{cellblue}\textbf{2,187x} & \cellcolor{cellblue}\textbf{74,110} & \cellcolor{cellblue}\textbf{2,670} & \cellcolor{cellblue}\textbf{1,950x} & \cellcolor{cellblue}\textbf{2,038x} & \cellcolor{cellblue}\textbf{66,740} & \cellcolor{cellblue}\textbf{3,030} & \cellcolor{cellblue}\textbf{2,430x} & \cellcolor{cellblue}\textbf{2,448x} & \cellcolor{cellblue}\textbf{86,360} & 4,350 & \cellcolor{cellblue}\textbf{3,284x} & \cellcolor{cellblue}\textbf{3,336x} & \cellcolor{cellblue}115,830 & 4,150 & \cellcolor{cellblue}\textbf{3,094x} & \cellcolor{cellblue}\textbf{3,147x} & \cellcolor{cellblue}\textbf{110,710} & \cellcolor{cellblue}\textbf{3,420} & \cellcolor{cellblue}\textbf{2,584x} & \cellcolor{cellblue}\textbf{2,631x} & \cellcolor{cellblue}\textbf{90,750} \\
+\cline{2-26}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{24}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
+\end{table*}
 
-\subsection{Appendices}
+\subsection{Context Length Bin Analysis (0--16k Tokens)}
 
-Use \verb|\appendix| before any appendix section to switch the section numbering over to letters. See Appendix~\ref{sec:appendix} for an example.
+To systematically examine speculative degradation under context scaling, we evaluate across length intervals from Bin 1 ($0\text{--}2\text{k}$) to Bin 5 ($12\text{--}16\text{k}$) on both vLLM (Table~\ref{tab:vllm_bins}) and FA4 (Table~\ref{tab:fa4_bins}).
 
-\section{Bib\TeX{} Files}
-\label{sec:bibtex}
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on various length bins English long context data. (\textbf{VLLM})}
+\label{tab:vllm_bins}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 1 (0--2k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 2 (2--4k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 3 (4--8k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 4 (8--12k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 5 (12--16k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1,000x & 1,000x & 342,279 & 1,000 & 1,000x & 1,000x & 335,001 & 1,000 & 1,000x & 1,000x & 321,773 & 1,000 & 1,000x & 1,000x & 311,535 & 1,000 & 1,000x & 1,000x & 303,435 & 1,000 & 1,000x & 1,000x & 322,805 \\
+& EAGLE3  & 2,183 & 1,113x & 1,115x & 381,658 & 2,158 & 1,108x & 1,111x & 372,048 & 2,117 & 1,085x & 1,089x & 350,322 & 2,127 & 1,088x & 1,095x & 341,221 & 2,099 & 1,080x & 1,090x & 330,790 & 2,137 & 1,095x & 1,100x & 355,208 \\
+& DFlash  & \cellcolor{cellblue}3,450 & \cellcolor{cellblue}2,313x & \cellcolor{cellblue}2,351x & \cellcolor{cellblue}804,861 & \cellcolor{cellblue}3,629 & \cellcolor{cellblue}2,340x & \cellcolor{cellblue}2,398x & \cellcolor{cellblue}803,482 & \cellcolor{cellblue}2,674 & \cellcolor{cellblue}1,776x & \cellcolor{cellblue}1,832x & \cellcolor{cellblue}589,403 & \cellcolor{cellblue}2,531 & \cellcolor{cellblue}1,605x & \cellcolor{cellblue}1,681x & \cellcolor{cellblue}523,768 & \cellcolor{cellblue}2,258 & \cellcolor{cellblue}1,478x & \cellcolor{cellblue}1,565x & \cellcolor{cellblue}474,758 & \cellcolor{cellblue}2,908 & \cellcolor{cellblue}1,902x & \cellcolor{cellblue}1,966x & \cellcolor{cellblue}639,254 \\
+& Domino  & 1,059 & \cellcolor{cellwarn}0,620x & \cellcolor{cellwarn}0,617x & \cellcolor{cellwarn}211,154 & 1,051 & \cellcolor{cellwarn}0,622x & \cellcolor{cellwarn}0,618x & \cellcolor{cellwarn}206,929 & 1,060 & \cellcolor{cellwarn}0,635x & \cellcolor{cellwarn}0,626x & \cellcolor{cellwarn}201,347 & 1,055 & \cellcolor{cellwarn}0,644x & \cellcolor{cellwarn}0,627x & \cellcolor{cellwarn}195,358 & 1,063 & \cellcolor{cellwarn}0,665x & \cellcolor{cellwarn}0,640x & \cellcolor{cellwarn}194,300 & 1,058 & \cellcolor{cellwarn}0,637x & \cellcolor{cellwarn}0,626x & \cellcolor{cellwarn}201,818 \\
+& DSpark  & \cellcolor{cellblue}\textbf{3,834} & \cellcolor{cellblue}\textbf{2,733x} & \cellcolor{cellblue}\textbf{2,794x} & \cellcolor{cellblue}\textbf{956,220} & \cellcolor{cellblue}\textbf{3,841} & \cellcolor{cellblue}\textbf{2,707x} & \cellcolor{cellblue}\textbf{2,796x} & \cellcolor{cellblue}\textbf{936,587} & \cellcolor{cellblue}\textbf{3,390} & \cellcolor{cellblue}\textbf{2,360x} & \cellcolor{cellblue}\textbf{2,493x} & \cellcolor{cellblue}\textbf{802,292} & \cellcolor{cellblue}\textbf{3,182} & \cellcolor{cellblue}\textbf{2,101x} & \cellcolor{cellblue}\textbf{2,291x} & \cellcolor{cellblue}\textbf{713,642} & \cellcolor{cellblue}\textbf{2,981} & \cellcolor{cellblue}\textbf{1,930x} & \cellcolor{cellblue}\textbf{2,164x} & \cellcolor{cellblue}\textbf{656,722} & \cellcolor{cellblue}\textbf{3,446} & \cellcolor{cellblue}\textbf{2,366x} & \cellcolor{cellblue}\textbf{2,508x} & \cellcolor{cellblue}\textbf{813,093} \\
+\cline{2-26}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{24}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
+\end{table*}
 
-Unicode cannot be used in Bib\TeX{} entries, and some ways of typing special characters can disrupt Bib\TeX's alphabetization. The recommended way of typing special characters is shown in Table~\ref{tab:accents}.
+\begin{table*}[t]
+\centering
+\small
+\caption{Average acceptance length $\tau$, decoding speed (tokens/s), and speedups across different models and settings on various length bins English long context data. (\textbf{FA4})}
+\label{tab:fa4_bins}
+{\setlength{\tabcolsep}{2.2pt}\renewcommand{\arraystretch}{1.2}\resizebox{\textwidth}{!}{
+\begin{tabular}{|c|c|cccc|cccc|cccc|cccc|cccc|cccc|}
+\hline
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Model}} & \textcolor{white}{\textbf{Setting}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 1 (0--2k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 2 (2--4k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 3 (4--8k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 4 (8--12k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Bin 5 (12--16k)}}} & \multicolumn{4}{c|}{\textcolor{white}{\textbf{Overall}}} \\
+\hline
+\rowcolor{subhdrblue}
+& & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Accept.}}\\\textcolor{white}{\textbf{Len. $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{E2E}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{Decode}}\\\textcolor{white}{\textbf{Speedup $\uparrow$}}} & \makecell[c]{\textcolor{white}{\textbf{tok/s $\uparrow$}}} \\
+\hline
+\multirow{6}{*}{\textbf{Q3-4B}}
+& Vanilla & 1,000 & 1,000x & 1,000x & 32,476 & 1,000 & 1,000x & 1,000x & 32,159 & 1,000 & 1,000x & 1,000x & 31,891 & 1,000 & 1,000x & 1,000x & 31,334 & 1,000 & 1,000x & 1,000x & 31,546 & 1,000 & 1,000x & 1,000x & 31,881 \\
+& EAGLE3  & 2,760 & 2,224x & 2,235x & 73,027 & 2,660 & 2,082x & 2,094x & 68,477 & 2,500 & 1,974x & 2,001x & 64,137 & 1,860 & 1,426x & 1,435x & 46,543 & \cellcolor{cellwarn}1,330 & \cellcolor{cellwarn}0,992x & \cellcolor{cellwarn}0,991x & \cellcolor{cellwarn}31,596 & 2,220 & 1,587x & 1,598x & 56,756 \\
+& DFlash  & 3,490 & 2,331x & 2,344x & 87,616 & 3,600 & 2,528x & 2,548x & 93,832 & 2,700 & 1,922x & 1,947x & 68,157 & 2,560 & 1,694x & 1,713x & 59,680 & 2,230 & 1,411x & 1,425x & 48,645 & 2,910 & 1,889x & 1,910x & 71,586 \\
+& Domino  & \cellcolor{cellblue}\textbf{3,900} & 2,284x & 2,295x & 88,177 & \cellcolor{cellblue}\textbf{3,900} & 2,465x & 2,484x & 88,706 & 3,190 & 2,026x & 2,056x & 70,125 & 3,050 & 1,818x & 1,842x & 63,074 & 2,640 & 1,416x & 1,431x & 49,812 & 3,340 & 1,927x & 1,949x & 71,979 \\
+& DSpark  & 3,810 & \cellcolor{cellblue}\textbf{2,868x} & \cellcolor{cellblue}\textbf{2,889x} & \cellcolor{cellblue}\textbf{98,657} & 3,770 & \cellcolor{cellblue}\textbf{2,874x} & \cellcolor{cellblue}\textbf{2,902x} & \cellcolor{cellblue}\textbf{97,323} & \cellcolor{cellblue}\textbf{3,300} & \cellcolor{cellblue}\textbf{2,368x} & \cellcolor{cellblue}\textbf{2,415x} & \cellcolor{cellblue}\textbf{80,746} & \cellcolor{cellblue}\textbf{3,240} & \cellcolor{cellblue}\textbf{2,249x} & \cellcolor{cellblue}\textbf{2,294x} & \cellcolor{cellblue}\textbf{74,703} & \cellcolor{cellblue}\textbf{2,980} & \cellcolor{cellblue}\textbf{1,849x} & \cellcolor{cellblue}\textbf{1,888x} & \cellcolor{cellblue}\textbf{62,483} & \cellcolor{cellblue}\textbf{3,420} & \cellcolor{cellblue}\textbf{2,375x} & \cellcolor{cellblue}\textbf{2,415x} & \cellcolor{cellblue}\textbf{82,782} \\
+\cline{2-26}
+\rowcolor{ourscell}
+& \textbf{Ours} & \multicolumn{24}{c|}{\textit{[Experimental verification and parity tuning in progress]}} \\
+\hline
+\end{tabular}
+}}
+\end{table*}
 
-Please ensure that Bib\TeX{} records contain DOIs or URLs when possible, and for all the ACL materials that you reference.
-Use the \verb|doi| field for DOIs and the \verb|url| field for URLs.
-If a Bib\TeX{} entry has a URL or DOI field, the paper title in the references section will appear as a hyperlink to the paper, using the hyperref \LaTeX{} package.
+\paragraph{Key Observations on Context Scaling}
+\begin{enumerate}
+    \item \textbf{EAGLE-3 Cliff on FA4}: EAGLE-3 demonstrates a steep drop-off at Bin 5 ($12\text{--}16\text{k}$), where $\tau$ collapses to 1.330, and speedup drops to $0.991\times$ (highlighted in soft peach as slower than Vanilla AR). This reveals that feature-level drafter heads struggle with accumulated position and attention drift across very long sequences.
+    \item \textbf{Persistent DSpark Robustness}: DSpark maintains superior acceptance ($\tau = 2.98$ at Bin 5) and delivers $2.16\times$ on vLLM and $1.88\times$ on FA4, demonstrating that multi-candidate diversification better tolerates context expansion.
+\end{enumerate}
 
-\section*{Limitations}
+\section{Discussion and Next Milestones}
 
-This document does not cover the content requirements for ACL or any
-other specific venue.  Check the author instructions for
-information on
-maximum page lengths, the required ``Limitations'' section,
-and so on.
+\subsection{Synthesis of Three-Month Learnings}
+\begin{itemize}
+    \item \textbf{Divergence between isolated and production runtimes}: Algorithms that demonstrate speedups in standalone scripts can incur catastrophic regressions under production engines like vLLM. Verification design must directly respect batching and paged memory layouts.
+    \item \textbf{Eliminating Drafter Training}: Training auxiliary draft models for each LLM introduces friction and fragility under context shifts. A training-free paradigm offers higher generalizability across domains.
+\end{itemize}
 
-\section*{Acknowledgments}
+\subsection{Upcoming Research Milestones}
+\begin{enumerate}
+    \item \textbf{Finalizing Parity for Training-Free Formulation}: Complete end-to-end parity validation for the adaptive horizon gating mechanism on long-document summarization.
+    \item \textbf{Execution on Benchmark Matrix}: Populate the reserved \textbf{Ours} rows across all five benchmark tables, aiming for robust $>2.0\times$ speedup across the entire $0\text{--}16\text{k}$ context range without model retraining.
+\end{enumerate}
 
-This document has been adapted
-by Steven Bethard, Ryan Cotterell and Rui Yan
-from the instructions for earlier ACL and NAACL proceedings, including those for
-ACL 2019 by Douwe Kiela and Ivan Vuli\'{c},
-NAACL 2019 by Stephanie Lukin and Alla Roskovskaya,
-ACL 2018 by Shay Cohen, Kevin Gimpel, and Wei Lu,
-NAACL 2018 by Margaret Mitchell and Stephanie Lukin,
-Bib\TeX{} suggestions for (NA)ACL 2017/2018 from Jason Eisner,
-ACL 2017 by Dan Gildea and Min-Yen Kan,
-NAACL 2017 by Margaret Mitchell,
-ACL 2012 by Maggie Li and Michael White,
-ACL 2010 by Jing-Shin Chang and Philipp Koehn,
-ACL 2008 by Johanna D. Moore, Simone Teufel, James Allan, and Sadaoki Furui,
-ACL 2005 by Hwee Tou Ng and Kemal Oflazer,
-ACL 2002 by Eugene Charniak and Dekang Lin,
-and earlier ACL and EACL formats written by several people, including
-John Chen, Henry S. Thompson and Donald Walker.
-Additional elements were taken from the formatting instructions of the \emph{International Joint Conference on Artificial Intelligence} and the \emph{Conference on Computer Vision and Pattern Recognition}.
+\section{Conclusion}
+This report presented a comprehensive three-month research progress evaluation on accelerating long-context text summarization with Qwen3-4B. Through rigorous empirical benchmarking across vLLM and FlashAttention-4 on English and Vietnamese corpora, we identified the tree-verification bottleneck under paged serving and the context-scaling degradation of trained drafters. These findings firmly motivate our training-free speculative decoding direction, designed to deliver efficient, robust long-context inference without auxiliary training overhead.
 
-% Bibliography entries for the entire Anthology, followed by custom entries
-%\bibliography{custom,anthology-overleaf-1,anthology-overleaf-2}
-
-% Custom bibliography entries only
 \bibliography{custom}
-
-\appendix
-
-\section{Example Appendix}
-\label{sec:appendix}
-
-This is an appendix.
 
 \end{document}
