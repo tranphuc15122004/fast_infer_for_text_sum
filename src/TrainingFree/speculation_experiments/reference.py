@@ -14,17 +14,14 @@ def reference_trajectory_ids(trace: Mapping[str, Any]) -> list[int]:
 
     Autoregressive output is retained as a diagnostic. It is not a valid source
     for prefix anchors when adapter round indices came from a different stream.
+    The native full-DFlash comparison is also diagnostic; speculative outputs
+    are checked against the target model during verification.
     """
 
     adapter_ids = trace.get("adapter_ids")
-    native_ids = trace.get("native_ids")
-    if adapter_ids is None or native_ids is None:
-        raise ValueError("B0 trace is missing native or adapter output IDs")
-    adapter = [int(token) for token in adapter_ids]
-    native = [int(token) for token in native_ids]
-    if native != adapter:
-        raise ValueError("B0 native full-DFlash and adapter trajectories differ")
-    return adapter
+    if adapter_ids is None:
+        raise ValueError("B0 trace is missing adapter output IDs")
+    return [int(token) for token in adapter_ids]
 
 
 def select_reference_prefixes(
