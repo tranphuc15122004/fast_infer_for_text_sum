@@ -25,6 +25,7 @@ Chạy campaign A1–A3 trên một GPU B200, không cần truyền config hoặ
 
   bash scripts/run_dflash_context_A_b200.sh check   # preflight + cohort, không generation
   bash scripts/run_dflash_context_A_b200.sh start   # chạy nền toàn campaign qua các phase gates
+  bash scripts/run_dflash_context_A_b200.sh resume RUN_ID    # nối tiếp campaign đã dừng
 EOF
 }
 
@@ -37,15 +38,41 @@ require_inputs() {
 run_phase() {
   local run_id="$1"
   local mode="$2"
+  local -a phase_args=(
+    --run-id "$run_id"
+    --exposure-manifest "$EXPOSURE_MANIFEST"
+    --gpu-ids "$GPU_ID"
+    --attention-backend flash_attention_4
+    --seed 42
+    --mode "$mode"
+  )
+  if [[ "${DCE_RESUME:-0}" == "1" ]]; then
+    phase_args+=(--resume)
+  fi
   shift 2
   echo "[$(date -u +%FT%TZ)] phase=$mode run_id=$run_id"
-  bash "$CORE" \
-    --run-id "$run_id" \
-    --exposure-manifest "$EXPOSURE_MANIFEST" \
-    --gpu-ids "$GPU_ID" \
-    --attention-backend flash_attention_4 \
-    --seed 42 \
-    --mode "$mode" "$@"
+  bash "$CORE" "${phase_args[@]}" "$@"
+}
+
+run_phase_resumable() {
+  local run_id="$1"
+  local mode="$2"
+  local status
+  shift 2
+  if run_phase "$run_id" "$mode" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  # A parity failure is a scientific gate, and an interrupt is an explicit
+  # operator action. Retrying either would reuse the same failed evidence.
+  if [[ "$status" == "3" || "$status" == "130" ]]; then
+    return "$status"
+  fi
+  echo "[$(date -u +%FT%TZ)] phase=$mode exited $status; retrying once from cell checkpoints" >&2
+  export DCE_RESUME=1
+  sleep 10
+  run_phase "$run_id" "$mode" "$@"
 }
 
 verify_prepare() {
@@ -113,7 +140,7 @@ for phase in ("pilot", "dev", "confirm"):
     }
     if phase in {"pilot", "dev"} and cohort.get("status") != "complete":
         raise SystemExit(f"CHECK FAILED: cohort {phase} không đủ quota: {cohorts[phase]}")
-    if phase == "confirm" and any(count < 1 for count in selected.values()):
+    if phase == "confirm" and any(selected.get(dataset, 0) < 1 for dataset in cohort.get("quotas", {})):
         raise SystemExit(f"CHECK FAILED: confirm cần ít nhất một nhóm sạch mỗi dataset: {cohorts[phase]}")
 
 result = {
@@ -138,16 +165,23 @@ check_command() {
 
 campaign_command() {
   local run_id="$1"
+  local resume_mode="${2:-0}"
   require_inputs
+  if [[ "$resume_mode" == "1" ]]; then
+    export DCE_RESUME=1
+    echo "[$(date -u +%FT%TZ)] resuming campaign run_id=$run_id"
+  else
+    unset DCE_RESUME || true
+  fi
   run_phase "$run_id" preflight
   run_phase "$run_id" prepare
   verify_prepare "$run_id"
-  run_phase "$run_id" validate
-  run_phase "$run_id" pilot
-  run_phase "$run_id" dev
+  run_phase_resumable "$run_id" validate
+  run_phase_resumable "$run_id" pilot
+  run_phase_resumable "$run_id" dev
   # Preregistered default from the B200 runbook; lock still enforces dev gates.
   run_phase "$run_id" lock --a3-selector previous_dflash --a3-budget 2048 --refresh-period 4
-  run_phase "$run_id" confirm \
+  run_phase_resumable "$run_id" confirm \
     --locked-config "$OUTPUT_ROOT/$run_id/locked_config.json" \
     --allow-partial-confirm
   run_phase "$run_id" report --report-phase confirm
@@ -155,22 +189,109 @@ campaign_command() {
   echo "Report: $OUTPUT_ROOT/$run_id/reports/confirm_decision.md"
 }
 
+campaign_is_running() {
+  local run_root="$1"
+  local run_id="$2"
+  local pid cmdline proc_cmd
+  if [[ -s "$run_root/campaign.pid" ]]; then
+    pid="$(<"$run_root/campaign.pid")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+        && [[ -r "/proc/$pid/cmdline" ]]; then
+      cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" || true)"
+      if [[ "$cmdline" == *"$SELF"* && "$cmdline" == *"_campaign"* && "$cmdline" == *"$run_id"* ]]; then
+        return 0
+      fi
+    fi
+  fi
+  # The launcher can die while its Python child is still writing. Scan Linux
+  # command lines as well as the PID file so resume cannot start a second
+  # writer against the same checkpoint directory.
+  for proc_cmd in /proc/[0-9]*/cmdline; do
+    [[ -r "$proc_cmd" ]] || continue
+    pid="${proc_cmd#/proc/}"
+    pid="${pid%/cmdline}"
+    cmdline="$(tr '\0' ' ' <"$proc_cmd" 2>/dev/null || true)"
+    if [[ "$cmdline" == *"$SELF _campaign $run_id"* \
+        || "$cmdline" == *"run_dflash_context_experiments.sh --run-id $run_id"* \
+        || "$cmdline" == *"run_dflash_context_experiments.py --run-id $run_id"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+launch_campaign() {
+  local run_id="$1"
+  local resume_mode="$2"
+  local run_root="$OUTPUT_ROOT/$run_id"
+  local log_path="$run_root/campaign.log"
+  mkdir -p "$run_root"
+  command -v flock >/dev/null 2>&1 || {
+    echo "Thiếu flock của util-linux; không thể bảo vệ checkpoint khỏi hai campaign cùng RUN_ID." >&2
+    return 2
+  }
+  if campaign_is_running "$run_root" "$run_id"; then
+    echo "Campaign $run_id is already running (PID $(<"$run_root/campaign.pid"))." >&2
+    return 2
+  fi
+  local lock_fd
+  exec {lock_fd}>"$run_root/campaign.lock"
+  if ! flock -n "$lock_fd"; then
+    exec {lock_fd}>&-
+    echo "Campaign $run_id is already starting or running." >&2
+    return 2
+  fi
+  local pid
+  if [[ "$resume_mode" == "1" ]]; then
+    printf '\n[%s] resume requested\n' "$(date -u +%FT%TZ)" >>"$log_path"
+    nohup bash "$SELF" _campaign "$run_id" --resume >>"$log_path" 2>&1 </dev/null &
+  else
+    nohup bash "$SELF" _campaign "$run_id" >"$log_path" 2>&1 </dev/null &
+  fi
+  pid=$!
+  printf '%s\n' "$pid" >"$run_root/campaign.pid.tmp.$$"
+  mv "$run_root/campaign.pid.tmp.$$" "$run_root/campaign.pid"
+  if [[ "$resume_mode" == "1" ]]; then
+    printf 'Đã nối tiếp campaign.\nRUN_ID=%s\nPID=%s\nLOG=%s\n' "$run_id" "$pid" "$log_path"
+  else
+    printf 'Đã treo campaign A1–A3.\nRUN_ID=%s\nPID=%s\nLOG=%s\n' "$run_id" "$pid" "$log_path"
+  fi
+  printf 'Theo dõi: tail -f %q\n' "$log_path"
+}
+
 start_command() {
   require_inputs
   local run_id="${RUN_ID_PREFIX}_$(date -u +%Y%m%dT%H%M%SZ)"
   local run_root="$OUTPUT_ROOT/$run_id"
-  mkdir -p "$run_root"
-  if [[ -e "$run_root/campaign.pid" ]]; then
-    echo "Run directory already has a campaign PID: $run_root/campaign.pid" >&2
+  if [[ -e "$run_root" ]]; then
+    echo "Run directory already exists: $run_root; use resume only if its source signature matches." >&2
     return 2
   fi
-  nohup bash "$SELF" _campaign "$run_id" \
-    >"$run_root/campaign.log" 2>&1 </dev/null &
-  local pid=$!
-  printf '%s\n' "$pid" > "$run_root/campaign.pid"
-  printf 'Đã treo campaign A1–A3.\nRUN_ID=%s\nPID=%s\nLOG=%s\n' \
-    "$run_id" "$pid" "$run_root/campaign.log"
-  printf 'Theo dõi: tail -f %q\n' "$run_root/campaign.log"
+  mkdir -p "$OUTPUT_ROOT"
+  if ! mkdir "$run_root" 2>/dev/null; then
+    echo "Run directory was created concurrently: $run_root" >&2
+    return 2
+  fi
+  launch_campaign "$run_id" 0
+}
+
+resume_command() {
+  require_inputs
+  local run_id="${1:-}"
+  if [[ ! "$run_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "resume requires a simple RUN_ID (letters, digits, underscore, hyphen)." >&2
+    return 2
+  fi
+  local run_root="$OUTPUT_ROOT/$run_id"
+  if [[ ! -d "$run_root" ]]; then
+    echo "Run directory not found: $run_root" >&2
+    return 2
+  fi
+  if [[ -s "$run_root/campaign.status" ]] && grep -qx 'exit_code=0' "$run_root/campaign.status"; then
+    echo "Campaign $run_id already completed successfully." >&2
+    return 2
+  fi
+  launch_campaign "$run_id" 1
 }
 
 case "${1:-}" in
@@ -184,10 +305,35 @@ case "${1:-}" in
     [[ $# -eq 0 ]] || { usage >&2; exit 2; }
     start_command
     ;;
-  _campaign)
+  resume)
     shift
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
-    campaign_command "$1"
+    resume_command "$1"
+    ;;
+  _campaign)
+    shift
+    [[ $# -eq 1 || ( $# -eq 2 && "$2" == "--resume" ) ]] || { usage >&2; exit 2; }
+    run_id="$1"
+    run_root="$OUTPUT_ROOT/$run_id"
+    [[ "$run_id" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid RUN_ID: $run_id" >&2; exit 2; }
+    mkdir -p "$run_root"
+    printf 'running\nstarted_at=%s\n' "$(date -u +%FT%TZ)" >"$run_root/campaign.status.tmp.$$"
+    mv "$run_root/campaign.status.tmp.$$" "$run_root/campaign.status"
+    campaign_exit_status() {
+      local exit_code=$?
+      trap - EXIT
+      printf 'exit_code=%s\nfinished_at=%s\n' "$exit_code" "$(date -u +%FT%TZ)" \
+        >"$run_root/campaign.status.tmp.$$"
+      mv "$run_root/campaign.status.tmp.$$" "$run_root/campaign.status" || true
+      echo "[$(date -u +%FT%TZ)] campaign exit_code=$exit_code run_id=$run_id" >&2
+      exit "$exit_code"
+    }
+    trap campaign_exit_status EXIT
+    if [[ $# -eq 2 ]]; then
+      campaign_command "$run_id" 1
+    else
+      campaign_command "$run_id" 0
+    fi
     ;;
   -h|--help|help)
     usage

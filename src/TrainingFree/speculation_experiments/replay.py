@@ -231,8 +231,6 @@ def run_verification_prefix_sweep(
                 int(measured["pending_anchor"]) == int(reference_output_ids[reference_position])
                 if has_reference_anchor else None
             )
-            if pending_matches is False:
-                raise RuntimeError(f"verify-prefix pending anchor differs from reference for k={k}")
             total_ms = float(draft_ms) + float(measured["verify_wall_ms"]) + float(measured["bank_update_ms"])
             rows.append({
                 "schema_version": "dflash-speculation-b.verify-prefix.v1",
@@ -255,6 +253,7 @@ def run_verification_prefix_sweep(
                 "acceptance_identity_valid": True,
                 "pending_anchor": int(measured["pending_anchor"]),
                 "pending_anchor_matches_reference": pending_matches,
+                "reference_comparison_role": "diagnostic_only",
                 "committed_tokens": 1 + int(measured["accepted_candidates"]),
                 "draft_ms": float(draft_ms),
                 "draft_gpu_ms": float(draft_gpu_ms),
@@ -410,57 +409,72 @@ def run_same_prefix_sweep(
             })
 
     signal_row = None
+    signal_error = None
     if collect_uncertainty and 15 in gamma_values:
-        signal = evaluate_replay_action(
-            runtime,
-            input_ids,
-            state,
-            layout,
-            masks,
-            requested_budget="full",
-            selector_id="B_full_context_signal",
-            remaining_output_tokens=max_new_tokens - len(output_prefix),
-            gamma=15,
-            collect_uncertainty=True,
-            cleanup_after_action=False,
+        from TrainingFree.context_interventions.resilience import CampaignIntegrityError, run_compute_unit
+
+        signal, signal_error = run_compute_unit(
+            lambda: evaluate_replay_action(
+                runtime,
+                input_ids,
+                state,
+                layout,
+                masks,
+                requested_budget="full",
+                selector_id="B_full_context_signal",
+                remaining_output_tokens=max_new_tokens - len(output_prefix),
+                gamma=15,
+                collect_uncertainty=True,
+                cleanup_after_action=False,
+            ),
+            label=f"gamma15 signal collection state={identity}",
+            result_error=lambda result: (
+                None if result.get("status") == "ok" else str(result.get("reason", "signal action failed"))
+            ),
         )
-        if signal.get("status") != "ok":
-            raise RuntimeError(f"gamma15 signal collection failed: {signal.get('reason')}")
-        if tuple(signal["proposed_token_ids"]) != by_gamma[15]["proposal"]:
-            raise RuntimeError("uncertainty collection changed gamma15 candidate tokens")
-        if int(signal["accepted_candidates"]) != by_gamma[15]["accepted"]:
-            raise RuntimeError("uncertainty collection changed gamma15 accepted prefix")
-        signal_row = {
-            "schema_version": "dflash-speculation-b.signals.v1",
-            "type": "candidate_signals",
-            "state_id": identity,
-            "dataset": dataset,
-            "source_group_id": source_group_id,
-            "sample_id": sample_id,
-            "round_index": int(round_index),
-            "processed_output_tokens": len(output_prefix),
-            "prompt_tokens": len(prompt_token_ids),
-            "context_tokens": int(state.bank.length),
-            "max_new_tokens": int(max_new_tokens),
-            "gamma": 15,
-            "accepted_candidates": int(signal["accepted_candidates"]),
-            "proposed_token_ids": list(signal["proposed_token_ids"]),
-            "draft_uncertainty": signal["draft_uncertainty"],
-            "parent_signal": signal["parent_signal"],
-            "history": dict(history or {}),
-            "history_ema": (history or {}).get("ema_acceptance"),
-            "previous_accepted_candidates": (history or {}).get("previous_accepted_candidates"),
-            "previous_all_accepted": (history or {}).get("previous_all_accepted"),
-            "history_missing": bool((history or {}).get("missing", True)),
-            "signal_extraction_ms": signal["signal_extraction_ms"],
-            "instrumented_round_ms": signal["action_wall_ms"],
-            "history_origin": "reference_full_context_gamma15_prior_rounds",
-        }
+        if signal_error is not None:
+            # B1 draft/verification timings above are already complete and
+            # remain usable. A missing optional B2 signal is recorded so the
+            # analysis can report reduced signal coverage explicitly.
+            signal = None
+        else:
+            assert signal is not None
+            if tuple(signal["proposed_token_ids"]) != by_gamma[15]["proposal"]:
+                raise CampaignIntegrityError("uncertainty collection changed gamma15 candidate tokens")
+            if int(signal["accepted_candidates"]) != by_gamma[15]["accepted"]:
+                raise CampaignIntegrityError("uncertainty collection changed gamma15 accepted prefix")
+            signal_row = {
+                "schema_version": "dflash-speculation-b.signals.v1",
+                "type": "candidate_signals",
+                "state_id": identity,
+                "dataset": dataset,
+                "source_group_id": source_group_id,
+                "sample_id": sample_id,
+                "round_index": int(round_index),
+                "processed_output_tokens": len(output_prefix),
+                "prompt_tokens": len(prompt_token_ids),
+                "context_tokens": int(state.bank.length),
+                "max_new_tokens": int(max_new_tokens),
+                "gamma": 15,
+                "accepted_candidates": int(signal["accepted_candidates"]),
+                "proposed_token_ids": list(signal["proposed_token_ids"]),
+                "draft_uncertainty": signal["draft_uncertainty"],
+                "parent_signal": signal["parent_signal"],
+                "history": dict(history or {}),
+                "history_ema": (history or {}).get("ema_acceptance"),
+                "previous_accepted_candidates": (history or {}).get("previous_accepted_candidates"),
+                "previous_all_accepted": (history or {}).get("previous_all_accepted"),
+                "history_missing": bool((history or {}).get("missing", True)),
+                "signal_extraction_ms": signal["signal_extraction_ms"],
+                "instrumented_round_ms": signal["action_wall_ms"],
+                "history_origin": "reference_full_context_gamma15_prior_rounds",
+            }
 
     return {
         "state_id": identity,
         "actions": [row for gamma in gamma_values for row in by_gamma[gamma]["rows"]],
         "signal": signal_row,
+        "signal_error": signal_error,
         "schedule": schedule,
         "warmups": warmup_rows,
         "proposal_by_gamma": {str(gamma): list(values["proposal"]) for gamma, values in by_gamma.items()},

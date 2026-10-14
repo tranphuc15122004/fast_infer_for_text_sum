@@ -35,6 +35,7 @@ from TrainingFree.context_interventions.replay import (
     mean_target_scoring_vectors,
     rebuild_replay_state,
 )
+from TrainingFree.context_interventions.resilience import CampaignIntegrityError, is_fatal_compute_error
 
 
 def _eos_ids(target: Any) -> set[int]:
@@ -103,6 +104,8 @@ def run_reference_pair(
         ar_started = time.perf_counter()
         with torch.inference_mode():
             ar = generate_target_only(runtime["target"], ids, max_new_tokens=max_new_tokens, temperature=0.0)
+        if ar.status != "ok":
+            raise RuntimeError(f"AR reference generation failed: {ar.error}")
         torch.cuda.synchronize(ids.device)
         ar_ms: float | None = (time.perf_counter() - ar_started) * 1000.0
         ar_ids = [int(value) for value in ar.output_ids.detach().cpu().tolist()]
@@ -150,6 +153,8 @@ def run_reference_pair(
         )
     torch.cuda.synchronize(ids.device)
     adapter_ms = (time.perf_counter() - adapter_started) * 1000.0
+    if adapter.status != "ok":
+        raise RuntimeError(f"full-adapter reference generation failed: {adapter.error}")
     adapter_ids = [int(value) for value in adapter.output_ids.detach().cpu().tolist()]
 
     native_matches_ar = native_ids == ar_ids
@@ -257,6 +262,122 @@ def _action_row(
     return row
 
 
+def _previous_dflash_evidence(
+    outcome: Mapping[str, Any] | None,
+    *,
+    reference_accepted: int | None,
+    layer_count: int,
+    round_index: int | None,
+) -> tuple[dict[int, dict[int, float]] | None, dict[str, Any]]:
+    """Validate the optional previous-round ranking signal without aborting a campaign.
+
+    A previous-round replay supplies a selector feature, not the full-DFlash
+    baseline for the current experimental cell. Its attention map can remain
+    usable when verifier acceptance differs; that discrepancy is retained as
+    row-level evidence. Missing replay output or incomplete attention maps make
+    only the previous_dflash selector ineligible.
+    """
+    diagnostic: dict[str, Any] = {
+        "round_index": round_index,
+        "status": "unavailable",
+        "reference_accepted_candidates": (
+            int(reference_accepted) if reference_accepted is not None else None
+        ),
+        "replay_accepted_candidates": None,
+        "acceptance_matches": None,
+        "missing_attention_layers": list(range(max(int(layer_count), 0))),
+    }
+    if outcome is None:
+        diagnostic["reason"] = "previous_dense_round_missing"
+        return None, diagnostic
+
+    diagnostic["replay_status"] = outcome.get("status")
+    if outcome.get("status") != "ok":
+        diagnostic["status"] = "replay_failed"
+        diagnostic["reason"] = outcome.get("reason") or "previous_dense_replay_not_ok"
+        return None, diagnostic
+
+    accepted = outcome.get("accepted_candidates")
+    if accepted is not None:
+        diagnostic["replay_accepted_candidates"] = int(accepted)
+    if reference_accepted is not None and accepted is not None:
+        diagnostic["acceptance_matches"] = int(accepted) == int(reference_accepted)
+
+    raw_scores = outcome.get("attention_scores_by_layer")
+    scores: dict[int, dict[int, float]] = {}
+    missing_layers: list[int] = []
+    if not isinstance(raw_scores, Mapping):
+        missing_layers = list(range(max(int(layer_count), 0)))
+    else:
+        for layer_index in range(max(int(layer_count), 0)):
+            layer_scores = raw_scores.get(layer_index, raw_scores.get(str(layer_index)))
+            if not isinstance(layer_scores, Mapping) or not layer_scores:
+                missing_layers.append(layer_index)
+                continue
+            try:
+                scores[layer_index] = {
+                    int(position): float(score) for position, score in layer_scores.items()
+                }
+            except (TypeError, ValueError, OverflowError):
+                missing_layers.append(layer_index)
+    diagnostic["missing_attention_layers"] = missing_layers
+    if missing_layers:
+        diagnostic["status"] = "attention_unavailable"
+        diagnostic["reason"] = "previous_dense_attention_map_missing_layers"
+        return None, diagnostic
+
+    if reference_accepted is None or accepted is None:
+        diagnostic["status"] = "acceptance_unavailable"
+    elif diagnostic["acceptance_matches"]:
+        diagnostic["status"] = "ok"
+    else:
+        diagnostic["status"] = "acceptance_mismatch"
+    return scores, diagnostic
+
+
+def _replay_previous_dflash_round(
+    runtime: Mapping[str, Any],
+    input_ids: torch.Tensor,
+    reference_output: Sequence[int],
+    prefix: ReferencePrefix,
+    layout,
+    *,
+    max_new_tokens: int,
+) -> Mapping[str, Any]:
+    """Rebuild the optional prior-round signal and turn local failures into evidence."""
+    state = None
+    try:
+        state = rebuild_replay_state(
+            runtime, input_ids, reference_output, prefix, layout,
+            max_new_tokens=max_new_tokens,
+        )
+        return evaluate_replay_action(
+            runtime, input_ids, state, layout,
+            [tuple(range(state.bank.length)) for _ in runtime["draft"].layers],
+            requested_budget="full", selector_id="previous_dense_reference",
+            remaining_output_tokens=prefix.remaining_output_tokens,
+            collect_attention_scores=True,
+        )
+    except Exception as exc:
+        if is_fatal_compute_error(exc):
+            raise CampaignIntegrityError(f"previous DFlash replay: {exc}") from exc
+        state = None
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return {
+            "status": "error",
+            "reason": f"{type(exc).__name__}:{str(exc)[:500]}",
+            "accepted_candidates": None,
+            "attention_scores_by_layer": None,
+        }
+    finally:
+        state = None
+
+
 def _evaluate_mask(
     runtime: Mapping[str, Any],
     input_ids: torch.Tensor,
@@ -295,6 +416,8 @@ def _evaluate_mask(
             torch.cuda.empty_cache()
         outcome = {"status": "error", "reason": f"out_of_memory:{str(exc)[:300]}", "accepted_candidates": None}
     except Exception as exc:
+        if is_fatal_compute_error(exc):
+            raise CampaignIntegrityError(f"replay action {label}: {exc}") from exc
         outcome = {"status": "error", "reason": f"{type(exc).__name__}:{str(exc)[:500]}", "accepted_candidates": None}
     return _action_row(
         experiment=experiment,
@@ -512,29 +635,33 @@ def run_a2_prefix(
         )
     current_scores = full.get("attention_scores_by_layer") or dense_draft_scores(runtime, state, layout)
     previous_scores: dict[int, dict[int, float]] | None = None
+    previous_replay_check: dict[str, Any] | None = None
+    if prefix.previous_dense_round_index is not None:
+        previous_replay_check = {
+            "round_index": prefix.previous_dense_round_index,
+            "status": "unavailable",
+            "reference_accepted_candidates": previous_reference_accepted,
+            "replay_accepted_candidates": None,
+            "acceptance_matches": None,
+            "missing_attention_layers": list(range(len(runtime["draft"].layers))),
+            "reason": "previous_dense_round_not_replayed",
+        }
     if prefix.previous_dense_round_index is not None and previous_prefix is not None:
         previous_full = (replay_cache or {}).get(previous_prefix.round_index)
-        previous_state = None
         if previous_full is None:
-            previous_state = rebuild_replay_state(
+            previous_full = _replay_previous_dflash_round(
                 runtime, input_ids, reference_output, previous_prefix, layout,
                 max_new_tokens=max_new_tokens,
             )
-            previous_full = evaluate_replay_action(
-                runtime, input_ids, previous_state, layout,
-                [tuple(range(previous_state.bank.length)) for _ in runtime["draft"].layers],
-                requested_budget="full", selector_id="previous_dense_reference",
-                remaining_output_tokens=previous_prefix.remaining_output_tokens,
-                collect_attention_scores=True,
-            )
             if replay_cache is not None:
                 replay_cache[previous_prefix.round_index] = previous_full
-        if previous_full.get("status") != "ok":
-            raise RuntimeError("could not reproduce previous dense DFlash round for A2")
-        if previous_reference_accepted is not None and int(previous_full["accepted_candidates"]) != int(previous_reference_accepted):
-            raise RuntimeError("previous full DFlash replay acceptance differs from its reference round")
-        previous_scores = previous_full.get("attention_scores_by_layer") or {}
-        del previous_state, previous_full
+        previous_scores, previous_replay_check = _previous_dflash_evidence(
+            previous_full,
+            reference_accepted=previous_reference_accepted,
+            layer_count=len(runtime["draft"].layers),
+            round_index=previous_prefix.round_index,
+        )
+        del previous_full
     protected = global_protected_positions(
         layout,
         bank_length=bank_length,
@@ -564,7 +691,9 @@ def run_a2_prefix(
                         },
                         nominal_budget=budget,
                         random_seed=int(seed) if selector == "random" else None,
-                        extra={"canonicalized_full": True, "oracle_diagnostic_only": selector == "current_dflash_oracle"},
+                        extra={"canonicalized_full": True,
+                               "oracle_diagnostic_only": selector == "current_dflash_oracle",
+                               "previous_replay_check": previous_replay_check},
                     ))
                     continue
                 try:
@@ -589,7 +718,10 @@ def run_a2_prefix(
                         masks = [keep for _ in runtime["draft"].layers]
                     elif selector == "previous_dflash":
                         if previous_scores is None:
-                            raise ValueError("previous_dense_round_unavailable_at_prefill")
+                            detail = (previous_replay_check or {}).get("reason") or (
+                                previous_replay_check or {}
+                            ).get("status", "no_previous_dense_round")
+                            raise ValueError(f"previous_dense_round_unavailable:{detail}")
                         masks = []
                         for layer_index in range(len(runtime["draft"].layers)):
                             prior = previous_scores.get(layer_index)
@@ -635,7 +767,8 @@ def run_a2_prefix(
                         ranking_origin_round=prefix.previous_dense_round_index if selector == "previous_dflash" else None,
                         extra={"ranking_coverage": outcome.get("ranking_coverage"), "ranking_age": outcome.get("ranking_age"),
                                "oracle_diagnostic_only": selector == "current_dflash_oracle",
-                               "canonicalized_full": canonical_full},
+                               "canonicalized_full": canonical_full,
+                               "previous_replay_check": previous_replay_check},
                     ))
                 except ValueError as exc:
                     rows.append(_action_row(
@@ -646,7 +779,9 @@ def run_a2_prefix(
                         nominal_budget=budget,
                         random_seed=int(seed) if selector == "random" else None,
                         ranking_origin_round=prefix.previous_dense_round_index if selector == "previous_dflash" else None,
-                        extra={"oracle_diagnostic_only": selector == "current_dflash_oracle", "canonicalized_full": canonical_full},
+                        extra={"oracle_diagnostic_only": selector == "current_dflash_oracle",
+                               "canonicalized_full": canonical_full,
+                               "previous_replay_check": previous_replay_check},
                     ))
     del state, full
     gc.collect()
@@ -946,26 +1081,30 @@ def run_a3_prefix(
             f"trace={reference_accepted}, replay={baseline_l}"
         )
     previous_scores: dict[int, dict[int, float]] | None = None
+    previous_replay_check: dict[str, Any] | None = None
     if selector == "previous_dflash" and previous_prefix is not None:
         old_full = (replay_cache or {}).get(previous_prefix.round_index)
-        old_state = None
         if old_full is None:
-            old_state = rebuild_replay_state(runtime, input_ids, reference_output, previous_prefix, layout, max_new_tokens=max_new_tokens)
-            old_full = evaluate_replay_action(
-                runtime, input_ids, old_state, layout,
-                [tuple(range(old_state.bank.length)) for _ in runtime["draft"].layers],
-                requested_budget="full", selector_id="previous_dense_reference",
-                remaining_output_tokens=previous_prefix.remaining_output_tokens,
-                collect_attention_scores=True,
+            old_full = _replay_previous_dflash_round(
+                runtime, input_ids, reference_output, previous_prefix, layout,
+                max_new_tokens=max_new_tokens,
             )
             if replay_cache is not None:
                 replay_cache[previous_prefix.round_index] = old_full
-        if old_full.get("status") != "ok":
-            raise RuntimeError("could not reproduce previous dense DFlash round for A3")
-        if previous_reference_accepted is not None and int(old_full["accepted_candidates"]) != int(previous_reference_accepted):
-            raise RuntimeError("previous full DFlash replay acceptance differs from its reference round")
-        previous_scores = old_full.get("attention_scores_by_layer") or {}
-        del old_state, old_full
+        previous_scores, previous_replay_check = _previous_dflash_evidence(
+            old_full,
+            reference_accepted=previous_reference_accepted,
+            layer_count=len(runtime["draft"].layers),
+            round_index=previous_prefix.round_index,
+        )
+        del old_full
+    elif selector == "previous_dflash":
+        previous_scores, previous_replay_check = _previous_dflash_evidence(
+            None,
+            reference_accepted=previous_reference_accepted,
+            layer_count=len(runtime["draft"].layers),
+            round_index=None,
+        )
 
     ranking_origin = previous_prefix.round_index if previous_prefix is not None else None
     actual_ranking_age = prefix.round_index - ranking_origin if ranking_origin is not None else ranking_age
@@ -987,7 +1126,11 @@ def run_a3_prefix(
                     * len(runtime["draft"].layers),
                 "draft_ms": full.get("draft_ms"), "verify_ms": full.get("verify_ms"),
             },
-            nominal_budget="full", extra={"canonicalized_full": True, "selection_and_rebuild_included": False},
+            nominal_budget="full", extra={
+                "canonicalized_full": True,
+                "selection_and_rebuild_included": False,
+                "previous_replay_check": previous_replay_check,
+            },
         ))
     for budget in budgets:
         full_budget = int(budget) >= bank_length
@@ -1007,7 +1150,8 @@ def run_a3_prefix(
                     "actual_context_tokens_by_layer": [bank_length] * len(runtime["draft"].layers),
                 },
                 nominal_budget=budget, ranking_origin_round=ranking_origin,
-                extra={"canonicalized_full": True, "alias_of": "full_Bfull", "ranking_age": actual_ranking_age},
+                extra={"canonicalized_full": True, "alias_of": "full_Bfull", "ranking_age": actual_ranking_age,
+                       "previous_replay_check": previous_replay_check},
             ))
             continue
         try:
@@ -1024,7 +1168,10 @@ def run_a3_prefix(
                 masks = [selected for _ in runtime["draft"].layers]
             else:
                 if previous_scores is None:
-                    raise ValueError("previous_dense_round_unavailable_at_prefill")
+                    detail = (previous_replay_check or {}).get("reason") or (
+                        previous_replay_check or {}
+                    ).get("status", "no_previous_dense_round")
+                    raise ValueError(f"previous_dense_round_unavailable:{detail}")
                 masks = []
                 for layer_index in range(len(runtime["draft"].layers)):
                     score_map = previous_scores.get(layer_index)
@@ -1055,13 +1202,15 @@ def run_a3_prefix(
                     if outcome.get("status") == "ok" else None
                 ),
                 "selection_and_rebuild_included": False,
+                "previous_replay_check": previous_replay_check,
             }
         except ValueError as exc:
             masks = [full_mask for _ in runtime["draft"].layers]
             outcome = {"status": "not_eligible" if "previous_dense" in str(exc) else "infeasible",
                        "reason": str(exc), "accepted_candidates": None,
                        "actual_context_tokens_by_layer": [len(mask) for mask in masks]}
-            extra = {"canonicalized_full": False, "selection_and_rebuild_included": False}
+            extra = {"canonicalized_full": False, "selection_and_rebuild_included": False,
+                     "previous_replay_check": previous_replay_check}
         rows.append(_action_row(
             experiment="A3_budget_replay", phase=phase, sample=sample, prefix=prefix,
             label=label, baseline_accepted=baseline_l, outcome=outcome,

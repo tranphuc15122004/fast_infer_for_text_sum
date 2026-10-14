@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import subprocess
@@ -26,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 for _directory in (ROOT / "src", ROOT / "scripts", ROOT / "externals" / "dflash"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
+
+from TrainingFree.context_interventions.resilience import CampaignIntegrityError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -114,6 +117,7 @@ def _load_samples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[
     missing = {"gov_report", "multi_news", "qmsum"} - datasets
     if missing:
         raise ValueError(f"campaign corpus missing required datasets: {sorted(missing)}")
+    _sample_index(samples)  # Reject ambiguous identities before any GPU work.
     return samples, source_paths
 
 
@@ -263,6 +267,47 @@ def _plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_gpu_driver(args: argparse.Namespace, gpu_uuid: str) -> tuple[str, str]:
+    """A temporary telemetry timeout must not change an established run signature."""
+    normalize = lambda value: str(value).removeprefix("GPU-").strip()
+    requested = str(os.environ.get("CUDA_VISIBLE_DEVICES", "0")).split(",")[0].strip()
+    last_error = "no matching GPU driver record"
+    for _attempt in range(2):
+        try:
+            lines = subprocess.run(
+                ["nvidia-smi", "--query-gpu=uuid,driver_version", "--format=csv,noheader"],
+                capture_output=True, text=True, check=True, timeout=10,
+            ).stdout.strip().splitlines()
+            parsed = [line.split(",", 1) for line in lines]
+            selected = next((row for row in parsed if normalize(row[0]) == normalize(gpu_uuid)), None)
+            if selected is None and gpu_uuid == "unknown":
+                if requested.isdigit() and int(requested) < len(parsed):
+                    selected = parsed[int(requested)]
+                else:
+                    selected = next((row for row in parsed if normalize(row[0]) == normalize(requested)), None)
+            if selected is not None and len(selected) == 2 and selected[1].strip():
+                return selected[0].strip(), selected[1].strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+    run_root = _run_root(args)
+    records = []
+    preflight_path = run_root / "preflight.json"
+    if preflight_path.is_file():
+        for line in json.loads(preflight_path.read_text(encoding="utf-8")).get("nvidia_smi", []):
+            fields = str(line).split(",")
+            if len(fields) >= 3:
+                records.append((fields[1].strip(), fields[2].strip()))
+    for saved_uuid, driver in records:
+        if (gpu_uuid != "unknown" and normalize(saved_uuid) == normalize(gpu_uuid) and driver):
+            print(
+                f"[provenance] nvidia-smi telemetry unavailable ({last_error}); "
+                f"reuse recorded driver={driver} for the same physical GPU {saved_uuid}",
+                flush=True,
+            )
+            return str(saved_uuid), str(driver)
+    raise CampaignIntegrityError(f"cannot establish GPU/driver provenance: {last_error}")
+
+
 def _runtime(args: argparse.Namespace) -> dict[str, Any]:
     if not args.target_model or not args.draft_model:
         raise ValueError("target/draft model paths must be set by master config or CLI")
@@ -286,41 +331,20 @@ def _runtime(args: argparse.Namespace) -> dict[str, Any]:
     signature = dict(runtime["runtime_signature"])
     signature["cuda_build"] = runtime["torch"].version.cuda
     signature["visible_gpu_ids"] = os.environ.get("CUDA_VISIBLE_DEVICES")
-    try:
-        device_properties = runtime["torch"].cuda.get_device_properties(0)
-        signature["gpu_name"] = str(device_properties.name)
-        signature["gpu_capability"] = list(runtime["torch"].cuda.get_device_capability(0))
-        signature["gpu_uuid"] = str(getattr(device_properties, "uuid", "unknown"))
-        gpu_lines = subprocess.run(
-            ["nvidia-smi", "--query-gpu=uuid,driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, check=True, timeout=10,
-        ).stdout.strip().splitlines()
-        selected_line = next(
-            (line for line in gpu_lines if signature["gpu_uuid"] != "unknown" and signature["gpu_uuid"] in line),
-            None,
-        )
-        if selected_line is None:
-            requested_gpu = str(os.environ.get("CUDA_VISIBLE_DEVICES", "0")).split(",")[0].strip()
-            if requested_gpu.isdigit() and int(requested_gpu) < len(gpu_lines):
-                selected_line = gpu_lines[int(requested_gpu)]
-            else:
-                selected_line = next((line for line in gpu_lines if requested_gpu and requested_gpu in line), None)
-        gpu_info = selected_line.split(",", 1) if selected_line else []
-        if gpu_info and gpu_info[0].strip():
-            signature["gpu_uuid"] = gpu_info[0].strip()
-        signature["driver_version"] = gpu_info[1].strip() if len(gpu_info) > 1 else None
-    except Exception:
-        signature["gpu_uuid"] = None
-        signature["driver_version"] = None
+    device_properties = runtime["torch"].cuda.get_device_properties(0)
+    signature["gpu_name"] = str(device_properties.name)
+    signature["gpu_capability"] = list(runtime["torch"].cuda.get_device_capability(0))
+    physical_uuid = str(getattr(device_properties, "uuid", "unknown") or "unknown")
+    signature["gpu_uuid"], signature["driver_version"] = _probe_gpu_driver(args, physical_uuid)
     signature.pop("signature", None)
     signature["signature"] = _hash_json(signature)
     runtime["runtime_signature"] = signature
     return runtime
 
 
-def _reference_trace_path(run_root: Path, sample_id: str) -> Path:
+def _reference_trace_path(run_root: Path, sample_id: str, *, phase: str) -> Path:
     key = hashlib.sha256(sample_id.encode("utf-8")).hexdigest()
-    return run_root / "traces" / f"{key}.json"
+    return run_root / "traces" / phase / f"{key}.json"
 
 
 def _replay_reference_ids(trace: Mapping[str, Any]) -> list[int]:
@@ -345,6 +369,13 @@ def _replay_reference_ids(trace: Mapping[str, Any]) -> list[int]:
     return adapter_ids
 
 
+def _reference_result_error(measured) -> str | None:
+    from TrainingFree.context_adaptive.schema import _check_finite
+
+    invalid = _check_finite(measured["parity"])
+    return f"nonfinite reference values: {invalid}" if invalid else None
+
+
 def _run_parity_cohort(
     args: argparse.Namespace,
     run_root: Path,
@@ -356,29 +387,58 @@ def _run_parity_cohort(
 ) -> tuple[bool, list[dict[str, Any]]]:
     from TrainingFree.context_adaptive.schema import atomic_json
     from TrainingFree.context_interventions.execution import run_reference_pair
+    from TrainingFree.context_interventions.resilience import FailureStreak, run_compute_unit
 
     traces: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     code_sig = _code_signature()
     runtime_sig = runtime["runtime_signature"].get("signature")
+    failures = FailureStreak()
     for index, sample in enumerate(samples, start=1):
         sample_id = str(sample["id"])
-        trace_path = _reference_trace_path(run_root, sample_id)
+        trace_path = _reference_trace_path(run_root, sample_id, phase=str(cohort["phase"]))
         trace_signature = _hash_json({
             "sample_id": sample_id, "run_id": args.run_id, "max_new_tokens": max_new_tokens,
             "runtime": runtime_sig, "code": code_sig["sha256"], "attention_backend": args.attention_backend,
+            "source_anchors": args.source_anchors, "recent_output": args.recent_output,
         })
-        if args.resume and trace_path.is_file():
+        if str(cohort["phase"]) == "pilot" and not trace_path.is_file():
+            validated_path = _reference_trace_path(run_root, sample_id, phase="validate")
+            if validated_path.is_file():
+                validated_trace = json.loads(validated_path.read_text(encoding="utf-8"))
+                if (validated_trace.get("trace_signature") == trace_signature
+                        and validated_trace.get("parity", {}).get("status") == "pass"):
+                    atomic_json(trace_path, validated_trace)
+                    print(f"[parity] reuse validated trace for {sample['dataset']}:{sample_id}", flush=True)
+        if (args.resume or str(cohort["phase"]) == "pilot") and trace_path.is_file():
             trace = json.loads(trace_path.read_text(encoding="utf-8"))
             if trace.get("trace_signature") != trace_signature:
                 raise ValueError(f"resume reference trace signature mismatch: {trace_path}")
         else:
             print(f"[parity {index}/{len(samples)}] {sample['dataset']}:{sample_id} start", flush=True)
-            measured = run_reference_pair(
-                runtime, sample, max_new_tokens=max_new_tokens,
-                source_anchors=args.source_anchors, recent_output=args.recent_output,
-                require_ar_match=False,
+            measured, compute_error = run_compute_unit(
+                lambda: run_reference_pair(
+                    runtime, sample, max_new_tokens=max_new_tokens,
+                    source_anchors=args.source_anchors, recent_output=args.recent_output,
+                    require_ar_match=False,
+                ),
+                label=f"{cohort['phase']} reference {sample['dataset']}:{sample_id}",
+                result_error=_reference_result_error,
             )
+            if compute_error is not None:
+                error_row = {
+                    "sample_id": sample_id, "dataset": str(sample["dataset"]),
+                    "source_group_id": str(sample["_cad_source_group_id"]),
+                    **compute_error,
+                }
+                results.append(error_row)
+                atomic_json(
+                    run_root / "evidence" / f"reference_error_{cohort['phase']}_{hashlib.sha256(sample_id.encode()).hexdigest()}.json",
+                    error_row,
+                )
+                failures.observe(failed=True, label=sample_id)
+                measured = None
+                continue
             trace = {
                 "schema_version": "dflash-context-interventions.trace.v1",
                 "trace_signature": trace_signature,
@@ -399,7 +459,9 @@ def _run_parity_cohort(
                 "parity": measured["parity"],
             }
             atomic_json(trace_path, trace)
+            del measured
         traces.append(trace)
+        failures.observe(failed=False, label=sample_id)
         results.append({
             "sample_id": sample_id,
             "dataset": str(sample["dataset"]),
@@ -415,13 +477,18 @@ def _run_parity_cohort(
     evidence = {
         "schema_version": "dflash-context-interventions.parity.v1",
         "run_id": args.run_id,
-        "status": "pass" if results and all(row["status"] == "pass" for row in results) else "fail",
+        "status": (
+            "fail" if not traces or any(row["status"] == "fail" for row in results)
+            else "partial_with_errors" if any(row["status"] == "error" for row in results)
+            else "pass"
+        ),
         "gate_basis": "native_full_dflash_equals_full_adapter",
         "ar_divergent_case_count": sum(
-            not (row.get("native_equals_ar") and row.get("adapter_equals_ar")) for row in results
+            not (row.get("native_equals_ar") and row.get("adapter_equals_ar"))
+            for row in results if row.get("status") != "error"
         ),
         "native_adapter_mismatch_count": sum(
-            not row.get("native_equals_adapter") for row in results
+            not row.get("native_equals_adapter") for row in results if row.get("status") != "error"
         ),
         "mode": cohort.get("phase"),
         "max_new_tokens": max_new_tokens,
@@ -433,11 +500,19 @@ def _run_parity_cohort(
     }
     evidence_path = run_root / "evidence" / f"parity_{cohort.get('phase')}.json"
     atomic_json(evidence_path, evidence)
-    return evidence["status"] == "pass", traces
+    # Every retained trace must pass parity. Missing references remain explicit
+    # incomplete evidence; the other samples can finish, and dev lock rejects it.
+    return evidence["status"] in {"pass", "partial_with_errors"}, traces
 
 
 def _sample_index(samples: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {str(sample["id"]): dict(sample) for sample in samples}
+    indexed = {}
+    for sample in samples:
+        sample_id = str(sample["id"])
+        if sample_id in indexed:
+            raise CampaignIntegrityError(f"duplicate sample ID makes traces ambiguous: {sample_id}")
+        indexed[sample_id] = dict(sample)
+    return indexed
 
 
 def _trace_index(traces: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
@@ -484,13 +559,19 @@ def _phase_store(run_root: Path, phase: str, kind: str, signature: str, resume: 
     return CellStore(run_root / phase / kind, signature=signature, resume=resume)
 
 
-def _save_rows(store, rows: Sequence[Mapping[str, Any]], existing: set[str]) -> None:
+def _save_rows(store, rows: Sequence[Mapping[str, Any]], existing: dict[str, Mapping[str, Any]]) -> None:
+    from TrainingFree.context_interventions.resilience import sanitize_failed_numbers
+
     for row in rows:
+        row = sanitize_failed_numbers(dict(row))
         cell_id = str(row["cell_id"])
-        if cell_id in existing:
+        previous = existing.get(cell_id)
+        if previous is not None and previous.get("status") != "error":
             continue
         store.save(cell_id, row)
-        existing.add(cell_id)
+        saved_row = dict(row)
+        saved_row["run_signature"] = store.signature
+        existing[cell_id] = saved_row
 
 
 def _cell_signature(runtime: Mapping[str, Any], args: argparse.Namespace, phase: str, kind: str) -> str:
@@ -512,6 +593,102 @@ def _cell_signature(runtime: Mapping[str, Any], args: argparse.Namespace, phase:
     })
 
 
+def _check_compute_reason(reason: str) -> None:
+    from TrainingFree.context_interventions.resilience import CampaignIntegrityError, is_fatal_compute_error
+
+    if is_fatal_compute_error(RuntimeError(reason)):
+        raise CampaignIntegrityError(reason)
+
+
+def _compute_replay_prefix(
+    args, runtime, sample, ids, layout, prefix, reference_ids, *, phase,
+    max_new_tokens, run_a3, trace, previous, reference_accepted, previous_accepted,
+):
+    from TrainingFree.context_interventions.execution import run_a1_prefix, run_a2_prefix, run_a3_prefix
+    from TrainingFree.context_interventions.replay import rebuild_replay_state, evaluate_replay_action
+    from TrainingFree.context_interventions.resilience import release_compute_memory
+
+    state = None
+    replay_cache = {}
+    try:
+        state = rebuild_replay_state(
+            runtime, ids, reference_ids, prefix, layout, max_new_tokens=max_new_tokens,
+        )
+        full_positions = tuple(range(state.bank.length))
+        full = evaluate_replay_action(
+            runtime, ids, state, layout, [full_positions for _ in runtime["draft"].layers],
+            requested_budget="full", selector_id="full",
+            remaining_output_tokens=prefix.remaining_output_tokens, collect_attention_scores=True,
+        )
+        accepted = full.get("accepted_candidates")
+        if full.get("status") != "ok" or accepted is None or int(accepted) != reference_accepted:
+            status = "baseline_mismatch" if full.get("status") == "ok" else "baseline_error"
+            reason = (
+                f"{full.get('reason') or 'acceptance_mismatch'}: "
+                f"replay={accepted}, reference={reference_accepted}"
+            )
+            _check_compute_reason(reason)
+            return {"status": status, "reason": reason, "replay_accepted_candidates": accepted}
+        a1 = run_a1_prefix(
+            runtime, sample, ids, layout, prefix, reference_ids, phase=phase,
+            max_new_tokens=max_new_tokens, state=state, full_outcome=full,
+            source_anchors=args.source_anchors, recent_output=args.recent_output,
+            reference_accepted=reference_accepted,
+        )
+        a2 = run_a2_prefix(
+            runtime, sample, ids, layout, prefix, reference_ids, phase=phase,
+            max_new_tokens=max_new_tokens, state=state, full_outcome=full,
+            replay_cache=replay_cache, previous_prefix=previous,
+            reference_accepted=reference_accepted, previous_reference_accepted=previous_accepted,
+            source_anchors=args.source_anchors, recent_output=args.recent_output,
+        )
+        a3 = []
+        if run_a3:
+            round_rows = {
+                int(row["round_index"]): row for row in trace["adapter_rounds"]
+                if row.get("type") == "round" and int(row.get("gamma_executed", 0)) >= 15
+            }
+            ages = (1, 2, 4, 8, 16) if phase == "dev" and args.a3_selector == "previous_dflash" else (1,)
+            for age in ages:
+                age_prefix = _prefix_at_age(trace, prefix, age, max_new_tokens) if args.a3_selector == "previous_dflash" else None
+                age_row = round_rows.get(age_prefix.round_index) if age_prefix is not None else None
+                age_accepted = int(age_row.get("accepted_candidates", 0)) if age_row else None
+                a3.extend(run_a3_prefix(
+                    runtime, sample, ids, layout, prefix, reference_ids, phase=phase,
+                    selector=args.a3_selector, max_new_tokens=max_new_tokens,
+                    state=state, full_outcome=full, replay_cache=replay_cache,
+                    previous_prefix=age_prefix if args.a3_selector == "previous_dflash" else previous,
+                    ranking_age=age if args.a3_selector == "previous_dflash" else None,
+                    source_anchors=args.source_anchors, recent_output=args.recent_output,
+                    reference_accepted=reference_accepted,
+                    previous_reference_accepted=age_accepted if args.a3_selector == "previous_dflash" else previous_accepted,
+                ))
+        return {"status": "ok", "a1": a1, "a2": a2, "a3_replay": a3}
+    finally:
+        # Release the old prefix before the next prefix is rebuilt, including
+        # exception paths. Keeping it during the next prefill can double VRAM.
+        state = None
+        replay_cache.clear()
+        release_compute_memory()
+
+
+def _replay_result_error(result) -> str | None:
+    from TrainingFree.context_adaptive.schema import _check_finite
+
+    if result.get("status") == "baseline_error":
+        return str(result.get("reason"))
+    for kind in ("a1", "a2", "a3_replay"):
+        for row in result.get(kind, []):
+            if row.get("status") == "error":
+                reason = str(row.get("reason") or "replay cell failed")
+                _check_compute_reason(reason)
+                return reason
+    nonfinite = _check_finite(result)
+    if nonfinite:
+        return f"nonfinite replay values: {nonfinite}"
+    return None
+
+
 def _run_replay(
     args: argparse.Namespace,
     run_root: Path,
@@ -524,17 +701,20 @@ def _run_replay(
     run_a3: bool,
 ) -> None:
     from TrainingFree.context_adaptive.prompt import prepare_prompt
-    from TrainingFree.context_interventions.execution import run_a1_prefix, run_a2_prefix, run_a3_prefix
-    from TrainingFree.context_interventions.replay import choose_reference_prefixes, evaluate_replay_action, rebuild_replay_state
+    from TrainingFree.context_interventions.replay import choose_reference_prefixes
     from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.context_interventions.resilience import FailureStreak, run_compute_unit
 
     sample_map = _sample_index(samples)
-    trace_map = _trace_index(traces)
+    failures = FailureStreak()
     stores = {
         kind: _phase_store(run_root, phase, kind, _cell_signature(runtime, args, phase, kind), args.resume)
-        for kind in ("a1", "a2", "a3_replay")
+        for kind in ("a1", "a2", "a3_replay", "prefix_diagnostics")
     }
-    existing = {kind: {str(row.get("cell_id")) for row in store.rows()} for kind, store in stores.items()}
+    existing = {
+        kind: {str(row.get("cell_id")): row for row in store.rows()}
+        for kind, store in stores.items()
+    }
     for sample_index, trace in enumerate(traces, start=1):
         sample = sample_map[str(trace["sample_id"])]
         sample["_campaign_run_id"] = args.run_id
@@ -561,7 +741,27 @@ def _run_replay(
                 marker = json.loads(prefix_marker.read_text(encoding="utf-8"))
                 if marker.get("signature") != _cell_signature(runtime, args, phase, "prefixes"):
                     raise ValueError(f"prefix resume signature mismatch: {prefix_marker}")
-                continue
+                marker_status = marker.get("status", "complete")
+                if marker_status == "baseline_mismatch":
+                    if marker.get("diagnostic_cell_id") in existing["prefix_diagnostics"]:
+                        failures.observe(failed=True, label=prefix_key)
+                        continue
+                elif marker_status in {"error", "baseline_error"}:
+                    pass  # A resumed phase retries failed computation.
+                elif marker_status == "complete":
+                    marker_cells = marker.get("cell_ids")
+                    if marker_cells is None:
+                        # Older markers were written only after all cells completed.
+                        continue
+                    if all(
+                        cell_id in existing[kind] and existing[kind][cell_id].get("status") != "error"
+                        for kind, cell_ids in marker_cells.items()
+                        for cell_id in cell_ids
+                    ):
+                        failures.observe(failed=False, label=prefix_key)
+                        continue
+                else:
+                    raise ValueError(f"unknown prefix checkpoint status {marker_status!r}: {prefix_marker}")
             previous = _prefix_pair(trace, prefix, max_new_tokens)
             reference_round = round_rows.get(prefix.round_index)
             if reference_round is None:
@@ -575,76 +775,88 @@ def _run_replay(
                 f"[{phase} replay {sample_index}/{len(traces)} prefix {prefix_index}/{len(prefixes)}] "
                 f"{sample['dataset']}:{sample['id']} round={prefix.round_index}", flush=True,
             )
-            replay_state = rebuild_replay_state(
-                runtime, ids, reference_output_ids, prefix, layout, max_new_tokens=max_new_tokens,
+            label = f"{phase} replay {sample['dataset']}:{sample['id']} round={prefix.round_index}"
+            computed, compute_error = run_compute_unit(
+                lambda: _compute_replay_prefix(
+                    args, runtime, sample, ids, layout, prefix, reference_output_ids,
+                    phase=phase, max_new_tokens=max_new_tokens, run_a3=run_a3, trace=trace,
+                    previous=previous, reference_accepted=reference_accepted,
+                    previous_accepted=previous_accepted,
+                ),
+                label=label, result_error=_replay_result_error,
             )
-            full_positions = tuple(range(replay_state.bank.length))
-            full_outcome = evaluate_replay_action(
-                runtime, ids, replay_state, layout,
-                [full_positions for _ in runtime["draft"].layers],
-                requested_budget="full", selector_id="full",
-                remaining_output_tokens=prefix.remaining_output_tokens,
-                collect_attention_scores=True,
-            )
-            replay_cache: dict[int, Mapping[str, Any]] = {}
-            if full_outcome.get("status") != "ok" or int(full_outcome.get("accepted_candidates", -1)) != reference_accepted:
-                raise RuntimeError(
-                    f"full replay did not reproduce reference acceptance for "
-                    f"{sample['dataset']}:{sample['id']} at round {prefix.round_index} "
-                    f"(processed_output_tokens={prefix.processed_output_tokens}, "
-                    f"prefix_hash={prefix.prefix_hash}): "
-                    f"{full_outcome.get('reason') or full_outcome.get('accepted_candidates')} != {reference_accepted}"
+            diagnostic_id = f"{prefix_key}|full_dflash_baseline"
+            if computed is None or computed.get("status") != "ok":
+                baseline_mismatch = computed is not None and computed.get("status") == "baseline_mismatch"
+                failure_status = "baseline_mismatch" if baseline_mismatch else "error"
+                reason = str((computed or compute_error or {}).get("reason", "prefix computation failed"))
+                diagnostic = {
+                    "schema_version": "dflash-context-interventions.prefix-diagnostic.v1",
+                    "type": "prefix_diagnostic", "experiment": "full_dflash_replay_baseline",
+                    "phase": phase, "sample_id": str(sample["id"]), "dataset": str(sample["dataset"]),
+                    "source_group_id": str(sample["_cad_source_group_id"]),
+                    "prefix_round_index": int(prefix.round_index),
+                    "processed_output_tokens": int(prefix.processed_output_tokens),
+                    "prefix_hash": str(prefix.prefix_hash), "status": failure_status, "reason": reason,
+                    "reference_accepted_candidates": reference_accepted,
+                    "replay_accepted_candidates": (computed or {}).get("replay_accepted_candidates"),
+                    "compute_error": compute_error, "run_id": args.run_id, "cell_id": diagnostic_id,
+                }
+                _save_rows(stores["prefix_diagnostics"], [diagnostic], existing["prefix_diagnostics"])
+                prefix_marker.parent.mkdir(parents=True, exist_ok=True)
+                atomic_json(prefix_marker, {
+                    "prefix_key": prefix_key,
+                    "signature": _cell_signature(runtime, args, phase, "prefixes"),
+                    "status": failure_status, "diagnostic_cell_id": diagnostic_id,
+                })
+                print(
+                    f"[{phase} replay] quarantined prefix sample={sample['id']} "
+                    f"round={prefix.round_index} status={failure_status} {reason}; continuing",
+                    file=sys.stderr, flush=True,
                 )
-            a1_rows = run_a1_prefix(
-                runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
-                max_new_tokens=max_new_tokens, state=replay_state, full_outcome=full_outcome,
-                source_anchors=args.source_anchors,
-                recent_output=args.recent_output, reference_accepted=reference_accepted,
-            )
-            _save_rows(stores["a1"], a1_rows, existing["a1"])
-            a2_rows = run_a2_prefix(
-                runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
-                max_new_tokens=max_new_tokens, state=replay_state, full_outcome=full_outcome,
-                replay_cache=replay_cache, previous_prefix=previous,
-                reference_accepted=reference_accepted, previous_reference_accepted=previous_accepted,
-                source_anchors=args.source_anchors, recent_output=args.recent_output,
-            )
-            _save_rows(stores["a2"], a2_rows, existing["a2"])
-            if run_a3:
-                ages = (1, 2, 4, 8, 16) if phase == "dev" and args.a3_selector == "previous_dflash" else (1,)
-                for age in ages:
-                    age_prefix = _prefix_at_age(trace, prefix, age, max_new_tokens) if args.a3_selector == "previous_dflash" else None
-                    age_accepted = None
-                    if age_prefix is not None:
-                        age_row = round_rows.get(age_prefix.round_index)
-                        age_accepted = int(age_row.get("accepted_candidates", 0)) if age_row else None
-                    a3_rows = run_a3_prefix(
-                        runtime, sample, ids, layout, prefix, reference_output_ids, phase=phase,
-                        selector=args.a3_selector, max_new_tokens=max_new_tokens,
-                        state=replay_state, full_outcome=full_outcome,
-                        replay_cache=replay_cache,
-                        previous_prefix=age_prefix if args.a3_selector == "previous_dflash" else previous,
-                        ranking_age=age if args.a3_selector == "previous_dflash" else None,
-                        source_anchors=args.source_anchors,
-                        recent_output=args.recent_output, reference_accepted=reference_accepted,
-                        previous_reference_accepted=age_accepted if args.a3_selector == "previous_dflash" else previous_accepted,
-                    )
-                    _save_rows(stores["a3_replay"], a3_rows, existing["a3_replay"])
+                failures.observe(failed=True, label=label)
+                continue
+            prefix_cell_ids = {}
+            for kind in ("a1", "a2", "a3_replay"):
+                rows = computed[kind]
+                _save_rows(stores[kind], rows, existing[kind])
+                prefix_cell_ids[kind] = [str(row["cell_id"]) for row in rows]
+            previous_check = next((
+                row.get("previous_replay_check") for row in computed["a2"]
+                if row.get("previous_replay_check") is not None
+            ), None)
+            if previous_check and previous_check.get("status") not in {"ok", "acceptance_unavailable"}:
+                print(
+                    f"[{phase} replay] previous_dflash evidence sample={sample['id']} "
+                    f"round={previous_check.get('round_index')} status={previous_check.get('status')}",
+                    flush=True,
+                )
+            prior_diagnostic = existing["prefix_diagnostics"].get(diagnostic_id)
+            if prior_diagnostic is not None and prior_diagnostic.get("status") == "error":
+                _save_rows(stores["prefix_diagnostics"], [{
+                    **prior_diagnostic, "status": "resolved", "reason": "prefix recovered on resume",
+                }], existing["prefix_diagnostics"])
             prefix_marker.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(prefix_marker, {
                 "prefix_key": prefix_key,
                 "signature": _cell_signature(runtime, args, phase, "prefixes"),
-                "a1_rows": len(a1_rows),
-                "a2_rows": len(a2_rows),
-                "a3_replay": run_a3,
+                "status": "complete", "cell_ids": prefix_cell_ids,
+                "a1_rows": len(computed["a1"]), "a2_rows": len(computed["a2"]), "a3_replay": run_a3,
             })
-            del a1_rows, a2_rows
+            failures.observe(failed=False, label=label)
+            del computed
     for kind, store in stores.items():
         rows = store.rows()
         statuses = Counter(str(row.get("status", "missing")) for row in rows)
+        failed_prefixes = sum(1 for row in existing["prefix_diagnostics"].values()
+                              if row.get("status") in {"baseline_mismatch", "baseline_error", "error"})
         store.merge(run_root / phase / f"{kind}.jsonl", summary={
             "type": "summary",
-            "status": "complete" if not statuses.get("error") else "partial_with_errors",
+            "status": (
+                "partial_with_errors"
+                if statuses.get("error") or failed_prefixes
+                else "complete"
+            ),
             "phase": phase,
             "experiment": kind,
             "planned_or_recorded_rows": len(rows),
@@ -653,72 +865,166 @@ def _run_replay(
         })
 
 
-def _run_rollouts(
-    args: argparse.Namespace,
-    run_root: Path,
-    runtime: Mapping[str, Any],
-    samples: Sequence[dict[str, Any]],
-    traces: Sequence[Mapping[str, Any]],
-    *,
-    phase: str,
-    max_new_tokens: int,
-    periods: Sequence[int],
-    repetitions: int,
-    warmups: int,
-) -> None:
-    from TrainingFree.context_adaptive.schema import atomic_json
-    from TrainingFree.context_interventions.execution import run_a3_comparison
-    from TrainingFree.context_interventions.artifacts import CellStore
+def _rollout_parity_failed(rows) -> bool:
+    arms = {str(row.get("variant")): row for row in rows}
+    adapter = arms.get("adapter_full")
+    native = arms.get("native_full_dflash")
+    if adapter is None or native is None or adapter.get("status") != "ok" or native.get("status") != "ok":
+        return False
+    if not adapter.get("matches_native_full_dflash"):
+        return True
+    if adapter.get("output_ids") is not None and native.get("output_ids") is not None:
+        return adapter["output_ids"] != native["output_ids"]
+    return False
 
-    store = _phase_store(run_root, phase, "a3_rollout", _cell_signature(runtime, args, phase, "a3_rollout"), args.resume)
-    existing = {str(row.get("cell_id")) for row in store.rows()}
+
+def _rollout_result_error(rows, selector) -> str | None:
+    from TrainingFree.context_interventions.resilience import CampaignIntegrityError
+    from TrainingFree.context_adaptive.schema import _check_finite
+
+    variants = [str(row.get("variant")) for row in rows]
+    required = {"ar", "native_full_dflash", "adapter_full", selector}
+    if len(variants) != 4 or set(variants) != required:
+        raise CampaignIntegrityError(f"A3 paired result has invalid arms: {variants}")
+    if _rollout_parity_failed(rows):
+        return None  # Save the failed parity evidence, then stop without retry.
+    nonfinite = _check_finite(rows)
+    if nonfinite:
+        return f"nonfinite rollout values: {nonfinite}"
+    for row in rows:
+        if row.get("status") != "ok":
+            reason = str(row.get("error") or row.get("reason") or f"{row['variant']} status={row.get('status')}")
+            _check_compute_reason(reason)
+            return reason
+        try:
+            latency = float(row["wall_e2e_ms"])
+            if not math.isfinite(latency) or latency <= 0:
+                return f"{row['variant']} has invalid wall latency: {latency}"
+            if row["variant"] in {"native_full_dflash", selector}:
+                acceptance = float(row["counters"]["mean_accepted_candidates"])
+                if not math.isfinite(acceptance) or not 0 <= acceptance <= 15:
+                    return f"{row['variant']} has invalid acceptance metric: {acceptance}"
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"{row['variant']} is missing usable timing/acceptance metrics: {exc}"
+    return None
+
+
+def _run_rollouts(
+    args: argparse.Namespace, run_root: Path, runtime: Mapping[str, Any],
+    samples: Sequence[dict[str, Any]], traces: Sequence[Mapping[str, Any]], *,
+    phase: str, max_new_tokens: int, periods: Sequence[int], repetitions: int, warmups: int,
+) -> None:
+    from TrainingFree.context_interventions.execution import run_a3_comparison
+    from TrainingFree.context_interventions.resilience import CampaignIntegrityError, FailureStreak, run_compute_unit, sanitize_failed_numbers
+
+    # Four measured arms belong to one attempt. Commit the complete bundle in
+    # one atomic checkpoint so retries/resume can never mix measurement attempts.
+    store = _phase_store(
+        run_root, phase, "a3_rollout_pairs", _cell_signature(runtime, args, phase, "a3_rollout_pairs"), args.resume,
+    )
+    saved_by_id = {str(row.get("cell_id")): row for row in store.rows()}
     sample_map = _sample_index(samples)
+    failures = FailureStreak()
+    required = ("ar", "native_full_dflash", "adapter_full", args.a3_selector)
     for index, trace in enumerate(traces, start=1):
         sample = sample_map[str(trace["sample_id"])]
+        sample_has_success = False
         for period in periods:
             for repetition in range(repetitions):
-                expected_ids = {
-                    "|".join((str(sample["dataset"]), str(sample["_cad_source_group_id"]),
-                              args.a3_selector, str(args.a3_budget), str(period), str(repetition), variant))
-                    for variant in ("ar", "native_full_dflash", "adapter_full", args.a3_selector)
-                }
-                if args.resume and expected_ids.issubset(existing):
-                    continue
+                pair_id = "|".join((
+                    str(sample["dataset"]), str(sample["_cad_source_group_id"]),
+                    args.a3_selector, str(args.a3_budget), str(period), str(repetition),
+                ))
+                previous = saved_by_id.get(pair_id)
+                if previous is not None:
+                    if previous.get("status") == "parity_fail":
+                        raise CampaignIntegrityError(f"A3 full-adapter/native-DFlash parity failed for saved cell {sample['id']}")
+                    saved_rows = previous.get("rows", [])
+                    saved_error = _rollout_result_error(saved_rows, args.a3_selector)
+                    if _rollout_parity_failed(saved_rows):
+                        raise CampaignIntegrityError(f"A3 full-adapter/native-DFlash parity failed for saved cell {sample['id']}")
+                    if previous.get("status") == "ok":
+                        if saved_error is not None:
+                            raise CampaignIntegrityError(f"A3 successful checkpoint has invalid evidence: {pair_id}: {saved_error}")
+                        sample_has_success = True
+                        continue
                 print(
                     f"[{phase} A3 {index}/{len(traces)}] {sample['dataset']}:{sample['id']} "
                     f"selector={args.a3_selector} B={args.a3_budget} period={period} rep={repetition}",
                     flush=True,
                 )
-                rows = run_a3_comparison(
-                    runtime, sample, max_new_tokens=max_new_tokens,
-                    selector=args.a3_selector, budget=args.a3_budget,
-                    refresh_period=period, repetition=repetition,
-                    warmups=warmups if repetition == 0 else 0,
-                    source_anchors=args.source_anchors, recent_output=args.recent_output,
+                attempt_count = 0
+
+                def measure_pair():
+                    nonlocal attempt_count
+                    attempt_count += 1
+                    return run_a3_comparison(
+                        runtime, sample, max_new_tokens=max_new_tokens,
+                        selector=args.a3_selector, budget=args.a3_budget,
+                        refresh_period=period, repetition=repetition,
+                        warmups=warmups if repetition == 0 and attempt_count == 1 else 0,
+                        source_anchors=args.source_anchors, recent_output=args.recent_output,
+                    )
+
+                rows, compute_error = run_compute_unit(
+                    measure_pair, label=f"{phase} A3 {pair_id}",
+                    result_error=lambda values: _rollout_result_error(values, args.a3_selector),
                 )
+                if rows is None:
+                    rows = [{"variant": variant, "status": "error"} for variant in required]
+                parity_failed = _rollout_parity_failed(rows)
                 for row in rows:
-                    cell_id = "|".join((
-                        str(sample["dataset"]), str(sample["_cad_source_group_id"]),
-                        args.a3_selector, str(args.a3_budget), str(period), str(repetition), str(row["variant"]),
-                    ))
-                    row["cell_id"] = cell_id
-                    row["run_id"] = args.run_id
-                    if cell_id not in existing:
-                        store.save(cell_id, row)
-                        existing.add(cell_id)
-                arms = {str(row.get("variant")): row for row in rows}
-                adapter = arms.get("adapter_full")
-                native = arms.get("native_full_dflash")
-                if (adapter is not None and native is not None
-                        and adapter.get("status") == "ok" and native.get("status") == "ok"
-                        and not adapter.get("matches_native_full_dflash")):
-                    raise RuntimeError(f"A3 full-adapter/native-DFlash parity failed for {sample['id']}")
-    all_rows = store.rows()
+                    row.update({
+                        "schema_version": "dflash-context-interventions.rollout.v1", "type": "rollout",
+                        "sample_id": str(sample["id"]), "dataset": str(sample["dataset"]),
+                        "source_group_id": str(sample["_cad_source_group_id"]),
+                        "split": str(sample.get("_cad_split", "unknown")),
+                        "selector": args.a3_selector, "budget": args.a3_budget,
+                        "refresh_period": period, "repetition": repetition,
+                        "cell_id": f"{pair_id}|{row['variant']}", "pair_id": pair_id,
+                        "run_id": args.run_id, "compute_attempts": attempt_count,
+                    })
+                    if compute_error is not None:
+                        row["attempt_status"] = row.get("status")
+                        row["status"] = "error"
+                        row["error"] = compute_error["reason"]
+                        row["pair_complete"] = False
+                    else:
+                        row["pair_complete"] = True
+                rows = [sanitize_failed_numbers(row) for row in rows]
+                bundle = {
+                    "schema_version": "dflash-context-interventions.rollout-pair.v1",
+                    "type": "rollout_pair", "run_id": args.run_id, "cell_id": pair_id,
+                    "status": "parity_fail" if parity_failed else ("error" if compute_error else "ok"),
+                    "rows": rows, "compute_error": compute_error, "compute_attempts": attempt_count,
+                }
+                store.save(pair_id, bundle)
+                saved_by_id[pair_id] = bundle
+                if parity_failed:
+                    raise CampaignIntegrityError(f"A3 full-adapter/native-DFlash parity failed for {sample['id']}")
+                sample_has_success = sample_has_success or compute_error is None
+        # Optional grid failures must not declare the whole GPU unusable while
+        # other configurations still produce valid paired evidence for a sample.
+        failures.observe(failed=not sample_has_success, label=str(sample["id"]))
+    all_rows = [row for bundle in saved_by_id.values() for row in bundle["rows"]]
     statuses = Counter(str(row.get("status", "missing")) for row in all_rows)
-    store.merge(run_root / phase / "a3_rollout.jsonl", summary={
-        "type": "summary", "status": "complete" if not statuses.get("error") else "partial_with_errors",
-        "phase": phase, "experiment": "A3_rollout", "rows": len(all_rows),
-        "status_counts": dict(statuses), "run_signature": store.signature,
+    configurations = []
+    for period in periods:
+        config_rows = [row for row in all_rows if int(row["refresh_period"]) == int(period)]
+        planned = len(samples) * repetitions * 4
+        config_statuses = Counter(str(row.get("status", "missing")) for row in config_rows)
+        configurations.append({
+            "selector": args.a3_selector, "budget": args.a3_budget, "refresh_period": period,
+            "rows": len(config_rows), "planned_rows": planned,
+            "status": "complete" if len(config_rows) == planned and config_statuses.get("ok", 0) == planned else "partial_with_errors",
+            "status_counts": dict(config_statuses),
+        })
+    planned_rows = len(samples) * len(periods) * repetitions * 4
+    store.merge(run_root / phase / "a3_rollout.jsonl", records=all_rows, summary={
+        "type": "summary",
+        "status": "complete" if statuses.get("ok", 0) == planned_rows and len(all_rows) == planned_rows else "partial_with_errors",
+        "phase": phase, "experiment": "A3_rollout", "rows": len(all_rows), "planned_rows": planned_rows,
+        "status_counts": dict(statuses), "configurations": configurations, "run_signature": store.signature,
     })
 
 
@@ -1004,6 +1310,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Interrupted; completed per-cell artifacts can be resumed with --resume.", file=sys.stderr, flush=True)
         raise SystemExit(130)
+    except CampaignIntegrityError as exc:
+        print(f"campaign integrity error: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(3)
     except Exception as exc:
         print(f"campaign error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         raise SystemExit(2)

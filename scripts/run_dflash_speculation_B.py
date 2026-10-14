@@ -9,6 +9,7 @@ or execute ``preflight``, ``validate``, ``b1`` and ``analyze`` separately.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -16,6 +17,7 @@ import os
 import random
 import sys
 import time
+import traceback
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +66,74 @@ def _parser() -> argparse.ArgumentParser:
 
 def _utc_run_id() -> str:
     return datetime.now(timezone.utc).strftime("b200_%Y%m%dT%H%M%SZ")
+
+
+def _is_fatal_campaign_error(exc: BaseException) -> bool:
+    from TrainingFree.context_interventions.resilience import is_fatal_compute_error
+
+    return isinstance(exc, Exception) and is_fatal_compute_error(exc)
+
+
+def _clear_exception_traceback(exc: Exception) -> str:
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-12000:]
+    exc.__traceback__ = None
+    return rendered
+
+
+def _compute_failure_exception(failure: Mapping[str, Any]) -> RuntimeError:
+    attempts = int(failure.get("attempts", 1))
+    message = f"{failure.get('reason', 'compute failed')} (attempts={attempts})"
+    previous_traceback = failure.get("traceback")
+    if previous_traceback:
+        message += f"\nlast attempt traceback:\n{previous_traceback}"
+    return RuntimeError(message)
+
+
+def _recover_after_cell_error() -> None:
+    """Release temporary tensors after a cell-local failure before continuing."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as cleanup_error:
+        if _is_fatal_campaign_error(cleanup_error):
+            raise
+
+
+def _record_cell_error(
+    path: Path,
+    *,
+    phase: str,
+    campaign_signature: str,
+    state_key: str,
+    sample_id: str,
+    exc: Exception,
+) -> None:
+    """Persist one failed cell and let the caller continue with other cells."""
+    if _is_fatal_campaign_error(exc):
+        raise exc
+    from TrainingFree.context_adaptive.schema import atomic_json
+
+    rendered_traceback = _clear_exception_traceback(exc)
+    _recover_after_cell_error()
+    atomic_json(path, {
+        "schema_version": "dflash-speculation-b.failed-cell.v1",
+        "status": "failed",
+        "phase": phase,
+        "campaign_signature": campaign_signature,
+        "state_key": state_key,
+        "sample_id": sample_id,
+        "error": {"type": type(exc).__name__, "message": str(exc)},
+        "traceback": rendered_traceback,
+    })
+    print(
+        f"[{phase}] cell failed; continuing: sample={sample_id} state={state_key} "
+        f"{type(exc).__name__}: {exc}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _resolve(value: str | None) -> Path | None:
@@ -260,6 +330,63 @@ def _load_prepared(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict
     return selected, campaign, run_root
 
 
+def _load_resume_campaign(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
+    """Load an existing run's saved cohort/protocol for a one-command resume."""
+    if not args.run_id:
+        raise ValueError("--mode run --resume requires the existing --run-id")
+    run_root = _run_root(args)
+    campaign_path = run_root / "campaign.json"
+    cohort_path = run_root / "cohort_manifest.json"
+    split_path = run_root / "split_manifest.json"
+    if not campaign_path.is_file() or not cohort_path.is_file() or not split_path.is_file():
+        raise FileNotFoundError(f"cannot resume an unprepared run: {run_root}")
+
+    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+    cohort = json.loads(cohort_path.read_text(encoding="utf-8"))
+    split_manifest = json.loads(split_path.read_text(encoding="utf-8"))
+    if campaign.get("run_id") != args.run_id:
+        raise ValueError("saved campaign run_id does not match --run-id")
+    if campaign.get("cohort_sha256") != _hash_json(cohort):
+        raise ValueError("saved cohort manifest does not match campaign.json")
+    if campaign.get("split_manifest_sha256") != _hash_json(split_manifest):
+        raise ValueError("saved split manifest does not match campaign.json")
+
+    args.allow_partial_cohort = bool(campaign.get("partial_cohort", False))
+    samples, paths = _load_samples(args)
+    if campaign.get("corpus") != _corpus_signature(paths):
+        raise ValueError("current corpus differs from the saved campaign; resume with its original data path")
+    sample_by_key = {(str(row["dataset"]), str(row["id"])): row for row in samples}
+    selected: list[dict[str, Any]] = []
+    for row in cohort.get("groups", []):
+        key = (str(row["dataset"]), str(row["sample_id"]))
+        sample = sample_by_key.get(key)
+        if sample is None:
+            raise ValueError(f"prepared cohort sample missing from current corpus: {key}")
+        item = dict(sample)
+        item["_cad_source_group_id"] = str(row["source_group_id"])
+        item["_cad_split"] = str(row["split"])
+        selected.append(item)
+    selected_keys = sorted(f"{row['dataset']}::{row['id']}" for row in selected)
+    if selected_keys != sorted(str(key) for key in campaign.get("selected_sample_keys", [])):
+        raise ValueError("saved cohort rows differ from campaign.json")
+
+    # Resume uses the protocol that created the run, even if CLI defaults have
+    # since changed. Model paths and runtime environment still come from config.
+    for name in (
+        "cohort_phase", "seed", "max_new_tokens", "validation_tokens", "max_prefixes",
+        "warmups", "repetitions", "selection_repetitions", "n_splits",
+        "bootstrap_replicates", "attention_backend",
+    ):
+        setattr(args, name, campaign[name])
+    args.gammas = ",".join(str(value) for value in campaign["gammas"])
+    print(
+        f"[resume] run={args.run_id} cohort={len(selected)} groups; "
+        f"protocol loaded from {campaign_path}",
+        flush=True,
+    )
+    return selected, campaign, run_root
+
+
 def _parse_gammas(raw: str) -> tuple[int, ...]:
     try:
         values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
@@ -348,10 +475,34 @@ def _trace_signature(
     })
 
 
+def _trace_signature_matches(trace: Mapping[str, Any], expected_signature: str) -> bool:
+    return trace.get("trace_signature") == expected_signature
+
+
+def _complete_b0_trace(trace: Mapping[str, Any], gammas: Sequence[int]) -> bool:
+    required_sequences = ("ar_ids", "native_ids", "adapter_ids", "adapter_rounds", "eos_ids")
+    if (
+        trace.get("b0_status") != "complete"
+        or not isinstance(trace.get("prompt_tokens"), int)
+        or trace.get("prompt_tokens", 0) < 1
+        or not isinstance(trace.get("prompt_hash"), str)
+        or not isinstance(trace.get("sample_id"), str)
+        or not isinstance(trace.get("dataset"), str)
+        or not isinstance(trace.get("source_group_id"), str)
+        or any(not isinstance(trace.get(key), list) for key in required_sequences)
+        or not isinstance(trace.get("parity_by_gamma"), dict)
+    ):
+        return False
+    if set(trace["parity_by_gamma"]) != {str(gamma) for gamma in gammas}:
+        return False
+    return all(isinstance(row, Mapping) for row in trace["adapter_rounds"])
+
+
 def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: Path, runtime: Mapping[str, Any]) -> bool:
     from TrainingFree.context_adaptive.prompt import prepare_prompt
     from TrainingFree.context_adaptive.schema import atomic_json
     from TrainingFree.context_interventions.execution import run_reference_pair
+    from TrainingFree.context_interventions.resilience import run_compute_unit
 
     gammas = _parse_gammas(args.gammas)
     validation_rows = []
@@ -359,7 +510,36 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
     runtime_signature = runtime["b_campaign_signature"]
     for sample_index, sample in enumerate(samples, start=1):
         path = _sample_trace_path(run_root, sample)
-        ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
+        try:
+            (ids, layout), setup_error = run_compute_unit(
+                lambda: prepare_prompt(sample, runtime["tokenizer"], chunk_size=128),
+                label=f"B0 prompt setup sample={sample['id']}",
+            )
+            if setup_error is not None:
+                raise _compute_failure_exception(setup_error)
+        except Exception as exc:
+            if _is_fatal_campaign_error(exc):
+                raise
+            error_traceback = _clear_exception_traceback(exc)
+            try:
+                del ids
+            except UnboundLocalError:
+                pass
+            _recover_after_cell_error()
+            validation_rows.append({
+                "sample_id": sample["id"],
+                "status": "failed",
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "traceback": error_traceback,
+                "comparisons_by_gamma": {},
+            })
+            print(
+                f"[B0 {sample_index}/{len(samples)}] prompt setup failed for "
+                f"{sample['dataset']}:{sample['id']}; continuing: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         expected_signature = _trace_signature(
             sample=sample,
             prompt_hash=layout.prompt_hash,
@@ -367,34 +547,61 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             runtime_signature=runtime_signature,
             code_signature=code,
         )
-        if path.exists() and args.resume:
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if saved.get("trace_signature") != expected_signature:
-                raise ValueError(f"resume trace signature mismatch: {path}")
-            if saved.get("b0_status") != "complete":
-                raise ValueError(f"resume trace lacks a completed B0 validation record: {path}")
-            parity = saved["parity_by_gamma"]
-            validation_rows.append({"sample_id": sample["id"], "comparisons_by_gamma": parity})
-            print(f"[B0 {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
-            continue
         if path.exists():
-            raise FileExistsError(f"trace already exists; pass --resume: {path}")
+            saved = _read_json_artifact(run_root, "traces", path)
+            if saved is not None:
+                if _trace_signature_matches(saved, expected_signature) and _complete_b0_trace(saved, gammas):
+                    parity = saved["parity_by_gamma"]
+                    validation_rows.append({"sample_id": sample["id"], "status": "complete", "comparisons_by_gamma": parity})
+                    print(f"[B0 {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
+                    continue
+                # A stale or incomplete trace is preserved for inspection, then
+                # recomputed under the current source/runtime signature.
+                _archive_stale_cell(run_root, "traces", path, saved)
 
         parity_by_gamma: dict[str, Any] = {}
         reference_ar: list[int] | None = None
         reference_trace: dict[str, Any] | None = None
+        measured: dict[str, Any] | None = None
+        sample_error: Exception | None = None
+        sample_error_traceback: str | None = None
         gamma_order = (15, *[gamma for gamma in gammas if gamma != 15])
         for gamma in gamma_order:
             limit = args.max_new_tokens if gamma == 15 else min(args.validation_tokens, args.max_new_tokens)
-            measured = run_reference_pair(
-                runtime,
-                sample,
-                max_new_tokens=limit,
-                gamma=gamma,
-                reference_ar_ids=reference_ar,
-                collect_uncertainty=(gamma == 15),
-                require_ar_match=False,
-            )
+            try:
+                measured, compute_error = run_compute_unit(
+                    lambda: run_reference_pair(
+                        runtime,
+                        sample,
+                        max_new_tokens=limit,
+                        gamma=gamma,
+                        reference_ar_ids=reference_ar,
+                        collect_uncertainty=(gamma == 15),
+                        require_ar_match=False,
+                    ),
+                    label=f"B0 reference pair sample={sample['id']} gamma={gamma}",
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+            except Exception as exc:
+                if _is_fatal_campaign_error(exc):
+                    raise
+                sample_error_traceback = _clear_exception_traceback(exc)
+                reference_trace = None
+                measured = None
+                try:
+                    del ids
+                except UnboundLocalError:
+                    pass
+                _recover_after_cell_error()
+                sample_error = exc
+                print(
+                    f"[B0 {sample_index}/{len(samples)}] failed {sample['dataset']}:{sample['id']} "
+                    f"gamma={gamma}; continuing with next sample: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             if gamma == 15:
                 reference_ar = measured["ar_ids"]
                 reference_trace = measured
@@ -406,8 +613,18 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
                 f"AR/adapter={measured['parity']['adapter_equals_ar']}",
                 flush=True,
             )
+        if sample_error is not None:
+            validation_rows.append({
+                "sample_id": sample["id"],
+                "status": "failed",
+                "error": {"type": type(sample_error).__name__, "message": str(sample_error)},
+                "traceback": sample_error_traceback,
+                "comparisons_by_gamma": parity_by_gamma,
+            })
+            del reference_trace, measured
+            continue
         if reference_trace is None:
-            raise RuntimeError("gamma15 reference trace was not produced")
+            raise RuntimeError("gamma15 reference trace was not produced despite successful validation")
         trace = {
             "schema_version": "dflash-speculation-b.reference.v1",
             "trace_signature": expected_signature,
@@ -426,20 +643,26 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             "parity_by_gamma": parity_by_gamma,
         }
         atomic_json(path, trace)
-        validation_rows.append({"sample_id": sample["id"], "comparisons_by_gamma": parity_by_gamma})
+        validation_rows.append({"sample_id": sample["id"], "status": "complete", "comparisons_by_gamma": parity_by_gamma})
+        del reference_trace, measured, ids
     comparisons = [
         comparison
         for sample in validation_rows
         for comparison in sample.get("comparisons_by_gamma", {}).values()
     ]
-    completed = len(validation_rows) == len(samples) and all(
+    valid_rows = [sample for sample in validation_rows if sample.get("status") == "complete"]
+    failed_rows = [sample for sample in validation_rows if sample.get("status") != "complete"]
+    completed = len(valid_rows) == len(samples) and all(
         len(sample.get("comparisons_by_gamma", {})) == len(gammas)
-        for sample in validation_rows
+        for sample in valid_rows
     )
     summary = {
         "schema_version": "dflash-speculation-b.b0-validation.v2",
-        "status": "complete" if completed else "incomplete",
+        "status": "complete" if completed else ("partial" if valid_rows else "failed"),
         "sample_count": len(validation_rows),
+        "valid_sample_count": len(valid_rows),
+        "failed_sample_count": len(failed_rows),
+        "failed_samples": failed_rows,
         "gamma_values": list(gammas),
         "comparisons": validation_rows,
         "ar_exact_match_rate": {
@@ -456,27 +679,152 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
     }
     atomic_json(run_root / "evidence" / "parity.json", summary)
     print(
-        "[B0] validation complete; AR/native/adapter token equality is diagnostic only; "
+        f"[B0] validation {summary['status']}; valid={len(valid_rows)}/{len(samples)} "
+        f"failed={len(failed_rows)}; AR/native/adapter equality is diagnostic only; "
         f"AR match rates={summary['ar_exact_match_rate']}",
         flush=True,
     )
-    return completed
+    # A partial B0 run can still provide valid independent samples to B1/B1-V.
+    # False means there is no usable reference trajectory at all.
+    return bool(valid_rows)
 
 
-def _state_cell_path(run_root: Path, state_key: str) -> Path:
-    return run_root / "b1" / "cells" / f"{hashlib.sha256(state_key.encode('utf-8')).hexdigest()}.json"
+def _state_cell_path(run_root: Path, state_key: str, *, phase: str = "b1") -> Path:
+    return run_root / phase / "cells" / f"{hashlib.sha256(state_key.encode('utf-8')).hexdigest()}.json"
+
+
+def _mark_sample_setup_recovered(
+    run_root: Path,
+    phase: str,
+    sample: Mapping[str, Any],
+    campaign_signature: str,
+) -> None:
+    state_key = f"sample|{sample['dataset']}|{sample['id']}|setup"
+    path = _state_cell_path(run_root, state_key, phase=phase)
+    if not path.is_file():
+        return
+    cell = _read_json_artifact(run_root, phase, path)
+    if cell is None:
+        return
+    if cell.get("campaign_signature") != campaign_signature or cell.get("status") != "failed":
+        return
+    cell["status"] = "recovered"
+    from TrainingFree.context_adaptive.schema import atomic_json
+
+    atomic_json(path, cell)
+    print(f"[{phase}] sample setup recovered: {sample['dataset']}:{sample['id']}", flush=True)
+
+
+def _archive_stale_cell(run_root: Path, phase: str, path: Path, cell: Mapping[str, Any]) -> Path:
+    stale_dir = run_root / "stale" / phase
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    old_signature = str(cell.get("campaign_signature", "unknown"))[:12]
+    destination = stale_dir / f"{path.stem}.{old_signature}.{time.time_ns()}{path.suffix}"
+    os.replace(path, destination)
+    print(f"[{phase}] archived incompatible cell: {destination}", flush=True)
+    return destination
+
+
+def _archive_corrupt_artifact(run_root: Path, phase: str, path: Path, reason: BaseException) -> Path:
+    stale_dir = run_root / "stale" / phase
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    destination = stale_dir / f"{path.stem}.corrupt.{time.time_ns()}{path.suffix}"
+    os.replace(path, destination)
+    print(
+        f"[{phase}] archived unreadable artifact and will rebuild it: {path.name} "
+        f"({type(reason).__name__}: {reason})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return destination
+
+
+def _read_json_artifact(run_root: Path, phase: str, path: Path) -> dict[str, Any] | None:
+    """Read a JSON object, quarantining a torn/corrupt checkpoint for recompute."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _archive_corrupt_artifact(run_root, phase, path, exc)
+        return None
+    if not isinstance(value, dict):
+        _archive_corrupt_artifact(
+            run_root, phase, path, ValueError("checkpoint root must be a JSON object")
+        )
+        return None
+    return value
+
+
+def _migrate_completed_cells(
+    run_root: Path,
+    phase: str,
+    *,
+    current_signature: str,
+    is_complete: Any,
+) -> None:
+    """Reuse only cells from the exact same code/runtime/protocol signature."""
+    for path in sorted((run_root / phase / "cells").glob("*.json")):
+        cell = _read_json_artifact(run_root, phase, path)
+        if cell is None:
+            continue
+        if cell.get("campaign_signature") == current_signature:
+            if cell.get("status", "complete") == "complete" and not is_complete(cell):
+                _archive_stale_cell(run_root, phase, path, cell)
+            continue
+        # A source signature alone cannot prove that a code change was limited
+        # to orchestration. Re-labeling would silently mix measurements made by
+        # different inference/replay implementations.
+        _archive_stale_cell(run_root, phase, path, cell)
+
+
+def _complete_b1_cell(cell: Mapping[str, Any], gammas: Sequence[int], repetitions: int) -> bool:
+    try:
+        expected = {(int(gamma), repetition) for gamma in gammas for repetition in range(repetitions)}
+        observed = {
+            (int(row["gamma"]), int(row["repetition"]))
+            for row in cell.get("actions", [])
+        }
+        return (
+            len(cell.get("actions", [])) == len(expected)
+            and observed == expected
+            and set(cell.get("accepted_by_gamma", {})) == {str(gamma) for gamma in gammas}
+            and set(cell.get("proposal_by_gamma", {})) == {str(gamma) for gamma in gammas}
+            and (
+                isinstance(cell.get("signal"), Mapping)
+                or isinstance(cell.get("signal_error"), Mapping)
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _complete_b1v_cell(cell: Mapping[str, Any], repetitions: int) -> bool:
+    try:
+        expected = {(k, repetition) for k in (3, 7, 11, 15) for repetition in range(repetitions)}
+        observed = {
+            (int(row["k"]), int(row["repetition"]))
+            for row in cell.get("actions", [])
+        }
+        return len(cell.get("actions", [])) == len(expected) and observed == expected
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: Path, runtime: Mapping[str, Any]) -> None:
     from TrainingFree.context_adaptive.prompt import prepare_prompt
     from TrainingFree.context_adaptive.schema import atomic_json
     from TrainingFree.context_interventions.replay import evaluate_replay_action, rebuild_replay_state
-    from TrainingFree.speculation_experiments.reference import reference_history, select_reference_prefixes
+    from TrainingFree.context_interventions.resilience import run_compute_unit
+    from TrainingFree.speculation_experiments.reference import (
+        reference_history,
+        reference_trajectory_ids,
+        select_reference_prefixes,
+    )
     from TrainingFree.speculation_experiments.replay import run_same_prefix_sweep
 
     parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
-        raise RuntimeError("B1 requires completed B0 runtime validation")
+    parity = _read_json_artifact(run_root, "evidence", parity_path) if parity_path.is_file() else None
+    if not parity or parity.get("status") not in {"complete", "partial"}:
+        raise RuntimeError("B1 requires at least one valid B0 reference trajectory")
     code = _code_signature()
     runtime_sig = runtime["b_campaign_signature"]
     params = {
@@ -489,161 +837,263 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
         "seed": args.seed,
     }
     campaign_signature = _hash_json({"code": code, "runtime": runtime_sig, "campaign": params})
+    _migrate_completed_cells(
+        run_root,
+        "b1",
+        current_signature=campaign_signature,
+        is_complete=lambda cell: _complete_b1_cell(cell, params["gammas"], args.repetitions),
+    )
     for sample_index, sample in enumerate(samples, start=1):
-        trace_path = _sample_trace_path(run_root, sample)
-        if not trace_path.is_file():
-            raise FileNotFoundError(f"missing gamma15 reference trace: {trace_path}")
-        trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        if trace.get("b0_status") != "complete":
-            raise RuntimeError(f"sample {sample['id']} lacks completed B0 runtime validation")
-        input_ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
-        input_ids = input_ids.to(runtime["target"].device).contiguous()
-        if layout.prompt_hash != trace["prompt_hash"]:
-            raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
-        expected_trace_signature = _trace_signature(
-            sample=sample,
-            prompt_hash=layout.prompt_hash,
-            args=args,
-            runtime_signature=runtime_sig,
-            code_signature=code,
-        )
-        if trace.get("trace_signature") != expected_trace_signature:
-            raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
-        prefixes = select_reference_prefixes(
-            trace["adapter_rounds"],
-            trace["ar_ids"],
-            prompt_length=int(trace["prompt_tokens"]),
-            max_new_tokens=args.max_new_tokens,
-            eos_ids={int(token) for token in trace.get("eos_ids", [])},
-            max_prefixes=args.max_prefixes,
-        )
-        reference_rounds = {
-            int(row["round_index"]): row
-            for row in trace["adapter_rounds"]
-            if row.get("type") == "round" and int(row.get("gamma_executed", 0)) == 15
-        }
+        try:
+            trace_path = _sample_trace_path(run_root, sample)
+            if not trace_path.is_file():
+                print(f"[B1 {sample_index}/{len(samples)}] skip {sample['dataset']}:{sample['id']}; B0 has no valid trace", flush=True)
+                continue
+            trace = _read_json_artifact(run_root, "traces", trace_path)
+            if trace is None:
+                print(f"[B1 {sample_index}/{len(samples)}] no readable B0 trace; run validation to rebuild", flush=True)
+                continue
+            if trace.get("b0_status") != "complete":
+                print(f"[B1 {sample_index}/{len(samples)}] skip {sample['dataset']}:{sample['id']}; B0 trace incomplete", flush=True)
+                continue
+            if not _complete_b0_trace(trace, params["gammas"]):
+                print(f"[B1 {sample_index}/{len(samples)}] skip malformed B0 trace; run validation to rebuild", flush=True)
+                continue
+            reference_ids = reference_trajectory_ids(trace)
+            (input_ids, layout), setup_error = run_compute_unit(
+                lambda: prepare_prompt(sample, runtime["tokenizer"], chunk_size=128),
+                label=f"B1 prompt setup sample={sample['id']}",
+            )
+            if setup_error is not None:
+                raise _compute_failure_exception(setup_error)
+            input_ids = input_ids.to(runtime["target"].device).contiguous()
+            if layout.prompt_hash != trace["prompt_hash"]:
+                raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
+            expected_trace_signature = _trace_signature(
+                sample=sample,
+                prompt_hash=layout.prompt_hash,
+                args=args,
+                runtime_signature=runtime_sig,
+                code_signature=code,
+            )
+            if not _trace_signature_matches(trace, expected_trace_signature):
+                raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
+            prefixes = select_reference_prefixes(
+                trace["adapter_rounds"],
+                reference_ids,
+                prompt_length=int(trace["prompt_tokens"]),
+                max_new_tokens=args.max_new_tokens,
+                eos_ids={int(token) for token in trace.get("eos_ids", [])},
+                max_prefixes=args.max_prefixes,
+            )
+            reference_rounds = {
+                int(row["round_index"]): row
+                for row in trace["adapter_rounds"]
+                if row.get("type") == "round" and int(row.get("gamma_executed", 0)) == 15
+            }
+        except Exception as exc:
+            try:
+                del state
+            except UnboundLocalError:
+                pass
+            try:
+                del input_ids
+            except UnboundLocalError:
+                pass
+            sample_state_key = f"sample|{sample['dataset']}|{sample['id']}|setup"
+            sample_cell_path = _state_cell_path(run_root, sample_state_key)
+            _record_cell_error(
+                sample_cell_path, phase="B1", campaign_signature=campaign_signature,
+                state_key=sample_state_key, sample_id=str(sample["id"]), exc=exc,
+            )
+            continue
+        _mark_sample_setup_recovered(run_root, "b1", sample, campaign_signature)
         if not prefixes:
             print(f"[B1 {sample_index}/{len(samples)}] no regular states for {sample['dataset']}:{sample['id']}", flush=True)
+            del input_ids
             continue
         for prefix_index, prefix in enumerate(prefixes, start=1):
             state_key = f"{sample['dataset']}|{sample['_cad_source_group_id']}|{prefix.round_index}"
             cell_path = _state_cell_path(run_root, state_key)
             if cell_path.exists():
-                if not args.resume:
-                    raise FileExistsError(f"B1 state cell exists; pass --resume: {cell_path}")
-                cell = json.loads(cell_path.read_text(encoding="utf-8"))
-                if cell.get("campaign_signature") != campaign_signature or cell.get("state_key") != state_key:
-                    raise ValueError(f"B1 cell signature mismatch: {cell_path}")
-                continue
-            reference_round = reference_rounds.get(prefix.round_index)
-            if reference_round is None:
-                raise ValueError(f"reference round missing: {prefix.round_index}")
-            state = rebuild_replay_state(
-                runtime,
-                input_ids,
-                trace["ar_ids"],
-                prefix,
-                layout,
-                max_new_tokens=args.max_new_tokens,
-            )
-            # Rebuild and verify gamma15 before measuring the other shapes.
-            full = evaluate_replay_action(
-                runtime,
-                input_ids,
-                state,
-                layout,
-                [tuple(range(state.bank.length)) for _ in runtime["draft"].layers],
-                requested_budget="full",
-                selector_id="B_full_context_gate",
-                remaining_output_tokens=prefix.remaining_output_tokens,
-                gamma=15,
-                cleanup_after_action=False,
-            )
-            if full.get("status") != "ok":
-                raise RuntimeError(f"gamma15 replay failed at {state_key}: {full.get('reason')}")
-            history = (
-                reference_history(trace["adapter_rounds"], current_round=prefix.round_index)
-                if trace["adapter_ids"] == trace["ar_ids"]
-                else {
-                    "previous_accepted_candidates": None,
-                    "mean4_acceptance": None,
-                    "ema_acceptance": None,
-                    "previous_all_accepted": None,
-                    "missing": True,
-                    "origin_rounds": [],
-                    "unavailable_reason": "adapter_reference_diverged_from_target_ar",
+                cell = _read_json_artifact(run_root, "b1", cell_path)
+                if cell is not None and (cell.get("campaign_signature") != campaign_signature or cell.get("state_key") != state_key):
+                    _archive_stale_cell(run_root, "b1", cell_path, cell)
+                elif cell is not None and (
+                    cell.get("status", "complete") == "complete"
+                    and _complete_b1_cell(cell, params["gammas"], args.repetitions)
+                ):
+                    continue
+                elif cell is not None and cell.get("status", "complete") == "complete":
+                    _archive_stale_cell(run_root, "b1", cell_path, cell)
+            try:
+                reference_round = reference_rounds.get(prefix.round_index)
+                if reference_round is None:
+                    raise ValueError(f"reference round missing: {prefix.round_index}")
+                state, compute_error = run_compute_unit(
+                    lambda: rebuild_replay_state(
+                        runtime,
+                        input_ids,
+                        reference_ids,
+                        prefix,
+                        layout,
+                        max_new_tokens=args.max_new_tokens,
+                    ),
+                    label=f"B1 state rebuild {state_key}",
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+                # Rebuild and verify gamma15 before measuring the other shapes.
+                full, compute_error = run_compute_unit(
+                    lambda: evaluate_replay_action(
+                        runtime,
+                        input_ids,
+                        state,
+                        layout,
+                        [tuple(range(state.bank.length)) for _ in runtime["draft"].layers],
+                        requested_budget="full",
+                        selector_id="B_full_context_gate",
+                        remaining_output_tokens=prefix.remaining_output_tokens,
+                        gamma=15,
+                        cleanup_after_action=False,
+                    ),
+                    label=f"B1 gamma15 validation {state_key}",
+                    result_error=lambda result: (
+                        None if result.get("status") == "ok" else str(result.get("reason", "replay failed"))
+                    ),
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+                history = reference_history(trace["adapter_rounds"], current_round=prefix.round_index)
+                result, compute_error = run_compute_unit(
+                    lambda: run_same_prefix_sweep(
+                        runtime,
+                        input_ids,
+                        state,
+                        layout,
+                        dataset=str(sample["dataset"]),
+                        source_group_id=str(sample["_cad_source_group_id"]),
+                        sample_id=str(sample["id"]),
+                        prompt_token_ids=[int(token) for token in input_ids[0].detach().cpu().tolist()],
+                        max_new_tokens=args.max_new_tokens,
+                        round_index=prefix.round_index,
+                        gammas=params["gammas"],
+                        repetitions=args.repetitions,
+                        selection_repetitions=args.selection_repetitions,
+                        warmups=args.warmups,
+                        seed=args.seed + prefix.round_index,
+                        collect_uncertainty=True,
+                        history=history,
+                    ),
+                    label=f"B1 timing sweep {state_key}",
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+                signal = result.get("signal")
+                if signal is not None:
+                    signal["history"] = history
+                    signal["history_ema"] = history.get("ema_acceptance")
+                    signal["previous_accepted_candidates"] = history.get("previous_accepted_candidates")
+                    signal["previous_all_accepted"] = history.get("previous_all_accepted")
+                    signal["history_missing"] = bool(history.get("missing", True))
+                cell = {
+                    "schema_version": "dflash-speculation-b.cell.v1",
+                    "status": "complete",
+                    "campaign_signature": campaign_signature,
+                    "state_key": state_key,
+                    "state_id": result["state_id"],
+                    "actions": result["actions"],
+                    "signal": signal,
+                    "signal_error": result.get("signal_error"),
+                    "schedule": result["schedule"],
+                    "warmups": result["warmups"],
+                    "accepted_by_gamma": result["accepted_by_gamma"],
+                    "proposal_by_gamma": result["proposal_by_gamma"],
+                    "bank_build_ms": state.bank_build_ms,
+                    "reference_anchor_check": {
+                        "reference_pending_anchor": int(state.pending_anchor),
+                        "rebuilt_full_target_greedy_anchor": int(state.full_target_greedy_anchor),
+                        "matches": bool(state.anchor_matches_full_target_greedy),
+                        "role": "diagnostic_only",
+                    },
+                    "gamma15_replay_acceptance_matches_paired_sweep": (
+                        int(full["accepted_candidates"]) == int(result["accepted_by_gamma"]["15"])
+                    ),
                 }
-            )
-            result = run_same_prefix_sweep(
-                runtime,
-                input_ids,
-                state,
-                layout,
-                dataset=str(sample["dataset"]),
-                source_group_id=str(sample["_cad_source_group_id"]),
-                sample_id=str(sample["id"]),
-                prompt_token_ids=[int(token) for token in input_ids[0].detach().cpu().tolist()],
-                max_new_tokens=args.max_new_tokens,
-                round_index=prefix.round_index,
-                gammas=params["gammas"],
-                repetitions=args.repetitions,
-                selection_repetitions=args.selection_repetitions,
-                warmups=args.warmups,
-                seed=args.seed + prefix.round_index,
-                collect_uncertainty=True,
-                history=history,
-            )
-            signal = result.get("signal")
-            if signal is not None:
-                signal["history"] = history
-                signal["history_ema"] = history.get("ema_acceptance")
-                signal["previous_accepted_candidates"] = history.get("previous_accepted_candidates")
-                signal["previous_all_accepted"] = history.get("previous_all_accepted")
-                signal["history_missing"] = bool(history.get("missing", True))
-            cell = {
-                "schema_version": "dflash-speculation-b.cell.v1",
-                "campaign_signature": campaign_signature,
-                "state_key": state_key,
-                "state_id": result["state_id"],
-                "actions": result["actions"],
-                "signal": signal,
-                "schedule": result["schedule"],
-                "warmups": result["warmups"],
-                "accepted_by_gamma": result["accepted_by_gamma"],
-                "proposal_by_gamma": result["proposal_by_gamma"],
-                "bank_build_ms": state.bank_build_ms,
-            }
-            atomic_json(cell_path, cell)
-            print(
-                f"[B1 {sample_index}/{len(samples)} state {prefix_index}/{len(prefixes)}] "
-                f"{sample['dataset']}:{sample['id']} round={prefix.round_index} complete",
-                flush=True,
-            )
+                atomic_json(cell_path, cell)
+                print(
+                    f"[B1 {sample_index}/{len(samples)} state {prefix_index}/{len(prefixes)}] "
+                    f"{sample['dataset']}:{sample['id']} round={prefix.round_index} complete",
+                    flush=True,
+                )
+                del state, full, result
+            except Exception as exc:
+                try:
+                    del state
+                except UnboundLocalError:
+                    pass
+                try:
+                    del full
+                except UnboundLocalError:
+                    pass
+                try:
+                    del result
+                except UnboundLocalError:
+                    pass
+                _record_cell_error(
+                    cell_path, phase="B1", campaign_signature=campaign_signature,
+                    state_key=state_key, sample_id=str(sample["id"]), exc=exc,
+                )
+        del input_ids
     cells = []
     for cell_path in sorted((run_root / "b1" / "cells").glob("*.json")):
-        cell = json.loads(cell_path.read_text(encoding="utf-8"))
+        cell = _read_json_artifact(run_root, "b1", cell_path)
+        if cell is None:
+            continue
         if cell.get("campaign_signature") != campaign_signature:
-            raise ValueError(f"found incompatible B1 state cell {cell_path}")
-        cells.append(cell)
+            _archive_stale_cell(run_root, "b1", cell_path, cell)
+            continue
+        if cell.get("status", "complete") == "complete" and _complete_b1_cell(cell, params["gammas"], args.repetitions):
+            cells.append(cell)
     actions = [row for cell in cells for row in cell.get("actions", [])]
     signals = [cell["signal"] for cell in cells if cell.get("signal") is not None]
-    _write_jsonl(run_root / "b1" / "draft_shape.jsonl", actions, {"type": "summary", "state_count": len(cells), "action_count": len(actions)})
-    _write_jsonl(run_root / "b2" / "signals.jsonl", signals, {"type": "summary", "state_count": len(signals)})
+    failed_count = 0
+    for path in sorted((run_root / "b1" / "cells").glob("*.json")):
+        cell = _read_json_artifact(run_root, "b1", path)
+        failed_count += int(cell is not None and cell.get("status") == "failed")
+    _write_jsonl(run_root / "b1" / "draft_shape.jsonl", actions, {"type": "summary", "state_count": len(cells), "failed_state_count": failed_count, "action_count": len(actions)})
+    signal_failure_count = sum(cell.get("signal") is None for cell in cells)
+    _write_jsonl(run_root / "b2" / "signals.jsonl", signals, {
+        "type": "summary",
+        "state_count": len(cells),
+        "available_signal_count": len(signals),
+        "failed_signal_count": signal_failure_count,
+        "failed_state_count": failed_count,
+    })
+    print(f"[B1] collected states={len(cells)} failed={failed_count}; continuing", flush=True)
 
 
 def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: Path, runtime: Mapping[str, Any]) -> None:
     from TrainingFree.context_adaptive.prompt import prepare_prompt
     from TrainingFree.context_adaptive.schema import atomic_json
     from TrainingFree.context_interventions.replay import rebuild_replay_state
-    from TrainingFree.speculation_experiments.reference import select_reference_prefixes
+    from TrainingFree.context_interventions.resilience import run_compute_unit
+    from TrainingFree.speculation_experiments.reference import reference_trajectory_ids, select_reference_prefixes
     from TrainingFree.speculation_experiments.replay import run_verification_prefix_sweep
 
     parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
-        raise RuntimeError("B1-V requires completed B0 runtime validation")
+    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") not in {"complete", "partial"}:
+        raise RuntimeError("B1-V requires at least one valid B0 reference trajectory")
     b1_cells = []
     for path in sorted((run_root / "b1" / "cells").glob("*.json")):
-        b1_cells.append(json.loads(path.read_text(encoding="utf-8")))
+        cell = _read_json_artifact(run_root, "b1", path)
+        if cell is None:
+            continue
+        if (
+            cell.get("status", "complete") == "complete"
+            and _complete_b1_cell(cell, _parse_gammas(args.gammas), args.repetitions)
+        ):
+            b1_cells.append(cell)
     proposal_by_state = {
         str(cell["state_id"]): tuple(int(token) for token in cell["proposal_by_gamma"]["15"])
         for cell in b1_cells
@@ -652,8 +1102,6 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         str(cell["state_id"]): int(cell["accepted_by_gamma"]["15"])
         for cell in b1_cells
     }
-    if not proposal_by_state:
-        raise FileNotFoundError("B1 cells are required before B1-V")
     code = _code_signature()
     runtime_sig = runtime["b_campaign_signature"]
     b1_params = {
@@ -667,7 +1115,28 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
     }
     b1_signature = _hash_json({"code": code, "runtime": runtime_sig, "campaign": b1_params})
     if any(cell.get("campaign_signature") != b1_signature for cell in b1_cells):
-        raise ValueError("B1 cells were produced with a different code/runtime/protocol signature")
+        stale_count = sum(cell.get("campaign_signature") != b1_signature for cell in b1_cells)
+        print(
+            f"[B1-V] ignoring {stale_count} B1 cells from another code/runtime/protocol signature",
+            file=sys.stderr,
+            flush=True,
+        )
+        b1_cells = [cell for cell in b1_cells if cell.get("campaign_signature") == b1_signature]
+        proposal_by_state = {
+            str(cell["state_id"]): tuple(int(token) for token in cell["proposal_by_gamma"]["15"])
+            for cell in b1_cells
+        }
+        accepted_by_state = {
+            str(cell["state_id"]): int(cell["accepted_by_gamma"]["15"])
+            for cell in b1_cells
+        }
+    if not b1_cells:
+        _write_jsonl(run_root / "b1v" / "verify_prefix.jsonl", [], {
+            "type": "summary", "status": "skipped_no_current_paired_b1_cells",
+            "state_count": 0, "failed_state_count": 0, "action_count": 0,
+        })
+        print("[B1-V] no current paired B1 cells; saved empty coverage artifact and continuing", flush=True)
+        return
     params = {
         "verify_prefixes": (3, 7, 11, 15),
         "repetitions": args.repetitions,
@@ -678,110 +1147,209 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
         "seed": args.seed,
     }
     signature = _hash_json({"code": code, "runtime": runtime_sig, "campaign": params})
+    _migrate_completed_cells(
+        run_root,
+        "b1v",
+        current_signature=signature,
+        is_complete=lambda cell: _complete_b1v_cell(cell, args.repetitions),
+    )
     for sample_index, sample in enumerate(samples, start=1):
-        trace_path = _sample_trace_path(run_root, sample)
-        if not trace_path.is_file():
-            raise FileNotFoundError(f"missing gamma15 reference trace: {trace_path}")
-        trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
-        ids = ids.to(runtime["target"].device).contiguous()
-        if layout.prompt_hash != trace["prompt_hash"]:
-            raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
-        expected_trace_signature = _trace_signature(
-            sample=sample,
-            prompt_hash=layout.prompt_hash,
-            args=args,
-            runtime_signature=runtime_sig,
-            code_signature=code,
-        )
-        if trace.get("trace_signature") != expected_trace_signature:
-            raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
-        prefixes = select_reference_prefixes(
-            trace["adapter_rounds"], trace["ar_ids"],
-            prompt_length=int(trace["prompt_tokens"]), max_new_tokens=args.max_new_tokens,
-            eos_ids={int(token) for token in trace.get("eos_ids", [])}, max_prefixes=args.max_prefixes,
-        )
-        reference_rounds = {
-            int(row["round_index"]): row for row in trace["adapter_rounds"]
-            if row.get("type") == "round" and int(row.get("gamma_executed", 0)) == 15
-        }
+        try:
+            trace_path = _sample_trace_path(run_root, sample)
+            if not trace_path.is_file():
+                print(f"[B1-V {sample_index}/{len(samples)}] skip {sample['dataset']}:{sample['id']}; B0 has no valid trace", flush=True)
+                continue
+            trace = _read_json_artifact(run_root, "traces", trace_path)
+            if trace is None:
+                print(f"[B1-V {sample_index}/{len(samples)}] no readable B0 trace; run validation to rebuild", flush=True)
+                continue
+            if trace.get("b0_status") != "complete":
+                print(f"[B1-V {sample_index}/{len(samples)}] skip {sample['dataset']}:{sample['id']}; B0 trace incomplete", flush=True)
+                continue
+            if not _complete_b0_trace(trace, (3, 7, 11, 15)):
+                print(f"[B1-V {sample_index}/{len(samples)}] skip malformed B0 trace; run validation to rebuild", flush=True)
+                continue
+            reference_ids = reference_trajectory_ids(trace)
+            (ids, layout), setup_error = run_compute_unit(
+                lambda: prepare_prompt(sample, runtime["tokenizer"], chunk_size=128),
+                label=f"B1-V prompt setup sample={sample['id']}",
+            )
+            if setup_error is not None:
+                raise _compute_failure_exception(setup_error)
+            ids = ids.to(runtime["target"].device).contiguous()
+            if layout.prompt_hash != trace["prompt_hash"]:
+                raise ValueError(f"prompt tokenization changed for sample {sample['id']}")
+            expected_trace_signature = _trace_signature(
+                sample=sample,
+                prompt_hash=layout.prompt_hash,
+                args=args,
+                runtime_signature=runtime_sig,
+                code_signature=code,
+            )
+            if trace.get("trace_signature") != expected_trace_signature:
+                raise ValueError(f"reference trace signature is stale for sample {sample['id']}; rerun B0 validate")
+            prefixes = select_reference_prefixes(
+                trace["adapter_rounds"], reference_ids,
+                prompt_length=int(trace["prompt_tokens"]), max_new_tokens=args.max_new_tokens,
+                eos_ids={int(token) for token in trace.get("eos_ids", [])}, max_prefixes=args.max_prefixes,
+            )
+            reference_rounds = {
+                int(row["round_index"]): row for row in trace["adapter_rounds"]
+                if row.get("type") == "round" and int(row.get("gamma_executed", 0)) == 15
+            }
+        except Exception as exc:
+            try:
+                del state
+            except UnboundLocalError:
+                pass
+            try:
+                del ids
+            except UnboundLocalError:
+                pass
+            sample_state_key = f"sample|{sample['dataset']}|{sample['id']}|setup"
+            sample_cell_path = _state_cell_path(run_root, sample_state_key, phase="b1v")
+            _record_cell_error(
+                sample_cell_path, phase="B1-V", campaign_signature=signature,
+                state_key=sample_state_key, sample_id=str(sample["id"]), exc=exc,
+            )
+            continue
+        _mark_sample_setup_recovered(run_root, "b1v", sample, signature)
         for prefix_index, prefix in enumerate(prefixes, start=1):
             state_key = f"{sample['dataset']}|{sample['_cad_source_group_id']}|{prefix.round_index}"
             cell_path = run_root / "b1v" / "cells" / f"{hashlib.sha256(state_key.encode('utf-8')).hexdigest()}.json"
             if cell_path.exists():
-                if not args.resume:
-                    raise FileExistsError(f"B1-V state cell exists; pass --resume: {cell_path}")
-                existing = json.loads(cell_path.read_text(encoding="utf-8"))
-                if existing.get("campaign_signature") != signature:
-                    raise ValueError(f"B1-V cell signature mismatch: {cell_path}")
-                continue
-            reference_round = reference_rounds.get(prefix.round_index)
-            if reference_round is None:
-                raise ValueError(f"reference round missing: {prefix.round_index}")
-            state = rebuild_replay_state(
-                runtime, ids, trace["ar_ids"], prefix, layout,
-                max_new_tokens=args.max_new_tokens,
-            )
-            prompt_ids = [int(token) for token in ids[0].detach().cpu().tolist()]
-            # B1 and B1-V share an action-independent state key.
-            from TrainingFree.speculation_experiments.protocol import state_identity
+                existing = _read_json_artifact(run_root, "b1v", cell_path)
+                if existing is not None and existing.get("campaign_signature") != signature:
+                    _archive_stale_cell(run_root, "b1v", cell_path, existing)
+                elif existing is not None and (
+                    existing.get("status", "complete") == "complete"
+                    and _complete_b1v_cell(existing, args.repetitions)
+                ):
+                    continue
+                elif existing is not None and existing.get("status", "complete") == "complete":
+                    _archive_stale_cell(run_root, "b1v", cell_path, existing)
+            try:
+                reference_round = reference_rounds.get(prefix.round_index)
+                if reference_round is None:
+                    raise ValueError(f"reference round missing: {prefix.round_index}")
+                state, compute_error = run_compute_unit(
+                    lambda: rebuild_replay_state(
+                        runtime, ids, reference_ids, prefix, layout,
+                        max_new_tokens=args.max_new_tokens,
+                    ),
+                    label=f"B1-V state rebuild {state_key}",
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+                prompt_ids = [int(token) for token in ids[0].detach().cpu().tolist()]
+                # B1 and B1-V share an action-independent state key.
+                from TrainingFree.speculation_experiments.protocol import state_identity
 
-            state_identity_value = state_identity(
-                dataset=str(sample["dataset"]),
-                source_group_id=str(sample["_cad_source_group_id"]),
-                prompt_token_ids=prompt_ids,
-                output_prefix_ids=state.output_ids,
-                pending_anchor=int(state.pending_anchor),
-                anchor_position=len(prompt_ids) + len(state.output_ids),
-                round_index=prefix.round_index,
-            )
-            if state_identity_value not in proposal_by_state:
-                raise ValueError(f"B1 proposal missing for paired state {state_identity_value}")
-            result = run_verification_prefix_sweep(
-                runtime,
-                ids,
-                state,
-                layout,
-                dataset=str(sample["dataset"]),
-                source_group_id=str(sample["_cad_source_group_id"]),
-                sample_id=str(sample["id"]),
-                prompt_token_ids=prompt_ids,
-                reference_output_ids=trace["ar_ids"],
-                max_new_tokens=args.max_new_tokens,
-                round_index=prefix.round_index,
-                full_accepted=accepted_by_state[state_identity_value],
-                repetitions=args.repetitions,
-                selection_repetitions=args.selection_repetitions,
-                warmups=args.warmups,
-                seed=args.seed + prefix.round_index,
-                expected_proposal_ids=proposal_by_state[state_identity_value],
-            )
-            if int(full["accepted_candidates"]) != int(result["accepted_by_gamma"]["15"]):
-                raise RuntimeError(f"gamma15 replay acceptance changed across paired sweeps at {state_key}")
-            atomic_json(cell_path, {
-                "schema_version": "dflash-speculation-b.b1v-cell.v1",
-                "campaign_signature": signature,
-                "state_key": state_key,
-                "state_id": result["state_id"],
-                "actions": result["actions"],
-                "schedule": result["schedule"],
-                "proposal_token_ids": result["proposal_token_ids"],
-            })
-            print(
-                f"[B1-V {sample_index}/{len(samples)} state {prefix_index}/{len(prefixes)}] "
-                f"{sample['dataset']}:{sample['id']} round={prefix.round_index} complete",
-                flush=True,
-            )
-    cells = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted((run_root / "b1v" / "cells").glob("*.json"))
-    ]
-    if any(cell.get("campaign_signature") != signature for cell in cells):
-        raise ValueError("B1-V cells contain an incompatible campaign signature")
-    actions = [row for cell in cells for row in cell.get("actions", [])]
+                state_identity_value = state_identity(
+                    dataset=str(sample["dataset"]),
+                    source_group_id=str(sample["_cad_source_group_id"]),
+                    prompt_token_ids=prompt_ids,
+                    output_prefix_ids=state.output_ids,
+                    pending_anchor=int(state.pending_anchor),
+                    anchor_position=len(prompt_ids) + len(state.output_ids),
+                    round_index=prefix.round_index,
+                )
+                if state_identity_value not in proposal_by_state:
+                    print(
+                        f"[B1-V {sample_index}/{len(samples)}] skip state={state_key}; "
+                        "paired B1 measurement unavailable",
+                        flush=True,
+                    )
+                    del state
+                    continue
+                result, compute_error = run_compute_unit(
+                    lambda: run_verification_prefix_sweep(
+                        runtime,
+                        ids,
+                        state,
+                        layout,
+                        dataset=str(sample["dataset"]),
+                        source_group_id=str(sample["_cad_source_group_id"]),
+                        sample_id=str(sample["id"]),
+                        prompt_token_ids=prompt_ids,
+                        reference_output_ids=reference_ids,
+                        max_new_tokens=args.max_new_tokens,
+                        round_index=prefix.round_index,
+                        full_accepted=accepted_by_state[state_identity_value],
+                        repetitions=args.repetitions,
+                        selection_repetitions=args.selection_repetitions,
+                        warmups=args.warmups,
+                        seed=args.seed + prefix.round_index,
+                        expected_proposal_ids=proposal_by_state[state_identity_value],
+                    ),
+                    label=f"B1-V timing sweep {state_key}",
+                )
+                if compute_error is not None:
+                    raise _compute_failure_exception(compute_error)
+                gamma15_rows = [row for row in result["actions"] if int(row["k"]) == 15]
+                gamma15_observed = sorted({int(row["accepted_candidates"]) for row in gamma15_rows})
+                atomic_json(cell_path, {
+                    "schema_version": "dflash-speculation-b.b1v-cell.v1",
+                    "status": "complete",
+                    "campaign_signature": signature,
+                    "state_key": state_key,
+                    "state_id": result["state_id"],
+                    "actions": result["actions"],
+                    "schedule": result["schedule"],
+                    "proposal_token_ids": result["proposal_token_ids"],
+                    "gamma15_acceptance_check": {
+                        "reference_accepted_candidates": accepted_by_state[state_identity_value],
+                        "observed_repetitions": gamma15_observed,
+                        "matches": gamma15_observed == [accepted_by_state[state_identity_value]],
+                        "role": "diagnostic_only",
+                    },
+                    "reference_anchor_check": {
+                        "reference_pending_anchor": int(state.pending_anchor),
+                        "rebuilt_full_target_greedy_anchor": int(state.full_target_greedy_anchor),
+                        "matches": bool(state.anchor_matches_full_target_greedy),
+                        "role": "diagnostic_only",
+                    },
+                })
+                print(
+                    f"[B1-V {sample_index}/{len(samples)} state {prefix_index}/{len(prefixes)}] "
+                    f"{sample['dataset']}:{sample['id']} round={prefix.round_index} complete",
+                    flush=True,
+                )
+                del state, result
+            except Exception as exc:
+                try:
+                    del state
+                except UnboundLocalError:
+                    pass
+                try:
+                    del result
+                except UnboundLocalError:
+                    pass
+                _record_cell_error(
+                    cell_path, phase="B1-V", campaign_signature=signature,
+                    state_key=state_key, sample_id=str(sample["id"]), exc=exc,
+                )
+        del ids
+    valid_cells = []
+    failed_count = 0
+    for path in sorted((run_root / "b1v" / "cells").glob("*.json")):
+        cell = _read_json_artifact(run_root, "b1v", path)
+        if cell is None:
+            failed_count += 1
+            continue
+        if cell.get("campaign_signature") != signature:
+            _archive_stale_cell(run_root, "b1v", path, cell)
+            continue
+        if cell.get("status", "complete") == "complete" and _complete_b1v_cell(cell, args.repetitions):
+            valid_cells.append(cell)
+        elif cell.get("status") == "failed":
+            failed_count += 1
+    actions = [row for cell in valid_cells for row in cell.get("actions", [])]
     _write_jsonl(run_root / "b1v" / "verify_prefix.jsonl", actions, {
-        "type": "summary", "state_count": len(cells), "action_count": len(actions),
+        "type": "summary", "state_count": len(valid_cells), "failed_state_count": failed_count,
+        "action_count": len(actions),
     })
+    print(f"[B1-V] collected states={len(valid_cells)} failed={failed_count}; continuing", flush=True)
 
 
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]) -> None:
@@ -804,14 +1372,28 @@ def _sample_cell_path(root: Path, phase: str, sample: Mapping[str, Any]) -> Path
     return root / "cells" / phase / f"{name}.json"
 
 
-def _load_resume_cell(path: Path, signature: str, *, resume: bool) -> dict[str, Any] | None:
+def _load_resume_cell(
+    path: Path,
+    signature: str,
+    *,
+    resume: bool,
+    run_root: Path,
+    phase: str,
+) -> dict[str, Any] | None:
+    """Reuse a complete matching cell automatically; archive stale or torn cells."""
     if not path.exists():
         return None
-    if not resume:
-        raise FileExistsError(f"completed E2E sample cell exists; pass --resume: {path}")
-    cell = json.loads(path.read_text(encoding="utf-8"))
+    # Reuse is keyed by the full signature, so requiring a second CLI switch
+    # only creates avoidable FileExistsError interruptions.
+    del resume
+    cell = _read_json_artifact(run_root, phase, path)
+    if cell is None:
+        return None
     if cell.get("campaign_signature") != signature:
-        raise ValueError(f"E2E resume cell signature mismatch: {path}")
+        _archive_stale_cell(run_root, phase, path, cell)
+        return None
+    if cell.get("status", "complete") != "complete":
+        return None
     return cell
 
 
@@ -865,6 +1447,38 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
         b2_positive_skill=float(thresholds.get("b2_positive_skill", 0.05)),
         b2_incremental_skill=float(thresholds.get("b2_incremental_skill", 0.02)),
     )
+    parity_path = run_root / "evidence" / "parity.json"
+    parity = json.loads(parity_path.read_text(encoding="utf-8")) if parity_path.is_file() else {}
+
+    def phase_cell_counts(phase: str) -> dict[str, int]:
+        counts = {"complete": 0, "failed": 0}
+        for path in sorted((run_root / phase / "cells").glob("*.json")):
+            cell = json.loads(path.read_text(encoding="utf-8"))
+            status = str(cell.get("status", "complete"))
+            if status in counts:
+                counts[status] += 1
+        return counts
+
+    b1_coverage = phase_cell_counts("b1")
+    b1v_coverage = phase_cell_counts("b1v")
+    coverage_status = (
+        "partial"
+        if parity.get("status") != "complete" or b1_coverage["failed"] or b1v_coverage["failed"]
+        else "complete"
+    )
+    coverage = {
+        "status": coverage_status,
+        "b0_valid_samples": int(parity.get("valid_sample_count", 0)),
+        "b0_sample_count": int(parity.get("sample_count", 0)),
+        "b1_states": b1_coverage,
+        "b1v_states": b1v_coverage,
+    }
+    b1["collection_coverage"] = coverage
+    b2["collection_coverage"] = coverage
+    if coverage_status == "partial":
+        decisions["evidence_status"] = "partial_coverage_descriptive_only"
+    else:
+        decisions["evidence_status"] = "complete_coverage"
     reports = run_root / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     b1v_path = run_root / "b1v" / "verify_prefix.jsonl"
@@ -916,6 +1530,7 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
         "",
         f"- B1 opportunity: **{decisions['b1_opportunity']}**; oracle gap J={decisions['b1_oracle_gap_j']}; CI95={decisions['b1_oracle_gap_j_ci95']}.",
         f"- B2 DFlash entropy: **{decisions['b2_drafter_entropy']}**; Brier skill vs R={decisions['b2_entropy_skill_vs_R']}; CI95={decisions['b2_entropy_skill_ci95']}.",
+        f"- Coverage: **{coverage['status']}**; B0={coverage['b0_valid_samples']}/{coverage['b0_sample_count']} samples, B1 states={coverage['b1_states']}, B1-V states={coverage['b1v_states']}.",
         f"- Entropy bổ sung sau acceptance history: **{decisions['b2_entropy_incremental_after_history']}**; skill={decisions['b2_entropy_incremental_skill']}; CI95={decisions['b2_entropy_incremental_ci95']}.",
         f"- DFlash confidence: **{decisions['b2_drafter_confidence']}**.",
         *(
@@ -929,6 +1544,118 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
     (reports / "decision.md").write_text("\n".join(decision_lines) + "\n", encoding="utf-8")
     print(json.dumps(decisions, ensure_ascii=False, indent=2), flush=True)
     return decisions
+
+
+def _analyze_without_stopping_collection(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
+    """Keep completed raw measurements when a downstream statistic is unavailable."""
+    from TrainingFree.context_adaptive.schema import atomic_json
+
+    try:
+        result = _analyze(args, run_root)
+    except Exception as exc:
+        failure = {
+            "status": "unavailable",
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-12000:],
+            "raw_artifacts_retained": True,
+        }
+        report_root = run_root / "reports"
+        report_root.mkdir(parents=True, exist_ok=True)
+        try:
+            atomic_json(report_root / "analysis_status.json", failure)
+        except Exception as write_error:
+            print(
+                f"[analyze] status checkpoint unavailable "
+                f"({type(write_error).__name__}: {write_error}); raw artifacts are retained",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            f"[analyze] metrics unavailable ({type(exc).__name__}: {exc}); "
+            "raw experiment artifacts are retained and collection can finish",
+            file=sys.stderr,
+            flush=True,
+        )
+        return failure
+    try:
+        atomic_json(run_root / "reports" / "analysis_status.json", {"status": "complete"})
+    except Exception as exc:
+        print(
+            f"[analyze] completed analysis but could not save optional status "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+    return result
+
+
+def _write_run_status(run_root: Path) -> dict[str, Any]:
+    from TrainingFree.context_adaptive.schema import atomic_json
+
+    parity_path = run_root / "evidence" / "parity.json"
+    parity = _read_json_artifact(run_root, "evidence", parity_path) if parity_path.is_file() else {}
+    parity = parity or {}
+
+    def cell_counts(phase: str) -> dict[str, int]:
+        counts = {"complete": 0, "failed": 0}
+        for path in sorted((run_root / phase / "cells").glob("*.json")):
+            cell = _read_json_artifact(run_root, phase, path)
+            if cell is None:
+                counts["failed"] += 1
+                continue
+            status = str(cell.get("status", "complete"))
+            if status in counts:
+                counts[status] += 1
+        return counts
+
+    b1 = cell_counts("b1")
+    b1v = cell_counts("b1v")
+    b2_signal_failures = 0
+    for path in sorted((run_root / "b1" / "cells").glob("*.json")):
+        cell = _read_json_artifact(run_root, "b1", path)
+        if cell is not None and cell.get("status", "complete") == "complete" and cell.get("signal") is None:
+            b2_signal_failures += 1
+    analysis_path = run_root / "reports" / "analysis_status.json"
+    analysis = _read_json_artifact(run_root, "reports", analysis_path) if analysis_path.is_file() else {"status": "not_run"}
+    analysis = analysis or {"status": "unavailable", "error": {"message": "analysis status artifact is unreadable"}}
+    partial = (
+        parity.get("status") != "complete"
+        or b1["failed"] > 0
+        or b1v["failed"] > 0
+        or b2_signal_failures > 0
+    )
+    summary = {
+        "schema_version": "dflash-speculation-b.run-status.v1",
+        "collection_status": "partial" if partial else "complete",
+        "analysis_status": analysis.get("status", "not_run"),
+        "b0": {
+            "status": parity.get("status", "missing"),
+            "valid_samples": int(parity.get("valid_sample_count", 0)),
+            "failed_samples": int(parity.get("failed_sample_count", 0)),
+            "sample_count": int(parity.get("sample_count", 0)),
+        },
+        "b1_states": b1,
+        "b2_signal_failures": b2_signal_failures,
+        "b1v_states": b1v,
+        "analysis_error": analysis.get("error"),
+    }
+    atomic_json(run_root / "run_status.json", summary)
+    print(f"[run] saved status: {run_root / 'run_status.json'} ({summary['collection_status']})", flush=True)
+    return summary
+
+
+def _write_run_status_best_effort(run_root: Path) -> dict[str, Any] | None:
+    """Do not turn finished measurements into a failed process for a report tail."""
+    try:
+        return _write_run_status(run_root)
+    except Exception as exc:
+        print(
+            f"[run] could not write optional final run_status.json "
+            f"({type(exc).__name__}: {exc}); collected artifacts remain available in {run_root}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
 
 
 def _b3_eligible_models(run_root: Path) -> tuple[list[str], dict[str, Any]]:
@@ -1372,6 +2099,32 @@ def _request_quality_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
     return summary
 
 
+def _run_e2e_with_retry(operation: Any, *, label: str) -> dict[str, Any]:
+    from TrainingFree.context_interventions.resilience import run_compute_unit
+
+    result, error = run_compute_unit(
+        operation,
+        label=label,
+        result_error=lambda item: (
+            None if item.get("status") == "ok" else str(item.get("error") or item.get("status"))
+        ),
+    )
+    if error is not None:
+        return {
+            "status": "error",
+            "error": error["reason"],
+            "input_tokens": 0,
+            "output_ids": [],
+            "output_tokens": 0,
+            "e2e_ms": None,
+            "reported_timings": {},
+            "counters": {},
+            "rounds": [],
+            "correctness_status": "unavailable",
+        }
+    return result
+
+
 def _b3_campaign(
     args: argparse.Namespace,
     samples: Sequence[dict[str, Any]],
@@ -1484,18 +2237,18 @@ def _b3_campaign(
     saved_profile: dict[str, Any] | None = None
     warmup_total_overhead_ms: dict[str, float] = {}
     if not confirm and profile_path.exists():
-        if not args.resume:
-            raise FileExistsError(f"B3 dev profile exists; pass --resume or choose a new run id: {profile_path}")
-        saved_profile = json.loads(profile_path.read_text(encoding="utf-8"))
-        if saved_profile.get("profile_signature") != profile_signature:
-            raise ValueError("B3 dev warmup profile signature mismatch")
-        learned_overheads = {key: float(value) for key, value in saved_profile["policy_overhead_ms"].items()}
-        warmup_total_overhead_ms = {
-            key: float(value) for key, value in saved_profile.get("total_overhead_ms", {}).items()
-        }
-        for name, value in learned_overheads.items():
-            if name in policies:
-                policies[name].set_policy_overhead(value)
+        saved_profile = _read_json_artifact(run_root, "b3", profile_path)
+        if saved_profile is not None and saved_profile.get("profile_signature") != profile_signature:
+            _archive_stale_cell(run_root, "b3", profile_path, saved_profile)
+            saved_profile = None
+        if saved_profile is not None:
+            learned_overheads = {key: float(value) for key, value in saved_profile["policy_overhead_ms"].items()}
+            warmup_total_overhead_ms = {
+                key: float(value) for key, value in saved_profile.get("total_overhead_ms", {}).items()
+            }
+            for name, value in learned_overheads.items():
+                if name in policies:
+                    policies[name].set_policy_overhead(value)
 
     def run_variant(sample: Mapping[str, Any], variant: str, repetition: int) -> dict[str, Any]:
         args._b3_repetition = repetition
@@ -1518,14 +2271,18 @@ def _b3_campaign(
             policy = FixedVerificationPrefixController(fixed_k_best)
         else:
             raise ValueError(f"unknown B3 variant {variant}")
-        return _b3_run_one(
-            runtime=runtime, sample=sample, args=args, variant=generation_variant,
-            policy=policy, fixed_gamma=gamma,
+        return _run_e2e_with_retry(
+            lambda: _b3_run_one(
+                runtime=runtime, sample=sample, args=args, variant=generation_variant,
+                policy=policy, fixed_gamma=gamma,
+            ),
+            label=f"B3 {variant} sample={sample['id']} repetition={repetition}",
         )
 
     warmup_policy_ms: dict[str, list[float]] = {name: [] for name in candidate_variants}
     warmup_total_policy_ms: dict[str, list[float]] = {name: [] for name in candidate_variants}
     warmup_samples = list(samples[: min(args.e2e_warmups, len(samples))])
+    warmup_failed_variants: list[str] = []
     for variant in measured_variants:
         if variant == "ar":
             warmup_name, policy_name = "ar", None
@@ -1540,10 +2297,17 @@ def _b3_campaign(
             warmup_name, policy_name = f"fixed_gamma_{fixed_gamma_best}", None
         else:
             warmup_name, policy_name = variant, None
+        warmup_success_count = 0
         for warm_index, sample in enumerate(warmup_samples):
             warmed = run_variant(sample, warmup_name, -warm_index - 1)
             if warmed["status"] != "ok":
-                raise RuntimeError(f"B3 warmup failed for {warmup_name} on {sample['id']}: {warmed['error']}")
+                print(
+                    f"[B3-{phase}] warmup failed after retry: {warmup_name} {sample['id']}: {warmed['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            warmup_success_count += 1
             if policy_name is not None:
                 warmup_policy_ms[policy_name].extend(
                     float(row.get("verification_policy_ms", 0.0))
@@ -1556,6 +2320,19 @@ def _b3_campaign(
                     for row in warmed["rounds"]
                     if int(row.get("gamma_executed", 0)) > 0
                 )
+        if warmup_success_count == 0:
+            warmup_failed_variants.append(variant)
+    if warmup_failed_variants:
+        failure = {
+            "schema_version": "dflash-speculation-b.b3-summary.v1",
+            "phase": phase,
+            "status": "warmup_incomplete",
+            "failed_variants": warmup_failed_variants,
+            "reason": "No warmup completed for these variants after bounded retries; latency measurements would be unreliable.",
+        }
+        atomic_json(b3_root / f"{phase}_summary.json", failure)
+        print(json.dumps(failure, ensure_ascii=False, indent=2), flush=True)
+        return failure
     if not confirm and saved_profile is None:
         for name, values in warmup_policy_ms.items():
             if values:
@@ -1604,11 +2381,11 @@ def _b3_campaign(
     cell_signature = _hash_json({"profile_signature": profile_signature, "policy_overhead_ms": learned_overheads})
     cells_root = b3_root / "cells" / phase
     cells_root.mkdir(parents=True, exist_ok=True)
-    if not args.resume and any(cells_root.glob("*.json")):
-        raise FileExistsError(f"B3 {phase} sample cells already exist; pass --resume or choose a new run id")
     for sample_index, sample in enumerate(samples, start=1):
         cell_path = _sample_cell_path(b3_root, phase, sample)
-        saved_cell = _load_resume_cell(cell_path, cell_signature, resume=args.resume)
+        saved_cell = _load_resume_cell(
+            cell_path, cell_signature, resume=args.resume, run_root=run_root, phase=f"b3/cells/{phase}"
+        )
         if saved_cell is not None:
             records.extend(saved_cell.get("requests", []))
             round_rows.extend(saved_cell.get("rounds", []))
@@ -1620,10 +2397,19 @@ def _b3_campaign(
             continue
         request_start = len(records)
         round_start = len(round_rows)
+        sample_ar_failed = False
         for repetition in range(args.e2e_repetitions):
             ar = run_variant(sample, "ar", repetition)
             if ar["status"] != "ok":
-                raise RuntimeError(f"target-only AR failed for {sample['id']}: {ar['error']}")
+                generation_failure = True
+                sample_ar_failed = True
+                print(
+                    f"[B3-{phase}] AR failed after retry for {sample['dataset']}:{sample['id']} "
+                    f"rep={repetition}; skipping this sample and continuing: {ar['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             ar_record = {
                 "schema_version": "dflash-speculation-b.b3-request.v1",
                 "type": "request",
@@ -1715,8 +2501,21 @@ def _b3_campaign(
                         f"{variant} {sample['dataset']}:{sample['id']} rep={repetition}",
                         flush=True,
                     )
+        if sample_ar_failed:
+            del records[request_start:]
+            del round_rows[round_start:]
+            atomic_json(cell_path, {
+                "schema_version": "dflash-speculation-b.b3-sample-cell.v1",
+                "status": "failed",
+                "campaign_signature": cell_signature,
+                "requests": [],
+                "rounds": [],
+                "error": {"type": "target_only_ar_failed", "message": str(ar.get("error"))},
+            })
+            continue
         atomic_json(cell_path, {
             "schema_version": "dflash-speculation-b.b3-sample-cell.v1",
+            "status": "complete",
             "campaign_signature": cell_signature,
             "requests": records[request_start:],
             "rounds": round_rows[round_start:],
@@ -1732,6 +2531,18 @@ def _b3_campaign(
     _write_jsonl(b3_root / f"{phase}_rounds.jsonl", round_rows, {
         "type": "summary", "phase": phase, "round_count": len(round_rows),
     })
+    if not records:
+        summary = {
+            "schema_version": "dflash-speculation-b.b3-summary.v1",
+            "phase": phase,
+            "status": "no_valid_requests",
+            "request_count": 0,
+            "all_generations_ok": False,
+            "reason": "Every sample failed target-only AR; artifacts record the failed samples and can be resumed.",
+        }
+        atomic_json(b3_root / f"{phase}_summary.json", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+        return summary
     by_variant = sorted({str(row["variant"]) for row in records})
     latency = {name: _macro_geomean_latency(records, name) for name in by_variant}
     if confirm:
@@ -2070,8 +2881,6 @@ def _b4_campaign(
     })
     cells_root = b4_root / "cells" / phase
     cells_root.mkdir(parents=True, exist_ok=True)
-    if not args.resume and any(cells_root.glob("*.json")):
-        raise FileExistsError(f"B4 {phase} sample cells already exist; pass --resume or choose a new run id")
 
     def run_variant(sample: Mapping[str, Any], variant: str, repetition: int) -> dict[str, Any]:
         args._b3_repetition = repetition
@@ -2088,22 +2897,46 @@ def _b4_campaign(
             draft_policy = policies[name]
         else:
             raise ValueError(f"unknown B4 variant {variant}")
-        return _b3_run_one(
-            runtime=runtime, sample=sample, args=args, variant=generation_variant,
-            fixed_gamma=gamma, draft_policy=draft_policy,
+        return _run_e2e_with_retry(
+            lambda: _b3_run_one(
+                runtime=runtime, sample=sample, args=args, variant=generation_variant,
+                fixed_gamma=gamma, draft_policy=draft_policy,
+            ),
+            label=f"B4 {variant} sample={sample['id']} repetition={repetition}",
         )
 
     warm_samples = list(samples[: min(args.e2e_warmups, len(samples))])
+    warmup_failed_variants: list[str] = []
     for variant in variants:
         warm_variant = (
             f"fixed_gamma_{fixed_gamma_best}"
             if variant.startswith("best_fixed_gamma_")
             else variant
         )
+        warmup_success_count = 0
         for index, sample in enumerate(warm_samples):
             warmed = run_variant(sample, warm_variant, -index - 1)
             if warmed["status"] != "ok":
-                raise RuntimeError(f"B4 warmup failed for {warm_variant} on {sample['id']}: {warmed['error']}")
+                print(
+                    f"[B4-{phase}] warmup failed after retry: {warm_variant} {sample['id']}: {warmed['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            warmup_success_count += 1
+        if warmup_success_count == 0:
+            warmup_failed_variants.append(variant)
+    if warmup_failed_variants:
+        failure = {
+            "schema_version": "dflash-speculation-b.b4-summary.v1",
+            "phase": phase,
+            "status": "warmup_incomplete",
+            "failed_variants": warmup_failed_variants,
+            "reason": "No warmup completed for these variants after bounded retries; latency measurements would be unreliable.",
+        }
+        atomic_json(b4_root / f"{phase}_summary.json", failure)
+        print(json.dumps(failure, ensure_ascii=False, indent=2), flush=True)
+        return failure
 
     records: list[dict[str, Any]] = []
     rounds: list[dict[str, Any]] = []
@@ -2111,7 +2944,9 @@ def _b4_campaign(
     rng = random.Random(args.seed)
     for sample_index, sample in enumerate(samples, start=1):
         cell_path = _sample_cell_path(b4_root, phase, sample)
-        saved_cell = _load_resume_cell(cell_path, cell_signature, resume=args.resume)
+        saved_cell = _load_resume_cell(
+            cell_path, cell_signature, resume=args.resume, run_root=run_root, phase=f"b4/cells/{phase}"
+        )
         if saved_cell is not None:
             records.extend(saved_cell.get("requests", []))
             rounds.extend(saved_cell.get("rounds", []))
@@ -2123,10 +2958,19 @@ def _b4_campaign(
             continue
         request_start = len(records)
         round_start = len(rounds)
+        sample_ar_failed = False
         for repetition in range(args.e2e_repetitions):
             ar = run_variant(sample, "ar", repetition)
             if ar["status"] != "ok":
-                raise RuntimeError(f"target-only AR failed for {sample['id']}: {ar['error']}")
+                generation_failure = True
+                sample_ar_failed = True
+                print(
+                    f"[B4-{phase}] AR failed after retry for {sample['dataset']}:{sample['id']} "
+                    f"rep={repetition}; skipping this sample and continuing: {ar['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             ar_record = {
                 "schema_version": "dflash-speculation-b.b4-request.v1",
                 "type": "request", "run_id": str(args.run_id), "phase": phase,
@@ -2186,8 +3030,21 @@ def _b4_campaign(
                         f"{variant} {sample['dataset']}:{sample['id']} rep={repetition}",
                         flush=True,
                     )
+        if sample_ar_failed:
+            del records[request_start:]
+            del rounds[round_start:]
+            atomic_json(cell_path, {
+                "schema_version": "dflash-speculation-b.b4-sample-cell.v1",
+                "status": "failed",
+                "campaign_signature": cell_signature,
+                "requests": [],
+                "rounds": [],
+                "error": {"type": "target_only_ar_failed", "message": str(ar.get("error"))},
+            })
+            continue
         atomic_json(cell_path, {
             "schema_version": "dflash-speculation-b.b4-sample-cell.v1",
+            "status": "complete",
             "campaign_signature": cell_signature,
             "requests": records[request_start:],
             "rounds": rounds[round_start:],
@@ -2202,6 +3059,18 @@ def _b4_campaign(
     _write_jsonl(b4_root / f"{phase}_rounds.jsonl", rounds, {
         "type": "summary", "phase": phase, "round_count": len(rounds),
     })
+    if not records:
+        summary = {
+            "schema_version": "dflash-speculation-b.b4-summary.v1",
+            "phase": phase,
+            "status": "no_valid_requests",
+            "request_count": 0,
+            "all_generations_ok": False,
+            "reason": "Every sample failed target-only AR; artifacts record the failed samples and can be resumed.",
+        }
+        atomic_json(b4_root / f"{phase}_summary.json", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+        return summary
     latency = {str(row["variant"]): _macro_geomean_latency(records, str(row["variant"])) for row in records}
     if confirm:
         selected_model = str(lock["selected_policy_variant"])
@@ -2276,10 +3145,13 @@ def main() -> int:
             _prepare(args, allow_existing=True)
             return 0
         if args.mode == "analyze":
-            _analyze(args, _run_root(args))
+            _analyze_without_stopping_collection(args, _run_root(args))
             return 0
         if args.mode == "run":
-            samples, campaign, run_root = _prepare(args, allow_existing=True)
+            if args.resume:
+                samples, campaign, run_root = _load_resume_campaign(args)
+            else:
+                samples, campaign, run_root = _prepare(args, allow_existing=True)
         else:
             samples, campaign, run_root = _load_prepared(args)
         if args.mode == "preflight":
@@ -2303,10 +3175,12 @@ def main() -> int:
             return 0
         if args.mode == "run":
             if not _validate(args, samples, run_root, runtime):
+                _write_run_status_best_effort(run_root)
                 return 2
             _b1(args, samples, run_root, runtime)
             _b1v(args, samples, run_root, runtime)
-            _analyze(args, run_root)
+            _analyze_without_stopping_collection(args, run_root)
+            _write_run_status_best_effort(run_root)
             return 0
         if args.mode == "b3-dev":
             summary = _b3_campaign(args, samples, run_root, runtime, confirm=False)

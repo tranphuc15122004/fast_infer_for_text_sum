@@ -17,6 +17,7 @@ class CellStore:
         self.root = Path(phase_root)
         self.cells = self.root / "cells"
         self.cells.mkdir(parents=True, exist_ok=True)
+        self._had_cells_at_start = any(self.cells.glob("*.json"))
         self.signature = str(signature)
         self.resume = bool(resume)
 
@@ -40,29 +41,37 @@ class CellStore:
 
     def save(self, cell_id: str, row: Mapping[str, Any]) -> None:
         path = self.path(cell_id)
-        if path.exists() and self.resume:
-            existing = self.load(cell_id)
-            if existing != dict(row):
-                raise ValueError(f"refusing to replace completed cell {cell_id}")
-            return
-        if path.exists():
-            raise FileExistsError(f"cell checkpoint already exists: {path}")
         payload = dict(row)
         payload["cell_id"] = cell_id
         payload["run_signature"] = self.signature
+        if path.exists() and self.resume:
+            existing = self.load(cell_id)
+            if existing == payload:
+                return
+            if existing.get("status") != "error":
+                raise ValueError(f"refusing to replace completed cell {cell_id}")
+            # Error rows are failed attempts, not completed evidence. Replacing
+            # them atomically lets a resumed phase retry transient cell errors.
+            atomic_json(path, payload)
+            return
+        if path.exists():
+            raise FileExistsError(f"cell checkpoint already exists: {path}")
         atomic_json(path, payload)
 
     def rows(self) -> list[dict[str, Any]]:
         paths = sorted(self.cells.glob("*.json"))
-        if paths and not self.resume:
+        if self._had_cells_at_start and not self.resume:
             raise FileExistsError(f"campaign cells already exist; pass --resume or choose a new run id: {self.cells}")
         rows = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
         for path, row in zip(paths, rows):
-            if row.get("run_signature") != self.signature:
+            if row.get("run_signature") != self.signature or self.path(str(row.get("cell_id"))) != path:
                 raise ValueError(f"resume signature mismatch at {path}")
         return sorted(rows, key=lambda row: str(row.get("cell_id", "")))
 
-    def merge(self, output_path: Path, *, summary: Mapping[str, Any]) -> None:
+    def merge(
+        self, output_path: Path, *, summary: Mapping[str, Any],
+        records: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
         # Use the repository's canonical writer, then atomically publish the
         # complete stream. A stopped phase retains per-cell checkpoints only.
         from common.io_util import JsonlWriter
@@ -71,14 +80,18 @@ class CellStore:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(prefix=".campaign-", suffix=".jsonl", dir=output_path.parent, delete=False) as handle:
             temp_path = Path(handle.name)
-        rows = self.rows()
+        rows = self.rows() if records is None else list(records)
         writer = JsonlWriter(temp_path)
         for row in rows:
             writer.add(row)
         summary_record = dict(summary)
-        if any(any(row.get(key) is not None for key in ("rouge1", "rouge2", "rougeL")) for row in rows):
+        quality_rows = [row for row in rows if row.get("status") == "ok"]
+        if any(any(row.get(key) is not None for key in ("rouge1", "rouge2", "rougeL")) for row in quality_rows):
             from common.rouge import aggregate_rouge
 
-            summary_record.update(aggregate_rouge(rows))
+            try:
+                summary_record.update(aggregate_rouge(quality_rows))
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                summary_record["rouge_status"] = f"error:{type(exc).__name__}:{exc}"
         writer.finalize(summary_record)
         os.replace(temp_path, output_path)

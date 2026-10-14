@@ -283,12 +283,97 @@ def summarize_phase(rows: Sequence[Mapping[str, Any]], *, phase: str) -> dict[st
 def build_report(run_root: Path, phase: str) -> dict[str, Any]:
     run_root = Path(run_root)
     phase_rows: list[dict[str, Any]] = []
-    for filename in ("a1.jsonl", "a2.jsonl", "a3_replay.jsonl", "a3_rollout.jsonl"):
+    for filename in (
+        "a1.jsonl", "a2.jsonl", "a3_replay.jsonl", "a3_rollout.jsonl",
+        "prefix_diagnostics.jsonl",
+    ):
         path = run_root / phase / filename
         if path.is_file():
             phase_rows.extend(read_jsonl(path))
     report = summarize_phase(phase_rows, phase=phase)
+    rollout_summary = next((
+        row for row in phase_rows
+        if row.get("type") == "summary" and row.get("experiment") == "A3_rollout"
+    ), None)
+    if rollout_summary and rollout_summary.get("status") != "complete":
+        report["rollout_completeness"] = {
+            "status": rollout_summary.get("status"),
+            "rows": rollout_summary.get("rows"),
+            "planned_rows": rollout_summary.get("planned_rows"),
+            "status_counts": rollout_summary.get("status_counts", {}),
+            "configurations": rollout_summary.get("configurations"),
+        }
+    prefix_diagnostics = [
+        row for row in phase_rows
+        if row.get("type") == "prefix_diagnostic"
+        and row.get("status") in {"baseline_mismatch", "baseline_error", "error"}
+    ]
+    replay_cell_errors = [
+        row for row in phase_rows
+        if row.get("type") == "replay" and row.get("status") == "error"
+    ]
+    reference_errors = []
+    parity_path = run_root / "evidence" / f"parity_{phase}.json"
+    if parity_path.is_file():
+        parity_evidence = json.loads(parity_path.read_text(encoding="utf-8"))
+        reference_errors = [row for row in parity_evidence.get("cases", []) if row.get("status") == "error"]
+    if prefix_diagnostics or replay_cell_errors or reference_errors:
+        diagnostic_counts = Counter(str(row.get("status")) for row in prefix_diagnostics)
+        diagnostic_counts.update(str(row.get("status")) for row in replay_cell_errors)
+        diagnostic_counts.update("reference_error" for _row in reference_errors)
+        report["replay_diagnostics"] = {
+            "failed_prefix_count": len(prefix_diagnostics),
+            "failed_cell_count": len(replay_cell_errors),
+            "failed_reference_count": len(reference_errors),
+            "status_counts": dict(diagnostic_counts),
+            "records": [
+                {
+                    "sample_id": row.get("sample_id"),
+                    "dataset": row.get("dataset"),
+                    "prefix_round_index": row.get("prefix_round_index"),
+                    "status": row.get("status"),
+                    "reason": row.get("reason"),
+                }
+                for row in prefix_diagnostics
+            ] + [
+                {
+                    "sample_id": row.get("sample_id"),
+                    "dataset": row.get("dataset"),
+                    "prefix_round_index": row.get("prefix_round_index"),
+                    "status": row.get("status"),
+                    "reason": row.get("reason"),
+                    "experiment": row.get("experiment"),
+                    "selector_id": row.get("selector_id"),
+                }
+                for row in replay_cell_errors
+            ] + [
+                {"sample_id": row.get("sample_id"), "dataset": row.get("dataset"),
+                 "status": "reference_error", "reason": row.get("reason")}
+                for row in reference_errors
+            ],
+        }
+        # Keep the observed estimates, but prevent incomplete fixed-prefix
+        # evidence from being described as a supported A1/A2/A3 replay result.
+        family_metrics = report["family_metrics"]
+        for family in ("A1", "A2"):
+            family_metrics[family]["decision"] = "inconclusive_incomplete_replay_evidence"
+        for selector_metrics in family_metrics["A3"].values():
+            selector_metrics["decision"] = "inconclusive_incomplete_replay_evidence"
     report["rollout_metrics"] = _rollout_metrics(phase_rows)
+    if report.get("rollout_completeness"):
+        configurations = report["rollout_completeness"].get("configurations")
+        if configurations is None:
+            for selector_metrics in report["rollout_metrics"].values():
+                for result in selector_metrics.values():
+                    result["decision"] = "inconclusive_incomplete_rollout"
+        else:
+            for config in configurations:
+                if config.get("status") == "complete":
+                    continue
+                key = f"B{config['budget']}_period{config['refresh_period']}"
+                result = report["rollout_metrics"].get(str(config["selector"]), {}).get(key)
+                if result is not None:
+                    result["decision"] = "inconclusive_incomplete_rollout"
     cohort_path = run_root / "cohorts" / f"{phase}.json"
     if cohort_path.is_file():
         cohort = json.loads(cohort_path.read_text(encoding="utf-8"))
@@ -461,6 +546,33 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
         f"- Trạng thái: `{json.dumps(report.get('status_counts', {}), ensure_ascii=False)}`",
         "",
     ]
+    diagnostics = report.get("replay_diagnostics")
+    if diagnostics:
+        lines.extend([
+            "## A1/A2/A3 replay không đầy đủ",
+            "",
+            f"- Số prefix không tái lập được baseline full DFlash: `{diagnostics.get('failed_prefix_count')}`",
+            f"- Số cell replay có lỗi: `{diagnostics.get('failed_cell_count')}`",
+            f"- Số mẫu không dựng được reference: `{diagnostics.get('failed_reference_count', 0)}`",
+            f"- Trạng thái: `{json.dumps(diagnostics.get('status_counts', {}), ensure_ascii=False)}`",
+            "- Các quyết định A1/A2/A3 replay được hạ về inconclusive; các ước lượng còn lại chỉ là mô tả.",
+        ])
+        for row in diagnostics.get("records", [])[:12]:
+            lines.append(
+                f"- `{row.get('dataset')}:{row.get('sample_id')}` round "
+                f"`{row.get('prefix_round_index')}` ({row.get('status')}): {row.get('reason')}"
+            )
+        lines.append("")
+    rollout_completeness = report.get("rollout_completeness")
+    if rollout_completeness:
+        lines.extend([
+            "## A3 rollout incomplete",
+            "",
+            f"- Rows: `{rollout_completeness.get('rows')}/{rollout_completeness.get('planned_rows')}`",
+            f"- Trạng thái: `{json.dumps(rollout_completeness.get('status_counts', {}), ensure_ascii=False)}`",
+            "- Các kết luận tốc độ/acceptance được đánh dấu inconclusive.",
+            "",
+        ])
     cohort = report.get("cohort_summary")
     if cohort:
         lines.extend([

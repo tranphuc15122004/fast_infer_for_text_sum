@@ -72,6 +72,22 @@ bash scripts/run_dflash_speculation_B_b200.sh \
 artifact ngay khi tạo cohort. Để chạy từng phase, dùng cùng `--run-id`, corpus,
 exposure manifests, `--cohort-phase` và protocol options:
 
+Khi một run đã có `campaign.json` và cần chạy tiếp sau khi bị ngắt, dùng lệnh
+ngắn dưới đây. Runner nạp cohort và protocol đã lưu, xác nhận corpus vẫn đúng,
+rồi resume B0/B1/B1-V/analyze; không cần truyền lại exposure manifest:
+
+```bash
+bash scripts/run_dflash_speculation_B_b200.sh \
+  --config /path/to/master.env \
+  --gpu-ids 0 \
+  --mode run \
+  --run-id B_main_02 \
+  --resume
+```
+
+Nếu corpus không được khai báo trong master config, thêm đúng `--data-dir` hoặc
+`--data-file` đã dùng cho run ban đầu.
+
 ```bash
 bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
   --gpu-ids 0 --mode prepare --run-id B_pilot_01 --cohort-phase pilot \
@@ -97,12 +113,30 @@ bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
   --mode analyze --run-id B_pilot_01
 ```
 
-`--resume` chỉ tái dùng cell khớp campaign/code/runtime signature. Thay model,
-backend, cohort, gamma grid, prompt hoặc protocol cần run mới và chạy lại B0.
+`--resume` chỉ tái dùng artifact khớp campaign/code/runtime signature. Thay model,
+backend, cohort, gamma grid, prompt, protocol hoặc source code liên quan phép đo
+thì trace/cell cũ được lưu dưới `stale/` rồi tính lại; code signature cũ không
+được gắn lại cho cell mới vì không chứng minh được thay đổi chỉ nằm ở orchestration.
 Lưới gamma hiện khóa ở 3/7/11/15; CLI từ chối lưới rút gọn để tránh ngầm đổi
-protocol. Với B3/B4, `--resume` tái dùng E2E cell theo sample; B3 dev còn lưu
-warmup overhead profile để không đổi policy cost giữa lần chạy tiếp. Nếu signature
-không khớp, phase dừng thay vì ghép artifacts khác cấu hình.
+protocol. B3/B4 tự tái dùng E2E cell theo sample khi chữ ký khớp, không cần
+`--resume`; cell cũ khác chữ ký được archive và tính lại. B3 dev lưu warmup
+overhead profile để giữ nguyên policy cost khi tiếp tục. Các phase khóa policy
+vẫn từ chối dùng runtime/model/protocol sai chữ ký thay vì ghép artifacts khác cấu hình.
+
+Trong B0/B1/B1-V, lỗi chỉ ảnh hưởng một sample/state được ghi lại rồi runner
+dọn bộ nhớ tạm và tiếp tục các cell độc lập còn lại; phép tính được retry tối đa
+hai lần trước khi đánh dấu lỗi. File JSON hỏng được chuyển vào `stale/<phase>/`
+và tính lại. B0 ghi lỗi vào
+`evidence/parity.json`; B1/B1-V ghi state lỗi thành cell `status=failed`.
+`run_status.json` cho biết lượt thu thập là `complete` hay `partial`, số sample/state
+đạt và lỗi; cell lỗi sẽ được thử lại khi chạy tiếp với `--resume`. Cell hoàn tất
+cùng code/runtime/protocol được giữ lại nếu dữ liệu trong cell đủ số gamma/k và
+repetition. Nếu thu tín hiệu B2 lỗi sau hai lần thử, timing B1 vẫn được lưu;
+B2 coverage bị giảm và trạng thái tổng hợp chuyển thành `partial`. Lỗi hỏng CUDA context, không còn reference
+trajectory hợp lệ, sai runtime/model/corpus/protocol hoặc không thể ghi artifact
+vẫn dừng lượt chạy để tránh báo cáo kết quả không đáng tin. Lỗi phân tích hoặc
+ghi file trạng thái cuối không làm mất các phép đo đã lưu; raw artifacts được giữ
+để phân tích lại; lỗi phân tích được ghi ở `reports/analysis_status.json`.
 
 ### Dev / confirm cho B3
 
@@ -182,7 +216,14 @@ cùng GPU/runtime identity.
 ## Đọc artifacts và kết luận
 
 - `evidence/parity.json`: AR/native/adapter token comparisons theo document/gamma.
-  AR-token mismatch là diagnostic; runtime/instrumentation/cache failure mới chặn B1/B1-V.
+  AR-token mismatch là diagnostic; lỗi cục bộ trong một replay được ghi riêng,
+  còn lỗi CUDA làm hỏng context hoặc sai integrity toàn campaign mới chặn B1/B1-V.
+  Prefix B1/B1-V lấy token từ `adapter_ids`, cùng luồng với `adapter_rounds`;
+  anchor so với greedy token khi dựng lại full prefill được ghi diagnostic, không
+  chặn run. Native DFlash và adapter vẫn phải cùng trajectory.
+- `run_status.json`: trạng thái đầy đủ/thiếu một phần của lượt thu thập. Cell
+  `status=failed` trong `b1/cells/` hoặc `b1v/cells/` có loại lỗi và traceback;
+  cell đó không được đưa vào bảng số liệu.
 - `b1/draft_shape.jsonl`: cùng `state_id` có bốn gamma, proposals riêng từng
   shape, accepted candidates và round/component timing. `round_ms` gồm draft,
   full-context gather, verification, cache crop và draft-bank append; cache
@@ -192,8 +233,8 @@ cùng GPU/runtime identity.
   gamma 15 trước round. Candidate sau rejection chỉ tham gia survival label,
   không được tính là rejection độc lập ở vị trí không reach.
 - `b1v/verify_prefix.jsonl`: cùng proposals gamma 15 cho cả k, verify riêng
-  prefix và cache fork. Mỗi cell phải thỏa `L_k=min(L_15,k)`, cache crop length
-  và pending anchor phù hợp reference; mismatch dừng phase.
+  prefix và cache fork. Mỗi cell phải thỏa `L_k=min(L_15,k)` và cache crop
+  length; pending-anchor comparison với output tham chiếu được lưu diagnostic.
 - `reports/b1_metrics.json`: oracle gamma chọn bằng 3 selection repetitions,
   gap/regret đo trên 3 evaluation repetitions, near-optimal fixed coverage,
   tail acceptance, proposal-prefix equality và CI theo source group.

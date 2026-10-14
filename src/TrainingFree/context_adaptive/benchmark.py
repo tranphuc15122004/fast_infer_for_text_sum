@@ -150,10 +150,14 @@ def _asset_signature(path: str | Path) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
         raise FileNotFoundError(resolved)
-    # Include every regular file: model and tokenizer snapshots may use
-    # SentencePiece, vocab/merges, Jinja templates, or custom config assets.
+    # Include all snapshot assets, including custom tokenizer/code files. Local
+    # download metadata, notebook mirrors and bytecode are not runtime assets;
+    # changes to those must not invalidate otherwise identical model weights.
+    transient_dirs = {".cache", ".git", ".ipynb_checkpoints", "__pycache__"}
     files = [resolved] if resolved.is_file() else sorted(
         item for item in resolved.rglob("*") if item.is_file()
+        and not transient_dirs.intersection(item.relative_to(resolved).parts)
+        and item.suffix != ".pyc"
     )
     digest = hashlib.sha256()
     total_bytes = 0

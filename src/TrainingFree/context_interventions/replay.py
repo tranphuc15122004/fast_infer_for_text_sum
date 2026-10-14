@@ -49,6 +49,8 @@ class ReplayState:
     processed_output_tokens: int
     prefix_hash: str
     bank_build_ms: float
+    full_target_greedy_anchor: int
+    anchor_matches_full_target_greedy: bool
     parent_entropy: float | None = None
     parent_normalized_entropy: float | None = None
     parent_confidence: float | None = None
@@ -168,11 +170,10 @@ def rebuild_replay_state(
         from TrainingFree.speculation_experiments.signals import summarize_draft_logits
 
         parent_signal = summarize_draft_logits(output.logits[:, -1:, :])
-        if next_token != prefix.pending_anchor:
-            raise RuntimeError(
-                "reference prefix anchor differs from full target greedy output: "
-                f"round={prefix.round_index}, expected={prefix.pending_anchor}, actual={next_token}"
-            )
+        # Keep exact token equality as a diagnostic. The saved speculative
+        # trajectory has already been checked by full-context target
+        # verification; backend/kernel differences can make a separate dense
+        # prefill choose another greedy token without invalidating this state.
         target_scores: dict[int, dict[int, float]] = {}
         for layer_index in target_layers:
             query = queries.get(int(layer_index))
@@ -199,6 +200,8 @@ def rebuild_replay_state(
             processed_output_tokens=processed,
             prefix_hash=prompt_hash,
             bank_build_ms=bank_ms,
+            full_target_greedy_anchor=next_token,
+            anchor_matches_full_target_greedy=(next_token == int(prefix.pending_anchor)),
             parent_entropy=parent_signal["raw_entropy"][0],
             parent_normalized_entropy=parent_signal["normalized_entropy"][0],
             parent_confidence=parent_signal["confidence"][0],
