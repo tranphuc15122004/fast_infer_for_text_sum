@@ -1,5 +1,4 @@
 # [ACL 2026 Findings] ASL: Adaptive Layer Selection for Layer-Wise Token Pruning in LLM Inference
-!["FastKVandASL_comparison"](/images/comparison.png)
 We propose **ASL**, a training-free method that adaptively chooses the token-selection layer for Prefill Acceleration and KV cache reduction, exploiting the variance of token ranks ordered by attention score. 
 
 ASL balances the performance across different tasks while meeting the user-specified KV budget requirement. 

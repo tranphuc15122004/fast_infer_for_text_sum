@@ -21,6 +21,8 @@ from .types import Action, GenerationResult, PromptLayout, RoundState, Selection
 
 
 SelectionPolicy = Callable[..., Selection | None]
+VerificationPrefixPolicy = Callable[..., int | Mapping[str, Any]]
+DraftLengthPolicy = Callable[..., int | Mapping[str, Any]]
 
 
 def _sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -206,7 +208,9 @@ def _draft_and_verify_action(
     collect_full_context_scores: bool,
     collect_uncertainty: bool = False,
     query_capture: TargetQueryCapture | None,
-) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, float, torch.Tensor | None, Any, Any, Any, dict[str, Any] | None]:
+    verification_prefix_policy: VerificationPrefixPolicy | None = None,
+    round_state: RoundState | None = None,
+) -> tuple[torch.Tensor, Any, int, torch.Tensor, dict[int, dict[int, float]], float, float, float, torch.Tensor | None, Any, Any, Any, dict[str, Any] | None, int, dict[str, Any] | None, float]:
     device = input_ids.device
     block = torch.full((1, action.block_size), mask_token_id, dtype=input_ids.dtype, device=device)
     block[0, 0] = int(anchor)
@@ -229,6 +233,32 @@ def _draft_and_verify_action(
         collect_uncertainty=collect_uncertainty,
     )
     block[0, 1:] = proposal.token_ids[0]
+    verify_gamma = int(action.gamma)
+    policy_decision: dict[str, Any] | None = None
+    policy_ms = 0.0
+    if verification_prefix_policy is not None:
+        if round_state is None:
+            raise ValueError("verification-prefix policy requires the current round state")
+        from TrainingFree.speculation_experiments.b_controller import resolve_verification_prefix
+
+        policy_started = time.perf_counter()
+        decision = verification_prefix_policy(
+            state=round_state,
+            draft_uncertainty={
+                "raw_entropy": proposal.draft_entropy or (),
+                "normalized_entropy": proposal.draft_normalized_entropy or (),
+                "confidence": proposal.draft_confidence or (),
+                "probability_margin": proposal.draft_probability_margin or (),
+                "logit_margin": proposal.draft_logit_margin or (),
+                "signal_extraction_ms": proposal.signal_extraction_ms,
+            },
+            draft_gamma=int(action.gamma),
+            available_prefixes=tuple(value for value in (3, 7, 11, 15) if value <= action.gamma),
+        )
+        verify_gamma, policy_decision = resolve_verification_prefix(
+            decision, maximum_prefix=int(action.gamma)
+        )
+        policy_ms = (time.perf_counter() - policy_started) * 1000.0
     if draft_end is not None:
         draft_end.record()
     if query_capture is not None:
@@ -238,13 +268,15 @@ def _draft_and_verify_action(
     if verify_start is not None:
         verify_start.record()
     verify_started = time.perf_counter()
-    target_output = _verify_one(target, cache, block, position_ids)
+    verify_block = block[:, : verify_gamma + 1].contiguous()
+    verify_positions = position_ids[: verify_gamma + 1]
+    target_output = _verify_one(target, cache, verify_block, verify_positions)
     verify_wall_ms = (time.perf_counter() - verify_started) * 1000.0
     if verify_end is not None:
         verify_end.record()
     target_query = query_capture.disable() if query_capture is not None else None
     posterior = _sample(target_output.logits, temperature)
-    matches = (block[:, 1:] == posterior[:, :-1]).to(torch.int32)
+    matches = (verify_block[:, 1:] == posterior[:, :-1]).to(torch.int32)
     accepted = int(torch.cumprod(matches, dim=1).sum().item())
     return (
         block,
@@ -267,6 +299,9 @@ def _draft_and_verify_action(
             "logit_margin": proposal.draft_logit_margin,
             "signal_extraction_ms": proposal.signal_extraction_ms,
         } if proposal.draft_entropy is not None else None),
+        verify_gamma,
+        policy_decision,
+        policy_ms,
     )
 
 
@@ -363,7 +398,7 @@ def _replay_calibration_actions(
         if config.timing_mode == "diagnostic" and torch.cuda.is_available():
             torch.cuda.synchronize(input_ids.device)
         started = time.perf_counter()
-        block, output, accepted, posterior, draft_scores, _, gather_ms, gather_bytes, query, _, _, _, _ = _draft_and_verify_action(
+        block, output, accepted, posterior, draft_scores, _, gather_ms, gather_bytes, query, _, _, _, _, _, _, _ = _draft_and_verify_action(
             target=target,
             draft=draft,
             bank=bank,
@@ -472,6 +507,9 @@ def generate_adaptive(
     selection_policy: SelectionPolicy | None = None,
     collect_full_target_scores: bool = False,
     collect_full_draft_scores: bool = False,
+    collect_uncertainty: bool = False,
+    verification_prefix_policy: VerificationPrefixPolicy | None = None,
+    draft_length_policy: DraftLengthPolicy | None = None,
 ) -> GenerationResult:
     """Generate one sequence; target sees full context on every verification."""
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -532,6 +570,11 @@ def generate_adaptive(
     proposed_total = accepted_total = useful_accepted_total = speculative_rounds = 0
     signal_ms_total = selection_ms_total = bank_update_ms_total = 0.0
     draft_ms_wall = verify_ms_wall = 0.0
+    draft_signal_ms_total = 0.0
+    draft_policy_ms_total = 0.0
+    last_draft_uncertainty: dict[str, Any] | None = None
+    last_draft_signal_round: int | None = None
+    last_draft_gamma: int | None = None
     fallback_rounds = dense_refresh_rounds = 0
     draft_context_total = gamma_total = 0
     prefill_ms = 0.0
@@ -704,7 +747,33 @@ def generate_adaptive(
             )
             state_parent_entropy_origin = parent_entropy_origin_round
             state_parent_query_index = parent_query_index_for_state
+            previous_draft_uncertainty = last_draft_uncertainty
+            previous_draft_signal_round = last_draft_signal_round
+            previous_draft_gamma = last_draft_gamma
             action, action_reason, controller_ms = controller.choose(state, actions)
+            draft_policy_decision: dict[str, Any] | None = None
+            draft_policy_ms = 0.0
+            if draft_length_policy is not None:
+                draft_policy_started = time.perf_counter()
+                feasible_gammas = tuple(sorted({item.gamma for item in actions if item.budget == "full"}))
+                decision = draft_length_policy(
+                    state=state,
+                    previous_draft_uncertainty=previous_draft_uncertainty,
+                    previous_draft_gamma=previous_draft_gamma,
+                    feasible_gammas=feasible_gammas,
+                    fallback_gamma=int(action.gamma),
+                )
+                raw_gamma = decision.get("gamma") if isinstance(decision, Mapping) else decision
+                try:
+                    selected_gamma = int(raw_gamma)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("draft-length policy must select an integer gamma") from exc
+                if selected_gamma not in feasible_gammas:
+                    raise ValueError("draft-length policy selected a gamma outside the feasible grid")
+                action = Action(action.budget, selected_gamma, action.length_mode)
+                draft_policy_decision = dict(decision) if isinstance(decision, Mapping) else {"gamma": selected_gamma}
+                draft_policy_ms = (time.perf_counter() - draft_policy_started) * 1000.0
+                action_reason += ":b4_" + str(draft_policy_decision.get("reason", "policy"))
             if refresh_required and action.budget != "full":
                 action = Action("full", action.gamma, action.length_mode)
                 action_reason += ":refresh_full"
@@ -845,6 +914,9 @@ def generate_adaptive(
                 verify_event_data,
                 gather_event_pair,
                 _draft_uncertainty,
+                verification_gamma,
+                verification_decision,
+                verification_policy_ms,
             ) = _draft_and_verify_action(
                 target=target,
                 draft=draft,
@@ -860,7 +932,20 @@ def generate_adaptive(
                 mask_token_id=int(mask_token_id),
                 collect_refresh_scores=refresh_required and config.selector == "draft_refresh",
                 collect_full_context_scores=collect_full_draft_scores and refresh_required,
+                collect_uncertainty=(
+                    collect_uncertainty
+                    or (
+                        verification_prefix_policy is not None
+                        and bool(getattr(verification_prefix_policy, "requires_uncertainty", True))
+                    )
+                    or (
+                        draft_length_policy is not None
+                        and bool(getattr(draft_length_policy, "requires_uncertainty", True))
+                    )
+                ),
                 query_capture=query_capture if collect_target_signal else None,
+                verification_prefix_policy=verification_prefix_policy,
+                round_state=state,
             )
             proposed_total += action.gamma
             speculative_rounds += 1
@@ -947,7 +1032,7 @@ def generate_adaptive(
                 and processed_output_tokens < max_new_tokens
                 and pending_anchor in eos_ids
             )
-            all_accepted = accepted == action.gamma
+            all_accepted = accepted == verification_gamma
             state_hash = _state_hash(state, action, layout.prompt_hash)
             action_cost_ms = None
             round_total_ms = None
@@ -960,6 +1045,7 @@ def generate_adaptive(
                 action,
                 accepted_for_commit,
                 action_cost_ms if config.cost_update_mode == "async_event" else None,
+                history_denominator=verification_gamma,
             )
 
             if refresh_required and draft_scores:
@@ -976,6 +1062,17 @@ def generate_adaptive(
 
             selection_ms_total += selection_ms
             signal_ms_total += signal_ms
+            draft_signal_ms = float((_draft_uncertainty or {}).get("signal_extraction_ms", 0.0))
+            draft_signal_ms_total += draft_signal_ms + verification_policy_ms
+            draft_policy_ms_total += draft_policy_ms
+            if _draft_uncertainty is not None:
+                last_draft_uncertainty = dict(_draft_uncertainty)
+                last_draft_signal_round = round_index
+                last_draft_gamma = int(action.gamma)
+            elif draft_length_policy is not None:
+                last_draft_uncertainty = None
+                last_draft_signal_round = None
+                last_draft_gamma = None
             bank_update_ms_total += bank_update_ms
             draft_ms_wall += draft_ms
             if gpu_start is not None and gpu_end is not None:
@@ -1005,6 +1102,17 @@ def generate_adaptive(
                 "selected_context_tokens_by_layer": [len(x) for x in selection.positions_by_layer],
                 "physical_context_tokens_by_layer": [len(x) for x in selection.positions_by_layer],
                 "gamma_requested": action.gamma, "gamma_executed": action.gamma,
+                "draft_gamma_executed": action.gamma,
+                "verified_gamma_executed": verification_gamma,
+                "verification_prefix": verification_gamma,
+                "verification_policy": verification_decision,
+                "draft_length_policy": draft_policy_decision,
+                "draft_signal": _draft_uncertainty,
+                "draft_signal_source_round": round_index if _draft_uncertainty is not None else None,
+                "lagged_draft_signal": (dict(previous_draft_uncertainty) if draft_length_policy is not None else None),
+                "lagged_draft_signal_origin_round": previous_draft_signal_round if draft_length_policy is not None else None,
+                "lagged_draft_gamma": previous_draft_gamma if draft_length_policy is not None else None,
+                "discarded_draft_suffix": action.gamma - verification_gamma,
                 "block_size": action.block_size, "length_mode": action.length_mode,
                 "selector_id": config.selector, "refresh_required": refresh_required,
                 "action_reason": action_reason,
@@ -1017,6 +1125,8 @@ def generate_adaptive(
                 "boundary_round": remaining <= max(action.gamma + 1, 1),
                 "trimmed_commits": trimmed, "signal_ms": signal_ms,
                 "controller_ms": controller_ms, "selection_ms": selection_ms,
+                "draft_signal_ms": draft_signal_ms, "verification_policy_ms": verification_policy_ms,
+                "draft_policy_ms": draft_policy_ms,
                 "bank_update_ms": bank_update_ms, "draft_ms": draft_ms,
                 "gather_ms": gather_ms,
                 "verify_ms": verify_event_data[2], "round_gpu_span_ms": None,
@@ -1106,10 +1216,12 @@ def generate_adaptive(
         "draft_latency_ms": draft_ms,
         "verification_latency_ms": verify_ms,
         "signal_latency_ms": signal_ms_total,
+        "draft_signal_latency_ms": draft_signal_ms_total,
         "selection_latency_ms": selection_ms_total,
         "gather_latency_ms": sum(float(row.get("gather_ms") or 0.0) for row in rounds),
         "bank_update_latency_ms": bank_update_ms_total,
         "controller_latency_ms": controller.choose_ms_total,
+        "draft_policy_latency_ms": draft_policy_ms_total,
     }
     counters = {
         "processed_commits": processed_commits_total,

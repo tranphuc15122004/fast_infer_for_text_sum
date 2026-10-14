@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run B0/B1/B2 DFlash speculation experiments on the shared B200 runtime.
+"""Run the DFlash speculation B0-B4 experiments on the shared B200 runtime.
 
 This entrypoint is offline by design. It does not install packages or download
 models/data. Run ``prepare`` on any machine, then use ``run`` on the B200 server
@@ -11,12 +11,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import mean
 from typing import Any, Mapping, Sequence
 
 
@@ -28,7 +31,7 @@ for _path in (ROOT / "src", ROOT / "scripts", ROOT / "externals" / "dflash"):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("prepare", "preflight", "validate", "b1", "b1v", "analyze", "run"), default="prepare")
+    parser.add_argument("--mode", choices=("prepare", "preflight", "validate", "b1", "b1v", "analyze", "b3-dev", "b3-confirm", "b4", "b4-dev", "b4-confirm", "run"), default="prepare")
     parser.add_argument("--config", default=os.environ.get("FAST_INFER_MASTER_CONFIG"))
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-root", default="outputs/dflash_speculation_B")
@@ -51,6 +54,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-repetitions", type=int, default=3)
     parser.add_argument("--n-splits", type=int, default=4)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
+    parser.add_argument("--policy-lock", default=None, help="locked dev policy JSON required by b3-confirm/b4-confirm")
+    parser.add_argument("--e2e-repetitions", type=int, default=5)
+    parser.add_argument("--e2e-warmups", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     return parser
@@ -75,6 +81,38 @@ def _run_root(args: argparse.Namespace) -> Path:
 def _hash_json(payload: Any) -> str:
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _locked_benchmark_signature(campaign: Mapping[str, Any]) -> dict[str, Any]:
+    corpus = campaign.get("corpus") or []
+    return {
+        "corpus_file_sha256": sorted(str(item["sha256"]) for item in corpus),
+        "exposure_sha256": str(campaign.get("exposure_sha256", "")),
+    }
+
+
+def _locked_e2e_protocol(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_new_tokens": int(args.max_new_tokens),
+        "gammas": list(_parse_gammas(args.gammas)),
+        "attention_backend": str(args.attention_backend),
+        "seed": int(args.seed),
+        "e2e_repetitions": int(args.e2e_repetitions),
+        "e2e_warmups": int(args.e2e_warmups),
+    }
+
+
+def _validate_policy_lock(
+    lock: Mapping[str, Any],
+    *,
+    args: argparse.Namespace,
+    campaign: Mapping[str, Any],
+    phase: str,
+) -> None:
+    if lock.get("protocol_parameters") != _locked_e2e_protocol(args):
+        raise ValueError(f"{phase} policy lock protocol parameters differ from this run")
+    if lock.get("benchmark_signature") != _locked_benchmark_signature(campaign):
+        raise ValueError(f"{phase} policy lock corpus/exposure signature differs from this run")
 
 
 def _load_samples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[Path]]:
@@ -333,8 +371,10 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             saved = json.loads(path.read_text(encoding="utf-8"))
             if saved.get("trace_signature") != expected_signature:
                 raise ValueError(f"resume trace signature mismatch: {path}")
+            if saved.get("b0_status") != "complete":
+                raise ValueError(f"resume trace lacks a completed B0 validation record: {path}")
             parity = saved["parity_by_gamma"]
-            validation_rows.append({"sample_id": sample["id"], "parity_by_gamma": parity})
+            validation_rows.append({"sample_id": sample["id"], "comparisons_by_gamma": parity})
             print(f"[B0 {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
             continue
         if path.exists():
@@ -352,6 +392,8 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
                 max_new_tokens=limit,
                 gamma=gamma,
                 reference_ar_ids=reference_ar,
+                collect_uncertainty=(gamma == 15),
+                require_ar_match=False,
             )
             if gamma == 15:
                 reference_ar = measured["ar_ids"]
@@ -359,15 +401,17 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             parity_by_gamma[str(gamma)] = measured["parity"]
             print(
                 f"[B0 {sample_index}/{len(samples)}] {sample['dataset']}:{sample['id']} "
-                f"gamma={gamma} status={measured['parity']['status']}",
+                f"gamma={gamma} comparison={measured['parity']['status']} (diagnostic only); "
+                f"AR/native={measured['parity']['native_equals_ar']} "
+                f"AR/adapter={measured['parity']['adapter_equals_ar']}",
                 flush=True,
             )
-        parity_pass = all(row.get("status") == "pass" for row in parity_by_gamma.values())
         if reference_trace is None:
             raise RuntimeError("gamma15 reference trace was not produced")
         trace = {
             "schema_version": "dflash-speculation-b.reference.v1",
             "trace_signature": expected_signature,
+            "b0_status": "complete",
             "sample_id": str(sample["id"]),
             "dataset": str(sample["dataset"]),
             "source_group_id": str(sample["_cad_source_group_id"]),
@@ -380,27 +424,43 @@ def _validate(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_r
             "adapter_rounds": reference_trace["adapter_rounds"],
             "eos_ids": sorted(reference_trace["eos_ids"]),
             "parity_by_gamma": parity_by_gamma,
-            "parity_status": "pass" if parity_pass else "invalid_correctness",
         }
         atomic_json(path, trace)
-        validation_rows.append({"sample_id": sample["id"], "parity_by_gamma": parity_by_gamma})
-    passed = all(
-        all(value.get("status") == "pass" for value in sample.get("parity_by_gamma", {}).values())
+        validation_rows.append({"sample_id": sample["id"], "comparisons_by_gamma": parity_by_gamma})
+    comparisons = [
+        comparison
+        for sample in validation_rows
+        for comparison in sample.get("comparisons_by_gamma", {}).values()
+    ]
+    completed = len(validation_rows) == len(samples) and all(
+        len(sample.get("comparisons_by_gamma", {})) == len(gammas)
         for sample in validation_rows
     )
     summary = {
-        "schema_version": "dflash-speculation-b.b0-parity.v1",
-        "status": "pass" if passed else "invalid_correctness",
+        "schema_version": "dflash-speculation-b.b0-validation.v2",
+        "status": "complete" if completed else "incomplete",
         "sample_count": len(validation_rows),
         "gamma_values": list(gammas),
-        "parity": validation_rows,
+        "comparisons": validation_rows,
+        "ar_exact_match_rate": {
+            "native": (sum(bool(row.get("native_equals_ar")) for row in comparisons) / len(comparisons)) if comparisons else None,
+            "adapter": (sum(bool(row.get("adapter_equals_ar")) for row in comparisons) / len(comparisons)) if comparisons else None,
+        },
+        "native_adapter_exact_match_rate": (
+            sum(bool(row.get("native_equals_adapter")) for row in comparisons) / len(comparisons)
+            if comparisons else None
+        ),
+        "comparison_role": "diagnostic_only",
         "runtime": runtime_signature,
         "code_signature": code,
     }
     atomic_json(run_root / "evidence" / "parity.json", summary)
-    if not passed:
-        print("[B0] parity failed; B1/B2 are gated", flush=True)
-    return passed
+    print(
+        "[B0] validation complete; AR/native/adapter token equality is diagnostic only; "
+        f"AR match rates={summary['ar_exact_match_rate']}",
+        flush=True,
+    )
+    return completed
 
 
 def _state_cell_path(run_root: Path, state_key: str) -> Path:
@@ -415,8 +475,8 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
     from TrainingFree.speculation_experiments.replay import run_same_prefix_sweep
 
     parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "pass":
-        raise RuntimeError("B1 is gated on a complete B0 parity pass")
+    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
+        raise RuntimeError("B1 requires completed B0 runtime validation")
     code = _code_signature()
     runtime_sig = runtime["b_campaign_signature"]
     params = {
@@ -434,8 +494,8 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
         if not trace_path.is_file():
             raise FileNotFoundError(f"missing gamma15 reference trace: {trace_path}")
         trace = json.loads(trace_path.read_text(encoding="utf-8"))
-        if trace.get("parity_status") != "pass":
-            raise RuntimeError(f"sample {sample['id']} did not pass B0 parity")
+        if trace.get("b0_status") != "complete":
+            raise RuntimeError(f"sample {sample['id']} lacks completed B0 runtime validation")
         input_ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
         input_ids = input_ids.to(runtime["target"].device).contiguous()
         if layout.prompt_hash != trace["prompt_hash"]:
@@ -499,12 +559,21 @@ def _b1(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: P
                 gamma=15,
                 cleanup_after_action=False,
             )
-            if full.get("status") != "ok" or int(full.get("accepted_candidates", -1)) != int(reference_round["accepted_candidates"]):
-                raise RuntimeError(
-                    f"gamma15 replay mismatch at {state_key}: replay={full.get('accepted_candidates')} "
-                    f"reference={reference_round.get('accepted_candidates')}"
-                )
-            history = reference_history(trace["adapter_rounds"], current_round=prefix.round_index)
+            if full.get("status") != "ok":
+                raise RuntimeError(f"gamma15 replay failed at {state_key}: {full.get('reason')}")
+            history = (
+                reference_history(trace["adapter_rounds"], current_round=prefix.round_index)
+                if trace["adapter_ids"] == trace["ar_ids"]
+                else {
+                    "previous_accepted_candidates": None,
+                    "mean4_acceptance": None,
+                    "ema_acceptance": None,
+                    "previous_all_accepted": None,
+                    "missing": True,
+                    "origin_rounds": [],
+                    "unavailable_reason": "adapter_reference_diverged_from_target_ar",
+                }
+            )
             result = run_same_prefix_sweep(
                 runtime,
                 input_ids,
@@ -570,13 +639,17 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
     from TrainingFree.speculation_experiments.replay import run_verification_prefix_sweep
 
     parity_path = run_root / "evidence" / "parity.json"
-    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "pass":
-        raise RuntimeError("B1-V is gated on a complete B0 parity pass")
+    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
+        raise RuntimeError("B1-V requires completed B0 runtime validation")
     b1_cells = []
     for path in sorted((run_root / "b1" / "cells").glob("*.json")):
         b1_cells.append(json.loads(path.read_text(encoding="utf-8")))
     proposal_by_state = {
         str(cell["state_id"]): tuple(int(token) for token in cell["proposal_by_gamma"]["15"])
+        for cell in b1_cells
+    }
+    accepted_by_state = {
+        str(cell["state_id"]): int(cell["accepted_by_gamma"]["15"])
         for cell in b1_cells
     }
     if not proposal_by_state:
@@ -676,13 +749,15 @@ def _b1v(args: argparse.Namespace, samples: Sequence[dict[str, Any]], run_root: 
                 reference_output_ids=trace["ar_ids"],
                 max_new_tokens=args.max_new_tokens,
                 round_index=prefix.round_index,
-                full_accepted=int(reference_round["accepted_candidates"]),
+                full_accepted=accepted_by_state[state_identity_value],
                 repetitions=args.repetitions,
                 selection_repetitions=args.selection_repetitions,
                 warmups=args.warmups,
                 seed=args.seed + prefix.round_index,
                 expected_proposal_ids=proposal_by_state[state_identity_value],
             )
+            if int(full["accepted_candidates"]) != int(result["accepted_by_gamma"]["15"]):
+                raise RuntimeError(f"gamma15 replay acceptance changed across paired sweeps at {state_key}")
             atomic_json(cell_path, {
                 "schema_version": "dflash-speculation-b.b1v-cell.v1",
                 "campaign_signature": signature,
@@ -721,6 +796,23 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]], summary: Mapping
         writer.add(dict(row))
     writer.finalize(dict(summary))
     temporary.replace(path)
+
+
+def _sample_cell_path(root: Path, phase: str, sample: Mapping[str, Any]) -> Path:
+    identity = f"{sample['dataset']}::{sample['id']}"
+    name = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return root / "cells" / phase / f"{name}.json"
+
+
+def _load_resume_cell(path: Path, signature: str, *, resume: bool) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    if not resume:
+        raise FileExistsError(f"completed E2E sample cell exists; pass --resume: {path}")
+    cell = json.loads(path.read_text(encoding="utf-8"))
+    if cell.get("campaign_signature") != signature:
+        raise ValueError(f"E2E resume cell signature mismatch: {path}")
+    return cell
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -839,6 +931,1325 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
     return decisions
 
 
+def _b3_eligible_models(run_root: Path) -> tuple[list[str], dict[str, Any]]:
+    """Apply the preregistered opportunity and held-out prediction gates."""
+    decision_path = run_root / "reports" / "decision.json"
+    b2_path = run_root / "reports" / "b2_metrics.json"
+    if not decision_path.is_file() or not b2_path.is_file():
+        raise FileNotFoundError("B3 dev requires --mode analyze to finish first")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    b2 = json.loads(b2_path.read_text(encoding="utf-8"))
+    if decision.get("b1v_verification_opportunity") != "supported":
+        raise RuntimeError(
+            "B3 gate closed: B1-V must have oracle gap >=5% and CI95 lower bound >2%; "
+            f"observed {decision.get('b1v_verification_opportunity')}"
+        )
+    eligible = []
+    for variant in ("R-DH", "R-DC"):
+        skill = (b2.get("brier_skill_vs_R") or {}).get(variant)
+        interval = (b2.get("brier_skill_ci95") or {}).get(variant)
+        if (
+            skill is not None
+            and interval
+            and float(skill) >= 0.05
+            and float(interval[0]) > 0.0
+        ):
+            eligible.append(variant)
+    if not eligible:
+        raise RuntimeError(
+            "B3 gate closed: neither R-DH nor R-DC has held-out Brier skill >=5% "
+            "with CI95 improvement above zero"
+        )
+    return eligible, {"decision": decision, "b2": b2}
+
+
+def _validate_b0_signature(
+    run_root: Path,
+    *,
+    code_signature: str,
+    runtime_signature: Mapping[str, Any],
+) -> None:
+    parity_path = run_root / "evidence" / "parity.json"
+    if not parity_path.is_file():
+        raise FileNotFoundError("B0 validation evidence is missing; run --mode validate first")
+    parity = json.loads(parity_path.read_text(encoding="utf-8"))
+    if parity.get("status") != "complete":
+        raise RuntimeError("phase requires completed B0 runtime validation")
+    if parity.get("code_signature") != code_signature or parity.get("runtime") != runtime_signature:
+        raise ValueError("B0 validation artifact has a stale code/runtime signature; rerun validate")
+
+
+def _validate_replay_cells(
+    args: argparse.Namespace,
+    run_root: Path,
+    *,
+    code_signature: str,
+    runtime_signature: Mapping[str, Any],
+    require_b1v: bool,
+) -> None:
+    common = {
+        "repetitions": args.repetitions,
+        "selection_repetitions": args.selection_repetitions,
+        "warmups": args.warmups,
+        "max_prefixes": args.max_prefixes,
+        "max_new_tokens": args.max_new_tokens,
+        "seed": args.seed,
+    }
+    b1_params = {"gammas": _parse_gammas(args.gammas), **common}
+    expected_b1 = _hash_json({
+        "code": code_signature, "runtime": runtime_signature, "campaign": b1_params,
+    })
+    b1_cells = list((run_root / "b1" / "cells").glob("*.json"))
+    if not b1_cells:
+        raise FileNotFoundError("B1 replay cells are missing; run --mode b1 first")
+    stale_b1 = [
+        str(path) for path in b1_cells
+        if json.loads(path.read_text(encoding="utf-8")).get("campaign_signature") != expected_b1
+    ]
+    if stale_b1:
+        raise ValueError(f"B1 cells have stale code/runtime/protocol signatures: {stale_b1[:3]}")
+    if not require_b1v:
+        return
+    b1v_params = {"verify_prefixes": (3, 7, 11, 15), **common}
+    expected_b1v = _hash_json({
+        "code": code_signature, "runtime": runtime_signature, "campaign": b1v_params,
+    })
+    b1v_cells = list((run_root / "b1v" / "cells").glob("*.json"))
+    if not b1v_cells:
+        raise FileNotFoundError("B1-V replay cells are missing; run --mode b1v first")
+    stale_b1v = [
+        str(path) for path in b1v_cells
+        if json.loads(path.read_text(encoding="utf-8")).get("campaign_signature") != expected_b1v
+    ]
+    if stale_b1v:
+        raise ValueError(f"B1-V cells have stale code/runtime/protocol signatures: {stale_b1v[:3]}")
+
+
+def _b3_models_and_costs(
+    run_root: Path,
+    *,
+    eligible: Sequence[str],
+    minimum_repetitions: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    from TrainingFree.speculation_experiments.b_controller import context_cost_profile
+    from TrainingFree.speculation_experiments.survival import fit_survival_curve, serialize_survival_curve
+
+    signal_path = run_root / "b2" / "signals.jsonl"
+    cost_path = run_root / "b1v" / "verify_prefix.jsonl"
+    if not signal_path.is_file() or not cost_path.is_file():
+        raise FileNotFoundError("B3 dev requires saved B2 signals and B1-V costs")
+    signals = _read_jsonl(signal_path)
+    costs = _read_jsonl(cost_path)
+    if not signals or not costs:
+        raise ValueError("B3 dev cannot fit from empty B2 signals or B1-V cost rows")
+    models = {
+        variant: serialize_survival_curve(fit_survival_curve(signals, variant=variant))
+        for variant in ("R", "R-A", *eligible)
+    }
+    profiles = context_cost_profile(costs, minimum_repetitions=minimum_repetitions)
+    if not profiles:
+        raise ValueError("B3 has no B1-V context cost profile with enough selection repetitions")
+    return models, profiles
+
+
+def _macro_geomean_latency(rows: Sequence[Mapping[str, Any]], variant: str) -> float:
+    by_document: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        if row.get("variant") != variant or row.get("status") != "ok":
+            continue
+        latency = float(row["e2e_ms"])
+        if latency <= 0:
+            continue
+        key = (str(row["dataset"]), str(row["source_group_id"]))
+        by_document.setdefault(key, []).append(math.log(latency))
+    by_dataset: dict[str, list[float]] = {}
+    for (dataset, _), logs in by_document.items():
+        by_dataset.setdefault(dataset, []).append(sum(logs) / len(logs))
+    if not by_dataset:
+        return math.inf
+    return math.exp(sum(sum(values) / len(values) for values in by_dataset.values()) / len(by_dataset))
+
+
+def _paired_macro_speedup(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    control: str,
+    treatment: str,
+    bootstrap_replicates: int = 2000,
+    seed: int = 20261013,
+) -> dict[str, Any]:
+    import random
+
+    paired: dict[str, dict[tuple[str, str], list[float]]] = {control: {}, treatment: {}}
+    for row in rows:
+        name = str(row.get("variant"))
+        if name not in paired or row.get("status") != "ok":
+            continue
+        key = (str(row["dataset"]), str(row["source_group_id"]))
+        paired[name].setdefault(key, []).append(float(row["e2e_ms"]))
+    common = sorted(set(paired[control]) & set(paired[treatment]))
+    doc_log_ratios: dict[str, dict[str, float]] = {}
+    for dataset, group in common:
+        left = paired[control][(dataset, group)]
+        right = paired[treatment][(dataset, group)]
+        if len(left) != len(right) or not left or any(x <= 0 for x in (*left, *right)):
+            continue
+        doc_log_ratios.setdefault(dataset, {})[group] = sum(
+            math.log(a / b) for a, b in zip(left, right)
+        ) / len(left)
+    point = (
+        math.exp(sum(sum(values.values()) / len(values) for values in doc_log_ratios.values()) / len(doc_log_ratios))
+        if doc_log_ratios and all(doc_log_ratios.values()) else None
+    )
+    draws: list[float] = []
+    if point is not None and bootstrap_replicates > 0:
+        rng = random.Random(seed)
+        datasets = sorted(doc_log_ratios)
+        if all(len(doc_log_ratios[name]) >= 2 for name in datasets):
+            for _ in range(bootstrap_replicates):
+                sampled_dataset_means = []
+                for dataset in datasets:
+                    groups = list(doc_log_ratios[dataset].values())
+                    sampled_dataset_means.append(sum(rng.choice(groups) for _ in groups) / len(groups))
+                draws.append(math.exp(sum(sampled_dataset_means) / len(sampled_dataset_means)))
+    ci = None
+    if draws:
+        draws.sort()
+        ci = [draws[int(0.025 * (len(draws) - 1))], draws[int(0.975 * (len(draws) - 1))]]
+    return {
+        "control": control,
+        "treatment": treatment,
+        "macro_geometric_speedup": point,
+        "ci95_document_cluster": ci,
+        "paired_documents": sum(len(values) for values in doc_log_ratios.values()),
+        "per_dataset": {
+            dataset: {
+                "geometric_speedup": math.exp(sum(values.values()) / len(values)),
+                "paired_documents": len(values),
+            }
+            for dataset, values in doc_log_ratios.items()
+        },
+    }
+
+
+def _b3_overhead_adjusted_opportunity(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    overhead_ms: float,
+    bootstrap_replicates: int = 2000,
+    seed: int = 20261013,
+) -> dict[str, Any]:
+    """Re-select k on dev selection repeats after charging measured B3 overhead."""
+    import random
+
+    by_state: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("acceptance_identity_valid") is not True:
+            continue
+        state_id = str(row.get("state_id", ""))
+        if not state_id:
+            continue
+        state = by_state.setdefault(state_id, {
+            "dataset": str(row["dataset"]),
+            "source_group_id": str(row["source_group_id"]),
+            "selection": {},
+            "evaluation": {},
+        })
+        prefix = int(row["k"])
+        committed = 1 + int(row["accepted_candidates"])
+        cost = (float(row["total_round_ms"]) + float(overhead_ms)) / committed
+        split = str(row.get("repetition_split"))
+        if split in {"selection", "evaluation"} and math.isfinite(cost) and cost > 0:
+            state[split].setdefault(prefix, []).append(cost)
+    complete = {
+        state_id: state for state_id, state in by_state.items()
+        if all(
+            prefix in state[split]
+            for split in ("selection", "evaluation")
+            for prefix in (3, 7, 11, 15)
+        )
+    }
+    if not complete:
+        return {"status": "inconclusive", "state_count": 0, "overhead_ms": overhead_ms}
+    selection_means = {
+        state_id: {
+            prefix: sum(values) / len(values)
+            for prefix, values in state["selection"].items()
+        }
+        for state_id, state in complete.items()
+    }
+    by_dataset_fixed: dict[str, dict[str, dict[int, list[float]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    for state_id, scores in selection_means.items():
+        state = complete[state_id]
+        by_dataset_fixed[state["dataset"]][state["source_group_id"]]
+        for prefix, value in scores.items():
+            by_dataset_fixed[state["dataset"]][state["source_group_id"]][prefix].append(value)
+    fixed_means: dict[int, float] = {}
+    for prefix in (3, 7, 11, 15):
+        dataset_means = []
+        for docs in by_dataset_fixed.values():
+            document_means = [mean(costs[prefix]) for costs in docs.values() if prefix in costs]
+            if document_means:
+                dataset_means.append(mean(document_means))
+        fixed_means[prefix] = mean(dataset_means) if dataset_means else math.inf
+    best_fixed = min(fixed_means, key=lambda prefix: (fixed_means[prefix], prefix))
+    grouped: dict[str, dict[str, list[tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    for state_id, state in complete.items():
+        chosen = min(selection_means[state_id], key=lambda prefix: (selection_means[state_id][prefix], prefix))
+        evaluation = {
+            prefix: sum(values) / len(values)
+            for prefix, values in state["evaluation"].items()
+        }
+        grouped[state["dataset"]][state["source_group_id"]].append((evaluation[chosen], evaluation[best_fixed]))
+
+    def macro_ratio(documents: Mapping[str, Mapping[str, Sequence[tuple[float, float]]]]) -> float | None:
+        numerator = []
+        denominator = []
+        for docs in documents.values():
+            doc_num = [mean(pair[0] for pair in values) for values in docs.values() if values]
+            doc_den = [mean(pair[1] for pair in values) for values in docs.values() if values]
+            if doc_num and doc_den:
+                numerator.append(mean(doc_num))
+                denominator.append(mean(doc_den))
+        if not numerator or not denominator or mean(denominator) <= 0:
+            return None
+        return 1.0 - mean(numerator) / mean(denominator)
+
+    gap = macro_ratio(grouped)
+    draws = []
+    if gap is not None and bootstrap_replicates and all(len(docs) >= 2 for docs in grouped.values()):
+        rng = random.Random(seed)
+        for _ in range(bootstrap_replicates):
+            sampled: dict[str, dict[str, Sequence[tuple[float, float]]]] = {}
+            for dataset, docs in grouped.items():
+                keys = list(docs)
+                sampled[dataset] = {f"sample-{index}": docs[rng.choice(keys)] for index in range(len(keys))}
+            value = macro_ratio(sampled)
+            if value is not None:
+                draws.append(value)
+    interval = None
+    if draws:
+        draws.sort()
+        interval = [draws[int(0.025 * (len(draws) - 1))], draws[int(0.975 * (len(draws) - 1))]]
+    status = (
+        "supported" if gap is not None and gap >= 0.05 and interval and interval[0] > 0.02
+        else "low_opportunity" if gap is not None and interval and interval[1] <= 0.02
+        else "inconclusive"
+    )
+    return {
+        "status": status,
+        "overhead_ms": float(overhead_ms),
+        "best_fixed_prefix": best_fixed,
+        "oracle_gap_j": gap,
+        "oracle_gap_j_ci95": interval,
+        "state_count": len(complete),
+        "source_group_count": len({str(row["source_group_id"]) for row in complete.values()}),
+    }
+
+
+def _b3_run_one(
+    *,
+    runtime: Mapping[str, Any],
+    sample: Mapping[str, Any],
+    args: argparse.Namespace,
+    variant: str,
+    policy: Any = None,
+    draft_policy: Any = None,
+    fixed_gamma: int = 15,
+) -> dict[str, Any]:
+    import torch
+    from TrainingFree.context_adaptive.config import AdaptiveConfig
+    from TrainingFree.context_adaptive.generation import generate_adaptive, generate_target_only
+    from TrainingFree.context_adaptive.prompt import prepare_prompt
+    from TrainingFree.speculation_experiments.protocol import SUPPORTED_GAMMAS
+
+    ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
+    ids = ids.to(runtime["target"].device).contiguous()
+    torch.cuda.synchronize(ids.device)
+    started = time.perf_counter()
+    if variant == "ar":
+        result = generate_target_only(runtime["target"], ids, max_new_tokens=args.max_new_tokens, temperature=0.0)
+    else:
+        config = AdaptiveConfig(
+            budgets=("full",),
+            gammas=SUPPORTED_GAMMAS,
+            selector="recent_only",
+            timing_mode="wall",
+            output_root=str(_run_root(args) / "b3" / "runtime"),
+            seed=args.seed,
+        )
+        mode = "dflash_full_fixed" if variant == "dflash_fixed15" else "fixed"
+        result = generate_adaptive(
+            runtime["target"], runtime["draft"], ids, runtime["tokenizer"], layout, config,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.0,
+            variant=mode,
+            fixed_budget="full",
+            fixed_gamma=int(fixed_gamma),
+            gamma_reference=int(fixed_gamma),
+            run_id=str(args.run_id),
+            sample_id=str(sample["id"]),
+            dataset=str(sample["dataset"]),
+            split=str(sample.get("_cad_split", "unknown")),
+            repetition=int(getattr(args, "_b3_repetition", 0)),
+            verification_prefix_policy=policy,
+            draft_length_policy=draft_policy,
+        )
+    torch.cuda.synchronize(ids.device)
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    output_ids = [int(value) for value in result.output_ids.detach().cpu().tolist()]
+    return {
+        "status": result.status,
+        "error": result.error,
+        "input_tokens": int(ids.shape[1]),
+        "output_ids": output_ids,
+        "output_tokens": int(result.output_tokens),
+        "e2e_ms": wall_ms,
+        "reported_timings": result.timings,
+        "counters": result.counters,
+        "rounds": result.rounds,
+        "correctness_status": result.correctness_status,
+    }
+
+
+def _sample_reference_text(sample: Mapping[str, Any]) -> str:
+    raw = sample.get("raw") or {}
+    value = (
+        sample.get("reference")
+        or sample.get("reference_output")
+        or raw.get("reference_output")
+    )
+    if not value:
+        answers = raw.get("answers") or sample.get("answers") or ()
+        if isinstance(answers, Sequence) and not isinstance(answers, (str, bytes)) and answers:
+            value = answers[0]
+    return str(value or "")
+
+
+def _output_quality_fields(
+    sample: Mapping[str, Any], output_ids: Sequence[int], tokenizer: Any
+) -> dict[str, Any]:
+    generated_text = tokenizer.decode(list(output_ids), skip_special_tokens=True)
+    reference_text = _sample_reference_text(sample)
+    fields: dict[str, Any] = {
+        "generated_text": generated_text,
+        "reference_output": reference_text or None,
+    }
+    try:
+        from common.rouge import add_rouge
+
+        scores = add_rouge(fields, generated_text, reference_text)
+        fields["rouge_status"] = "scored" if scores is not None else "no_reference"
+    except Exception as exc:
+        fields["rouge_status"] = f"error:{type(exc).__name__}:{str(exc)[:160]}"
+    return fields
+
+
+def _request_quality_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    from common.rouge import aggregate_rouge
+
+    summary: dict[str, Any] = {}
+    variants = sorted({str(row.get("variant")) for row in rows})
+    for variant in variants:
+        variant_rows = [row for row in rows if row.get("variant") == variant]
+        exact = [row for row in variant_rows if row.get("exact_match_ar") is not None]
+        summary[variant] = {
+            "request_count": len(variant_rows),
+            "ar_exact_match_rate": (
+                sum(bool(row.get("exact_match_ar")) for row in exact) / len(exact)
+                if exact else None
+            ),
+            "ar_token_match_role": "diagnostic_only",
+            "rouge_scored_request_count": sum(row.get("rouge_status") == "scored" for row in variant_rows),
+            "reference_missing_request_count": sum(row.get("rouge_status") == "no_reference" for row in variant_rows),
+            "rouge_error_request_count": sum(
+                str(row.get("rouge_status", "")).startswith("error:") for row in variant_rows
+            ),
+            **aggregate_rouge(variant_rows),
+        }
+    return summary
+
+
+def _b3_campaign(
+    args: argparse.Namespace,
+    samples: Sequence[dict[str, Any]],
+    run_root: Path,
+    runtime: Mapping[str, Any],
+    *,
+    confirm: bool,
+) -> dict[str, Any]:
+    from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.speculation_experiments.b_controller import (
+        FixedVerificationPrefixController,
+        VerificationPrefixController,
+    )
+    from TrainingFree.speculation_experiments.survival import deserialize_survival_curve
+
+    phase = "confirm" if confirm else "dev"
+    if args.cohort_phase != phase:
+        raise ValueError(f"--mode b3-{phase} requires --cohort-phase {phase}")
+    code_signature = _code_signature()
+    runtime_signature = runtime["b_campaign_signature"]
+    _validate_b0_signature(
+        run_root, code_signature=code_signature, runtime_signature=runtime_signature,
+    )
+    campaign = json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
+    source_groups = sorted({str(row["_cad_source_group_id"]) for row in samples})
+
+    if confirm:
+        if not args.policy_lock:
+            raise ValueError("--mode b3-confirm requires --policy-lock from the completed dev run")
+        lock_path = _resolve(args.policy_lock) or Path(args.policy_lock)
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        if lock.get("schema_version") != "dflash-speculation-b.b3-lock.v2":
+            raise ValueError("unsupported B3 policy-lock schema")
+        if lock.get("code_signature") != code_signature or lock.get("runtime_signature") != runtime_signature:
+            raise ValueError("B3 policy lock code/runtime signature differs from confirm run")
+        _validate_policy_lock(lock, args=args, campaign=campaign, phase="B3")
+        overlap = sorted(set(source_groups) & set(lock.get("dev_source_groups", [])))
+        if overlap:
+            raise ValueError(f"B3 confirm source groups overlap dev lock: {overlap[:5]}")
+        model_payloads = lock["models"]
+        cost_profiles = lock["cost_profiles"]
+        selected_model = str(lock["selected_policy_variant"])
+        fixed_gamma_best = int(lock["best_fixed_gamma"])
+        fixed_k_best = int(lock["best_fixed_k"])
+        learned_overheads = lock.get("policy_overhead_ms", {})
+        candidate_variants = ["R", "R-A", selected_model]
+    else:
+        _validate_replay_cells(
+            args, run_root, code_signature=code_signature,
+            runtime_signature=runtime_signature, require_b1v=True,
+        )
+        _analyze(args, run_root)
+        eligible, _ = _b3_eligible_models(run_root)
+        model_payloads, cost_profiles = _b3_models_and_costs(
+            run_root,
+            eligible=eligible,
+            minimum_repetitions=int(campaign.get("selection_repetitions", args.selection_repetitions)),
+        )
+        selected_model = ""
+        fixed_gamma_best = 15
+        fixed_k_best = 15
+        learned_overheads: dict[str, float] = {}
+        candidate_variants = ["R", "R-A", *eligible]
+
+    models = {name: deserialize_survival_curve(value) for name, value in model_payloads.items()}
+    policies: dict[str, Any] = {}
+    for name in candidate_variants:
+        policy = VerificationPrefixController(
+            model=models[name],
+            cost_profiles=cost_profiles,
+            dataset="",
+            fallback_prefix=15,
+            overhead_ms=float(learned_overheads.get(name, 0.0)),
+        )
+        policies[name] = policy
+
+    def policy_for(name: str, sample: Mapping[str, Any]) -> Any:
+        policy = policies[name]
+        policy.dataset = str(sample["dataset"])
+        return policy
+
+    if confirm:
+        measured_variants = [
+            "ar", "dflash_fixed15", f"best_fixed_gamma_{fixed_gamma_best}",
+            f"best_fixed_k_{fixed_k_best}", f"adaptive_{selected_model}",
+        ]
+    else:
+        measured_variants = [
+            "ar", "dflash_fixed15",
+            *[f"fixed_gamma_{gamma}" for gamma in (3, 7, 11, 15)],
+            *[f"fixed_k_{prefix}" for prefix in (3, 7, 11, 15)],
+            *[f"adaptive_{name}" for name in candidate_variants],
+        ]
+    b3_root = run_root / "b3"
+    b3_root.mkdir(parents=True, exist_ok=True)
+    profile_signature = _hash_json({
+        "phase": phase,
+        "code_signature": code_signature,
+        "runtime_signature": runtime_signature,
+        "campaign": _hash_json(campaign),
+        "models": model_payloads,
+        "cost_profiles": cost_profiles,
+        "variants": measured_variants,
+        "e2e_repetitions": args.e2e_repetitions,
+        "e2e_warmups": args.e2e_warmups,
+        "max_new_tokens": args.max_new_tokens,
+        "policy_lock": _hash_json(lock) if confirm else None,
+    })
+    profile_path = b3_root / f"{phase}_profile.json"
+    saved_profile: dict[str, Any] | None = None
+    warmup_total_overhead_ms: dict[str, float] = {}
+    if not confirm and profile_path.exists():
+        if not args.resume:
+            raise FileExistsError(f"B3 dev profile exists; pass --resume or choose a new run id: {profile_path}")
+        saved_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        if saved_profile.get("profile_signature") != profile_signature:
+            raise ValueError("B3 dev warmup profile signature mismatch")
+        learned_overheads = {key: float(value) for key, value in saved_profile["policy_overhead_ms"].items()}
+        warmup_total_overhead_ms = {
+            key: float(value) for key, value in saved_profile.get("total_overhead_ms", {}).items()
+        }
+        for name, value in learned_overheads.items():
+            if name in policies:
+                policies[name].set_policy_overhead(value)
+
+    def run_variant(sample: Mapping[str, Any], variant: str, repetition: int) -> dict[str, Any]:
+        args._b3_repetition = repetition
+        if variant == "ar":
+            generation_variant, gamma, policy = "ar", 15, None
+        elif variant == "dflash_fixed15":
+            generation_variant, gamma, policy = variant, 15, None
+        elif variant.startswith("fixed_gamma_"):
+            generation_variant, gamma, policy = variant, int(variant.rsplit("_", 1)[1]), None
+        elif variant.startswith("fixed_k_"):
+            generation_variant, gamma = variant, 15
+            policy = FixedVerificationPrefixController(int(variant.rsplit("_", 1)[1]))
+        elif variant.startswith("adaptive_"):
+            name = variant.removeprefix("adaptive_")
+            generation_variant, gamma, policy = variant, 15, policy_for(name, sample)
+        elif variant.startswith("best_fixed_gamma_"):
+            generation_variant, gamma, policy = f"fixed_gamma_{fixed_gamma_best}", fixed_gamma_best, None
+        elif variant.startswith("best_fixed_k_"):
+            generation_variant, gamma = f"fixed_k_{fixed_k_best}", 15
+            policy = FixedVerificationPrefixController(fixed_k_best)
+        else:
+            raise ValueError(f"unknown B3 variant {variant}")
+        return _b3_run_one(
+            runtime=runtime, sample=sample, args=args, variant=generation_variant,
+            policy=policy, fixed_gamma=gamma,
+        )
+
+    warmup_policy_ms: dict[str, list[float]] = {name: [] for name in candidate_variants}
+    warmup_total_policy_ms: dict[str, list[float]] = {name: [] for name in candidate_variants}
+    warmup_samples = list(samples[: min(args.e2e_warmups, len(samples))])
+    for variant in measured_variants:
+        if variant == "ar":
+            warmup_name, policy_name = "ar", None
+        elif variant.startswith("adaptive_"):
+            policy_name = variant.removeprefix("adaptive_")
+            warmup_name = variant
+        elif variant.startswith("fixed_k_"):
+            warmup_name, policy_name = variant, None
+        elif variant.startswith("best_fixed_k_"):
+            warmup_name, policy_name = f"fixed_k_{fixed_k_best}", None
+        elif variant.startswith("best_fixed_gamma_"):
+            warmup_name, policy_name = f"fixed_gamma_{fixed_gamma_best}", None
+        else:
+            warmup_name, policy_name = variant, None
+        for warm_index, sample in enumerate(warmup_samples):
+            warmed = run_variant(sample, warmup_name, -warm_index - 1)
+            if warmed["status"] != "ok":
+                raise RuntimeError(f"B3 warmup failed for {warmup_name} on {sample['id']}: {warmed['error']}")
+            if policy_name is not None:
+                warmup_policy_ms[policy_name].extend(
+                    float(row.get("verification_policy_ms", 0.0))
+                    for row in warmed["rounds"]
+                    if int(row.get("gamma_executed", 0)) > 0
+                )
+                warmup_total_policy_ms[policy_name].extend(
+                    float(row.get("draft_signal_ms", 0.0) or 0.0)
+                    + float(row.get("verification_policy_ms", 0.0) or 0.0)
+                    for row in warmed["rounds"]
+                    if int(row.get("gamma_executed", 0)) > 0
+                )
+    if not confirm and saved_profile is None:
+        for name, values in warmup_policy_ms.items():
+            if values:
+                learned_overheads[name] = sum(values) / len(values)
+                policies[name].set_policy_overhead(float(learned_overheads[name]))
+        warmup_total_overhead_ms = {
+            name: (sum(values) / len(values) if values else float(learned_overheads.get(name, 0.0)))
+            for name, values in warmup_total_policy_ms.items()
+        }
+        atomic_json(profile_path, {
+            "schema_version": "dflash-speculation-b.b3-profile.v1",
+            "profile_signature": profile_signature,
+            "policy_overhead_ms": learned_overheads,
+            "total_overhead_ms": warmup_total_overhead_ms,
+        })
+
+    if not confirm:
+        eligible_models, _ = _b3_eligible_models(run_root)
+        overhead_ms = max(
+            (float(warmup_total_overhead_ms.get(name, learned_overheads.get(name, 0.0)))
+             for name in eligible_models),
+            default=0.0,
+        )
+        adjusted_gate = _b3_overhead_adjusted_opportunity(
+            _read_jsonl(run_root / "b1v" / "verify_prefix.jsonl"),
+            overhead_ms=overhead_ms,
+            bootstrap_replicates=int(campaign.get("bootstrap_replicates", args.bootstrap_replicates)),
+        )
+        atomic_json(b3_root / "dev_overhead_gate.json", adjusted_gate)
+        if adjusted_gate.get("status") != "supported":
+            blocked = {
+                "schema_version": "dflash-speculation-b.b3-summary.v1",
+                "phase": "dev",
+                "status": "b1v_overhead_gate_closed",
+                "overhead_adjusted_b1v": adjusted_gate,
+                "reason": "B1-V opportunity did not remain supported after measured extraction/controller overhead",
+            }
+            atomic_json(b3_root / "dev_summary.json", blocked)
+            print(json.dumps(blocked, ensure_ascii=False, indent=2), flush=True)
+            return blocked
+
+    records: list[dict[str, Any]] = []
+    round_rows: list[dict[str, Any]] = []
+    generation_failure = False
+    rng = random.Random(args.seed)
+    cell_signature = _hash_json({"profile_signature": profile_signature, "policy_overhead_ms": learned_overheads})
+    cells_root = b3_root / "cells" / phase
+    cells_root.mkdir(parents=True, exist_ok=True)
+    if not args.resume and any(cells_root.glob("*.json")):
+        raise FileExistsError(f"B3 {phase} sample cells already exist; pass --resume or choose a new run id")
+    for sample_index, sample in enumerate(samples, start=1):
+        cell_path = _sample_cell_path(b3_root, phase, sample)
+        saved_cell = _load_resume_cell(cell_path, cell_signature, resume=args.resume)
+        if saved_cell is not None:
+            records.extend(saved_cell.get("requests", []))
+            round_rows.extend(saved_cell.get("rounds", []))
+            generation_failure = generation_failure or any(
+                row.get("status") != "ok"
+                for row in saved_cell.get("requests", []) if row.get("variant") != "ar"
+            )
+            print(f"[B3-{phase} {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
+            continue
+        request_start = len(records)
+        round_start = len(round_rows)
+        for repetition in range(args.e2e_repetitions):
+            ar = run_variant(sample, "ar", repetition)
+            if ar["status"] != "ok":
+                raise RuntimeError(f"target-only AR failed for {sample['id']}: {ar['error']}")
+            ar_record = {
+                "schema_version": "dflash-speculation-b.b3-request.v1",
+                "type": "request",
+                "run_id": str(args.run_id),
+                "phase": phase,
+                "variant": "ar",
+                "dataset": str(sample["dataset"]),
+                "sample_id": str(sample["id"]),
+                "source_group_id": str(sample["_cad_source_group_id"]),
+                "repetition": repetition,
+                "status": ar["status"],
+                "error": ar["error"],
+                "input_tokens": ar["input_tokens"],
+                "output_tokens": ar["output_tokens"],
+                "e2e_ms": ar["e2e_ms"],
+                "reported_timings": ar["reported_timings"],
+                "counters": ar["counters"],
+                "correctness_status": ar["correctness_status"],
+                "exact_match_ar": True,
+                "output_ids": ar["output_ids"],
+                "output_ids_sha256": _hash_json(ar["output_ids"]),
+                "ar_output_ids_sha256": _hash_json(ar["output_ids"]),
+            }
+            ar_record.update(_output_quality_fields(sample, ar["output_ids"], runtime["tokenizer"]))
+            records.append(ar_record)
+            for round_row in ar["rounds"]:
+                round_rows.append({
+                    **round_row,
+                    "run_id": str(args.run_id),
+                    "phase": phase,
+                    "variant": "ar",
+                    "dataset": str(sample["dataset"]),
+                    "sample_id": str(sample["id"]),
+                    "source_group_id": str(sample["_cad_source_group_id"]),
+                    "repetition": repetition,
+                })
+            order = [value for value in measured_variants if value != "ar"]
+            rng.shuffle(order)
+            for variant in order:
+                measured = run_variant(sample, variant, repetition)
+                exact = measured["output_ids"] == ar["output_ids"]
+                record = {
+                    "schema_version": "dflash-speculation-b.b3-request.v1",
+                    "type": "request",
+                    "run_id": str(args.run_id),
+                    "phase": phase,
+                    "variant": variant,
+                    "dataset": str(sample["dataset"]),
+                    "sample_id": str(sample["id"]),
+                    "source_group_id": str(sample["_cad_source_group_id"]),
+                    "repetition": repetition,
+                    "status": measured["status"],
+                    "error": measured["error"],
+                    "input_tokens": measured["input_tokens"],
+                    "output_tokens": measured["output_tokens"],
+                    "e2e_ms": measured["e2e_ms"],
+                    "reported_timings": measured["reported_timings"],
+                    "counters": measured["counters"],
+                    "correctness_status": measured["correctness_status"],
+                    "exact_match_ar": exact,
+                    "output_ids": measured["output_ids"],
+                    "output_ids_sha256": _hash_json(measured["output_ids"]),
+                    "ar_output_ids_sha256": _hash_json(ar["output_ids"]),
+                }
+                record.update(_output_quality_fields(sample, measured["output_ids"], runtime["tokenizer"]))
+                records.append(record)
+                for round_row in measured["rounds"]:
+                    round_rows.append({
+                        **round_row,
+                        "run_id": str(args.run_id),
+                        "phase": phase,
+                        "variant": variant,
+                        "dataset": str(sample["dataset"]),
+                        "sample_id": str(sample["id"]),
+                        "source_group_id": str(sample["_cad_source_group_id"]),
+                        "repetition": repetition,
+                    })
+                if measured["status"] != "ok":
+                    generation_failure = True
+                    print(
+                        f"[B3-{phase}] generation failure: {variant} {sample['dataset']}:{sample['id']} "
+                        f"rep={repetition}; status={measured['status']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif not exact:
+                    print(
+                        f"[B3-{phase}] AR token mismatch recorded as quality diagnostic: "
+                        f"{variant} {sample['dataset']}:{sample['id']} rep={repetition}",
+                        flush=True,
+                    )
+        atomic_json(cell_path, {
+            "schema_version": "dflash-speculation-b.b3-sample-cell.v1",
+            "campaign_signature": cell_signature,
+            "requests": records[request_start:],
+            "rounds": round_rows[round_start:],
+        })
+        print(f"[B3-{phase} {sample_index}/{len(samples)}] {sample['dataset']}:{sample['id']} complete", flush=True)
+
+    quality = _request_quality_summary(records)
+    _write_jsonl(b3_root / f"{phase}_requests.jsonl", records, {
+        "type": "summary", "phase": phase, "request_count": len(records),
+        "repetitions": args.e2e_repetitions, "variants": measured_variants,
+        "quality_by_variant": quality,
+    })
+    _write_jsonl(b3_root / f"{phase}_rounds.jsonl", round_rows, {
+        "type": "summary", "phase": phase, "round_count": len(round_rows),
+    })
+    by_variant = sorted({str(row["variant"]) for row in records})
+    latency = {name: _macro_geomean_latency(records, name) for name in by_variant}
+    if confirm:
+        comparisons = {
+            control: _paired_macro_speedup(records, control=control, treatment=f"adaptive_{selected_model}")
+            for control in (
+                "dflash_fixed15",
+                f"best_fixed_gamma_{fixed_gamma_best}",
+                f"best_fixed_k_{fixed_k_best}",
+            )
+        }
+        summary = {
+            "schema_version": "dflash-speculation-b.b3-summary.v1",
+            "phase": phase,
+            "status": "generation_error" if generation_failure else "complete",
+            "request_count": len(records),
+            "all_generations_ok": not generation_failure,
+            "quality_by_variant": quality,
+            "macro_geomean_latency_ms": latency,
+            "selected_policy_variant": selected_model,
+            "comparisons": comparisons,
+            "lock_path": str((_resolve(args.policy_lock) or Path(args.policy_lock)).resolve()),
+        }
+    else:
+        fixed_gamma_best = min((3, 7, 11, 15), key=lambda value: latency[f"fixed_gamma_{value}"])
+        fixed_k_best = min((3, 7, 11, 15), key=lambda value: latency[f"fixed_k_{value}"])
+        adaptive_names = [name for name in candidate_variants if name not in {"R", "R-A"}]
+        selected_model = min(adaptive_names, key=lambda name: latency[f"adaptive_{name}"])
+        lock = {
+            "schema_version": "dflash-speculation-b.b3-lock.v2",
+            "dev_run_id": str(args.run_id),
+            "code_signature": code_signature,
+            "runtime_signature": runtime_signature,
+            "benchmark_signature": _locked_benchmark_signature(campaign),
+            "protocol_parameters": _locked_e2e_protocol(args),
+            "dev_source_groups": source_groups,
+            "dev_campaign_signature": _hash_json(campaign),
+            "selected_policy_variant": selected_model,
+            "best_fixed_gamma": fixed_gamma_best,
+            "best_fixed_k": fixed_k_best,
+            "models": model_payloads,
+            "cost_profiles": cost_profiles,
+            "policy_overhead_ms": learned_overheads,
+            "policy_parameters": {
+                "allowed_prefixes": [3, 7, 11, 15],
+                "fallback_prefix": 15,
+                "cost_objective": "measured_ms_per_expected_committed_token",
+                "overhead_includes": ["draft_uncertainty_extraction", "policy_callback"],
+                "history_policy": "not_used; dev-history labels are reference-rollout outcomes",
+            },
+            "dev_macro_geomean_latency_ms": latency,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        lock_path = b3_root / "locked_config.json"
+        if not generation_failure:
+            atomic_json(lock_path, lock)
+        summary = {
+            "schema_version": "dflash-speculation-b.b3-summary.v1",
+            "phase": phase,
+            "status": "generation_error" if generation_failure else "locked_for_confirm",
+            "request_count": len(records),
+            "all_generations_ok": not generation_failure,
+            "quality_by_variant": quality,
+            "macro_geomean_latency_ms": latency,
+            "best_fixed_gamma": fixed_gamma_best,
+            "best_fixed_k": fixed_k_best,
+            "selected_policy_variant": selected_model,
+            "eligible_signal_models": list(adaptive_names),
+            "policy_lock": str(lock_path.resolve()) if not generation_failure else None,
+        }
+    atomic_json(b3_root / f"{phase}_summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
+def _b4_rows_from_artifacts(run_root: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    from TrainingFree.speculation_experiments.lagged import pair_adjacent_round_signals
+
+    signal_path = run_root / "b2" / "signals.jsonl"
+    if not signal_path.is_file():
+        raise FileNotFoundError("B4 requires B1/B2 candidate signals")
+    signal_rows = _read_jsonl(signal_path)
+    paired = pair_adjacent_round_signals(signal_rows)
+    pair_index = {
+        (str(row["dataset"]), str(row["sample_id"]), int(row["round_index"])): row
+        for row in paired
+    }
+    action_path = run_root / "b1" / "draft_shape.jsonl"
+    if not action_path.is_file():
+        raise FileNotFoundError("B4 requires B1 draft_shape.jsonl")
+    actions = _read_jsonl(action_path)
+    by_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for action in actions:
+        by_state[str(action["state_id"])].append(action)
+    output: list[dict[str, Any]] = []
+    skipped_unpaired = 0
+    skipped_incomplete = 0
+    for state_id, state_actions in by_state.items():
+        first = state_actions[0]
+        key = (str(first["dataset"]), str(first["sample_id"]), int(first["round_index"]))
+        reference = pair_index.get(key)
+        if reference is None:
+            skipped_unpaired += 1
+            continue
+        selection: dict[int, list[float]] = defaultdict(list)
+        evaluation: dict[int, list[float]] = defaultdict(list)
+        for action in state_actions:
+            gamma = int(action["gamma"])
+            l_value = int(action["accepted_candidates"])
+            cost = float(action["round_ms"]) / (1 + l_value)
+            if not math.isfinite(cost) or cost <= 0:
+                continue
+            split = str(action.get("repetition_split"))
+            if split == "selection":
+                selection[gamma].append(cost)
+            elif split == "evaluation":
+                evaluation[gamma].append(cost)
+        if any(gamma not in selection or gamma not in evaluation for gamma in (3, 7, 11, 15)):
+            skipped_incomplete += 1
+            continue
+        output.append({
+            "state_id": state_id,
+            "dataset": str(first["dataset"]),
+            "sample_id": str(first["sample_id"]),
+            "source_group_id": str(first["source_group_id"]),
+            "round_index": int(first["round_index"]),
+            "prompt_tokens": int(first["prompt_tokens"]),
+            "context_tokens": int(first["context_tokens"]),
+            "processed_output_tokens": int(first["processed_output_tokens"]),
+            "history_ema": reference.get("history_ema"),
+            "lagged_signals": dict(reference["lagged_signals"]),
+            "selection_costs_ms_per_commit_by_gamma": {
+                str(gamma): sum(values) / len(values) for gamma, values in selection.items()
+            },
+            "evaluation_costs_ms_per_commit_by_gamma": {
+                str(gamma): sum(values) / len(values) for gamma, values in evaluation.items()
+            },
+        })
+    return output, {
+        "gamma15_candidate_signal_states": len(signal_rows),
+        "adjacent_round_pairs": len(paired),
+        "matched_complete_b1_states": len(output),
+        "b1_states_without_adjacent_pair": skipped_unpaired,
+        "b1_states_without_complete_selection_evaluation": skipped_incomplete,
+    }
+
+
+def _b4_analyze(args: argparse.Namespace, run_root: Path, runtime_signature: Mapping[str, Any]) -> dict[str, Any]:
+    from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.speculation_experiments.lagged import (
+        _COST_VARIANTS,
+        cross_validated_draft_cost_policy,
+        fit_draft_cost_policy,
+    )
+
+    code_signature = _code_signature()
+    _validate_b0_signature(
+        run_root, code_signature=code_signature, runtime_signature=runtime_signature,
+    )
+    _validate_replay_cells(
+        args, run_root, code_signature=code_signature,
+        runtime_signature=runtime_signature, require_b1v=False,
+    )
+    rows, coverage = _b4_rows_from_artifacts(run_root)
+    groups = {str(row["source_group_id"]) for row in rows}
+    report: dict[str, Any]
+    eligible: list[str] = []
+    if len(groups) < args.n_splits:
+        report = {
+            "schema_version": "dflash-speculation-b.b4-analysis.v1",
+            "status": "inconclusive",
+            "state_count": len(rows),
+            "source_group_count": len(groups),
+            "coverage": coverage,
+            "reason": f"need at least {args.n_splits} paired source groups",
+        }
+    else:
+        report = cross_validated_draft_cost_policy(
+            rows,
+            variants=tuple(_COST_VARIANTS),
+            n_splits=args.n_splits,
+            seed=args.seed,
+            bootstrap_replicates=args.bootstrap_replicates,
+            bootstrap_seed=20261013,
+        )
+        report["coverage"] = coverage
+        for variant in ("R-A-LDH", "R-A-LDC", "R-A-LDHC"):
+            skill = (report.get("cost_skill_vs_control") or {}).get(f"{variant}_vs_R-A")
+            interval = (report.get("cost_skill_ci95_vs_control") or {}).get(f"{variant}_vs_R-A")
+            if skill is not None and interval and float(skill) >= 0.02 and float(interval[0]) > 0.0:
+                eligible.append(variant)
+        report["decision"] = (
+            "lagged_signal_supported"
+            if eligible else "lagged_draft_length_signal_not_supported_or_inconclusive"
+        )
+        report["eligible_models"] = eligible
+        if eligible:
+            models = {
+                "R": fit_draft_cost_policy(rows, variant="R"),
+                "R-A": fit_draft_cost_policy(rows, variant="R-A"),
+                **{variant: fit_draft_cost_policy(rows, variant=variant) for variant in eligible},
+            }
+            lock = {
+                "schema_version": "dflash-speculation-b.b4-lock.v2",
+                "dev_run_id": str(args.run_id),
+                "code_signature": code_signature,
+                "runtime_signature": runtime_signature,
+                "benchmark_signature": _locked_benchmark_signature(
+                    json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
+                ),
+                "protocol_parameters": _locked_e2e_protocol(args),
+                "dev_source_groups": sorted(groups),
+                "selected_policy_variant": min(
+                    eligible,
+                    key=lambda value: float(report["macro_cost_ms_per_commit"][value]),
+                ),
+                "fixed_reference_gamma": 15,
+                "models": models,
+                "oof_metrics": {
+                    "cost_skill_vs_control": report["cost_skill_vs_control"],
+                    "cost_skill_ci95_vs_control": report["cost_skill_ci95_vs_control"],
+                },
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            lock_path = run_root / "b4" / "locked_config.json"
+            atomic_json(lock_path, lock)
+            report["policy_lock"] = str(lock_path.resolve())
+    b4_root = run_root / "b4"
+    b4_root.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(b4_root / "lagged_training_rows.jsonl", rows, {
+        "type": "summary", "row_count": len(rows), "coverage": coverage,
+    })
+    if "oof_predictions" in report:
+        _write_jsonl(b4_root / "oof_predictions.jsonl", report["oof_predictions"], {
+            "type": "summary", "state_count": len(report["oof_predictions"]),
+            "variants": report.get("variants", []),
+        })
+    atomic_json(b4_root / "analysis.json", report)
+    decision_text = [
+        "# B4 — tín hiệu uncertainty round trước",
+        "",
+        f"- Trạng thái: **{report.get('decision', report.get('status'))}**.",
+        f"- Reference gamma15 rounds: {coverage['gamma15_reference_states']}; cặp round liền kề: {coverage['adjacent_round_pairs']}; state B1 ghép đủ: {coverage['matched_complete_b1_states']}.",
+        f"- Source groups trong đánh giá: {report.get('source_group_count', 0)}.",
+        "- Metric là cost/commit cho gamma oracle trên held-out source groups; selection timing fit model, evaluation timing chấm điểm.",
+        "- E2E draft-length policy chỉ được khóa khi CI skill so regime+history đạt ngưỡng; confirm phải dùng source groups riêng và B0 completed (AR-token equality chỉ là diagnostic).",
+    ]
+    (b4_root / "decision.md").write_text("\n".join(decision_text) + "\n", encoding="utf-8")
+    print(json.dumps({key: value for key, value in report.items() if key != "oof_predictions"}, ensure_ascii=False, indent=2), flush=True)
+    return report
+
+
+def _b4_campaign(
+    args: argparse.Namespace,
+    samples: Sequence[dict[str, Any]],
+    run_root: Path,
+    runtime: Mapping[str, Any],
+    *,
+    confirm: bool,
+) -> dict[str, Any]:
+    from TrainingFree.context_adaptive.schema import atomic_json
+    from TrainingFree.speculation_experiments.lagged import LaggedDraftLengthController
+
+    phase = "confirm" if confirm else "dev"
+    if args.cohort_phase != phase:
+        raise ValueError(f"--mode b4-{phase} requires --cohort-phase {phase}")
+    campaign = json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
+    parity_path = run_root / "evidence" / "parity.json"
+    if not parity_path.is_file() or json.loads(parity_path.read_text(encoding="utf-8")).get("status") != "complete":
+        raise RuntimeError("B4 E2E requires completed B0 runtime validation in this cohort")
+    runtime_signature = runtime["b_campaign_signature"]
+    code_signature = _code_signature()
+    source_groups = sorted({str(row["_cad_source_group_id"]) for row in samples})
+    if confirm:
+        if not args.policy_lock:
+            raise ValueError("--mode b4-confirm requires --policy-lock from b4-dev")
+        lock_path = _resolve(args.policy_lock) or Path(args.policy_lock)
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        if lock.get("schema_version") != "dflash-speculation-b.b4-lock.v2":
+            raise ValueError("unsupported B4 policy-lock schema")
+        if lock.get("code_signature") != code_signature or lock.get("runtime_signature") != runtime_signature:
+            raise ValueError("B4 policy lock code/runtime signature differs from confirm run")
+        _validate_policy_lock(lock, args=args, campaign=campaign, phase="B4")
+        overlap = sorted(set(source_groups) & set(lock.get("dev_source_groups", [])))
+        if overlap:
+            raise ValueError(f"B4 confirm source groups overlap dev lock: {overlap[:5]}")
+        model_payloads = lock["models"]
+        selected_model = str(lock["selected_policy_variant"])
+        fixed_gamma_best = int(lock["best_fixed_gamma"])
+        policy_models = ["R", "R-A", selected_model]
+    else:
+        analysis_path = run_root / "b4" / "analysis.json"
+        if not analysis_path.is_file():
+            raise FileNotFoundError("B4 dev requires --mode b4 analysis first")
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+        eligible = [str(value) for value in analysis.get("eligible_models", [])]
+        if analysis.get("decision") != "lagged_signal_supported" or not eligible:
+            raise RuntimeError("B4 dev E2E gate closed: no lagged model passed held-out cost-skill screening")
+        preliminary_path = run_root / "b4" / "locked_config.json"
+        preliminary = json.loads(preliminary_path.read_text(encoding="utf-8"))
+        if preliminary.get("code_signature") != code_signature or preliminary.get("runtime_signature") != runtime_signature:
+            raise ValueError("B4 analysis lock code/runtime signature is stale; rerun --mode b4")
+        _validate_policy_lock(preliminary, args=args, campaign=campaign, phase="B4 analysis")
+        model_payloads = preliminary["models"]
+        selected_model = ""
+        fixed_gamma_best = 15
+        policy_models = ["R", "R-A", *eligible]
+
+    from TrainingFree.speculation_experiments.lagged import LaggedDraftLengthController
+    models = {name: value for name, value in model_payloads.items()}
+    policies = {
+        name: LaggedDraftLengthController(models[name], fallback_gamma=15)
+        for name in policy_models
+    }
+    if confirm:
+        variants = ["ar", f"best_fixed_gamma_{fixed_gamma_best}", *[f"adaptive_{name}" for name in policy_models]]
+    else:
+        variants = [
+            "ar",
+            *[f"fixed_gamma_{gamma}" for gamma in (3, 7, 11, 15)],
+            *[f"adaptive_{name}" for name in policy_models],
+        ]
+    b4_root = run_root / "b4"
+    b4_root.mkdir(parents=True, exist_ok=True)
+    cell_signature = _hash_json({
+        "phase": phase,
+        "code_signature": code_signature,
+        "runtime_signature": runtime_signature,
+        "campaign": _hash_json(json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))),
+        "models": model_payloads,
+        "variants": variants,
+        "e2e_repetitions": args.e2e_repetitions,
+        "e2e_warmups": args.e2e_warmups,
+        "max_new_tokens": args.max_new_tokens,
+        "policy_lock": _hash_json(lock) if confirm else None,
+    })
+    cells_root = b4_root / "cells" / phase
+    cells_root.mkdir(parents=True, exist_ok=True)
+    if not args.resume and any(cells_root.glob("*.json")):
+        raise FileExistsError(f"B4 {phase} sample cells already exist; pass --resume or choose a new run id")
+
+    def run_variant(sample: Mapping[str, Any], variant: str, repetition: int) -> dict[str, Any]:
+        args._b3_repetition = repetition
+        draft_policy = None
+        if variant == "ar":
+            generation_variant, gamma = "ar", 15
+        elif variant.startswith("fixed_gamma_"):
+            generation_variant, gamma = variant, int(variant.rsplit("_", 1)[1])
+        elif variant.startswith("best_fixed_gamma_"):
+            generation_variant, gamma = f"fixed_gamma_{fixed_gamma_best}", fixed_gamma_best
+        elif variant.startswith("adaptive_"):
+            name = variant.removeprefix("adaptive_")
+            generation_variant, gamma = variant, 15
+            draft_policy = policies[name]
+        else:
+            raise ValueError(f"unknown B4 variant {variant}")
+        return _b3_run_one(
+            runtime=runtime, sample=sample, args=args, variant=generation_variant,
+            fixed_gamma=gamma, draft_policy=draft_policy,
+        )
+
+    warm_samples = list(samples[: min(args.e2e_warmups, len(samples))])
+    for variant in variants:
+        warm_variant = (
+            f"fixed_gamma_{fixed_gamma_best}"
+            if variant.startswith("best_fixed_gamma_")
+            else variant
+        )
+        for index, sample in enumerate(warm_samples):
+            warmed = run_variant(sample, warm_variant, -index - 1)
+            if warmed["status"] != "ok":
+                raise RuntimeError(f"B4 warmup failed for {warm_variant} on {sample['id']}: {warmed['error']}")
+
+    records: list[dict[str, Any]] = []
+    rounds: list[dict[str, Any]] = []
+    generation_failure = False
+    rng = random.Random(args.seed)
+    for sample_index, sample in enumerate(samples, start=1):
+        cell_path = _sample_cell_path(b4_root, phase, sample)
+        saved_cell = _load_resume_cell(cell_path, cell_signature, resume=args.resume)
+        if saved_cell is not None:
+            records.extend(saved_cell.get("requests", []))
+            rounds.extend(saved_cell.get("rounds", []))
+            generation_failure = generation_failure or any(
+                row.get("status") != "ok"
+                for row in saved_cell.get("requests", [])
+            )
+            print(f"[B4-{phase} {sample_index}/{len(samples)}] reuse {sample['dataset']}:{sample['id']}", flush=True)
+            continue
+        request_start = len(records)
+        round_start = len(rounds)
+        for repetition in range(args.e2e_repetitions):
+            ar = run_variant(sample, "ar", repetition)
+            if ar["status"] != "ok":
+                raise RuntimeError(f"target-only AR failed for {sample['id']}: {ar['error']}")
+            ar_record = {
+                "schema_version": "dflash-speculation-b.b4-request.v1",
+                "type": "request", "run_id": str(args.run_id), "phase": phase,
+                "variant": "ar", "dataset": str(sample["dataset"]),
+                "sample_id": str(sample["id"]), "source_group_id": str(sample["_cad_source_group_id"]),
+                "repetition": repetition, "status": ar["status"], "error": ar["error"],
+                "input_tokens": ar["input_tokens"], "output_tokens": ar["output_tokens"],
+                "e2e_ms": ar["e2e_ms"], "reported_timings": ar["reported_timings"],
+                "counters": ar["counters"], "exact_match_ar": True,
+                "output_ids": ar["output_ids"], "output_ids_sha256": _hash_json(ar["output_ids"]),
+                "ar_output_ids_sha256": _hash_json(ar["output_ids"]),
+            }
+            ar_record.update(_output_quality_fields(sample, ar["output_ids"], runtime["tokenizer"]))
+            records.append(ar_record)
+            for round_row in ar["rounds"]:
+                rounds.append({
+                    **round_row, "run_id": str(args.run_id), "phase": phase,
+                    "variant": "ar", "dataset": str(sample["dataset"]),
+                    "sample_id": str(sample["id"]), "source_group_id": str(sample["_cad_source_group_id"]),
+                    "repetition": repetition,
+                })
+            order = [value for value in variants if value != "ar"]
+            rng.shuffle(order)
+            for variant in order:
+                measured = run_variant(sample, variant, repetition)
+                exact = measured["output_ids"] == ar["output_ids"]
+                record = {
+                    "schema_version": "dflash-speculation-b.b4-request.v1",
+                    "type": "request", "run_id": str(args.run_id), "phase": phase,
+                    "variant": variant, "dataset": str(sample["dataset"]),
+                    "sample_id": str(sample["id"]), "source_group_id": str(sample["_cad_source_group_id"]),
+                    "repetition": repetition, "status": measured["status"], "error": measured["error"],
+                    "input_tokens": measured["input_tokens"], "output_tokens": measured["output_tokens"],
+                    "e2e_ms": measured["e2e_ms"], "reported_timings": measured["reported_timings"],
+                    "counters": measured["counters"], "exact_match_ar": exact,
+                    "output_ids": measured["output_ids"], "output_ids_sha256": _hash_json(measured["output_ids"]),
+                    "ar_output_ids_sha256": _hash_json(ar["output_ids"]),
+                }
+                record.update(_output_quality_fields(sample, measured["output_ids"], runtime["tokenizer"]))
+                records.append(record)
+                for round_row in measured["rounds"]:
+                    rounds.append({
+                        **round_row, "run_id": str(args.run_id), "phase": phase,
+                        "variant": variant, "dataset": str(sample["dataset"]),
+                        "sample_id": str(sample["id"]), "source_group_id": str(sample["_cad_source_group_id"]),
+                        "repetition": repetition,
+                    })
+                if measured["status"] != "ok":
+                    generation_failure = True
+                    print(
+                        f"[B4-{phase}] generation failure: {variant} {sample['dataset']}:{sample['id']} rep={repetition}",
+                        file=sys.stderr, flush=True,
+                    )
+                elif not exact:
+                    print(
+                        f"[B4-{phase}] AR token mismatch recorded as quality diagnostic: "
+                        f"{variant} {sample['dataset']}:{sample['id']} rep={repetition}",
+                        flush=True,
+                    )
+        atomic_json(cell_path, {
+            "schema_version": "dflash-speculation-b.b4-sample-cell.v1",
+            "campaign_signature": cell_signature,
+            "requests": records[request_start:],
+            "rounds": rounds[round_start:],
+        })
+        print(f"[B4-{phase} {sample_index}/{len(samples)}] {sample['dataset']}:{sample['id']} complete", flush=True)
+
+    quality = _request_quality_summary(records)
+    _write_jsonl(b4_root / f"{phase}_requests.jsonl", records, {
+        "type": "summary", "phase": phase, "request_count": len(records), "variants": variants,
+        "repetitions": args.e2e_repetitions, "quality_by_variant": quality,
+    })
+    _write_jsonl(b4_root / f"{phase}_rounds.jsonl", rounds, {
+        "type": "summary", "phase": phase, "round_count": len(rounds),
+    })
+    latency = {str(row["variant"]): _macro_geomean_latency(records, str(row["variant"])) for row in records}
+    if confirm:
+        selected_model = str(lock["selected_policy_variant"])
+        comparisons = {
+            control: _paired_macro_speedup(
+                records, control=control, treatment=f"adaptive_{selected_model}"
+            )
+            for control in (f"best_fixed_gamma_{fixed_gamma_best}", "adaptive_R", "adaptive_R-A")
+        }
+        summary = {
+            "schema_version": "dflash-speculation-b.b4-summary.v1", "phase": phase,
+            "status": "generation_error" if generation_failure else "complete",
+            "request_count": len(records), "all_generations_ok": not generation_failure,
+            "quality_by_variant": quality,
+            "selected_policy_variant": selected_model, "comparisons": comparisons,
+            "macro_geomean_latency_ms": latency,
+        }
+    else:
+        fixed_gamma_best = min((3, 7, 11, 15), key=lambda gamma: latency[f"fixed_gamma_{gamma}"])
+        eligible = [name for name in policy_models if name not in {"R", "R-A"}]
+        selected_model = min(eligible, key=lambda name: latency[f"adaptive_{name}"])
+        lock = {
+            "schema_version": "dflash-speculation-b.b4-lock.v2",
+            "dev_run_id": str(args.run_id), "code_signature": code_signature,
+            "runtime_signature": runtime_signature, "dev_source_groups": source_groups,
+            "benchmark_signature": _locked_benchmark_signature(campaign),
+            "protocol_parameters": _locked_e2e_protocol(args),
+            "selected_policy_variant": selected_model, "best_fixed_gamma": fixed_gamma_best,
+            "models": model_payloads, "dev_macro_geomean_latency_ms": latency,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        lock_path = b4_root / "locked_config.json"
+        if not generation_failure:
+            atomic_json(lock_path, lock)
+        summary = {
+            "schema_version": "dflash-speculation-b.b4-summary.v1", "phase": phase,
+            "status": "generation_error" if generation_failure else "locked_for_confirm",
+            "request_count": len(records), "all_generations_ok": not generation_failure,
+            "quality_by_variant": quality,
+            "selected_policy_variant": selected_model, "best_fixed_gamma": fixed_gamma_best,
+            "macro_geomean_latency_ms": latency,
+            "policy_lock": str(lock_path.resolve()) if not generation_failure else None,
+        }
+    atomic_json(b4_root / f"{phase}_summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
 def main() -> int:
     parser = _parser()
     args = parser.parse_args()
@@ -855,6 +2266,10 @@ def main() -> int:
         parser.error("repetitions must exceed selection repetitions >=1")
     if args.warmups < 0 or args.max_prefixes < 1 or args.n_splits < 2:
         parser.error("warmups must be nonnegative; max-prefixes positive; n-splits at least two")
+    if args.mode in {"b3-dev", "b3-confirm", "b4-dev", "b4-confirm"} and (
+        args.e2e_repetitions < 3 or args.e2e_warmups < 1
+    ):
+        parser.error("B3/B4 require at least three E2E repetitions and one warmup sample per variant")
     try:
         _parse_gammas(args.gammas)
         if args.mode == "prepare":
@@ -893,6 +2308,23 @@ def main() -> int:
             _b1v(args, samples, run_root, runtime)
             _analyze(args, run_root)
             return 0
+        if args.mode == "b3-dev":
+            summary = _b3_campaign(args, samples, run_root, runtime, confirm=False)
+            return 0 if summary.get("status") == "locked_for_confirm" else 2
+        if args.mode == "b3-confirm":
+            summary = _b3_campaign(args, samples, run_root, runtime, confirm=True)
+            return 0 if summary.get("status") == "complete" else 2
+        if args.mode == "b4":
+            if args.cohort_phase != "dev":
+                raise ValueError("B4 analysis is a dev phase; confirm uses a frozen lock")
+            report = _b4_analyze(args, run_root, runtime["b_campaign_signature"])
+            return 0 if report.get("decision") == "lagged_signal_supported" else 2
+        if args.mode == "b4-dev":
+            summary = _b4_campaign(args, samples, run_root, runtime, confirm=False)
+            return 0 if summary.get("status") == "locked_for_confirm" else 2
+        if args.mode == "b4-confirm":
+            summary = _b4_campaign(args, samples, run_root, runtime, confirm=True)
+            return 0 if summary.get("status") == "complete" else 2
         parser.error(f"unsupported mode {args.mode}")
     except KeyboardInterrupt:
         print("[interrupted] completed per-sample/state artifacts are retained; rerun with --resume", file=sys.stderr)

@@ -28,13 +28,6 @@ The most common parallelism strategy for inference is **Tensor Parallelism (TP)*
 
 DPA addresses these limitations by applying **data parallelism specifically to the attention component**.
 
-<table>
-<tr>
-<td width="50%">
-<img src="../_static/image/dpa.png" alt="DPA + EP Architecture" width="100%">
-</td>
-<td width="50%" valign="top">
-
 **Each DP replica:**
 
 - Processes different batches independently (can be in different forward modes: prefill, decode, or idle)
@@ -42,13 +35,8 @@ DPA addresses these limitations by applying **data parallelism specifically to t
 - Enables significantly larger batch sizes due to memory savings
 
 **Communication patterns in DPA + EP:**
--
 -  **All2All (Dispatch)**: Routes tokens to expert sub-groups based on gating decisions
 - **All2All (Combine)**: Gathers computed results from experts back to original token positions
-
-</td>
-</tr>
-</table>
 
 ### Key benefits of DPA
 

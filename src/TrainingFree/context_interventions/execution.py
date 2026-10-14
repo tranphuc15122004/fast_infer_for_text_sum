@@ -89,6 +89,7 @@ def run_reference_pair(
     gamma: int = 15,
     reference_ar_ids: Sequence[int] | None = None,
     require_ar_match: bool = True,
+    collect_uncertainty: bool = False,
 ) -> dict[str, Any]:
     """Run AR/native DFlash/adapter Full on the exact same tokenized prompt."""
     ids, layout = prepare_prompt(sample, runtime["tokenizer"], chunk_size=128)
@@ -145,6 +146,7 @@ def run_reference_pair(
             sample_id=str(sample["id"]),
             dataset=str(sample["dataset"]),
             split=str(sample.get("_cad_split", "unknown")),
+            collect_uncertainty=collect_uncertainty,
         )
     torch.cuda.synchronize(ids.device)
     adapter_ms = (time.perf_counter() - adapter_started) * 1000.0
@@ -199,6 +201,7 @@ def _action_row(
     deletion_side: str | None = None,
     deletion_count: int | None = None,
     random_seed: int | None = None,
+    ranking_origin_round: int | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     cell_id = "|".join((
@@ -238,7 +241,11 @@ def _action_row(
         "reason": outcome.get("reason"),
         "actual_context_tokens_by_layer": outcome.get("actual_context_tokens_by_layer"),
         "positions_sha256_by_layer": outcome.get("positions_sha256_by_layer"),
-        "ranking_origin_round": outcome.get("ranking_origin_round"),
+        "ranking_origin_round": (
+            ranking_origin_round
+            if ranking_origin_round is not None
+            else outcome.get("ranking_origin_round")
+        ),
         "draft_ms": outcome.get("draft_ms"),
         "verify_ms": outcome.get("verify_ms"),
         "gather_bytes": outcome.get("gather_bytes"),

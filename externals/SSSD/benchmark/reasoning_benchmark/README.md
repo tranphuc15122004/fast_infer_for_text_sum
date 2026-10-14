@@ -65,13 +65,9 @@ To collect the accuracy, run the following command 30 times:
 python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
 ```
 
-![acc_hist](figure/Acc_histplot.png)
-
-
 **Experiment 2**: We explored the relationship between the number of attempts (num_tries) and the standard error (SE) by varying num_tries across a range (e.g., 8, 16, 32, ..., 256) and performing a single run for each value. The results demonstrate that as the number of attempts increases, the standard error decreases, leading to **greater stability in answer accuracy**.
 
 To reveal the relationship, run the command 6 times and adjust the parameter `--num-tries` for each run:
 ```bash
 python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries <num_tries>
 ```
-![SE_num_tries](figure/SE_numtries.png)

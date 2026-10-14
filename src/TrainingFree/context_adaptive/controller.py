@@ -166,9 +166,20 @@ class AdaptiveController:
         self.last_reason = reason
         return selected, reason, elapsed_ms
 
-    def observe(self, state: RoundState, action: Action, accepted_prefix: int, action_cost_ms: float | None = None) -> None:
+    def observe(
+        self,
+        state: RoundState,
+        action: Action,
+        accepted_prefix: int,
+        action_cost_ms: float | None = None,
+        *,
+        history_denominator: int | None = None,
+    ) -> None:
         if self.statistics is not None:
             self.statistics.observe(action, state, accepted_prefix, action_cost_ms)
-        ratio = accepted_prefix / action.gamma
+        denominator = action.gamma if history_denominator is None else int(history_denominator)
+        if denominator < 1 or denominator > action.gamma or accepted_prefix > denominator:
+            raise ValueError("history denominator must cover the accepted prefix and not exceed the draft shape")
+        ratio = accepted_prefix / denominator
         alpha = self.config.history_alpha
         self.history_acceptance = ratio if self.history_acceptance is None else (1.0 - alpha) * self.history_acceptance + alpha * ratio

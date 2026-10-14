@@ -32,9 +32,7 @@ SSSD follows a simple host/device split:
 3. Use the candidates and tree-mask for one speculative verification pass on the target model.
 4. Feed accepted output back into the prompt cache and, at a slower cadence, into the live datastore.
 
-<p align="center">
-  <img src="images/sssd_diagram.png" alt="Overview of the SSSD pipeline, showing datastore retrieval, prompt/self-output caching, trie merging, and device-side verification." />
-</p>
+SSSD retrieves candidates from a datastore and the current sequence, merges them into a trie on the host, and verifies them on the target model. Accepted output is fed back into the prompt cache and live datastore.
 
 ## Quick Start
 

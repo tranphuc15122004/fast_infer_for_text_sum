@@ -37,33 +37,12 @@
 
 REST is a retrieval-based speculative decoding method designed to boost generation speed of LLMs. Instead of relying on a draft language model like speculative decoding, REST utilizes a datastore to retrieve and employ draft tokens. Moreover, REST differs from blockwise parallel decoding and Medusa in that it doesn't require extra training steps. It functions as a plug-and-play solution capable of **accelerating any pre-existing language model**.
 
-<div align="center">
-  <picture>
-  <img src="assets/rest_overview.png" width="85%">
-  </picture>
-  <br>
-  <div align="left" width="80%">
+**Overview of REST:**
   <em>Overview of REST. During inference, the input context is utilized as the query to retrieve docs from the datastore that match the longest suffix of the input. A Trie is constructed using the continuations from the retrieved docs and low-frequency branches are pruned. Candidates from the pruned subtree will be further fed into the LLM with a tree attention mask for verification. All correct tokens from the start will be accepted, and the draft tokens after the first mistake will be rejected.</em>
-  </div>
-  <br>
-</div>
 
-<div align="center">
-  <picture>
-  <img src="assets/rest_results.png" width="85%">
-  </picture>
-  <br>
-  <div align="left" width="40%">
+**Results:**
   <em>Speed on HumanEval and MT-Bench with standard autoregressive generation and REST. The temperature is set to 0.8 and the top-p to 0.95 for nucleus sampling in HumanEval. For MT-Bench, the settings are 0.7 for temperature and 0.8 for top-p. All the experiments are conducted on a single NVIDIA A6000 GPU and 96 CPU cores with a batch size of 1.</em>
-  </div>
-  <br>
-</div>
 
-<!-- <p align="center">
-  <picture>
-  <img src="assets/rest_results.png" width="55%">
-  </picture>
-</p> -->
 
 ## Contents
 - [Introduction](#introduction)
@@ -156,4 +135,3 @@ Besides, change [these two lines in Reader](https://github.com/FasterDecoding/RE
 
 ## Acknowledgements
 The codebase is from [Medusa](https://github.com/FasterDecoding/Medusa) and influenced by remarkable projects from the LLM community, including [FastChat](https://github.com/lm-sys/FastChat), [TinyChat](https://github.com/mit-han-lab/llm-awq/tree/main/), [vllm](https://github.com/vllm-project/vllm) and many others.
-

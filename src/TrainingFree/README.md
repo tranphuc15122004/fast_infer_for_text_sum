@@ -1,6 +1,6 @@
 # Training-Free: Context-Adaptive DFlash
 
-Ngày cập nhật: **2026-10-13**. Trạng thái: **45/45 ca hồi quy Context-Adaptive DFlash và 117/117 test `src/TrainingFree/tests` đạt trên CPU; harness B0/B1/B2/B1-V đã có CLI B200; parity/cache-prefix/timing GPU vẫn pending**.
+Ngày cập nhật: **2026-10-14**. Trạng thái: **CLI B0–B4, controller B3/B4 và dev-lock/confirm đã được hiện thực hóa; AR-token equality là diagnostic; cache-prefix/timing GPU vẫn pending**.
 
 Mục tiêu là cùng thích nghi context budget của drafter và số speculative tokens trên DFlash đã train, cho long-context summarization. Target giữ full context và thực hiện exact verification. Trọng số target, DFlash, embedding và LM head không thay đổi.
 
@@ -15,7 +15,7 @@ Mục tiêu là cùng thích nghi context budget của drafter và số speculat
 | [Protocol thực nghiệm](docs/context_adaptive_dflash/experiment_protocol.md) | Split, calibration, ablation, fairness và các gate |
 | [Ma trận và kế hoạch thực nghiệm](docs/context_adaptive_dflash/experiment_matrix.md) | Preregistration, exposure audit, tuning/controls, lịch chạy, gate và artifact paper |
 | [Kế hoạch phần B — 13/10/2026](plans/experiment_plan_B_13_10_26.md) | B1 oracle opportunity, B2 candidate uncertainty/survival, B1-V verification cost, B3/B4 có điều kiện; metrics, CI và bảng quyết định |
-| [Runbook B200 cho phần B](docs/dflash_speculation_B_b200.md) | CLI `run_dflash_speculation_B_b200.sh`, phases B0/B1/B2/B1-V, artifacts và cách đọc verdict |
+| [Runbook B200 cho phần B](docs/dflash_speculation_B_b200.md) | CLI `run_dflash_speculation_B_b200.sh`, phases B0–B4, dev/confirm gates, artifacts và cách đọc verdict |
 | [Kiểm chứng GPU](docs/context_adaptive_dflash/gpu_validation.md) | G0/G1/G2 trên checkpoint thật, cases parity/cache/positions/EOS và harness còn cần |
 | [Runbook](docs/context_adaptive_dflash/runbook.md) | Runtime offline và các lệnh chạy prepare→preflight→calibrate→dev→lock→test→report |
 | [Mẫu báo cáo và bàn giao](docs/context_adaptive_dflash/results_template.md) | Coverage/exactness, calibration support, paired CI, latency/quality/memory và verdict G0–G6 |
@@ -32,11 +32,12 @@ Ghi chép ban đầu `plans/RECENT_idea.md` hiện không có trong checkout nà
 
 Hướng nghiên cứu B trong [kế hoạch 13/10/2026](plans/experiment_plan_B_13_10_26.md)
 bắt đầu bằng same-prefix gamma sweep và kiểm predictive value của entropy/confidence
-từng DFlash candidate. Harness riêng cho B0/B1/B2/B1-V đã được viết và có test
-CPU; cách chạy nằm trong [runbook B200](docs/dflash_speculation_B_b200.md).
-Parity/cost thật trên B200 vẫn pending. Executor Context-Adaptive DFlash V1 vẫn
-chưa có adaptive `verify_prefix` controller; B1-V hiện chỉ là phép đo/replay
-chẩn đoán, chưa là đường generation end-to-end.
+từng DFlash candidate. Harness B0–B4 có CLI B200 và test CPU; B3 thêm adaptive
+verification prefix sau khi đo overhead, còn B4 thử draft gamma theo tín hiệu
+round trước với fallback khi thiếu hỗ trợ. Cả hai E2E phase yêu cầu B0 chạy
+hoàn tất và gate thống kê đạt; AR-token equality chỉ là diagnostic. Request
+summary ghi ROUGE khi có reference. Cache-prefix và timing thật trên B200 vẫn
+pending. Cách chạy nằm trong [runbook B200](docs/dflash_speculation_B_b200.md).
 
 Selective context có cơ sở thực nghiệm từ SpecExtend. Chuyển cơ chế sang DFlash, giá trị của entropy có sẵn trước round và lợi ích của joint adaptation cần được đo theo protocol.
 

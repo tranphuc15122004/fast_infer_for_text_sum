@@ -9,8 +9,6 @@
 
 ## Overview
 
-![FAFO pipeline](figures/fafo_pipeline.png)
-
 FAFO ("**F**umble **A**round and **F**ind **O**ut") accelerates LLM decoding by using **lossy** KV-cache compression as a *means* to deliver **lossless** generation. Within a single forward pass it runs two branches: **Fumble Around** generates many n-gram "guesses" cheaply on a *compressed* KV cache, while **Find Out** verifies previously-cached guesses against the *full* KV cache — accepting only tokens that match greedy decoding. Because drafting and verification happen in parallel in one pass, FAFO needs only **one model and one set of KV cache**, and it delivers a **1.20–2.71× latency speedup** over vanilla decoding while preserving the original output distribution.
 
 ## Abstract

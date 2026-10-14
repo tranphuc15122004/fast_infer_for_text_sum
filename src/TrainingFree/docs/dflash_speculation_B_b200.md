@@ -1,11 +1,12 @@
 # Thực nghiệm B — DFlash uncertainty và verification depth trên B200
 
-Ngày cập nhật: **2026-10-13**.
+Ngày cập nhật: **2026-10-14**.
 
-Harness đã có CLI cho B0, B1, B2 và B1-V. Test logic/schema chạy trên CPU; chưa
-chạy parity, cache-prefix validation hay timing GPU. B1/B2/B1-V chỉ được xem là
-bằng chứng hợp lệ sau khi B0 exact greedy parity qua trên đúng checkpoint và
-backend của server.
+Harness có CLI cho B0, B1, B2, B1-V và các phase E2E có điều kiện B3/B4. Logic
+được kiểm tra trên CPU; chưa chạy cache-prefix validation hay timing GPU trên
+B200. B0 phải hoàn thành các lượt chạy và ghi chẩn đoán AR/native/adapter; khác
+token với AR không chặn phase sau. Lỗi runtime hoặc bất biến verifier/cache
+vẫn chặn phase bị ảnh hưởng.
 
 ## Bố cục
 
@@ -18,11 +19,27 @@ backend của server.
 | `b1v` | Draft gamma 15 rồi verify prefix k=3/7/11/15 trên cache fork riêng; kiểm tra L và pending anchor | Bảng B1-V |
 | `analyze` | Tính oracle/fixed gaps, bootstrap theo source group, grouped OOF survival/Brier và quyết định screening | `reports/*`, không nạp model |
 | `run` | Chạy prepare, B0, B1, B1-V rồi analyze tuần tự | Toàn bộ artifacts trên |
+| `b3-dev` | Chỉ mở khi B1-V và B2 qua gate; chạy AR, fixed gamma/k, regime/history controls và policy signal trên dev; khóa model/cost/fallback | `b3/dev_requests.jsonl`, `b3/locked_config.json` |
+| `b3-confirm` | Chạy lock B3 đã chọn trên cohort confirm riêng; paired E2E, ROUGE và tỉ lệ khớp token AR dạng chẩn đoán | `b3/confirm_requests.jsonl`, `b3/confirm_summary.json` |
+| `b4` | Ghép uncertainty của đúng round liền trước với state B1 hiện tại; grouped CV chọn gamma trên evaluation timing | `b4/analysis.json`, OOF và lock nếu gate đạt |
+| `b4-dev` | E2E draft-length rollout với regime/history controls và lagged policy đủ điều kiện; chọn best fixed gamma/policy trên dev | `b4/dev_requests.jsonl`, `b4/locked_config.json` |
+| `b4-confirm` | Chạy B4 lock trên cohort confirm riêng; paired E2E, ROUGE và tỉ lệ khớp token AR dạng chẩn đoán | `b4/confirm_requests.jsonl`, `b4/confirm_summary.json` |
 
-Không có adaptive controller B3/B4 trong harness này. B3 chỉ nên bắt đầu khi
-B1-V cho thấy headroom, B2 có predictive value ngoài regime/history controls,
-và decision-regret đánh giá heldout đã được bổ sung/khóa. Vì vậy kết quả của
-harness hiện tại là opportunity/predictability, chưa phải E2E speedup.
+B3 tự đóng gate nếu B1-V chưa có gap ít nhất 5% với CI95 lower >2%, hoặc nếu
+`R-DH`/`R-DC` không có Brier skill tối thiểu 5% với CI improvement >0 trên
+source groups held-out. Sau warmup dev, B3 tính lại opportunity của B1-V khi
+cộng overhead extraction/controller lớn nhất đã đo trong các policy eligible;
+nếu gap điều chỉnh không giữ ngưỡng 5% / CI lower >2%, E2E measured dừng.
+`R-A` chạy như history-only diagnostic; do history ở
+B3 được cập nhật từ rollout có k biến đổi, nó không được chọn làm policy khóa
+khi chưa có calibration riêng cho history deployable. Controller đã khóa dùng
+cost table B1-V, cộng extraction và callback overhead được đo ở warmup dev.
+
+B4 chỉ ghép round `t-1` nếu trace gamma15 có cả `t-1` và `t` cùng request.
+Cost model dùng selection repetitions; evaluation repetitions chỉ chấm OOF
+cost/commit theo gamma. Trong rollout, nếu gamma của round trước khác 15 thì
+policy fallback về gamma cố định đã khóa vì chưa có dữ liệu calibration cho
+shape trước khác. Đây là giới hạn support được ghi vào từng round.
 
 ## Chạy trên server
 
@@ -83,12 +100,89 @@ bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
 `--resume` chỉ tái dùng cell khớp campaign/code/runtime signature. Thay model,
 backend, cohort, gamma grid, prompt hoặc protocol cần run mới và chạy lại B0.
 Lưới gamma hiện khóa ở 3/7/11/15; CLI từ chối lưới rút gọn để tránh ngầm đổi
-protocol.
+protocol. Với B3/B4, `--resume` tái dùng E2E cell theo sample; B3 dev còn lưu
+warmup overhead profile để không đổi policy cost giữa lần chạy tiếp. Nếu signature
+không khớp, phase dừng thay vì ghép artifacts khác cấu hình.
+
+### Dev / confirm cho B3
+
+Chạy discovery trên đúng cohort `dev`; `run` đã bao gồm B0, B1, B1-V và
+analysis. B3 tự từ chối nếu gate B1-V/B2 chưa đạt. `b3-dev` cần ít nhất ba
+E2E repetitions (mặc định 5) và lưu policy lock. Output token IDs/hash, tỉ lệ
+khớp AR và ROUGE được lưu để đánh giá; khác token với AR không làm phase thất bại:
+
+```bash
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode run --run-id B_dev_01 --cohort-phase dev \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json
+
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode b3-dev --run-id B_dev_01 --cohort-phase dev \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json \
+  --e2e-repetitions 5 --e2e-warmups 3
+```
+
+Confirm dùng `run_id` mới và cohort `confirm`. Chạy B0 trước, sau đó đưa đúng
+lock từ dev vào `--policy-lock`:
+
+```bash
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode prepare --run-id B_confirm_01 --cohort-phase confirm \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json
+
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode validate --run-id B_confirm_01 --cohort-phase confirm \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json
+
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode b3-confirm --run-id B_confirm_01 --cohort-phase confirm \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json \
+  --policy-lock outputs/dflash_speculation_B/B_dev_01/b3/locked_config.json \
+  --e2e-repetitions 5 --e2e-warmups 3
+```
+
+### Dev / confirm cho B4
+
+Trace B0 gamma15 đã bật collector entropy/confidence cho mọi round. B4 ghép
+tín hiệu B2 của hai round liền kề chỉ khi tiến triển token output khớp
+accepted prefix cộng pending anchor. Khác token với AR không chặn phân tích.
+Chạy grouped cost/regret analysis
+trên dev sau `run`, rồi chỉ mở E2E nếu ít nhất một lagged model có cost skill
+>=2% so regime+history và CI95 lower >0:
+
+```bash
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode b4 --run-id B_dev_01 --cohort-phase dev \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json
+
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode b4-dev --run-id B_dev_01 --cohort-phase dev \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json \
+  --e2e-repetitions 5 --e2e-warmups 3
+```
+
+Sau đó chuẩn bị cohort confirm mới, chạy `validate` như B3, rồi:
+
+```bash
+bash scripts/run_dflash_speculation_B_b200.sh --config /path/to/master.env \
+  --gpu-ids 0 --mode b4-confirm --run-id B_confirm_01 --cohort-phase confirm \
+  --exposure-manifest data/dflash_context_A_audit/combined_exposure_manifest.json \
+  --policy-lock outputs/dflash_speculation_B/B_dev_01/b4/locked_config.json \
+  --e2e-repetitions 5 --e2e-warmups 3
+```
+
+B3/B4 requests lưu output token IDs/hash, tỉ lệ khớp AR dạng chẩn đoán và ROUGE
+khi có reference; rounds lưu gamma, k, tín hiệu, fallback, accepted/committed
+tokens và overhead. Summary gộp ROUGE theo variant. Lock xác nhận
+code/runtime signature, corpus/exposure hash và cấu hình E2E (token limit, gamma,
+backend, seed, số repetition/warmup); confirm từ chối cấu hình lệch hoặc source
+group trùng dev. E2E không tự động gộp giữa nhiều GPU; mỗi paired campaign cần
+cùng GPU/runtime identity.
 
 ## Đọc artifacts và kết luận
 
-- `evidence/parity.json`: parity theo document/gamma. Bất kỳ mismatch nào làm
-  `invalid_correctness`; B1/B1-V bị chặn.
+- `evidence/parity.json`: AR/native/adapter token comparisons theo document/gamma.
+  AR-token mismatch là diagnostic; runtime/instrumentation/cache failure mới chặn B1/B1-V.
 - `b1/draft_shape.jsonl`: cùng `state_id` có bốn gamma, proposals riêng từng
   shape, accepted candidates và round/component timing. `round_ms` gồm draft,
   full-context gather, verification, cache crop và draft-bank append; cache
@@ -111,6 +205,12 @@ protocol.
   như B1. Đây là local cost opportunity, chưa tính chi phí chọn k ở controller.
 - `reports/decision.md`: screening theo ngưỡng đã khai báo trong campaign;
   CI rộng hoặc cohort thiếu sẽ cho `inconclusive`, không tự biến thành kết quả âm.
+- `b3/dev_requests.jsonl`, `b3/confirm_requests.jsonl`: request paired AR/fixed/adaptive,
+  AR-token match diagnostic, ROUGE, E2E wall, generation breakdown, counters và output IDs. `b3/locked_config.json`
+  chứa model B2 đã fit trên dev, B1-V cost table, best fixed gamma/k và signature.
+- `b4/lagged_training_rows.jsonl`, `b4/oof_predictions.jsonl`, `b4/analysis.json`:
+  chỉ ghép round liền kề, đo B1 gamma-specific cost/commit trên groups held-out;
+  E2E B4 khóa model trên dev; confirm ghi quality metrics và AR-token match diagnostic.
 
 Ngưỡng B1 đề xuất: gap J ít nhất 5% và CI lower trên 2% để mở nhánh
 opportunity; CI upper không quá 2% là ít headroom trong grid/workload hiện tại.
@@ -119,7 +219,10 @@ entropy bổ sung sau history cần tối thiểu 2% so `R-A` và CI dương. Bo
 đơn vị source group/document, không phải round hay timing repetition.
 
 Pilot 6 documents chỉ dùng để debug runtime/ước lượng chi phí; grouped folds
-và CI từ pilot rất thô. Không dùng pilot làm paper claim. Khi B0 parity fail,
-điều tra backend/cache/accounting trước khi đọc acceptance như một thuộc tính
-của DFlash. B3 E2E, output exactness của controller, ROUGE và B4 lagged
-draft-length policy chưa được triển khai trong harness này.
+và CI từ pilot rất thô. Không dùng pilot làm paper claim. Khi B0 báo token
+divergence, đọc first-mismatch fields như chẩn đoán và báo ROUGE trên reference;
+lỗi runtime, instrumentation hoặc bất biến cache/verifier vẫn cần được xử lý
+trước khi dùng kết quả phase bị ảnh hưởng. CPU test và CLI không chứng minh GPU
+correctness/performance; chưa có kết quả chạy trên B200. Outputs B3/B4 có thể
+khác AR; report ROUGE theo reference và tỉ lệ khớp AR thay vì giả định chất lượng
+giống hệt AR.

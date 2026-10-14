@@ -27,6 +27,16 @@ DEFAULT_VARIANTS: dict[str, tuple[str, ...]] = {
     "R-DAll-noDH": ("history_ema", "history_missing", "parent_entropy", "parent_confidence", "draft_confidence_min"),
 }
 
+LAGGED_VARIANTS: dict[str, tuple[str, ...]] = {
+    "R-A-LDH": ("history_ema", "history_missing", "lagged_draft_entropy_max"),
+    "R-A-LDC": ("history_ema", "history_missing", "lagged_draft_confidence_min"),
+    "R-A-LDHC": (
+        "history_ema", "history_missing", "lagged_draft_entropy_max",
+        "lagged_draft_confidence_min",
+    ),
+}
+SURVIVAL_VARIANTS = {**DEFAULT_VARIANTS, **LAGGED_VARIANTS}
+
 
 def _context_bin(value: int) -> int:
     return min(max(int(value), 0) // 4096, 3)
@@ -39,6 +49,16 @@ def _progress_bin(row: Mapping[str, Any]) -> int:
 
 def _signal_value(row: Mapping[str, Any], feature: str, threshold: int) -> float:
     uncertainty = row.get("draft_uncertainty") or {}
+    lagged = row.get("lagged_signals") or {}
+    if feature.startswith("lagged_"):
+        lagged_feature = feature.removeprefix("lagged_")
+        try:
+            value = float(lagged[lagged_feature])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"candidate_signals row is missing finite {feature}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"candidate_signals row is missing finite {feature}")
+        return value
     if feature == "draft_entropy_max":
         values = uncertainty.get("normalized_entropy")
         if values is None or len(values) < threshold:
@@ -257,11 +277,11 @@ def fit_survival_curve(
 ) -> dict[str, Any]:
     """Fit training-only binned Beta(1,1)-smoothed survival curves."""
 
-    if variant not in DEFAULT_VARIANTS:
+    if variant not in SURVIVAL_VARIANTS:
         raise ValueError(f"unsupported survival variant {variant!r}")
     if not train_rows or max_candidates < 1 or min_support_states < 1 or min_support_groups < 1:
         raise ValueError("survival fit requires rows and positive support settings")
-    features = DEFAULT_VARIANTS[variant]
+    features = SURVIVAL_VARIANTS[variant]
     models = [
         _fit_threshold(
             train_rows,
@@ -275,6 +295,90 @@ def fit_survival_curve(
     return {
         "variant": variant,
         "training_groups": sorted({str(row["source_group_id"]) for row in train_rows}),
+        "max_candidates": max_candidates,
+        "models": models,
+    }
+
+
+def serialize_survival_curve(model: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a fitted curve into a stable JSON-safe deployment artifact."""
+
+    variant = str(model.get("variant", ""))
+    if variant not in SURVIVAL_VARIANTS:
+        raise ValueError(f"unsupported survival variant {variant!r}")
+    serialized_models = []
+    for threshold_model in model.get("models", ()):
+        counts = []
+        for key, value in threshold_model["counts"].items():
+            successes, total, groups = value
+            counts.append({
+                "key": list(key),
+                "successes": int(successes),
+                "total": int(total),
+                "groups": sorted(str(group) for group in groups),
+            })
+        serialized_models.append({
+            "threshold": int(threshold_model["threshold"]),
+            "features": list(threshold_model["features"]),
+            "feature_edges": {
+                str(name): list(edges)
+                for name, edges in threshold_model["feature_edges"].items()
+            },
+            "counts": counts,
+            "min_support_states": int(threshold_model["min_support_states"]),
+            "min_support_groups": int(threshold_model["min_support_groups"]),
+        })
+    if len(serialized_models) != int(model.get("max_candidates", 0)):
+        raise ValueError("fitted survival curve has an inconsistent threshold count")
+    return {
+        "schema_version": "dflash-speculation-b.survival-model.v1",
+        "variant": variant,
+        "training_groups": [str(value) for value in model.get("training_groups", ())],
+        "max_candidates": int(model["max_candidates"]),
+        "models": serialized_models,
+    }
+
+
+def deserialize_survival_curve(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Load and validate a JSON-safe fitted survival curve."""
+
+    if payload.get("schema_version") != "dflash-speculation-b.survival-model.v1":
+        raise ValueError("unsupported survival-model schema")
+    variant = str(payload.get("variant", ""))
+    if variant not in SURVIVAL_VARIANTS:
+        raise ValueError(f"unsupported survival variant {variant!r}")
+    models = []
+    for raw_model in payload.get("models", ()):
+        counts: dict[tuple[Any, ...], list[Any]] = {}
+        for item in raw_model.get("counts", ()):
+            key = tuple(item["key"])
+            if key in counts:
+                raise ValueError("survival-model artifact has duplicate count keys")
+            total = int(item["total"])
+            successes = int(item["successes"])
+            groups = {str(value) for value in item.get("groups", ())}
+            if total < 0 or not 0 <= successes <= total or len(groups) > total:
+                raise ValueError("survival-model artifact has invalid counts")
+            counts[key] = [successes, total, groups]
+        models.append({
+            "threshold": int(raw_model["threshold"]),
+            "features": tuple(str(value) for value in raw_model.get("features", ())),
+            "feature_edges": {
+                str(name): tuple(float(value) for value in edges)
+                for name, edges in raw_model.get("feature_edges", {}).items()
+            },
+            "counts": counts,
+            "min_support_states": int(raw_model["min_support_states"]),
+            "min_support_groups": int(raw_model["min_support_groups"]),
+        })
+    max_candidates = int(payload.get("max_candidates", 0))
+    if max_candidates < 1 or len(models) != max_candidates:
+        raise ValueError("survival-model artifact has an invalid candidate count")
+    if [row["threshold"] for row in models] != list(range(1, max_candidates + 1)):
+        raise ValueError("survival-model thresholds must be the ordered range 1..max_candidates")
+    return {
+        "variant": variant,
+        "training_groups": [str(value) for value in payload.get("training_groups", ())],
         "max_candidates": max_candidates,
         "models": models,
     }
@@ -388,7 +492,7 @@ def cross_validated_survival(
     if bootstrap_replicates < 0:
         raise ValueError("bootstrap_replicates must be nonnegative")
     variant_values = tuple(variants)
-    if "R" not in variant_values or any(value not in DEFAULT_VARIANTS for value in variant_values):
+    if "R" not in variant_values or any(value not in SURVIVAL_VARIANTS for value in variant_values):
         raise ValueError("variants must include R and use supported model names")
     for row in signals:
         uncertainty = row.get("draft_uncertainty") or {}
@@ -496,6 +600,8 @@ def cross_validated_survival(
             ("R-A-DC", "R-A"),
             ("R-DH", "R-C"),
             ("R-DAll", "R-DAll-noDH"),
+            ("R-A-LDH", "R-A"),
+            ("R-A-LDC", "R-A"),
         )
         if variant in variant_values and control in variant_values
     }

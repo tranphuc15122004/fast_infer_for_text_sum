@@ -1,12 +1,12 @@
 # Kế hoạch thực nghiệm B — DFlash candidate uncertainty và speculation depth
 
-Ngày cập nhật: **2026-10-13**.
+Ngày cập nhật: **2026-10-14**.
 
-**Trạng thái:** protocol đã được hiện thực hóa thành harness B0/B1/B2/B1-V
-trong `speculation_experiments/` và `scripts/run_dflash_speculation_B.py`;
-test CPU pass, nhưng **chưa chạy B0/B1/B2/B1-V trên B200**, chưa có kết quả
-nghiên cứu hoặc controller mới. B3/B4 chưa implement vì phụ thuộc kết quả.
-Các ngưỡng dưới đây là
+**Trạng thái:** code campaign B0–B4, B3/B4 controller, dev lock/confirm CLI,
+ROUGE reporting và runbook đã được hiện thực hóa. AR-token equality chỉ là
+diagnostic; các module có CPU test coverage; **chưa chạy B0–B4 trên B200**, chưa xác nhận
+cache-prefix/timing GPU và chưa có kết quả nghiên cứu. Các phase B3/B4 tự dừng
+nếu evidence gate không đạt. Các ngưỡng dưới đây là
 **đề xuất đăng ký trước**, cần khóa trong campaign manifest trước đo dữ liệu.
 
 **Mục tiêu:** xác định speculation depth hữu ích có biến đổi theo decoding
@@ -17,7 +17,7 @@ E2E latency sau khi tính đủ overhead hay không.
 `outputs/dflash_speculation_B/<run_id>/`, gitignored.
 
 **Phạm vi kiểm chứng:** inference training-free; CPU kiểm logic, schema,
-causality; GPU kiểm checkpoint/backend, cache, greedy parity và latency thật.
+causality; GPU kiểm checkpoint/backend, cache, verifier invariants và latency thật.
 Không có training/backward hoặc tiny-overfit trong validation.
 
 **Thiết kế đánh giá:** replay paired trên cùng prefix; calibration và predictive
@@ -38,7 +38,7 @@ cơ chế tương ứng đã đủ bằng chứng.
 |---|---|---|
 | Opportunity | Depth tối ưu có biến đổi và best fixed bỏ lỡ lợi ích đáng kể? | Cost/acceptance surfaces từ same-prefix replay; oracle gap vượt timing noise |
 | Predictability | Tín hiệu có sẵn tại thời điểm quyết định có dự đoán accepted prefix/cost không? | Predictive evaluation trên source groups không dùng calibration |
-| Actionability | Quyết định dựa trên tín hiệu có giảm latency thật? | Paired E2E tốt hơn best fixed, tính extraction/controller/cache overhead, output exact |
+| Actionability | Quyết định dựa trên tín hiệu có giảm latency thật? | Paired E2E tốt hơn best fixed, tính extraction/controller/cache overhead; báo ROUGE và AR-token agreement |
 
 Phân biệt rõ hai cơ chế:
 
@@ -60,11 +60,11 @@ không phải thuộc tính đã được xác nhận của DFlash.
 
 | Bước | Làm gì? | Để làm gì? | Kết quả nhận được |
 |---|---|---|---|
-| B0 | Kiểm runtime, cache, instrumentation, AR/native/adapter parity | Loại lỗi verifier hoặc collector trước nghiên cứu | Correctness report và supported shape grid |
+| B0 | Kiểm runtime, cache, instrumentation; ghi AR/native/adapter token comparisons | Loại lỗi verifier hoặc collector trước nghiên cứu; token equality là diagnostic | Runtime report và supported shape grid |
 | B1 | Gamma sweep 3/7/11/15, draft riêng ở cùng state | Đo opportunity của adaptive draft length | L/T/J theo state/action, gamma oracle, marginal utility |
 | B2 | Thu entropy/confidence candidate, parent signals, history | Đo predictability và phần thông tin bổ sung của drafter | Survival calibration, Brier, correlations, cost regret |
 | B1-V | Draft 15 một lần; replay verifier prefixes 3/7/11/15 | Đo opportunity riêng của adaptive verification | Verification cost curve, k oracle, gap sau draft cost/overhead |
-| B3 | Nếu B2 + B1-V có triển vọng, chạy controller verification prefix | Đo actionability | Paired E2E, exactness, overhead và action distributions |
+| B3 | Nếu B2 + B1-V có triển vọng, chạy controller verification prefix | Đo actionability | Paired E2E, ROUGE/quality, overhead và action distributions |
 | B4 | Khi cần, dùng uncertainty các rounds trước dự đoán round sau | Đánh giá khả năng giảm cả draft computation | Heldout cross-round prediction, rồi draft-length E2E nếu đủ bằng chứng |
 
 B1 được phân tích trước. Collector B2 có thể thu ngay trong lượt gamma 15
@@ -141,8 +141,9 @@ trước khi xem kết quả, nhưng không gọi các analyses thích nghi sau 
 
 ### 4. Reference rollout, prefix selection và history
 
-Mỗi document có một reference rollout **full-context gamma=15 cố định** đã
-qua greedy parity với target-only AR. Trace chứa tất cả rounds, token IDs,
+Mỗi document có một reference rollout **full-context gamma=15 cố định**.
+Target-only AR là baseline comparison; khác biệt token của speculative rollout
+được lưu diagnostic và không phải gate. Trace chứa tất cả rounds, token IDs,
 processed output count, pending anchor, outcomes và uncertainty nếu thu.
 Không lấy states từ controller adaptive để làm reference chính.
 
@@ -229,21 +230,22 @@ giữa, all accepted, multi-round, EOS trong accepted prefix, pending EOS,
 cap/tail shape, positions và cache rollback; collector bật/tắt.
 
 **Để làm gì:** phân biệt prediction kém với lỗi adapter/kernel hoặc lỗi thu
-tín hiệu. Pilot H100 cũ chưa đạt greedy parity, nên không bỏ bước này.
+tín hiệu. Pilot H100 cũ có token divergence; B0 vẫn cần kiểm runtime, cache và
+instrumentation, còn divergence với AR được lưu để báo cáo chứ không chặn nghiên cứu.
 
 So target-only AR ↔ native DFlash ↔ full adapter trên cùng tokenized prompts,
 cùng greedy backend/stopping. Kiểm tất cả gamma 3/7/11/15, không chỉ 15.
 Native control phải được cấu hình đúng gamma và EOS/cap accounting.
 
-**Nhận gì:** `parity.json` chứa exact token equality, first divergence,
+**Nhận gì:** `parity.json` chứa token equality dạng diagnostic, first divergence,
 branch, logits/top-1 margin quanh divergence, target KV/bank lengths và
 instrumentation equality. Collector không được thay proposals/L/output.
 
-**Kết luận:** có mismatch/cache violation → `invalid_correctness`, dừng
-research/performance gate để điều tra; không kết luận B vô dụng. Diagnostic
-logs để debug được lưu riêng. Chỉ mở regular replay và E2E claim sau parity
-pass trên production runtime. Nếu một shape unsupported, campaign 4-gamma
-là incomplete; reduced grid chỉ là protocol mới được khai báo rõ.
+**Kết luận:** token mismatch với AR được lưu làm diagnostic; runtime, cache,
+instrumentation hoặc verifier invariant lỗi thì dừng phase bị ảnh hưởng. B0
+phải hoàn tất các shape/gamma được hỗ trợ trước khi chạy replay. Nếu một shape
+unsupported, campaign 4-gamma là incomplete; reduced grid chỉ là protocol mới
+được khai báo rõ.
 
 ### 7. B1 — Optimal draft length có biến đổi hữu ích không?
 
@@ -509,7 +511,7 @@ draft15** và với best fixed **draft gamma** trong dev E2E, hai controls khác
 
 ### 10. B3 — Controller có giảm E2E latency không?
 
-**Điều kiện mở:** B0 parity, B2 signal có heldout predictive value và B1-V
+**Điều kiện mở:** B0 runtime validation hoàn tất, B2 signal có heldout predictive value và B1-V
 cho thấy opportunity sau overhead. Chỉ thử curves/tables nhỏ đã khóa.
 
 Sau draft15 và thu features s_t:
@@ -566,8 +568,9 @@ primary controls tắt collector không cần cho inference của chúng.
 
 Warmup 3 runs/variant trên dev-only shapes, ngoài measured requests. Confirm
 5 timed repetitions/request/variant, tối thiểu 3; fresh caches/request-local
-history, xáo thứ tự variants trong mỗi repetition block. Fixed outputs greedy
-phải giống AR từng token. Natural EOS bật; fixed-output scaling là secondary
+history, xáo thứ tự variants trong mỗi repetition block. Ghi AR-token agreement
+làm diagnostic; không đặt exact-output gate vì speculative output đã qua target
+verifier trên full context. Natural EOS bật; fixed-output scaling là secondary
 campaign riêng, không dùng output sau EOS để claim summarization quality.
 
 #### 10.2. Metrics, success và failure
@@ -588,7 +591,7 @@ delta, median/p95 mô tả, dataset-specific effects và document-cluster CI.
 
 | Tín hiệu xác nhận | Kết luận |
 |---|---|
-| Exactness pass; S≥1.03 và adjusted CI95 lower >1 so **cả best fixed draft gamma và best fixed verification k** | Actionability của adaptive verification được xác nhận trong workload/runtime đã đo |
+| E2E hoàn tất; S≥1.03 và adjusted CI95 lower >1 so **cả best fixed draft gamma và best fixed verification k**; báo ROUGE theo reference và AR-token agreement diagnostic | Actionability của adaptive verification được xác nhận trong workload/runtime đã đo; quality được đọc từ ROUGE, không ép token equality |
 | Combined còn vượt history-only và strongest signal-only với CI >1 | Có contribution thực tế của phối hợp signals |
 | Nhanh hơn fixed15 nhưng không hơn best fixed gamma/k | Gain được giải thích bằng constant shorter block/prefix; chưa chứng minh adaptation |
 | Acceptance rate tăng nhưng E2E không giảm | Không có inference gain; phân tích lost commits, rounds và overhead |
@@ -596,7 +599,8 @@ delta, median/p95 mô tả, dataset-specific effects và document-cluster CI.
 | T_V giảm nhưng tổng E2E không giảm vì extraction/sync/T_D chiếm ưu thế | Bottleneck/overhead chặn gain; giới hạn verification-only đã được đo |
 | CI95 upper S<1.03 | Chưa có gain đạt mức thực tiễn đề xuất; báo có/không cải thiện nhỏ theo CI quanh 1 |
 | CI chứa cả 1 và 1.03, quota thiếu hoặc missing cells | `inconclusive/partial`; không claim success hoặc no effect |
-| Bất kỳ output mismatch/invalid cache | Correctness fail; không claim lossless speedup dù timing tốt |
+| Token mismatch với AR | Ghi tỉ lệ/first mismatch và ROUGE; bản thân mismatch không làm phase thất bại |
+| Invalid cache, pending anchor hoặc verifier accounting | Correctness/runtime failure; dừng phase bị ảnh hưởng dù timing tốt |
 
 3% là effect threshold đề xuất thống nhất với G4 cũ. Điểm S≥1.03 với CI lower>1
 chứng minh gain dương với effect estimate thực tiễn; nếu muốn claim **gain ít
@@ -631,8 +635,9 @@ Primary lag calibration reference15 chỉ chứng minh predictability trên fixe
 trajectory; adaptive rollout phải log previous gamma, censoring và support,
 dev-calibrate cho policy history thật như B3. Missing history/unsupported
 lagged shape fallback fixed gamma. So best fixed draft gamma, regime-only,
-history-only và lagged combined, áp exactness/E2E threshold như B3. Không suy
-B4 actionability chỉ từ cross-round Spearman.
+history-only và lagged combined, áp E2E threshold như B3. Ghi ROUGE theo
+reference và token agreement với AR dạng diagnostic; không bắt buộc equality.
+Không suy B4 actionability chỉ từ cross-round Spearman.
 
 ## Phần IV — Phân tích thống kê, bàn giao và triển khai
 
@@ -662,7 +667,7 @@ B4 actionability chỉ từ cross-round Spearman.
   trừ contrasts đã đăng ký. Không chọn một bin thuận lợi rồi gọi pooled hypothesis
   được xác nhận. Báo within-regime và between-regime findings riêng.
 - Không độc lập hóa timing repetitions, queries QMSum hoặc thousands of rounds.
-  Missing/error/parity failures hiện trong coverage denominator; không drop để
+  Runtime/verifier/cache failures hiện trong coverage denominator; không drop để
   tính speedup thuận lợi. Incomplete cells khiến affected gate pending.
 - Không reject practical null vì p>0.05. Low-potential conclusion cần CI upper
   dưới practical threshold. Kết quả âm hợp lệ vẫn là deliverable nghiên cứu.
@@ -685,7 +690,7 @@ outputs/dflash_speculation_B/<run_id>/
   calibration/curves.json        # bins, support, backoff, cost tables
   dev/requests.jsonl             # fixed controls + eligible policies
   locked_config.json             # baseline choices + frozen estimator
-  confirm/requests.jsonl         # repetitions + exactness + timings + ROUGE
+  confirm/requests.jsonl         # repetitions + AR-token diagnostic + timings + ROUGE
   confirm/rounds.jsonl           # actions, causality, commits/cache/fallback
   reports/coverage.json
   reports/metrics.json
@@ -726,19 +731,19 @@ phải kết quả giả:
 | Opportunity lớn; signals không dự đoán được trên groups mới | Có headroom hindsight, chưa có deployable predictor |
 | Signals dự đoán được; opportunity cost nhỏ | Uncertainty giải thích acceptance, chưa đáng làm adaptive controller |
 | B1-V + B2 tốt; B3 không thắng fixed | Có predictable depth, actionability chưa đạt; báo bottleneck/overhead |
-| B3 thắng hai best fixed và exactness | Confidence-aware adaptive verification có giá trị thực tế |
+| B3 thắng hai best fixed và ROUGE/quality được báo cùng latency | Confidence-aware adaptive verification có giá trị thực tế trong workload đã đo |
 | History thắng, entropy không bổ sung | Giữ history-based control; loại entropy contribution |
 | Confidence thắng, entropy không bổ sung | Giữ confidence; không gán benefit cho entropy |
 | Chỉ B4 lagged signals + draft-length E2E đạt | Có predictive adaptive draft length, phân biệt với verification control |
-| Parity fail hoặc CI/quota thiếu | Kết quả invalid hoặc inconclusive; không claim paper speedup |
+| Runtime/verifier/cache validation fail hoặc CI/quota thiếu | Kết quả invalid hoặc inconclusive; không claim paper speedup |
 
 ### 14. Kế hoạch triển khai theo chức năng
 
-Phần này là **hợp đồng triển khai dự kiến**, không là mô tả CLI đã có.
-Executor V1 vẫn chỉ nhận draft_shape; việc có Action.length_mode string
-verify_prefix chưa tạo đường chạy B3. Đọc kế hoạch task-by-task trước sửa mã.
+Phần này là bản đồ chức năng và bằng chứng còn lại. CLI hiện có các phase B0–B4,
+bao gồm B3/B4 dev-lock-confirm; xác nhận trên B200, cache-prefix và timing GPU
+vẫn pending. Các hàng dưới đây ghi phạm vi triển khai và bằng chứng cần thu.
 
-| Task | Files dự kiến | Làm gì và bằng chứng hoàn tất |
+| Task | Files chính | Phạm vi và bằng chứng hoàn tất |
 |---|---|---|
 | T1 — Protocol/cohort | Mới `src/TrainingFree/speculation_experiments/{config,cohort,schema}.py`; tái sử dụng splits/artifacts helpers | Lock grid/thresholds/exposure, source-group folds, state identity và summaries; CPU fixtures không leakage/duplicate |
 | T2 — Candidate collector | Sửa `context_adaptive/{attention,types}.py`; mới `speculation_experiments/signals.py` | Optional FP32 entropy/confidence/margin vectors, không giữ full logits; fixture phân phối uniform/peaked, proposal equality và missing/history origins |
@@ -746,12 +751,12 @@ verify_prefix chưa tạo đường chạy B3. Đọc kế hoạch task-by-task 
 | T4 — B1/B1-V replay | Mới `speculation_experiments/replay.py`; tái sử dụng bank/cache helpers | Isolated forks, draft-shape riêng vs same-proposals prefix verify, warmup/schedule/setup exclusion, full round accounting; branch/cache/replay consistency fixtures |
 | T5 — Predictive evaluation | Mới `speculation_experiments/{survival,evaluation}.py` | Train-fold-only bins, monotone curves, support/backoff, Brier/reliability/Spearman/regret; CPU analytic fixtures và leakage checks |
 | T6 — Report/decisions | Mới `speculation_experiments/report.py`, `scripts/analyze_dflash_speculation_B.py` | Coverage, cluster CI, practical null/positive/inconclusive ledger, figures; report từ saved artifacts không cần load model |
-| T7 — Verification controller, có điều kiện | Sửa `context_adaptive/generation.py` qua proposal/verifier API rõ ràng; mới `speculation_experiments/controller.py` | Verify k+anchor, discard suffix, row-L pending, cost/overhead/history censoring; GPU output exact và strong fixed controls |
+| T7 — Verification controller, có điều kiện | `context_adaptive/generation.py`; `speculation_experiments/b_controller.py`; CLI B3 | Draft15/verify-k rõ riêng; giữ row-L làm pending anchor, bỏ suffix, update cache/bank theo tokens giữ lại; dev-lock/confirm, strong fixed controls và đo extraction/controller overhead. AR token equality diagnostic; GPU validation vẫn pending |
 | T8 — Launcher/campaign [INTEGRATION] | Mới `scripts/run_dflash_speculation_B.py`, `scripts/run_dflash_speculation_B_b200.sh`, `src/TrainingFree/docs/dflash_speculation_B_b200.md` | Master/runtime helpers, phase gates, shared replay/evaluator, resume/signatures, request/round JSONL và runbook |
-| T9 — B4, có điều kiện | Mới `speculation_experiments/lagged.py`; tái sử dụng T5/T7 | Adjacent-round causal features, shape/censor support, draft-shape rollout nếu pass predictive gate |
+| T9 — B4, có điều kiện | `speculation_experiments/lagged.py`; all-round gamma15 traces; CLI B4 | Ghép round liền kề chỉ khi output progress causal; fit cost/commit theo gamma trên selection, grouped OOF trên evaluation; lagged draft-length E2E dev-lock/confirm; unsupported previous gamma fallback về fixed. GPU validation vẫn pending |
 
-T7/T9 không bắt buộc triển khai nếu evidence gate không đạt. T8 có đúng một
-integration task cho campaign inference; validation áp inference static/CPU
+T7/T9 đã có code; evidence gate quyết định có mở các campaign E2E này hay không.
+T8 tích hợp campaign inference; validation áp inference static/CPU
 logic + checkpoint/GPU runtime, không áp training-loss/MFU/overfit checks.
 Future meaningful fixtures nằm ở `src/TrainingFree/tests/`, gắn từng chức năng,
 không import tests/probe vào production inference core. Tái sử dụng API hiện
@@ -764,28 +769,30 @@ features, next anchor và crop lengths. Không overload một gamma field vừa 
 draft shape vừa là verification prefix. Giữ hành vi V1 mặc định để tránh làm
 sai baseline A; added mode có parity evidence riêng.
 
-#### 14.1. CLI phases hiện có và điều kiện chạy
+#### 14.1. CLI phases và điều kiện chạy
 
-Harness hiện có mode `prepare`, `preflight`, `validate`, `b1`, `b1v`,
-`analyze`, `run`; invocation và artifacts mô tả trong
+Harness có mode `prepare`, `preflight`, `validate`, `b1`, `b1v`,
+`analyze`, `run`, `b3-dev`, `b3-confirm`, `b4`, `b4-dev`, `b4-confirm`;
+invocation và artifacts mô tả trong
 [`docs/dflash_speculation_B_b200.md`](../docs/dflash_speculation_B_b200.md).
-`validate` thực hiện B0 parity và ghi fixed-gamma-15 reference trace;
+`validate` chạy B0, ghi AR/native/adapter token diagnostics và fixed-gamma-15 reference trace;
 `analyze` thực hiện offline B1/B2 analysis; `run` chạy B0→B1→B1-V→analysis.
-Không có B3/B4, verify-prefix generation controller hoặc E2E controller
-benchmark.
+B3/B4 E2E được chạy riêng trên dev, khóa policy/cost/fixed controls, rồi mới
+được confirm trên source groups riêng.
 
 | Phase | Inputs chính | Outputs / điều kiện đi tiếp |
 |---|---|---|
 | prepare | Corpus, reviewed exposure registry, cohort phase và protocol | Cohort/split/campaign manifest; không load model |
 | preflight | Local model snapshots và runtime | Runtime/GPU/backend signature; không chạy phase nghiên cứu |
-| validate (B0) | Checkpoint thật, cùng prompts, gamma 3/7/11/15 | Exact AR/native/adapter parity; gamma 15 ghi reference trace; dừng nếu mismatch |
-| b1 | B0 pass, fixed15 reference states | Independent draft-shape replay, timing split, gamma15 signal collection |
-| b1v | B0 pass + paired B1 proposals | Draft15 một lần/state, k=3/7/11/15 verifier replay, acceptance/cache/anchor checks |
+| validate (B0) | Checkpoint thật, cùng prompts, gamma 3/7/11/15 | B0 run completion; AR/native/adapter token comparison diagnostic; gamma 15 ghi reference trace. Runtime failure dừng phase |
+| b1 | B0 completed, fixed15 reference states | Independent draft-shape replay, timing split, gamma15 signal collection |
+| b1v | B0 completed + paired B1 proposals | Draft15 một lần/state, k=3/7/11/15 verifier replay, acceptance/cache/anchor checks |
 | analyze (B2) | B1 action/signal streams; B1-V nếu đã chạy | Grouped OOF survival/Brier, risk diagnostics, oracle/fixed metrics và decision screening |
 | run | Cohort/config đầy đủ | Chạy tuần tự validate→b1→b1v→analyze; outputs resumable theo trace/state |
+| b3-dev / b3-confirm | B1-V và B2 gates; B0 completed ở cả cohorts | Paired E2E, dev-chosen fixed gamma/k, serialized survival model/cost profile, output IDs/hash, ROUGE và AR-token match diagnostic; confirm phải disjoint source groups |
+| b4 | B0 traces có gamma15 signals + B1 actions | Adjacent-round joins, grouped OOF gamma cost/commit, dev model lock nếu lagged skill đạt ngưỡng |
+| b4-dev / b4-confirm | B4 OOF gate và B0 completed ở cả cohorts | Draft-shape E2E, regime/history controls, lagged controller, unsupported-shape fallback, output IDs/hash, ROUGE và AR-token match diagnostic |
 
-Các phase E2E dev/lock/confirm và B3/B4 vẫn là thiết kế tương lai; CLI không
-được hiểu là có controller hoặc phép đo E2E adaptive.
 Wrapper dùng `scripts/common/runtime.sh`, config master ngoài repository qua
 `config/master.path`, `FAST_INFER_PYTHON` hoặc system `python3` 3.12, offline.
 Không tạo venv từng baseline. Một process/card; nếu shard documents qua nhiều
@@ -801,15 +808,16 @@ gates chỉ tính khi đủ planned cohort/cells. Pilot 6 groups đo actual GPU 
 timed rounds B1, ngoài warmup/reference. B1-V thêm số verifier actions tương
 ứng và draft15/extraction profiling. Không suy wall time từ pilot H100 cũ.
 
-Default harness hiện chạy B0→B1+B2 signals→B1-V→offline analysis; B3/B4 có
-điều kiện và chưa được implement. Nếu GPU budget hạn chế, giảm số source groups/phase và ghi
+CLI hiện chạy B0→B1+B2 signals→B1-V→offline analysis; B3/B4 có lệnh riêng và
+điều kiện mở theo evidence gate. Nếu GPU budget hạn chế, giảm số source groups/phase và ghi
 partial; không giảm controls/repetitions rồi giữ nguyên confidence claim.
 Không tạo cloud spend từ kế hoạch này; Modal diagnostic là campaign riêng.
 
 | Failure | Hành vi bắt buộc |
 |---|---|
 | Asset/package/kernel không hợp lệ | Fail preflight với asset_missing/package_missing/kernel_incompatible; không online install hoặc silent backend swap |
-| Parity/cache/instrumentation mismatch | Lưu first-divergence rồi dừng affected research gate |
+| AR token divergence | Lưu first-divergence và ROUGE diagnostic; không tự dừng phase |
+| Cache, verifier invariant hoặc instrumentation failure | Lưu lỗi và dừng affected research gate |
 | OOM | Ghi error/state; cleanup ngoài measured span; retry tối đa 1 lần cùng signature; lặp lại thì incomplete cell |
 | Missing/non-finite signal hoặc timing | Invalid row có lý do; không impute thành zero/outcome thành rejection |
 | Không đủ groups/tail states/cost support | insufficient_data/partial hoặc fixed fallback logged; không fabricated rows |
@@ -824,22 +832,25 @@ mở, coverage/correctness evidence và câu trả lời B1/B2 cùng opportunity
 cơ chế được giữ. B3/B4 có thể kết thúc bằng quyết định không mở vì không đủ
 headroom/predictability; kết quả âm đúng quy trình là một kết luận hữu ích.
 
-Claim cho paper cần đồng thời: production parity, cohort/exposure đủ rõ,
+Claim cho paper cần đồng thời: runtime/verifier evidence, cohort/exposure đủ rõ,
 estimators/baselines frozen trước confirm, CI theo source groups và E2E tốt
-hơn strong fixed controls sau overhead. Local oracle, Spearman, acceptance
-rate tăng hoặc pilot throughput chưa đạt exactness không thay được các bằng
-chứng này. B-only full context cũng chưa chứng minh interaction A+B/C.
+hơn strong fixed controls sau overhead. Báo ROUGE trên reference và AR-token
+agreement như các số liệu chất lượng/chẩn đoán; không đòi output equality để
+gọi speculative decoding là hợp lệ. Local oracle, Spearman, acceptance rate
+tăng hoặc pilot throughput chưa thay được các bằng chứng này. B-only full
+context cũng chưa chứng minh interaction A+B/C.
 
-**Checklist nghiên cứu sau khi triển khai:**
+**Checklist code đã có; bằng chứng B200 còn pending:**
 
-- [ ] B0: full-context greedy parity mọi shape, instrumentation/caches/stopping.
-- [ ] B1: independent draft-shape sweep, timing selection/evaluation tách, gap CI.
-- [ ] B2: candidate vectors đúng thời điểm, grouped validation, incremental signals.
-- [ ] B1-V: same-proposals prefix verification, overhead-adjusted opportunity.
-- [ ] B3 nếu mở: dev-chosen strong fixed controls, lock, exact paired confirm E2E.
-- [ ] B4 nếu mở: causal adjacent-round signals và real draft-shape evaluation.
-- [ ] Coverage/exposure/QMSum limitations và positive/negative/inconclusive ledger.
+- [x] B0 harness: AR/native/adapter comparison diagnostics mọi shape; gamma15 thu uncertainty all-round khi collector bật.
+- [x] B1: independent draft-shape sweep, selection/evaluation timing và gap CI.
+- [x] B2: current-round candidate vectors, grouped validation, incremental signals.
+- [x] B1-V: same-proposals prefix verification, exact prefix/cache/anchor checks.
+- [x] B3: dev-chosen fixed controls, locked model/cost, paired confirm E2E với ROUGE và AR-token diagnostic.
+- [x] B4: causal adjacent-round pairing, grouped gamma cost/commit evaluation, dev-lock/confirm E2E.
+- [ ] Chạy các phase trên B200; xác nhận B0, cache prefix, latency, full cohort coverage và báo cáo cuối.
 
-Code harness B0/B1/B2/B1-V có test CPU; parity GPU, cache-prefix validation,
-timings và mọi paper claim vẫn **pending**. B3/B4 và E2E exactness chưa được
-implement; chưa có kết quả hoặc speedup từ kế hoạch này.
+Code logic hiện có test CPU; parity GPU, cache-prefix validation, timings và
+mọi paper claim vẫn **pending**. Chỉ báo speedup sau khi B200 E2E/confirm hoàn
+tất, internal verifier/cache invariants đạt, và ROUGE theo reference được báo
+cùng các strong fixed controls; AR-token equality là diagnostic.
