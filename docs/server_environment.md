@@ -216,9 +216,18 @@ draft model, MagicDec `.pth` và SSSD datastore vẫn do operator giữ nguyên.
 
 ### Preflight vLLM/SGLang cho MR-DFlash
 
-Server runtime hiện hành phải resolve đúng vLLM `0.24.0`, SGLang `0.5.14` và
-adapter/patch SpecForge từ môi trường đã cài sẵn. Worker regenerate vLLM gọi
-OpenAI-compatible `/v1/completions`; worker không tự cài hoặc tự tải model.
+Phần này mô tả HTTP server dùng cho MR-DFlash regenerate; tài liệu hiện ghi
+nhận endpoint đó với vLLM `0.24.0`, SGLang `0.5.14` và adapter/patch
+SpecForge. Worker regenerate chỉ gọi OpenAI-compatible `/v1/completions`; nó
+không tự cài hoặc tải model.
+
+Runner nghiên cứu mới `scripts/run.sh vllm_research` chạy vLLM trực tiếp trong
+Python runtime dùng chung và theo manifest hiện tại phải resolve vLLM
+`0.30.0` trong `requirements.txt` (torch `2.13.0`, transformers `5.12.1`).
+Adapter A3/B3/B4 kiểm tra version/source và sẽ ghi unsupported nếu Python
+runtime vẫn là vLLM `0.24.0`; không coi endpoint HTTP đang ghi trong phần này
+là runtime Python tương thích. Hai đường chạy chỉ có thể dùng chung một
+service khi package của interpreter đó đã được đồng bộ về đúng manifest.
 
 ```bash
 python3 - <<'PY'

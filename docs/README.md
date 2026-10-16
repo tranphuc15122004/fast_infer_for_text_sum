@@ -47,6 +47,7 @@ trước khi dùng kết quả hoặc mở heldout.
 
 | Baseline | Env | Doc |
 |---|---|---|
+| vLLM unified + DFlash A/B research | `python3` server / `.venv` mô phỏng | [`docs/baselines/vllm_research.md`](baselines/vllm_research.md) |
 | EAGLE-3 | `python3` server / `.venv` mô phỏng | `docs/baselines/eagle3.md` |
 | DFlash | `python3` server / `.venv` mô phỏng | `docs/baselines/dflash.md` |
 | Context-Adaptive DFlash (experimental, unvalidated) | `python3` server GPU | `docs/baselines/context_adaptive_dflash.md` |

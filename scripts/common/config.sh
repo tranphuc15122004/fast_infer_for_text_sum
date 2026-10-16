@@ -273,6 +273,31 @@ fast_infer__load_vllm_all() {
   fast_infer_default_from VLLM_SEED LONG_BENCH_SEED RUN_SEED
 }
 
+fast_infer__load_vllm_research() {
+  fast_infer__load_vllm_all
+  fast_infer_default_from VLLM_RESEARCH_OUTPUT_ROOT
+  fast_infer_default_from VLLM_RESEARCH_EXPERIMENTS
+  fast_infer_default_from VLLM_RESEARCH_SELECTORS
+  fast_infer_default_from VLLM_RESEARCH_BUDGETS
+  fast_infer_default_from VLLM_RESEARCH_PERIODS
+  fast_infer_default_from VLLM_RESEARCH_GAMMAS
+  fast_infer_default_from VLLM_RESEARCH_MAX_SAMPLES
+  fast_infer_default_from VLLM_RESEARCH_MEASUREMENT
+  fast_infer_default_from VLLM_RESEARCH_MAX_NUM_SEQS
+  fast_infer_default_from VLLM_RESEARCH_REPETITIONS
+
+  fast_infer_default VLLM_RESEARCH_OUTPUT_ROOT "outputs/vllm_research"
+  fast_infer_default VLLM_RESEARCH_EXPERIMENTS "ALL"
+  fast_infer_default VLLM_RESEARCH_SELECTORS "previous_dflash"
+  fast_infer_default VLLM_RESEARCH_BUDGETS "2048"
+  fast_infer_default VLLM_RESEARCH_PERIODS "2,4,8,16"
+  fast_infer_default VLLM_RESEARCH_GAMMAS "3,7,11,15"
+  fast_infer_default VLLM_RESEARCH_MAX_SAMPLES "2"
+  fast_infer_default VLLM_RESEARCH_MEASUREMENT "latency"
+  fast_infer_default VLLM_RESEARCH_MAX_NUM_SEQS "16"
+  fast_infer_default VLLM_RESEARCH_REPETITIONS "1"
+}
+
 fast_infer__load_dflash() {
   fast_infer_default_from TARGET_MODEL MODEL_TARGET
   fast_infer_default_from DRAFT_MODEL MODEL_DFLASH_DRAFT B200_DFLASH_MODEL
@@ -597,6 +622,7 @@ fast_infer_load_config() {
     specprefill) fast_infer__load_specprefill ;;
     syncspec) fast_infer__load_syncspec ;;
     vllm_all) fast_infer__load_vllm_all ;;
+    vllm_research) fast_infer__load_vllm_research ;;
     *)
       echo "fast-infer: unsupported baseline in master config loader: $baseline" >&2
       return 1

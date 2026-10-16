@@ -318,22 +318,10 @@ def _prepare(args: argparse.Namespace, *, allow_existing: bool = True) -> tuple[
 
 
 def _load_prepared(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
-    run_root = _run_root(args)
-    campaign_path = run_root / "campaign.json"
-    cohort_path = run_root / "cohort_manifest.json"
-    if not campaign_path.is_file() or not cohort_path.is_file():
-        raise FileNotFoundError(f"run is not prepared; execute --mode prepare first: {run_root}")
-    current, campaign, _ = _prepare(args, allow_existing=True)
-    saved = json.loads(cohort_path.read_text(encoding="utf-8"))
-    sample_by_key = {(str(row["dataset"]), str(row["id"])): row for row in current}
-    selected = []
-    for row in saved["groups"]:
-        key = (str(row["dataset"]), str(row["sample_id"]))
-        sample = sample_by_key.get(key)
-        if sample is None:
-            raise ValueError(f"prepared cohort sample missing from current corpus: {key}")
-        selected.append(sample)
-    return selected, campaign, run_root
+    # A prepared run is resumed from its saved protocol/cohort. Rebuilding the
+    # campaign from current CLI defaults can produce a different campaign hash
+    # and incorrectly block later phases such as B1-V.
+    return _load_resume_campaign(args)
 
 
 def _load_resume_campaign(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:

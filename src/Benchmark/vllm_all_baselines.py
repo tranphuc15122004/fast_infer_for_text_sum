@@ -34,7 +34,6 @@ from Benchmark.common.speculative_metrics import normalize_speculative_acceptanc
 from Benchmark.common.vllm_pilot import (
     install_domino_vllm_compat,
     paired_vllm_metrics,
-    pilot_warmup_tokens,
     resolve_eagle3_aux_hidden_state_layers,
     select_pilot_methods,
     speculative_token_count,
@@ -574,7 +573,7 @@ def _request_record(
     model: str,
     request_output: Any,
     tokenizer: Any,
-    client_wall_ms: float,
+    client_wall_ms: float | None,
     gpu_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     completion = request_output.outputs[0]
@@ -642,6 +641,7 @@ def _request_record(
     record = _base_record(method, sample, model)
     record.update(
         {
+            "execution_status": "success" if finish_reason in {"stop", "length"} else "failed",
             "status": (
                 "success"
                 if token_ids
@@ -692,7 +692,7 @@ def _request_record(
 
 def _failed_record(method: str, sample: dict[str, Any], model: str, error: str) -> dict[str, Any]:
     record = _base_record(method, sample, model)
-    record.update({"status": "failed", "error": error})
+    record.update({"status": "failed", "execution_status": "failed", "error": error})
     return record
 
 
@@ -807,7 +807,44 @@ def _method_metrics(records: list[dict[str, Any]], methods: tuple[str, ...]) -> 
             if row.get("draft_proposal_unit") is not None
         })
         rouge = aggregate_rouge(rows)
+        measurement = next((row.get("measurement") for row in rows if row.get("measurement")), "latency")
+        batches = {row["batch_id"]: row["batch_wall_ms"] for row in rows
+                   if row.get("batch_id") is not None and row.get("batch_wall_ms") is not None}
+        makespan_ms = sum(batches.values()) if batches else None
+        executed = [row for row in rows
+                    if row.get("execution_status", row.get("status")) == "success"]
+        latencies = sorted(float(row["e2e_ms"]) for row in executed if row.get("e2e_ms") is not None)
+        percentiles = {}
+        for label, quantile in (("latency_p50_ms", 0.50), ("latency_p95_ms", 0.95)):
+            if latencies:
+                position = (len(latencies) - 1) * quantile
+                lower, upper = math.floor(position), math.ceil(position)
+                percentiles[label] = latencies[lower] + (latencies[upper] - latencies[lower]) * (position - lower)
+            else:
+                percentiles[label] = None
+        active_events = []
+        for row in executed:
+            raw = row.get("raw_request_metrics") or {}
+            start, end = raw.get("scheduled_ts"), raw.get("last_token_ts")
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)) and 0 < start <= end:
+                active_events.extend(((start, 1), (end, -1)))
+        active = peak_active = 0
+        for _, change in sorted(active_events):
+            active += change
+            peak_active = max(peak_active, active)
+        if measurement == "throughput":
+            metrics = None  # Batch throughput does not establish batch-1 speculative speedup.
         output[method] = {
+            "measurement": measurement,
+            "executed_outputs": len(executed),
+            "measured_makespan_ms": makespan_ms,
+            "output_throughput_tok_s": (
+                1000.0 * sum(int(row.get("output_tokens", 0)) for row in executed) / makespan_ms
+                if makespan_ms else None
+            ),
+            "request_throughput_qps": 1000.0 * len(executed) / makespan_ms if makespan_ms else None,
+            "peak_active_requests_observed": peak_active if active_events else None,
+            **percentiles,
             "samples": len(rows),
             "successful_outputs": len(good),
             "quality_valid_outputs": quality_valid,
@@ -858,6 +895,68 @@ def _shutdown_engine(engine: Any) -> None:
             engine.shutdown()
         except Exception:
             pass
+
+
+
+def _execution_concurrency(args: argparse.Namespace) -> int:
+    return 1 if args.measurement == "latency" else args.max_num_seqs
+
+
+def _warmup_samples(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    ordered = sorted(samples, key=lambda row: row["input_tokens"])
+    count = min(limit, len(ordered))
+    if count <= 0:
+        return []
+    if count == 1:
+        return [ordered[len(ordered) // 2]]
+    return [ordered[round(i * (len(ordered) - 1) / (count - 1))] for i in range(count)]
+
+
+def _generation_batches(engine: Any, samples: list[dict[str, Any]], sampling: Any,
+                        *, batch_size: int, synchronize: Any, on_batch_start: Any = None):
+    """Submit bounded groups; retain shared makespan separately from request latency.
+
+    LLM.generate returns outputs in input order (vLLM public API). A failed batch
+    gets a terminal failure for each submitted request; later batches still run.
+    No automatic retry on a potentially corrupted CUDA engine is attempted here.
+    """
+    for offset in range(0, len(samples), batch_size):
+        batch = samples[offset:offset + batch_size]
+        if on_batch_start is not None:
+            on_batch_start(offset, batch)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        error = None
+        error_traceback = None
+        outputs = []
+        try:
+            outputs = engine.generate(
+                [{"prompt_token_ids": row["prompt_token_ids"]} for row in batch],
+                sampling, use_tqdm=False,
+            )
+            synchronize()
+        except Exception as exc:
+            error = exc
+            error_traceback = traceback.format_exc()
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        for index, sample in enumerate(batch):
+            output = outputs[index] if index < len(outputs) else None
+            request_error = error
+            if output is None and request_error is None:
+                request_error = RuntimeError("vLLM returned no output for this request")
+            yield {
+                "index": offset + index + 1, "sample": sample, "output": output,
+                "batch_id": offset // batch_size, "batch_size": len(batch),
+                "batch_wall_ms": wall_ms, "started_at_utc": started_at,
+                "error": request_error, "error_traceback": error_traceback,
+            }
+
+
+def _result_exit_code(*, complete: bool, execution: bool, quality: bool,
+                      correctness: bool, diagnostics: str) -> int:
+    return int(not complete or not execution or (
+        diagnostics == "strict" and (not quality or not correctness)
+    ))
 
 
 def _evaluate(args: argparse.Namespace) -> int:
@@ -934,11 +1033,17 @@ def _evaluate(args: argparse.Namespace) -> int:
         "dtype": args.dtype,
         "temperature": 0.0,
         "seed": args.seed,
-        "batch_size": 1,
+        "batch_size": _execution_concurrency(args),
+        "measurement": args.measurement,
+        "max_num_seqs": _execution_concurrency(args),
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "diagnostics": args.diagnostics,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": args.enforce_eager,
         "enable_prefix_caching": False,
-        "warmup_per_sample": True,
+        "warmup_per_sample": False,
+        "warmup_prompts": args.warmup_prompts,
+        "warmup_max_tokens": args.warmup_tokens,
         "sample_selection": "length_spread" if args.length_spread_samples else "input_order",
         "speculative_metric_capture": (
             "detailed"
@@ -1079,11 +1184,13 @@ def _evaluate(args: argparse.Namespace) -> int:
                 "enforce_eager": args.enforce_eager,
                 "enable_prefix_caching": False,
                 "max_model_len": args.max_model_len,
-                "max_num_seqs": 1,
+                "max_num_seqs": _execution_concurrency(args),
                 "gpu_memory_utilization": args.gpu_memory_utilization,
                 "seed": args.seed,
                 "speculative_config": speculative_config,
             }
+            if args.max_num_batched_tokens is not None:
+                engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
             if speculative_config is not None:
                 if supports_per_request_spec_metrics:
                     engine_kwargs["per_request_spec_decode_metrics"] = "detailed"
@@ -1132,7 +1239,7 @@ def _evaluate(args: argparse.Namespace) -> int:
                 temperature=0.0,
                 seed=args.seed,
                 max_tokens=min(
-                    pilot_warmup_tokens(speculative_tokens), args.max_new_tokens
+                    args.warmup_tokens, args.max_new_tokens
                 ),
                 n=1,
                 ignore_eos=True,
@@ -1152,10 +1259,10 @@ def _evaluate(args: argparse.Namespace) -> int:
                 "warmup_started",
                 run_started_perf,
                 method=method,
-                sample_count=len(samples),
+                sample_count=len(_warmup_samples(samples, args.warmup_prompts)),
                 warmup_max_tokens=warmup_sampling.max_tokens,
             )
-            for sample in samples:
+            for sample in _warmup_samples(samples, args.warmup_prompts):
                 warmup_started = time.perf_counter()
                 warmup_output = engine.generate(
                     [{"prompt_token_ids": sample["prompt_token_ids"]}],
@@ -1194,88 +1301,63 @@ def _evaluate(args: argparse.Namespace) -> int:
                 )
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
-            for index, sample in enumerate(samples, start=1):
-                request_started = time.perf_counter()
-                request_started_at_utc = datetime.now(timezone.utc).isoformat()
-                request_output = None
+            def batch_started(offset, batch):
                 _append_event(
-                    events_path,
-                    "request_started",
-                    run_started_perf,
-                    method=method,
-                    sample_id=sample["sample_id"],
-                    sample_index=index,
-                    input_tokens=sample["input_tokens"],
+                    events_path, "batch_started", run_started_perf, method=method,
+                    batch_id=offset // _execution_concurrency(args),
+                    sample_ids=[row["sample_id"] for row in batch],
+                    submitted_concurrency=len(batch), measurement=args.measurement,
                 )
-                _write_json(
-                    progress_path,
-                    {
-                        "run_id": run_id,
-                        "status": "running",
-                        "stage": "request_running",
-                        "current_method": method,
-                        "current_method_index": methods.index(method) + 1,
-                        "current_sample_id": sample["sample_id"],
-                        "current_sample_index": index,
-                        "records_written": len(records),
-                        "method_status": {
-                            name: config.get("status")
-                            for name, config in model_configs.items()
-                        },
-                    },
-                )
+                _write_json(progress_path, {
+                    "run_id": run_id, "status": "running", "stage": "batch_running",
+                    "current_method": method, "current_sample_index": offset + 1,
+                    "current_sample_ids": [row["sample_id"] for row in batch],
+                    "records_written": len(records),
+                })
+                torch.cuda.reset_peak_memory_stats()
+
+            for generated in _generation_batches(
+                engine, samples, sampling, batch_size=_execution_concurrency(args),
+                synchronize=torch.cuda.synchronize, on_batch_start=batch_started,
+            ):
+                index, sample = generated["index"], generated["sample"]
+                request_started_at_utc = generated["started_at_utc"]
+                request_output = generated["output"]
+                request_wall_ms = generated["batch_wall_ms"]
+                request_gpu_memory = _gpu_memory_snapshot(torch)
                 try:
-                    torch.cuda.reset_peak_memory_stats()
-                    request_output = engine.generate(
-                        [{"prompt_token_ids": sample["prompt_token_ids"]}],
-                        sampling,
-                        use_tqdm=False,
-                    )[0]
-                    torch.cuda.synchronize()
-                    request_wall_ms = (time.perf_counter() - request_started) * 1000.0
-                    request_gpu_memory = _gpu_memory_snapshot(torch)
+                    if generated["error"] is not None:
+                        raise generated["error"]
                     record = _request_record(
                         method=method,
                         sample=sample,
                         model=paths["vanilla_vllm"],
                         request_output=request_output,
                         tokenizer=tokenizer,
-                        client_wall_ms=request_wall_ms,
+                        client_wall_ms=request_wall_ms if args.measurement == "latency" else None,
                         gpu_memory=request_gpu_memory,
                     )
                 except Exception as exc:
-                    error_traceback = traceback.format_exc()
-                    traceback.print_exc()
-                    request_wall_ms = (time.perf_counter() - request_started) * 1000.0
-                    request_gpu_memory = _gpu_memory_snapshot(torch)
+                    error_traceback = generated["error_traceback"] or traceback.format_exc()
                     record = _failed_record(
-                        method,
-                        sample,
-                        paths["vanilla_vllm"],
-                        f"{type(exc).__name__}: {exc}",
+                        method, sample, paths["vanilla_vllm"], f"{type(exc).__name__}: {exc}",
                     )
-                    record["client_wall_ms"] = request_wall_ms
-                    record["gpu_memory"] = request_gpu_memory
                     record["error_traceback"] = error_traceback
+                    record["gpu_memory"] = request_gpu_memory
                     if request_output is not None:
                         record["raw_request_output"] = _jsonable(request_output)
-                        request_metrics = getattr(request_output, "metrics", None)
-                        record["raw_request_metrics"] = _jsonable(request_metrics)
-                        record["raw_speculative_metrics"] = _jsonable(
-                            getattr(request_output.outputs[0], "spec_decode_metrics", None)
-                        )
-                        record["speculative_decoding_metrics"] = record["raw_speculative_metrics"]
                     _append_event(
-                        events_path,
-                        "request_failed",
-                        run_started_perf,
-                        method=method,
-                        sample_id=sample["sample_id"],
-                        error_type=type(exc).__name__,
-                        error=str(exc),
+                        events_path, "request_failed", run_started_perf, method=method,
+                        sample_id=sample["sample_id"], error=str(exc),
                         error_traceback=error_traceback,
-                        client_wall_ms=request_wall_ms,
                     )
+                record.update({
+                    "measurement": args.measurement,
+                    "batch_id": generated["batch_id"],
+                    "batch_size": generated["batch_size"],
+                    "batch_wall_ms": request_wall_ms,
+                    "submitted_concurrency": generated["batch_size"],
+                })
                 record["request_started_at_utc"] = request_started_at_utc
                 record["request_ended_at_utc"] = datetime.now(timezone.utc).isoformat()
                 record["sample_index"] = index
@@ -1286,6 +1368,7 @@ def _evaluate(args: argparse.Namespace) -> int:
                 problems = validate_schema(record, spec=method != "vanilla_vllm")
                 if problems:
                     record["status"] = "invalid"
+                    record["execution_status"] = "failed"
                     record["schema_errors"] = problems
                 _append_event(
                     events_path,
@@ -1437,7 +1520,9 @@ def _evaluate(args: argparse.Namespace) -> int:
         and parity[method]["exact_matches"] == len(samples)
         for method in methods
     )
-    execution_pass = all(row.get("status") == "success" for row in records)
+    execution_pass = bool(records) and all(
+        row.get("execution_status", row.get("status")) == "success" for row in records
+    )
     quality_pass = all(bool(row.get("quality_valid")) for row in records)
     evaluation_finished_at_utc = datetime.now(timezone.utc).isoformat()
     evaluation_runtime_ms = round((time.perf_counter() - run_started_perf) * 1000.0, 3)
@@ -1489,6 +1574,9 @@ def _evaluate(args: argparse.Namespace) -> int:
         "excluded_samples": excluded,
         "data_file": str(Path(args.data_file).resolve()),
         "execution_complete": execution_complete,
+        "campaign_status": "finished" if execution_complete else "partial",
+        "execution_status": "complete" if execution_complete and execution_pass else "failed",
+        "diagnostics": args.diagnostics,
         "correctness_pass": correctness_pass,
         "execution_pass": execution_pass,
         "quality_pass": quality_pass,
@@ -1499,6 +1587,9 @@ def _evaluate(args: argparse.Namespace) -> int:
         "model_configs": model_configs,
         "metric_definitions": {
             "tpot_ms": "(last_token_ts - first_token_ts) / (output_tokens - 1)",
+            "output_throughput_tok_s": "completed output tokens / sum measured batch makespans (warmup/load excluded)",
+            "latency_p50_ms": "median of per-request last_token_ts - queued_ts; never batch wall / request count",
+            "peak_active_requests_observed": "peak overlap of scheduled_ts..last_token_ts when request timestamps exist",
             "dsr": "mean TPOT of vanilla_vllm / mean TPOT of method",
             "esr": "(mean vanilla prefill + vanilla TPOT * paired min output length) / (mean vanilla prefill + method TPOT * paired min output length)",
             "token_lcs_overlap_with_vanilla": "LCS(output token IDs, vanilla token IDs) / vanilla output token count",
@@ -1534,9 +1625,10 @@ def _evaluate(args: argparse.Namespace) -> int:
     partial_records_path.unlink(missing_ok=True)
     print(f"Kết quả: {output_dir}", flush=True)
     print(json.dumps(metric_summary, ensure_ascii=False, indent=2), flush=True)
-    if not execution_complete or not execution_pass or not quality_pass:
-        return 1
-    return 0
+    return _result_exit_code(
+        complete=execution_complete, execution=execution_pass, quality=quality_pass,
+        correctness=correctness_pass, diagnostics=args.diagnostics,
+    )
 
 
 def _render_markdown_table(lines: list[str], method_metrics: dict[str, Any], parity_dict: dict[str, Any]) -> None:
@@ -1621,7 +1713,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-model-len", type=int, default=12288)
     parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--measurement", choices=("latency", "throughput"), default="throughput")
+    parser.add_argument("--max-num-seqs", type=int, default=16, help="Throughput concurrency; latency always uses 1")
+    parser.add_argument("--max-num-batched-tokens", type=int)
+    parser.add_argument("--warmup-prompts", type=int, default=3)
+    parser.add_argument("--warmup-tokens", type=int, default=64)
+    parser.add_argument("--diagnostics", choices=("report-only", "strict"), default="report-only")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--smoke", action="store_true", help="Limit to two common samples")
@@ -1653,6 +1751,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("max-model-len must exceed max-new-tokens")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
         raise SystemExit("gpu-memory-utilization must be between 0 and 1")
+    if args.max_num_seqs < 1 or args.warmup_prompts < 0 or args.warmup_tokens < 1:
+        raise SystemExit("max-num-seqs/warmup-tokens must be positive; warmup-prompts non-negative")
+    if args.max_num_batched_tokens is not None and args.max_num_batched_tokens < 1:
+        raise SystemExit("max-num-batched-tokens must be positive")
     methods = order_methods(args.methods)
     paths = _model_paths(args, methods)
     if not Path(args.data_file).is_file():

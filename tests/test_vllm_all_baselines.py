@@ -256,3 +256,151 @@ def test_token_lcs_overlap_is_ordered_and_uses_vanilla_length_as_denominator():
     assert token_lcs_overlap([1, 2, 3, 4], [1, 3, 4]) == pytest.approx(0.75)
     assert token_lcs_overlap([1, 2, 3, 4], [1, 2, 3, 4, 5, 6]) == pytest.approx(1.0)
     assert token_lcs_overlap([], []) is None
+
+
+def test_execution_profile_defaults_to_real_throughput_batches():
+    args = evaluator._parser().parse_args(
+        ['--model', 'm', '--data-file', 'd', '--output-dir', 'o']
+    )
+    assert args.measurement == 'throughput'
+    assert args.max_num_seqs == 16
+    assert args.diagnostics == 'report-only'
+    assert evaluator._execution_concurrency(args) == 16
+    args.measurement = 'latency'
+    assert evaluator._execution_concurrency(args) == 1
+
+
+def test_generation_batches_submit_multiple_prompts_and_isolate_failed_batches():
+    class Engine:
+        def generate(self, prompts, sampling, use_tqdm=False):
+            if prompts[0]['prompt_token_ids'] == [2]:
+                raise RuntimeError('batch failed')
+            return [prompt['prompt_token_ids'][0] for prompt in prompts]
+
+    samples = [{'prompt_token_ids': [index]} for index in range(5)]
+    observed = list(evaluator._generation_batches(
+        Engine(), samples, object(), batch_size=2, synchronize=lambda: None
+    ))
+    assert [row['output'] for row in observed] == [0, 1, None, None, 4]
+    assert [row['batch_size'] for row in observed] == [2, 2, 2, 2, 1]
+    assert [row['index'] for row in observed] == [1, 2, 3, 4, 5]
+    assert isinstance(observed[2]['error'], RuntimeError)
+    assert observed[0]['batch_id'] == observed[1]['batch_id']
+    assert observed[-1]['batch_wall_ms'] >= 0
+
+
+def test_warmup_uses_at_most_three_representative_prompt_lengths():
+    samples = [{'input_tokens': n} for n in [99, 5, 40, 6, 300, 50, 12]]
+    assert [row['input_tokens'] for row in evaluator._warmup_samples(samples, 3)] == [5, 40, 300]
+    assert evaluator._warmup_samples(samples, 0) == []
+
+
+def test_report_only_diagnostics_do_not_hide_execution_failures():
+    assert evaluator._result_exit_code(complete=True, execution=True, quality=False,
+                                       correctness=False, diagnostics='report-only') == 0
+    assert evaluator._result_exit_code(complete=True, execution=False, quality=True,
+                                       correctness=True, diagnostics='report-only') == 1
+    assert evaluator._result_exit_code(complete=True, execution=True, quality=True,
+                                       correctness=False, diagnostics='strict') == 1
+
+
+def test_throughput_aggregation_counts_each_batch_wall_once_and_keeps_request_latency():
+    records = [
+        {'method': 'vanilla_vllm', 'status': 'success', 'quality_valid': True,
+         'tpot_ms': 20, 'raw_prefill_ms': 10, 'measurement': 'throughput',
+         'batch_id': batch, 'batch_wall_ms': wall, 'output_tokens': tokens,
+         'e2e_ms': latency}
+        for batch, wall, tokens, latency in [(0, 100, 4, 80), (0, 100, 6, 95), (1, 50, 5, 40)]
+    ]
+    metrics = evaluator._method_metrics(records, ('vanilla_vllm',))['vanilla_vllm']
+    assert metrics['measured_makespan_ms'] == 150
+    assert metrics['output_throughput_tok_s'] == 100
+    assert metrics['request_throughput_qps'] == 20
+    assert metrics['latency_p50_ms'] == 80
+    assert metrics['latency_p95_ms'] == pytest.approx(93.5)
+    assert metrics['paired_speed_metrics'] is None
+
+
+def test_request_without_timing_remains_executed_but_diagnostic_invalid():
+    from types import SimpleNamespace
+    sample = {'sample_id': 'a', 'dataset': 'd', 'input_tokens': 2,
+              'prompt': 'p', 'prompt_token_ids': [1, 2], 'reference': None}
+    request = SimpleNamespace(outputs=[SimpleNamespace(token_ids=[3, 4], text='ok',
+                              finish_reason='length')], metrics=None, prompt_token_ids=[1, 2])
+    tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: 'ok')
+    record = evaluator._request_record(method='vanilla_vllm', sample=sample, model='m',
+                                       request_output=request, tokenizer=tokenizer,
+                                       client_wall_ms=None)
+    assert record['execution_status'] == 'success'
+    assert record['status'] == 'invalid'
+    assert record['e2e_ms'] is None
+    assert record['client_wall_ms'] is None
+
+
+@pytest.mark.parametrize('measurement,expected_sizes', [('throughput', [2, 2, 1]), ('latency', [1] * 5)])
+def test_evaluate_uses_selected_concurrency_and_finalizes_real_artifacts(
+    tmp_path, monkeypatch, measurement, expected_sizes
+):
+    from types import SimpleNamespace
+
+    checkpoint = tmp_path / 'model'
+    checkpoint.mkdir()
+    (checkpoint / 'config.json').write_text('{}')
+    data = tmp_path / 'data.jsonl'
+    data.write_text('{}\n')
+    samples = [dict(sample_id=str(i), dataset='d', input_tokens=2, document_words=1,
+                    prompt='p', prompt_token_ids=[i, 2], reference=None, source_record={})
+               for i in range(5)]
+    engine_calls = []
+    engine_config = {}
+
+    class Engine:
+        def __init__(self, **kwargs):
+            engine_config.update(kwargs)
+
+        def generate(self, prompts, sampling, use_tqdm=False):
+            engine_calls.append(len(prompts))
+            return [SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[3, 4], text='ok', finish_reason='length')],
+                prompt_token_ids=prompt['prompt_token_ids'],
+                metrics=SimpleNamespace(scheduled_ts=1., first_token_ts=1.01,
+                                        last_token_ts=1.1, queued_ts=1., first_token_latency=.01),
+            ) for prompt in prompts]
+
+        def shutdown(self):
+            pass
+
+    tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: 'ok')
+    transformers = SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer),
+        AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: SimpleNamespace(
+            num_hidden_layers=36, to_dict=lambda: {})), __version__='5.12.1')
+    torch = SimpleNamespace(__version__='2.13.0', cuda=SimpleNamespace(
+        is_available=lambda: True, get_device_name=lambda _: 'Fake GPU',
+        synchronize=lambda: None, reset_peak_memory_stats=lambda: None, empty_cache=lambda: None))
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    monkeypatch.setitem(sys.modules, 'transformers', transformers)
+    monkeypatch.setitem(sys.modules, 'vllm', SimpleNamespace(
+        LLM=Engine, SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs), __version__='0.30.0'))
+    monkeypatch.setattr(evaluator, '_runtime_snapshot', lambda *args: {})
+    monkeypatch.setattr(evaluator, '_gpu_memory_snapshot', lambda *args: {})
+    monkeypatch.setattr(evaluator, '_nvidia_smi_snapshot', lambda: {})
+    monkeypatch.setattr(evaluator, '_prepare_samples', lambda *args, **kwargs: (samples, []))
+    args = evaluator._parser().parse_args([
+        '--model', str(checkpoint), '--data-file', str(data), '--output-dir', str(tmp_path / 'out'),
+        '--methods', 'vanilla_vllm', '--measurement', measurement, '--max-num-seqs', '2',
+        '--warmup-prompts', '0', '--run-id', 'test',
+    ])
+    assert evaluator._evaluate(args) == 0
+    assert engine_calls == expected_sizes
+    assert engine_config['max_num_seqs'] == max(expected_sizes)
+    output = tmp_path / 'out' / 'test'
+    rows = [json.loads(line) for line in (output / 'results.jsonl').read_text().splitlines()]
+    assert len(rows) == 6
+    assert rows[-1]['record_type'] == 'summary'
+    assert rows[-1]['execution_status'] == 'complete'
+    assert rows[-1]['configuration']['measurement'] == measurement
+    assert not (output / 'results.partial.jsonl').exists()
+    if measurement == 'throughput':
+        assert rows[0]['client_wall_ms'] is None
+        assert rows[0]['e2e_ms'] == pytest.approx(100.)

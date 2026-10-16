@@ -65,7 +65,7 @@ MAX_NEW_TOKENS="${VLLM_MAX_NEW_TOKENS:-${RUN_MAX_NEW_TOKENS:-512}}"
 MAX_INPUT_TOKENS="${VLLM_MAX_INPUT_TOKENS:-${RUN_MAX_INPUT_TOKENS:-8192}}"
 MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}"
 DTYPE="${VLLM_DTYPE:-bfloat16}"
-GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.88}"
+GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 METHODS="${VLLM_METHODS:-vanilla_vllm,eagle3,dflash,domino,dspark}"
 
 cd "$ROOT"
@@ -88,7 +88,16 @@ ARGS=(
   --max-model-len "$MAX_MODEL_LEN"
   --dtype "$DTYPE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --measurement "${VLLM_MEASUREMENT:-throughput}"
+  --max-num-seqs "${VLLM_MAX_NUM_SEQS:-16}"
+  --warmup-prompts "${VLLM_WARMUP_PROMPTS:-3}"
+  --warmup-tokens "${VLLM_WARMUP_TOKENS:-64}"
+  --diagnostics "${VLLM_DIAGNOSTICS:-report-only}"
 )
+
+if [[ -n "${VLLM_MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+  ARGS+=(--max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS")
+fi
 
 if [[ "${VLLM_SEED:-42}" != "42" ]]; then
   ARGS+=(--seed "$VLLM_SEED")
