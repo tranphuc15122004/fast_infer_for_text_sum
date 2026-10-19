@@ -53,7 +53,7 @@ def run_evaluation_remote():
 
 
 @app.local_entrypoint()
-def main(output_dir: str = "outputs/_PAPER_EXP/dflash_sota_selection_benchmark/m0_m5_matrix"):
+def main(output_dir: str = "outputs/_PAPER_EXP/dflash_sota_matrix_faithful_20261019"):
     if os.environ.get("MODAL_PROFILE") != "phuclk30":
         os.environ["MODAL_PROFILE"] = "phuclk30"
 

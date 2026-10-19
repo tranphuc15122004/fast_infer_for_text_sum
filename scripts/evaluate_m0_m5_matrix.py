@@ -315,6 +315,42 @@ def evaluate_snapshots(snapshot_dir: Path, output_dir: Path):
         w.writeheader()
         w.writerows(csv_rows)
 
+    # Matrix Experiment A CSVs
+    matrix_dir = output_dir / "matrix_experiment_A"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. experiment_A_cross_candidate_matrix.csv (16K, B=2048, next_round)
+    matrix_rows = []
+    for m in METHODS:
+        cand_covs = {}
+        for c in CANDIDATE_ORDER:
+            matching = [
+                r for r in results
+                if r["context_cap"] == 16384 and r["budget"] == 2048 and r["method"] == m
+                and r["candidate"] == c and r["evaluation_scope"] == "next_round"
+            ]
+            cand_covs[f"cov_{c}"] = 100 * matching[0]["mean_coverage"] if matching else float("nan")
+
+        mean_all = float(np.nanmean(list(cand_covs.values())))
+        row = {
+            "method": m,
+            "method_label": METHOD_LABELS[m],
+            "mean_coverage_across_all_candidates": mean_all,
+        }
+        row.update(cand_covs)
+        matrix_rows.append(row)
+
+    with (matrix_dir / "experiment_A_cross_candidate_matrix.csv").open("w") as f:
+        w = csv.DictWriter(f, fieldnames=list(matrix_rows[0].keys()))
+        w.writeheader()
+        w.writerows(matrix_rows)
+
+    # 2. experiment_A_all_budgets_matrix.csv
+    with (matrix_dir / "experiment_A_all_budgets_matrix.csv").open("w") as f:
+        w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+        w.writeheader()
+        w.writerows(csv_rows)
+
     print(f"[evaluate] Hoàn tất xuất kết quả: {len(results)} dòng macro tại {output_dir}")
     return report
 

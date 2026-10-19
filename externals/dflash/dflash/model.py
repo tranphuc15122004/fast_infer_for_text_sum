@@ -146,7 +146,6 @@ def dflash_generate(
         if verification_prefix_controller is not None and block_size > 1:
             try:
                 from TrainingFree.speculation_experiments.signals import summarize_draft_logits
-                from types import SimpleNamespace
 
                 req_entropy = getattr(verification_prefix_controller, "requires_entropy", True)
                 draft_unc = summarize_draft_logits(draft_logits, include_entropy=req_entropy)

@@ -20,7 +20,58 @@ SERVER_MODEL_ENV = {
     "dflash_phase_b": "MODEL_DFLASH_DRAFT",
 }
 
+SERVER_MODEL_ALIASES = {
+    "vanilla_hf": ("MODEL_TARGET", "B200_TARGET_MODEL", "LONG_BENCH_MODEL"),
+    "eagle3": ("MODEL_EAGLE_DRAFT", "B200_EAGLE_MODEL"),
+    "dflash": ("MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
+    "domino": ("MODEL_DOMINO_DRAFT", "B200_DOMINO_MODEL"),
+    "dspark": ("MODEL_DSPARK_DRAFT", "B200_DSPARK_MODEL"),
+    "dflash_phase_b": ("MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
+}
+
 SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_b")
+
+
+def auto_load_master_config(config_arg: str | None = None) -> Path | None:
+    """Auto-load master config into os.environ if models or paths are missing."""
+    root = Path(__file__).resolve().parents[2]
+    candidate: Path | None = None
+    if config_arg and Path(config_arg).expanduser().is_file():
+        candidate = Path(config_arg).expanduser()
+    elif os.environ.get("FAST_INFER_MASTER_CONFIG") and Path(os.environ["FAST_INFER_MASTER_CONFIG"]).expanduser().is_file():
+        candidate = Path(os.environ["FAST_INFER_MASTER_CONFIG"]).expanduser()
+    else:
+        pointer = root / "config" / "master.path"
+        if pointer.is_file():
+            for line in pointer.read_text(encoding="utf-8").splitlines():
+                target = line.split("#", 1)[0].strip()
+                if target:
+                    p = Path(target).expanduser()
+                    if not p.is_absolute():
+                        p = root / p
+                    if p.is_file():
+                        candidate = p
+                    break
+        if candidate is None:
+            default_canonical = Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env")
+            if default_canonical.is_file():
+                candidate = default_canonical
+
+    if candidate and candidate.is_file():
+        import subprocess
+        sub_cmd = f'set -a && source "{candidate}" && python3 -c "import os, json; print(json.dumps(dict(os.environ)))"'
+        proc = subprocess.run(["bash", "-c", sub_cmd], capture_output=True, text=True)
+        if proc.returncode == 0:
+            try:
+                loaded = json.loads(proc.stdout)
+                for k, v in loaded.items():
+                    if k not in os.environ or not str(os.environ[k]).strip():
+                        os.environ[k] = str(v)
+                return candidate
+            except Exception:
+                pass
+    return None
+
 
 def resolve_server_models(
     environ: Mapping[str, str], methods: str = "all"
@@ -37,17 +88,29 @@ def resolve_server_models(
         if "vanilla_hf" not in requested or "dflash" not in requested:
             raise ValueError("FA4 comparisons require both vanilla_hf and dflash")
         selected = tuple(method for method in SUPPORTED_METHODS if method in requested)
-    missing = [
-        SERVER_MODEL_ENV[method]
-        for method in selected
-        if not str(environ.get(SERVER_MODEL_ENV[method], "")).strip()
-    ]
+
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for method in selected:
+        value = None
+        for var in SERVER_MODEL_ALIASES.get(method, (SERVER_MODEL_ENV[method],)):
+            candidate = str(environ.get(var, "")).strip()
+            if candidate:
+                value = candidate
+                if isinstance(environ, dict):
+                    environ.setdefault(SERVER_MODEL_ENV[method], value)
+                elif hasattr(os, "environ"):
+                    os.environ.setdefault(SERVER_MODEL_ENV[method], value)
+                break
+        if value:
+            resolved[method] = value
+        else:
+            missing.append(SERVER_MODEL_ENV[method])
+
     if missing:
-        raise ValueError("Missing model paths from master config: " + ", ".join(missing))
-    return {
-        method: str(environ[SERVER_MODEL_ENV[method]]).strip()
-        for method in selected
-    }
+        dedup_missing = sorted(set(missing))
+        raise ValueError("Missing model paths from master config: " + ", ".join(dedup_missing))
+    return resolved
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verifier-audit", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--debug-cuda-launch-blocking", action="store_true")
+    parser.add_argument("--config", default=os.environ.get("FAST_INFER_MASTER_CONFIG", ""), help="Đường dẫn file master config shell-env (mặc định lấy theo config/master.path)")
     parser.add_argument("--data-dir", default=os.environ.get("FA4_DATA_DIR", os.environ.get("LONG_BENCH_DATA_DIR", "data/longbench_100_14k")))
     parser.add_argument("--output-dir", default=os.environ.get("FA4_OUTPUT_ROOT", "outputs/fa4_native_benchmark"))
     return parser
@@ -124,6 +188,7 @@ def runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    auto_load_master_config(args.config)
     args.methods = ",".join(args.methods.replace(",", " ").split())
     try:
         models = resolve_server_models(os.environ, args.methods)
