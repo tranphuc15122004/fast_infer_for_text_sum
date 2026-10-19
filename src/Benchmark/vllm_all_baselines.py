@@ -25,6 +25,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 from Benchmark.common.benchmark_data import read_jsonl, render_prompt
 from Benchmark.common.io_util import JsonlWriter, validate_schema
 from Benchmark.common.prompt_format import format_chat_prompt
@@ -479,13 +483,72 @@ def _local_checkpoint(path: str, label: str) -> Path:
     return checkpoint.resolve()
 
 
+def _auto_load_master_config() -> Path | None:
+    """Auto-load master config into os.environ if models or paths are missing."""
+    root = Path(__file__).resolve().parents[2]
+    candidate: Path | None = None
+    if os.environ.get("FAST_INFER_MASTER_CONFIG") and Path(os.environ["FAST_INFER_MASTER_CONFIG"]).expanduser().is_file():
+        candidate = Path(os.environ["FAST_INFER_MASTER_CONFIG"]).expanduser()
+    else:
+        pointer = root / "config" / "master.path"
+        if pointer.is_file():
+            for line in pointer.read_text(encoding="utf-8").splitlines():
+                target = line.split("#", 1)[0].strip()
+                if target:
+                    p = Path(target).expanduser()
+                    if not p.is_absolute():
+                        p = root / p
+                    if p.is_file():
+                        candidate = p
+                    break
+        if candidate is None:
+            default_canonical = Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env")
+            if default_canonical.is_file():
+                candidate = default_canonical
+
+    if candidate and candidate.is_file():
+        sub_cmd = f'set -a && source "{candidate}" && python3 -c "import os, json; print(json.dumps(dict(os.environ)))"'
+        proc = subprocess.run(["bash", "-c", sub_cmd], capture_output=True, text=True)
+        if proc.returncode == 0:
+            try:
+                loaded = json.loads(proc.stdout)
+                for k, v in loaded.items():
+                    if k not in os.environ or not str(os.environ[k]).strip():
+                        os.environ[k] = str(v)
+                return candidate
+            except Exception:
+                pass
+    return None
+
+
 def _model_paths(args: argparse.Namespace, methods: tuple[str, ...]) -> dict[str, str]:
-    target = str(_local_checkpoint(args.model, "target model"))
+    target_val = (
+        getattr(args, "model", None)
+        or os.environ.get("VLLM_TARGET_MODEL")
+        or os.environ.get("MODEL_TARGET")
+        or os.environ.get("LONG_BENCH_MODEL")
+        or os.environ.get("B200_TARGET_MODEL")
+    )
+    if not target_val:
+        raise ValueError("--model is required (or set VLLM_TARGET_MODEL in master config)")
+    target = str(_local_checkpoint(target_val, "target model"))
     paths = {"vanilla_vllm": target}
+    draft_env_fallbacks = {
+        "eagle3": ("VLLM_EAGLE3_MODEL", "MODEL_EAGLE_DRAFT", "EAGLE_MODEL", "B200_EAGLE_MODEL"),
+        "dflash": ("VLLM_DFLASH_MODEL", "MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
+        "domino": ("VLLM_DOMINO_MODEL", "MODEL_DOMINO_DRAFT", "MODEL_DOMINO", "DOMINO_DRAFT_MODEL", "B200_DOMINO_MODEL"),
+        "dspark": ("VLLM_DSPARK_MODEL", "MODEL_DSPARK_DRAFT", "MODEL_DSPARK", "DSPARK_DRAFT_MODEL", "B200_DSPARK_MODEL"),
+        "dflash_phase_a": ("VLLM_DFLASH_MODEL", "MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
+    }
     for method, arg_name in DRAFT_ARGUMENTS.items():
         if method not in methods:
             continue
-        value = getattr(args, arg_name)
+        value = getattr(args, arg_name, None)
+        if not value:
+            for env_key in draft_env_fallbacks.get(method, ()):
+                if os.environ.get(env_key):
+                    value = os.environ[env_key]
+                    break
         if not value:
             raise ValueError(f"--{arg_name.replace('_', '-')} is required when selecting {method}")
         paths[method] = str(_local_checkpoint(value, f"{method} draft model"))
@@ -1058,7 +1121,8 @@ def _evaluate(args: argparse.Namespace) -> int:
     )
     if Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run-id must be a single path component")
-    output_dir = Path(args.output_dir).expanduser().resolve() / run_id
+    output_dir_base = getattr(args, "output_dir", None) or os.environ.get("VLLM_OUTPUT_DIR") or "outputs/vllm_unified"
+    output_dir = Path(output_dir_base).expanduser().resolve() / run_id
     if output_dir.exists():
         if not output_dir.is_dir():
             raise FileExistsError(f"run output path is not a directory: {output_dir}")
@@ -1707,22 +1771,44 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Eval vanilla, EAGLE3, DFlash, Domino, DSpark with one local vLLM runtime."
     )
-    parser.add_argument("--model", required=True, help="Local target model directory")
-    parser.add_argument("--data-file", required=True, help="Canonical JSONL input file")
-    parser.add_argument("--output-dir", required=True, help="Root directory for unique run artifacts")
+    parser.add_argument("--model", default=None, help="Local target model directory")
+    parser.add_argument(
+        "--data-file",
+        "--data-path",
+        dest="data_file",
+        default=None,
+        help="Canonical JSONL input file",
+    )
+    parser.add_argument(
+        "--output-dir", default=None, help="Root directory for unique run artifacts"
+    )
     parser.add_argument("--eagle3-model")
     parser.add_argument("--dflash-model")
     parser.add_argument("--domino-model")
     parser.add_argument("--dspark-model")
     parser.add_argument("--methods", default=",".join(METHODS))
-    parser.add_argument("--max-samples", type=int, default=0, help="0 means every eligible input row")
+    parser.add_argument(
+        "--max-samples",
+        "--max-tokens",
+        dest="max_samples",
+        type=int,
+        default=0,
+        help="0 means every eligible input row",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-model-len", type=int, default=12288)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--measurement", choices=("latency", "throughput"), default="throughput")
-    parser.add_argument("--max-num-seqs", type=int, default=16, help="Throughput concurrency; latency always uses 1")
+    parser.add_argument(
+        "--max-num-seqs",
+        "--batch-size",
+        dest="max_num_seqs",
+        type=int,
+        default=16,
+        help="Throughput concurrency; latency always uses 1",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--warmup-prompts", type=int, default=3)
     parser.add_argument("--warmup-tokens", type=int, default=64)
@@ -1751,7 +1837,30 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _auto_load_master_config()
     args = _parser().parse_args(argv)
+    if not args.model:
+        args.model = (
+            os.environ.get("VLLM_TARGET_MODEL")
+            or os.environ.get("MODEL_TARGET")
+            or os.environ.get("LONG_BENCH_MODEL")
+            or os.environ.get("B200_TARGET_MODEL")
+        )
+    if not args.model:
+        raise SystemExit("--model is required (or set VLLM_TARGET_MODEL / MODEL_TARGET in master config)")
+
+    if not args.data_file:
+        args.data_file = (
+            os.environ.get("VLLM_DATA_FILE")
+            or os.environ.get("LONG_BENCH_DATA_FILE")
+            or os.environ.get("DATA_INPUT")
+        )
+    if not args.data_file:
+        raise SystemExit("--data-file (or --data-path) is required")
+
+    if not args.output_dir:
+        args.output_dir = os.environ.get("VLLM_OUTPUT_DIR") or "outputs/vllm_unified"
+
     if args.max_samples < 0 or args.max_new_tokens <= 1 or args.max_input_tokens < 0:
         raise SystemExit("max-samples/input-tokens must be non-negative; max-new-tokens must exceed 1")
     if args.max_model_len <= args.max_new_tokens:

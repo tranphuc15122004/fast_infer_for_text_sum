@@ -1,6 +1,6 @@
 # Đề xuất Phase A: adaptive context budget để tối ưu speedup FA4
 
-Ngày: 19/10/2026. Trạng thái: **thiết kế đề xuất, chưa triển khai controller**.
+Ngày: 19/10/2026. Trạng thái: **được chọn để triển khai trên FA4**.
 
 ## 1. Mục tiêu và phạm vi
 
@@ -69,8 +69,9 @@ exploration, tail và controller overhead.
 
 ## 5. Không gian budget và selector
 
-Grid khởi đầu: `{512, 1024, 2048, 4096, 8192, full}`. Đây là tham số đề xuất
-để khảo sát trên dev, không phải cấu hình đã được xác nhận tốt nhất.
+Khoảng budget khởi đầu: từ 512 đến 8192 token, bắt đầu ở 2048 và di chuyển
+theo các nấc chunk 128 token. Đây là giới hạn đề xuất để pilot trên B200,
+không phải budget tối ưu đã được xác nhận.
 
 - Budget là trần context keys, không gồm block parent + 15 draft candidates.
 - B >= logical context length được canonicalize thành `full`, loại action trùng.
@@ -84,63 +85,45 @@ Grid khởi đầu: `{512, 1024, 2048, 4096, 8192, full}`. Đây là tham số �
 
 ## 6. Thống kê online và khởi tạo
 
-Mỗi action giữ tổng trọng số w, tổng round-ms u, tổng commit v, và riêng
-draft-ms/verify-ms để quan sát. Các observation trong cùng context bucket
-được giảm trọng số theo số round thực đã trôi qua, kể cả khi action không được chọn:
+V1 giữ cho mỗi budget tổng trọng số, round-ms, số commit và component draft /
+verify để chẩn đoán. Sau mỗi observation hợp lệ, thống kê mọi budget được giảm
+trọng số `decay=0.9`; action vừa chạy được cộng thêm một observation. Chi phí
+được tính bằng tổng round-ms chia tổng commit, không lấy trung bình các tỷ số
+từng round.
 
-```text
-w_B <- lambda^delta * w_B
-u_B <- lambda^delta * u_B
-v_B <- lambda^delta * v_B
-                    # chỉ với action B vừa thực thi và timing hợp lệ:
-w_B <- w_B + 1
-u_B <- u_B + T_round
-v_B <- v_B + C
-J_hat(B) = (u_B + kappa * prior_round_ms(B))
-           / (v_B + kappa * prior_commits(B))
-```
-
-Giá trị khởi đầu để kiểm chứng: lambda=0.9, kappa=4. Prior lấy từ calibration
-riêng, cùng checkpoint, GPU/runtime signature, selector và context bucket.
-Bucket context khởi đầu rộng 2048 token; không ngoại suy cost ngoài support.
-Prior có thể backoff về cùng action/context bucket khi chia thêm state bị thiếu mẫu.
-
-Mỗi request reset lịch sử online về prior. Warmup chỉ làm nóng kernel/shapes,
-không để acceptance của chính prompt warmup làm prior cho request đo chính.
-Không học chéo test requests trong V1.
-
-Mode không có prior vẫn có thể chạy: bắt đầu từ 2048 (hoặc full nếu context
-ngắn), thử lân cận bằng round thật và log `cold_start`. 2048 khi đó chỉ là
-điểm khởi động. Không suy outcome cho các budget chưa chạy và không báo đây
-là mode đã calibrated. Request ngắn có thể không đủ round để học hữu ích.
+Triển khai V1 cold-start ở 2048 và chỉ học trong request hiện tại. Không có
+prior đã calibration, context bucket hay chia sẻ observation giữa warmup và
+request đo. Round draft đầu sau prefill được ghi là bootstrap nhưng không đưa
+vào thống kê: action đầu được chuẩn bị trong prefill, không có cùng boundary
+đo với những action tiếp theo. Không suy outcome cho budget chưa chạy. Request
+ngắn có thể không đủ round để học hữu ích.
 
 ## 7. Quy trình chọn budget
 
 1. Prefill full target; dùng query cuối prompt để tạo signal cho draft đầu.
-2. Khởi tạo budget từ action tốt nhất theo prior hợp lệ; thiếu prior dùng cold start.
+2. Khởi tạo budget ở 2048 trong V1 cold-start; không dùng prior chưa được calibration.
 3. Mỗi round thực thi đúng một draft với budget đã chọn rồi verify bình thường.
 4. Ghi observation theo action thực chạy; nhận timing GPU trễ nếu chưa ready.
-5. Sau mỗi cửa sổ 4 round thường, đánh giá lại J_hat của các action có support.
-6. Đổi budget khi cải thiện dự đoán ít nhất 3%; giữ ít nhất 4 round giữa hai
-   quyết định thường để giảm dao động. Không phản ứng với một lần reject.
-7. Sau mỗi 16 round thường, cho phép thử một budget liền kề ít được quan sát
-   hoặc đã cũ. Chọn phía có J_hat tốt hơn theo prior; nếu không có prior thì
-   luân phiên giảm/tăng. Mỗi lượt thử gồm 4 round sinh thật.
-8. Sau lượt thử, so thống kê đã cập nhật, giữ action tốt hơn hoặc quay lại.
-   Không loại observation thử kém khỏi latency cuối request.
-9. Nếu prior hợp lệ cho thấy action xa tốt hơn, có thể chuyển trực tiếp sau
-   cửa sổ quyết định; local exploration đơn thuần không bảo đảm tìm được action xa.
+5. Sau 3 round ở cùng budget, đánh giá chi phí trên token commit.
+6. Nếu budget thử thắng incumbent ít nhất 3%, nhận nó làm incumbent và nhân
+   đôi bước tìm kiếm tới trần 1024 token.
+7. Nếu budget thử không thắng, quay chiều và giảm bước một nửa, tối thiểu
+   128 token. Nếu hai phía ở bước tối thiểu đều không thắng, giữ incumbent.
+8. Sau 12 round giữ incumbent, thử lại một lân cận để thích ứng khi decode
+   tiếp tục và đặc tính các round đổi.
+9. Mọi lần thử là round sinh thật và được tính vào latency cuối request.
 10. Khi remaining output slots <= gamma+1, ngừng exploration, dùng action
-    incumbent; tail bị clip/EOS không cập nhật prior regular-round.
+    incumbent; nếu request kết thúc thì không chọn action tiếp theo.
 
-Các số 4/16/3% là giá trị khởi đầu; khóa trên dev trước held-out test. Với
+Các số 3/12/3% là giá trị khởi đầu; khóa trên dev trước held-out test. Với
 request ngắn, có thể tắt exploration để tránh mất nhiều round cho việc học.
 Không thể phân biệt chắc chắn đổi độ khó văn bản với tác động budget chỉ bằng
 online samples; dùng repeated trials và same-prefix replay khi đánh giá.
 
-Fallback khi thiếu signal hoặc controller lỗi: action fixed tốt nhất đã khóa
-trên dev, nếu không có thì dense DFlash; log lý do. Không âm thầm biến sparse
-thành dense mà vẫn ghi như thể controller đã thực thi action yêu cầu.
+Nếu thiếu query hoặc target key signal, draft dùng full context và observation
+budget của round đó bị loại khỏi controller; trace ghi rõ lý do. Cấu hình không
+hợp lệ fail-fast khi tạo selector, tránh âm thầm báo một action khác với action
+thực thi.
 
 ## 8. Đo timing không tạo thêm hàng rào đồng bộ
 
@@ -191,7 +174,7 @@ trong replay offline; không tính replay đó là online speedup.
    optimum có đổi theo round hay chỉ theo document/context length.
 4. **Online rollout:** dense, fixed-2048, best-fixed, adaptive-frozen-prior,
    adaptive-timing+acceptance; thêm draft-ms-only làm ablation.
-5. **Held-out test:** giữ nguyên grid/hyperparameters đã khóa trên dev; sinh
+5. **Held-out test:** giữ nguyên bounds/step/hyperparameters đã khóa trên dev; sinh
    summary đủ dài tới EOS hoặc cap thống nhất. Tính cả exploration và bootstrap.
 
 Báo cáo paired request wall speedup so dense, best fixed và vanilla; kèm TPOT,
@@ -219,3 +202,28 @@ phải hiệu năng đã được chứng minh.
 - GPU gate cho FA4 dispatch, parity, overhead và full-summary paired latency.
 
 Không triển khai adaptive controller hoặc chạy GPU trong bước viết đề xuất này.
+
+## 12. Quyết định triển khai sau khi chốt budget theo chunk
+
+Thiết kế triển khai giữ `dflash_phase_a` ở fixed mode theo mặc định và bật
+controller bằng `DFLASH_PHASE_A_BUDGET_MODE=adaptive`. Search không quét một
+grid budget cố định. Nó di chuyển trên budget nguyên theo bước tối thiểu
+`chunk_size=128`, bắt đầu từ 2048, giới hạn mặc định 512–8192.
+
+Controller giữ số đo theo budget đã thực sự chạy. Sau mỗi 3 round cùng budget,
+nó so sánh tỷ số thời gian round có suy giảm theo thời gian trên số token đã
+commit. Khi budget thử mới thắng quá 3%, nó trở thành incumbent và bước tìm
+kiếm tăng gấp đôi tới trần 1024 token. Khi không thắng, controller quay chiều
+và giảm bước tới tối thiểu 128. Nếu cả hai lân cận ở bước 128 đều không thắng,
+controller giữ incumbent; sau 12 round nó thử lại để bắt thay đổi hành vi.
+
+`round_ms` dùng để quyết định gồm thời gian thực hiện draft + verify đo bằng
+đồng hồ tường giữa hai mốc round, cộng overhead selector/controller trước đó
+đã được quy về budget hiện tại. Draft/verify CUDA event time được log riêng.
+Overhead selector/controller được đo và gắn vào quan sát budget kế tiếp. E2E
+đồng bộ của cả request vẫn là thước đo cuối cùng, gồm cả bootstrap, exploration
+và overhead tìm kiếm.
+
+Per-request state reset ở đầu mỗi generation. Round cuối bị clip theo output
+cap/EOS không tham gia cập nhật thường lệ. Adaptive trace được xuất cùng từng
+record sample để có thể kiểm tra budget trajectory và từng quyết định.

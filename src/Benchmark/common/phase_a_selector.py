@@ -14,11 +14,13 @@ zero CPU synchronization, zero Python loops over tokens/chunks).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
+
+from Benchmark.common.phase_a_budget import AdaptiveBudgetController
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,23 @@ class PhaseAConfig:
     recent_tokens: int = 32
     budget: int = 2048
     query_pooling: str = "max"
+    budget_mode: str = "fixed"
+    min_budget: int = 512
+    max_budget: int = 8192
+    controller_window_rounds: int = 3
+    controller_min_gain: float = 0.03
+    controller_decay: float = 0.9
+    controller_recheck_rounds: int = 12
+
+    def __post_init__(self) -> None:
+        if self.budget_mode not in {"fixed", "adaptive"}:
+            raise ValueError("DFLASH_PHASE_A_BUDGET_MODE must be 'fixed' or 'adaptive'")
+        if self.chunk_size < 1:
+            raise ValueError("DFLASH_PHASE_A_CHUNK_SIZE must be positive")
+        if self.budget < 1 or self.min_budget < 1 or self.max_budget < self.min_budget:
+            raise ValueError("Phase A budget and adaptive bounds must be positive and ordered")
+        if self.budget_mode == "adaptive" and not self.min_budget <= self.budget <= self.max_budget:
+            raise ValueError("DFLASH_PHASE_A_BUDGET must be within adaptive min/max bounds")
 
     @classmethod
     def from_env(cls) -> "PhaseAConfig":
@@ -44,6 +63,13 @@ class PhaseAConfig:
             recent_tokens=int(os.environ.get("DFLASH_PHASE_A_RECENT", "32")),
             budget=int(os.environ.get("DFLASH_PHASE_A_BUDGET", "2048")),
             query_pooling=os.environ.get("DFLASH_PHASE_A_POOLING", "max"),
+            budget_mode=os.environ.get("DFLASH_PHASE_A_BUDGET_MODE", "fixed").strip().lower(),
+            min_budget=int(os.environ.get("DFLASH_PHASE_A_MIN_BUDGET", "512")),
+            max_budget=int(os.environ.get("DFLASH_PHASE_A_MAX_BUDGET", "8192")),
+            controller_window_rounds=int(os.environ.get("DFLASH_PHASE_A_WINDOW_ROUNDS", "3")),
+            controller_min_gain=float(os.environ.get("DFLASH_PHASE_A_MIN_GAIN", "0.03")),
+            controller_decay=float(os.environ.get("DFLASH_PHASE_A_DECAY", "0.9")),
+            controller_recheck_rounds=int(os.environ.get("DFLASH_PHASE_A_RECHECK_ROUNDS", "12")),
         )
 
 
@@ -70,6 +96,7 @@ class TargetLayer18QueryCapture:
         self.query: Optional[torch.Tensor] = None
         self._position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._enabled = False
+        self._last_query_only = False
         self._handles: list[Any] = []
         self._handles.append(self.module.register_forward_pre_hook(self._capture_inputs, with_kwargs=True))
         self._handles.append(self.module.q_proj.register_forward_hook(self._capture_query))
@@ -88,15 +115,17 @@ class TargetLayer18QueryCapture:
         if self._position_embeddings is not None:
             cos, sin = self._position_embeddings
             q = q * cos.unsqueeze(1) + _rotate_half(q) * sin.unsqueeze(1)
-        self.query = q
+        self.query = q[:, :, -1:, :] if self._last_query_only else q
 
-    def enable(self) -> None:
+    def enable(self, *, last_query_only: bool = False) -> None:
         self.query = None
         self._position_embeddings = None
+        self._last_query_only = last_query_only
         self._enabled = True
 
     def disable(self) -> Optional[torch.Tensor]:
         self._enabled = False
+        self._last_query_only = False
         q = self.query
         self.query = None
         self._position_embeddings = None
@@ -259,23 +288,55 @@ class PhaseAContextSelector:
         self.target_model = target_model
         self.capture = TargetLayer18QueryCapture(target_model, layer_index=self.config.target_layer)
         self.selected_indices: Optional[torch.Tensor] = None
+        self.current_budget = self.config.budget
+        self.last_fallback_reason: Optional[str] = None
+        self.controller = (
+            AdaptiveBudgetController(
+                initial_budget=self.config.budget,
+                min_budget=self.config.min_budget,
+                max_budget=self.config.max_budget,
+                chunk_size=self.config.chunk_size,
+                window_rounds=self.config.controller_window_rounds,
+                min_gain=self.config.controller_min_gain,
+                decay=self.config.controller_decay,
+                recheck_rounds=self.config.controller_recheck_rounds,
+            )
+            if self.config.budget_mode == "adaptive"
+            else None
+        )
 
-    def begin_verification_round(self) -> None:
+    def reset(self) -> None:
+        self.current_budget = self.config.budget
+        self.selected_indices = None
+        self.last_fallback_reason = None
+        if self.controller is not None:
+            self.controller.reset()
+
+    def begin_verification_round(self, *, prefill: bool = False) -> None:
         """Call before target model verify step to capture Layer 18 Q."""
-        self.capture.enable()
+        self.capture.enable(last_query_only=prefill)
 
     def end_verification_round(
         self,
         target_cache: Any,
         accepted_length: int,
         total_length: int,
+        *,
+        prefill: bool = False,
+        budget_override: Optional[int] = None,
     ) -> torch.Tensor:
         """Extract signals and select focused context indices on GPU."""
         q = self.capture.disable()
         device = next(self.target_model.parameters()).device
+        active_budget = int(self.current_budget if budget_override is None else budget_override)
+        self.current_budget = active_budget
+        self.last_fallback_reason = None
         if q is None or accepted_length < 1:
-            indices = torch.arange(min(total_length, self.config.budget), device=device, dtype=torch.long)
+            # Missing signal must preserve dense semantics. Taking the first
+            # tokens would silently change the model's context and parity.
+            indices = torch.arange(total_length, device=device, dtype=torch.long)
             self.selected_indices = indices
+            self.last_fallback_reason = "query_signal_unavailable"
             return indices
 
         # Extract K from target cache at target layer
@@ -286,18 +347,31 @@ class PhaseAContextSelector:
             k = target_cache.key_cache[self.config.target_layer]
 
         if k is None:
-            indices = torch.arange(min(total_length, self.config.budget), device=device, dtype=torch.long)
+            indices = torch.arange(total_length, device=device, dtype=torch.long)
             self.selected_indices = indices
+            self.last_fallback_reason = "target_key_cache_unavailable"
             return indices
 
         scaling = float(self.capture.module.scaling)
+        if prefill:
+            q = q[:, :, -1:, :]
+            query_positions = torch.tensor([total_length - 1], device=q.device, dtype=torch.long)
+        else:
+            q = q[:, :, :accepted_length, :]
+            query_positions = torch.arange(
+                max(0, total_length - q.shape[-2]), total_length,
+                device=q.device,
+                dtype=torch.long,
+            )
         scores = compute_multi_query_scores_from_qk(
-            q[:, :, :accepted_length, :],
+            q,
             k[:, :, :total_length, :],
             scaling=scaling,
+            query_positions=query_positions,
             query_pooling=self.config.query_pooling,
         )
-        self.selected_indices = select_focused_context_indices(scores, total_length, self.config)
+        selection_config = replace(self.config, budget=active_budget)
+        self.selected_indices = select_focused_context_indices(scores, total_length, selection_config)
         return self.selected_indices
 
     def close(self) -> None:

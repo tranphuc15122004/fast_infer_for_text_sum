@@ -494,7 +494,7 @@ def select_focused_paged_blocks_vllm(
     import torch
     import torch.nn.functional as F
 
-    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    dev = device if device is not None else torch.device("cpu")
     r = total_seq_len % block_size
     total_full_blocks = total_seq_len // block_size
     max_full_blocks_budget = min(budget_blocks if r == 0 else budget_blocks - 1, total_full_blocks)

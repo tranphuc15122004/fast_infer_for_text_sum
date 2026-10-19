@@ -404,3 +404,16 @@ def test_evaluate_uses_selected_concurrency_and_finalizes_real_artifacts(
     if measurement == 'throughput':
         assert rows[0]['client_wall_ms'] is None
         assert rows[0]['e2e_ms'] == pytest.approx(100.)
+
+
+def test_parser_aliases_and_env_fallbacks():
+    # Test that --data-path, --max-tokens, --batch-size aliases parse accurately
+    args = evaluator._parser().parse_args([
+        "--data-path", "sample.jsonl",
+        "--max-tokens", "50",
+        "--batch-size", "16",
+    ])
+    assert args.data_file == "sample.jsonl"
+    assert args.max_samples == 50
+    assert args.max_num_seqs == 16
+

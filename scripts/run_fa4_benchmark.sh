@@ -7,8 +7,27 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
   shift
 fi
 
+# Keep explicit Phase A CLI environment overrides authoritative when the
+# external master config also contains DFLASH_PHASE_A_* assignments.
+declare -A DFLASH_PHASE_A_CALLER_OVERRIDES=()
+for phase_a_var in \
+  DFLASH_PHASE_A_BUDGET_MODE DFLASH_PHASE_A_BUDGET \
+  DFLASH_PHASE_A_MIN_BUDGET DFLASH_PHASE_A_MAX_BUDGET \
+  DFLASH_PHASE_A_CHUNK_SIZE DFLASH_PHASE_A_WINDOW_ROUNDS \
+  DFLASH_PHASE_A_MIN_GAIN DFLASH_PHASE_A_DECAY DFLASH_PHASE_A_RECHECK_ROUNDS \
+  DFLASH_PHASE_A_LAYER DFLASH_PHASE_A_SELECTOR DFLASH_PHASE_A_SINK \
+  DFLASH_PHASE_A_RECENT DFLASH_PHASE_A_POOLING; do
+  if [[ -v "$phase_a_var" ]]; then
+    DFLASH_PHASE_A_CALLER_OVERRIDES["$phase_a_var"]="${!phase_a_var}"
+  fi
+done
+
 source "$ROOT/scripts/common/config.sh"
 fast_infer_load_config fa4_native
+for phase_a_var in "${!DFLASH_PHASE_A_CALLER_OVERRIDES[@]}"; do
+  printf -v "$phase_a_var" '%s' "${DFLASH_PHASE_A_CALLER_OVERRIDES[$phase_a_var]}"
+  export "$phase_a_var"
+done
 source "$ROOT/scripts/common/runtime.sh" || exit 1
 
 export MODEL_TARGET="${LONG_BENCH_MODEL:-${MODEL_TARGET:-}}"

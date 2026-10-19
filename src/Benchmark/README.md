@@ -141,3 +141,18 @@ hoặc kết quả. Kết quả nằm dưới `outputs/fa4_native_benchmark/<run
 
 Các lần chạy có số liệu chỉ thực hiện trên B200; máy Tesla T4 chỉ dùng để rà
 soát logic CPU và không thể thực thi FA4.
+
+Để chạy DFlash Phase A với budget adaptive trên FA4, bật
+`DFLASH_PHASE_A_BUDGET_MODE=adaptive` khi gọi `fa4_native`; mặc định vẫn là
+budget fixed 2048 để giữ đối chứng. Ví dụ full run trên B200:
+
+```bash
+DFLASH_PHASE_A_BUDGET_MODE=adaptive FI_GPU_IDS=0 \
+  bash scripts/run.sh fa4_native --full \
+  --methods vanilla_hf,dflash,dflash_phase_a
+```
+
+Controller tìm budget theo từng request bằng round wall-time trên token đã
+commit. Trajectory và quyết định từng round nằm trong record của
+`dflash_phase_a`; cấu hình đầy đủ và các biến điều khiển được mô tả ở
+[`docs/baselines/dflash_phase_a.md`](../../docs/baselines/dflash_phase_a.md).

@@ -1281,6 +1281,18 @@ def _output_payload(
         }
         acceptance_lengths = list(getattr(result, "acceptance_lengths", []) or [])
         steps = len(acceptance_lengths)
+        phase_a_fields = {
+            "phase_a_budget_mode": getattr(result, "phase_a_budget_mode", None),
+            "phase_a_budget_initial": getattr(result, "phase_a_budget", None),
+            "phase_a_budget_min": getattr(result, "phase_a_budget_min", None),
+            "phase_a_budget_max": getattr(result, "phase_a_budget_max", None),
+            "phase_a_budget_current": getattr(result, "phase_a_budget_current", None),
+            "phase_a_selected_tokens": getattr(result, "phase_a_selected_tokens", None),
+            "phase_a_budget_trajectory": getattr(result, "phase_a_budget_trajectory", []),
+            "phase_a_round_trace": getattr(result, "phase_a_round_trace", []),
+            "phase_a_controller": getattr(result, "phase_a_controller", None),
+            "phase_a_controller_time_ms": getattr(result, "phase_a_controller_time_ms", None),
+        }
         if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
             accepted = int(getattr(result, "draft_tokens_accepted", 0) or 0)
             proposed = int(getattr(result, "draft_tokens_proposed", 0) or 0)
@@ -1324,6 +1336,7 @@ def _output_payload(
         "draft_tokens_proposed": proposed,
         "verification_steps": steps,
         "phases": phases,
+        **(phase_a_fields if method == "dflash_phase_a" else {}),
     }
 
 
@@ -2127,6 +2140,19 @@ def run_flashattn_benchmark(
                                     "quality_valid": None,
                                 }
                             )
+                            if method == "dflash_phase_a":
+                                record.update({
+                                    "phase_a_budget_mode": payload.get("phase_a_budget_mode"),
+                                    "phase_a_budget_initial": payload.get("phase_a_budget_initial"),
+                                    "phase_a_budget_min": payload.get("phase_a_budget_min"),
+                                    "phase_a_budget_max": payload.get("phase_a_budget_max"),
+                                    "phase_a_budget_current": payload.get("phase_a_budget_current"),
+                                    "phase_a_selected_tokens": payload.get("phase_a_selected_tokens"),
+                                    "phase_a_budget_trajectory": payload.get("phase_a_budget_trajectory", []),
+                                    "phase_a_round_trace": payload.get("phase_a_round_trace", []),
+                                    "phase_a_controller": payload.get("phase_a_controller"),
+                                    "phase_a_controller_time_ms": payload.get("phase_a_controller_time_ms"),
+                                })
                             if payload["acceptance_lengths"]:
                                 record["acceptance_lengths"] = [int(value) for value in payload["acceptance_lengths"]]
                             add_rouge(record, text, sample["reference"])
@@ -2467,6 +2493,24 @@ def run_flashattn_benchmark(
     except Exception:
         summary_metadata = {}
     summary_runtime = {**summary_metadata, **runtime, "methods": method_configs}
+    phase_a_policy = None
+    if "dflash_phase_a" in selected_methods:
+        from Benchmark.common.phase_a_selector import PhaseAConfig
+
+        phase_a_config = PhaseAConfig.from_env()
+        phase_a_policy = {
+            "mode": phase_a_config.budget_mode,
+            "initial_budget": phase_a_config.budget,
+            "min_budget": phase_a_config.min_budget,
+            "max_budget": phase_a_config.max_budget,
+            "chunk_size": phase_a_config.chunk_size,
+            "window_rounds": phase_a_config.controller_window_rounds,
+            "minimum_gain": phase_a_config.controller_min_gain,
+            "decay": phase_a_config.controller_decay,
+            "recheck_rounds": phase_a_config.controller_recheck_rounds,
+            "objective": "round_wall_ms_per_committed_token",
+            "runtime": "native_fa4",
+        }
     summary = {
         "record_type": "summary",
         "scope": "summary",
@@ -2498,6 +2542,7 @@ def run_flashattn_benchmark(
         "repetitions": repetitions,
         "sample_retries": sample_retries,
         "dflash_block_size": DFLASH_BLOCK_SIZE if any(m in selected_methods for m in {"dflash", "dflash_phase_a", "dflash_phase_b"}) else None,
+        "phase_a_budget_policy": phase_a_policy,
         "sample_count": len(samples),
         "sample_count_by_dataset": {
             dataset: sum(row["dataset"] == dataset for row in samples)

@@ -79,6 +79,17 @@ def dflash_generate(
     max_length = num_input_tokens + max_new_tokens
     block_size = model.block_size if block_size is None else block_size
     mask_token_id = model.mask_token_id if mask_token_id is None else mask_token_id
+    if phase_a_selector is not None:
+        phase_a_selector.reset()
+    phase_a_controller = getattr(phase_a_selector, "controller", None)
+    phase_a_adaptive = phase_a_controller is not None
+    phase_a_round_trace = []
+    phase_a_budget_trajectory = []
+    phase_a_pending_started = None
+    phase_a_pending_budget = None
+    phase_a_pending_context = None
+    phase_a_pending_fallback_reason = None
+    phase_a_controller_time_ms = 0.0
 
     output_ids = torch.full(
         (1, max_length + block_size), mask_token_id, dtype=torch.long, device=target.device,
@@ -89,7 +100,7 @@ def dflash_generate(
 
     prefill_start = _cuda_time() if return_stats else None
     if phase_a_selector is not None and block_size > 1:
-        phase_a_selector.begin_verification_round()
+        phase_a_selector.begin_verification_round(prefill=True)
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
@@ -109,10 +120,15 @@ def dflash_generate(
                     past_key_values_target,
                     accepted_length=1,
                     total_length=num_input_tokens,
+                    prefill=True,
                 )
                 model.config._phase_a_focused_indices = focused_indices
-            except Exception:
+                phase_a_pending_fallback_reason = phase_a_selector.last_fallback_reason
+            except Exception as exc:
                 model.config._phase_a_focused_indices = None
+                phase_a_selector.selected_indices = None
+                phase_a_selector.last_fallback_reason = f"prefill_selector_error:{type(exc).__name__}"
+                phase_a_pending_fallback_reason = phase_a_selector.last_fallback_reason
     time_to_first_token = _cuda_time() - prefill_start if return_stats else None
 
     decode_start = _cuda_time() if return_stats else None
@@ -126,8 +142,15 @@ def dflash_generate(
     last_parent_confidence = None
 
     while start < max_length:
+        round_start_position = start
+        round_budget_used = (
+            int(phase_a_selector.current_budget)
+            if phase_a_selector is not None else None
+        )
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
+        draft_round_events = None
+        verify_round_events = None
         if block_size > 1:
             draft_start_event = (
                 torch.cuda.Event(enable_timing=True)
@@ -151,6 +174,7 @@ def dflash_generate(
                 draft_end_event = torch.cuda.Event(enable_timing=True)
                 draft_end_event.record()
                 draft_events.append((draft_start_event, draft_end_event))
+                draft_round_events = (draft_start_event, draft_end_event)
             if draft_prefill and return_stats:
                 draft_prefill = False
                 decode_start = _cuda_time()
@@ -220,6 +244,7 @@ def dflash_generate(
             verification_events.append(
                 (verification_start_event, verification_end_event)
             )
+            verify_round_events = (verification_start_event, verification_end_event)
         output_ids[:, start : start + acceptance_length + 1] = curr_verify_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
@@ -227,16 +252,110 @@ def dflash_generate(
         acceptance_lengths.append(acceptance_length + 1)
         proposed_lengths.append(verify_k)
 
+        committed_tokens = min(acceptance_length + 1, max_length - round_start_position)
+        measured_round_ms = None
+        measured_budget = phase_a_pending_budget
+        observation_used = False
+        observation_skip_reason = None
+        draft_round_ms = None
+        verify_round_ms = None
+        if phase_a_adaptive:
+            # The acceptance .item() above synchronizes verification. Timing
+            # starts before the previous controller/selection and therefore
+            # accounts for their cost with the action they prepared.
+            if phase_a_pending_started is not None:
+                measured_round_ms = max(0.0, (time.perf_counter() - phase_a_pending_started) * 1000.0)
+                measured_budget = phase_a_pending_budget
+            if draft_round_events is not None and draft_round_events[1].query():
+                draft_round_ms = float(draft_round_events[0].elapsed_time(draft_round_events[1]))
+            if verify_round_events is not None and verify_round_events[1].query():
+                verify_round_ms = float(verify_round_events[0].elapsed_time(verify_round_events[1]))
+
         if phase_a_selector is not None:
-            try:
-                focused_indices = phase_a_selector.end_verification_round(
-                    past_key_values_target,
-                    accepted_length=acceptance_length + 1,
-                    total_length=start,
+            next_action_started = time.perf_counter() if phase_a_adaptive else None
+            decision_started = time.perf_counter() if phase_a_adaptive else None
+            next_budget = int(phase_a_selector.current_budget)
+            decision_reason = "fixed_budget"
+            if phase_a_adaptive:
+                if measured_round_ms is not None and measured_budget is not None:
+                    if phase_a_pending_fallback_reason is None:
+                        phase_a_controller.observe(
+                            budget=measured_budget,
+                            round_ms=measured_round_ms,
+                            committed_tokens=committed_tokens,
+                            context_length=int(phase_a_pending_context or round_start_position),
+                            draft_ms=draft_round_ms,
+                            verification_ms=verify_round_ms,
+                        )
+                        observation_used = True
+                    else:
+                        observation_skip_reason = phase_a_pending_fallback_reason
+                if start >= max_length:
+                    next_budget = None
+                    decision_reason = "generation_complete"
+                else:
+                    next_budget, decision_reason = phase_a_controller.choose(
+                        context_length=start,
+                        allow_exploration=(max_length - start > block_size),
+                    )
+            decision_ms = (
+                (time.perf_counter() - decision_started) * 1000.0
+                if decision_started is not None else 0.0
+            )
+            selection_launch_ms = 0.0
+            selected_tokens = None
+            if next_budget is not None:
+                selector_started = time.perf_counter() if phase_a_adaptive else None
+                try:
+                    focused_indices = phase_a_selector.end_verification_round(
+                        past_key_values_target,
+                        accepted_length=acceptance_length + 1,
+                        total_length=start,
+                        budget_override=next_budget if phase_a_adaptive else None,
+                    )
+                    model.config._phase_a_focused_indices = focused_indices
+                except Exception as exc:
+                    model.config._phase_a_focused_indices = None
+                    phase_a_selector.selected_indices = None
+                    phase_a_selector.last_fallback_reason = f"selector_error:{type(exc).__name__}"
+                if selector_started is not None:
+                    selection_launch_ms = (time.perf_counter() - selector_started) * 1000.0
+                selected_tokens = (
+                    int(phase_a_selector.selected_indices.shape[0])
+                    if phase_a_selector.selected_indices is not None else None
                 )
-                model.config._phase_a_focused_indices = focused_indices
-            except Exception:
-                model.config._phase_a_focused_indices = None
+            if phase_a_adaptive:
+                phase_a_controller_time_ms += decision_ms
+                if next_budget is not None:
+                    phase_a_budget_trajectory.append(int(next_budget))
+                phase_a_round_trace.append({
+                    "round": len(acceptance_lengths),
+                    "budget_used": int(measured_budget if measured_budget is not None else round_budget_used),
+                    "next_budget": int(next_budget) if next_budget is not None else None,
+                    "selected_context_tokens_for_next_round": selected_tokens,
+                    "committed_tokens": int(committed_tokens),
+                    "round_ms": round(measured_round_ms, 4) if measured_round_ms is not None else None,
+                    "draft_cuda_ms": round(draft_round_ms, 4) if draft_round_ms is not None else None,
+                    "verification_cuda_ms": round(verify_round_ms, 4) if verify_round_ms is not None else None,
+                    "controller_decision_ms": round(decision_ms, 4),
+                    "selection_launch_ms": round(selection_launch_ms, 4),
+                    "decision": decision_reason,
+                    "measurement_valid": measured_round_ms is not None,
+                    "controller_observation": observation_used,
+                    "observation_skip_reason": observation_skip_reason,
+                    "action_fallback_reason": phase_a_pending_fallback_reason,
+                    "next_selection_fallback_reason": phase_a_selector.last_fallback_reason,
+                })
+                if next_budget is not None:
+                    phase_a_pending_started = next_action_started
+                    phase_a_pending_budget = int(next_budget)
+                    phase_a_pending_context = int(start)
+                    phase_a_pending_fallback_reason = phase_a_selector.last_fallback_reason
+                else:
+                    phase_a_pending_started = None
+                    phase_a_pending_budget = None
+                    phase_a_pending_context = None
+                    phase_a_pending_fallback_reason = None
 
         if calibration_collector is not None and block_size > 1:
             try:
@@ -311,6 +430,14 @@ def dflash_generate(
             if (phase_a_selector is not None and phase_a_selector.selected_indices is not None)
             else None
         ),
+        phase_a_budget_mode=(phase_a_selector.config.budget_mode if phase_a_selector is not None else None),
+        phase_a_budget_min=(phase_a_selector.config.min_budget if phase_a_selector is not None else None),
+        phase_a_budget_max=(phase_a_selector.config.max_budget if phase_a_selector is not None else None),
+        phase_a_budget_current=(phase_a_selector.current_budget if phase_a_selector is not None else None),
+        phase_a_budget_trajectory=phase_a_budget_trajectory,
+        phase_a_round_trace=phase_a_round_trace,
+        phase_a_controller=(phase_a_controller.snapshot() if phase_a_adaptive else None),
+        phase_a_controller_time_ms=round(phase_a_controller_time_ms, 4),
     )
 
 
