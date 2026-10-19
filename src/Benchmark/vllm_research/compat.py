@@ -14,8 +14,12 @@ def inspect_capabilities(*, version: str | None = None) -> dict:
     if version is None:
         try:
             version = importlib.metadata.version('vllm')
-        except importlib.metadata.PackageNotFoundError:
-            version = None
+        except Exception:
+            try:
+                import vllm
+                version = getattr(vllm, '__version__', None)
+            except Exception:
+                version = None
     supported = version == '0.30.0'
     source_reason = None
     if supported:
@@ -38,7 +42,7 @@ def inspect_capabilities(*, version: str | None = None) -> dict:
               for name in ('a3', 'full_adapter', 'b3_fixed_k', 'b3', 'b4', 'trace')}
     for name in ('a1', 'a2', 'a3_replay', 'b1', 'b1_v'):
         result[name] = {'available': False, 'reason': 'immutable snapshot/target replay adapter has not been implemented', 'gpu_verified': False}
-    result['native'] = {'available': version is not None, 'reason': 'public vLLM API; research patch disabled', 'gpu_verified': False}
+    result['native'] = {'available': version is not None, 'reason': 'public vLLM API; research patch disabled', 'gpu_verified': False, 'vllm_version': version}
     return result
 
 

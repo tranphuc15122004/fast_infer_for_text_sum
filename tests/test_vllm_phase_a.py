@@ -42,47 +42,110 @@ def test_install_phase_a_vllm_compat_idempotent():
         raise
 
 
-def test_phase_a_gather_and_sdpa_simulation():
+def test_select_focused_paged_blocks_vllm():
+    from Benchmark.common.vllm_pilot import select_focused_paged_blocks_vllm
     import torch
-    import torch.nn.functional as F
 
-    num_blocks = 200
+    # 1. Short context (within budget <= 2048): returns all full blocks
+    short_blocks = select_focused_paged_blocks_vllm(total_seq_len=1000, block_size=16, budget_blocks=128)
+    assert len(short_blocks) == 1000 // 16
+    assert (short_blocks == torch.arange(1000 // 16)).all()
+
+    # 2. Long context with exact multiple (16000 tokens, 1000 blocks)
+    long_blocks_exact = select_focused_paged_blocks_vllm(
+        total_seq_len=16000,
+        block_size=16,
+        budget_blocks=128,
+        chunk_blocks=8,
+        sink_blocks=1,
+    )
+    assert len(long_blocks_exact) == 128
+    assert 0 in long_blocks_exact  # Sink block 0 must be included
+    assert 999 in long_blocks_exact  # Recent block must be included
+
+    # 3. Long context with remainder (16005 tokens, 1000 full blocks, r=5)
+    long_blocks_rem = select_focused_paged_blocks_vllm(
+        total_seq_len=16005,
+        block_size=16,
+        budget_blocks=128,
+        chunk_blocks=8,
+        sink_blocks=1,
+    )
+    assert len(long_blocks_rem) == 127
+    assert 0 in long_blocks_rem  # Sink block 0 must be included
+    assert 999 in long_blocks_rem  # Recent block must be included
+
+    # 4. Multi-query chunk reps scoring
+    num_chunks = (1000 + 7) // 8
+    hidden_size = 64
+    chunk_reps = torch.randn(num_chunks, hidden_size)
+    q = torch.randn(4, hidden_size)  # 4 accepted queries
+    scored_blocks = select_focused_paged_blocks_vllm(
+        total_seq_len=16000,
+        block_size=16,
+        budget_blocks=128,
+        chunk_blocks=8,
+        sink_blocks=1,
+        chunk_reps=chunk_reps,
+        q=q,
+        query_pooling="max",
+    )
+    assert len(scored_blocks) == 128
+    assert 0 in scored_blocks
+
+
+def test_phase_a_block_table_reordering_and_offset_parity():
+    from Benchmark.common.vllm_pilot import select_focused_paged_blocks_vllm
+    import torch
+
     block_size = 16
-    num_kv_heads = 2
-    num_heads = 16
-    head_dim = 128
+    num_query_tokens = 17
 
-    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
-    value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_dim)
+    # Test both r = 0 and r = 5
+    for total_seq_len in (16000, 16005):
+        r = total_seq_len % block_size
+        total_blocks = (total_seq_len + num_query_tokens + block_size - 1) // block_size
+        orig_row = torch.arange(100, 100 + total_blocks)  # unique physical block IDs
 
-    total_tokens = 3000
-    num_prompt_blocks = (total_tokens + block_size - 1) // block_size
-    block_table = torch.arange(5, 5 + num_prompt_blocks)
+        focused_logical = select_focused_paged_blocks_vllm(
+            total_seq_len=total_seq_len,
+            block_size=block_size,
+            budget_blocks=128,
+            chunk_blocks=8,
+            sink_blocks=1,
+        )
+        M = len(focused_logical)
+        focused_phys = orig_row[focused_logical]
 
-    focused_indices = torch.sort(torch.randperm(total_tokens)[:2048]).values
+        q_start_block = total_seq_len // block_size
+        q_end_block = (total_seq_len + num_query_tokens - 1) // block_size
 
-    phys_blocks = block_table[focused_indices // block_size]
-    offsets = focused_indices % block_size
+        new_row = orig_row.clone()
+        new_row[:M] = focused_phys
+        new_row[M] = orig_row[q_start_block]
+        if q_end_block > q_start_block:
+            new_row[M + 1] = orig_row[q_end_block]
 
-    k_focused = key_cache[phys_blocks, offsets]
-    v_focused = value_cache[phys_blocks, offsets]
-    assert k_focused.shape == (2048, num_kv_heads, head_dim)
+        focused_seq_len = M * block_size + r + num_query_tokens
 
-    # Query tokens (17 tokens)
-    q = torch.randn(1, num_heads, 17, head_dim)
-    k_q = torch.randn(17, num_kv_heads, head_dim)
-    v_q = torch.randn(17, num_kv_heads, head_dim)
+        # Verify that total attended tokens is <= 2065 (8x smaller than 16017)
+        assert focused_seq_len <= 128 * 16 + 17
 
-    k_all = torch.cat([k_focused, k_q], dim=0).unsqueeze(0)
-    v_all = torch.cat([v_focused, v_q], dim=0).unsqueeze(0)
+        # Verify exact offset parity for query tokens:
+        # Query tokens are at offsets 0..16
+        for query_off in range(num_query_tokens):
+            orig_token_pos = total_seq_len + query_off
+            orig_phys_block = orig_row[orig_token_pos // block_size].item()
+            orig_token_offset = orig_token_pos % block_size
 
-    head_rep = num_heads // num_kv_heads
-    k_in = k_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
-    v_in = v_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
+            # In the reordered block table, query token starts after focused context
+            new_token_pos = M * block_size + r + query_off
+            new_phys_block = new_row[new_token_pos // block_size].item()
+            new_token_offset = new_token_pos % block_size
 
-    attn_output = F.scaled_dot_product_attention(q, k_in, v_in)
-    assert attn_output.shape == (1, num_heads, 17, head_dim)
-    attn_output = attn_output.transpose(1, 2).reshape(17, num_heads * head_dim)
-    assert attn_output.shape == (17, 2048)
+            # Physical block and token offset MUST MATCH EXACTLY!
+            assert new_phys_block == orig_phys_block, f"Mismatch at query_off={query_off}: {new_phys_block} != {orig_phys_block}"
+            assert new_token_offset == orig_token_offset, f"Mismatch at query_off={query_off}: {new_token_offset} != {orig_token_offset}"
+
 
 

@@ -359,6 +359,15 @@ def main(argv: list[str] | None = None) -> int:
         if not jobs:
             raise SystemExit(f"không có job nào khớp với --variants={args.variants}")
     installed = inspect_capabilities()
+    if installed.get("native", {}).get("vllm_version") is None:
+        try:
+            import vllm
+            v_ver = getattr(vllm, "__version__", None)
+            if v_ver:
+                installed["native"]["vllm_version"] = v_ver
+                installed["native"]["available"] = True
+        except Exception:
+            pass
     replay = describe_replay_support(str(installed.get("native", {}).get("vllm_version") or "unknown"))
     if not installed.get("native", {}).get("available"):
         installed["native"] = {**installed["native"], "available": False,

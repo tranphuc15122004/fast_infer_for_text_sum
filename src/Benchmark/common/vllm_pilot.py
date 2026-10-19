@@ -479,12 +479,74 @@ def install_domino_vllm_compat() -> None:
     DFlashQwen3Model._fast_infer_domino_compat = True
 
 
+def select_focused_paged_blocks_vllm(
+    total_seq_len: int,
+    block_size: int = 16,
+    budget_blocks: int = 128,
+    chunk_blocks: int = 8,
+    sink_blocks: int = 1,
+    chunk_reps: Any = None,
+    q: Any = None,
+    query_pooling: str = "max",
+    device: Any = None,
+) -> Any:
+    """Select focused logical block indices for vLLM DFlash Phase A on GPU/CPU."""
+    import torch
+    import torch.nn.functional as F
+
+    dev = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    r = total_seq_len % block_size
+    total_full_blocks = total_seq_len // block_size
+    max_full_blocks_budget = min(budget_blocks if r == 0 else budget_blocks - 1, total_full_blocks)
+
+    if total_full_blocks <= max_full_blocks_budget:
+        return torch.arange(total_full_blocks, device=dev, dtype=torch.long)
+
+    num_chunks = (total_full_blocks + chunk_blocks - 1) // chunk_blocks
+    num_budget_chunks = max(1, max_full_blocks_budget // chunk_blocks)
+
+    if (
+        chunk_reps is not None
+        and q is not None
+        and hasattr(chunk_reps, "ndim")
+        and chunk_reps.ndim == 2
+        and chunk_reps.shape[0] == num_chunks
+    ):
+        q_norm = F.normalize(q.float(), p=2, dim=-1)
+        scores = torch.matmul(chunk_reps.float(), q_norm.transpose(-1, -2))
+        if query_pooling == "max":
+            chunk_scores = scores.amax(dim=-1)
+        else:
+            chunk_scores = scores.mean(dim=-1)
+        chunk_scores[0] = 1e9
+        chunk_scores[-1] = 1e9
+        k = min(num_budget_chunks, num_chunks)
+        selected_chunks = torch.topk(chunk_scores, k=k).indices.sort().values
+        focused_blocks: list[int] = []
+        for c in selected_chunks.tolist():
+            for b in range(chunk_blocks):
+                blk = c * chunk_blocks + b
+                if blk < total_full_blocks:
+                    focused_blocks.append(blk)
+        focused_blocks = focused_blocks[:max_full_blocks_budget]
+        return torch.tensor(focused_blocks, device=dev, dtype=torch.long)
+
+    # StreamingLLM fallback: Sink blocks (block 0) + most recent blocks
+    sink = list(range(min(sink_blocks, total_full_blocks)))
+    recent_needed = max_full_blocks_budget - len(sink)
+    recent_start = max(len(sink), total_full_blocks - recent_needed)
+    recent = list(range(recent_start, total_full_blocks))
+    return torch.tensor(sink + recent, device=dev, dtype=torch.long)
+
+
 def install_phase_a_vllm_compat() -> None:
     """Install Phase A Context Focusing on vLLM's DFlash path.
 
     When active (VLLM_DFLASH_PHASE_A=1), DFlashSpeculator utilizes focused
-    context selection for draft attention, avoiding attention over the full
-    context and reducing draft attention FLOPs by ~4.8x on long context.
+    context selection via physical Block Table Reordering and Sequence Length
+    Clamping. The draft model attends to only 2048 focused tokens (128 blocks)
+    instead of the full 16k context, achieving an ~8x reduction in KV cache
+    memory reads and FLOPs while executing 100% native FlashAttention-4 kernels.
     """
     import os
     from functools import wraps
@@ -492,7 +554,6 @@ def install_phase_a_vllm_compat() -> None:
 
     try:
         from vllm.config.compilation import CUDAGraphMode
-        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
     except ImportError:
         return
@@ -502,12 +563,7 @@ def install_phase_a_vllm_compat() -> None:
 
     import torch
     import torch.nn.functional as F
-
-    from Benchmark.common.phase_a_selector import (
-        PhaseAConfig,
-        compute_multi_query_scores_from_qk,
-        select_focused_context_indices,
-    )
+    from Benchmark.common.phase_a_selector import PhaseAConfig
 
     # 1. Force CUDAGraphMode.NONE for Speculator when Phase A is active to allow dynamic 17 x B attention
     original_init_cg = DFlashSpeculator.init_cudagraph_manager
@@ -520,196 +576,194 @@ def install_phase_a_vllm_compat() -> None:
 
     DFlashSpeculator.init_cudagraph_manager = phase_a_init_cg
 
-    # 2. Hook load_draft_model to capture Target Model Layer 18 query vector and KV cache
-    original_load_draft_model = DFlashSpeculator.load_draft_model
+    # 2. Hook _build_uniform_attn_metadata to reorder block tables and clamp sequence lengths
+    original_build_metadata = DFlashSpeculator._build_uniform_attn_metadata
 
-    @wraps(original_load_draft_model)
-    def phase_a_load_draft_model(
-        self: Any, target_model: Any, *args: Any, **kwargs: Any
+    @wraps(original_build_metadata)
+    def phase_a_build_metadata(
+        self: Any,
+        batch_desc: Any,
+        num_reqs: int,
+        num_query_per_req: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: Any = True,
+        dcp_local_seq_lens: Any = None,
     ) -> Any:
-        draft_model = original_load_draft_model(self, target_model, *args, **kwargs)
         if os.environ.get("VLLM_DFLASH_PHASE_A") != "1":
-            return draft_model
-
-        curr = target_model
-        while hasattr(curr, "unwrap"):
-            curr = curr.unwrap()
-        if hasattr(curr, "get_language_model"):
-            curr = curr.get_language_model()
-        target_core = getattr(curr, "model", curr)
-        layers = getattr(target_core, "layers", None)
-        if layers is not None and len(layers) > 0:
-            phase_a_cfg = PhaseAConfig.from_env()
-            target_layer_idx = min(phase_a_cfg.target_layer, len(layers) - 1)
-            target_layer = layers[target_layer_idx]
-            target_attn = getattr(target_layer, "self_attn", None)
-            if target_attn is not None and hasattr(target_attn, "attn"):
-                self._phase_a_target_layer_attn = target_attn
-
-                def _capture_q18(module: Any, pre_args: tuple[Any, ...]) -> None:
-                    if os.environ.get("VLLM_DFLASH_PHASE_A") == "1" and len(pre_args) > 0:
-                        # pre_args[0] is query: [num_tokens, num_heads * head_dim]
-                        self._phase_a_target_q = pre_args[0].detach()
-
-                target_attn.attn.register_forward_pre_hook(_capture_q18)
-
-        return draft_model
-
-    DFlashSpeculator.load_draft_model = phase_a_load_draft_model
-
-    # 3. Hook propose to compute scores and set focused indices for this speculative step
-    original_propose = DFlashSpeculator.propose
-
-    @wraps(original_propose)
-    def phase_a_propose(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if os.environ.get("VLLM_DFLASH_PHASE_A") == "1":
-            input_batch = (
-                kwargs.get("input_batch")
-                if "input_batch" in kwargs
-                else (args[0] if len(args) > 0 else None)
+            return original_build_metadata(
+                self,
+                batch_desc,
+                num_reqs,
+                num_query_per_req,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
             )
-            if input_batch is not None:
-                total_ctx_len = (
-                    int(input_batch.seq_lens_cpu_upper_bound[0])
-                    if hasattr(input_batch, "seq_lens_cpu_upper_bound")
-                    else int(input_batch.num_tokens)
+
+        phase_a_cfg = PhaseAConfig.from_env()
+        needs_focusing = False
+        for req_idx in range(num_reqs):
+            if int(seq_lens_cpu_upper_bound[req_idx].item()) > phase_a_cfg.budget:
+                needs_focusing = True
+                break
+
+        if not needs_focusing:
+            return original_build_metadata(
+                self,
+                batch_desc,
+                num_reqs,
+                num_query_per_req,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+            )
+
+        if not hasattr(self, "_phase_a_chunk_cache"):
+            self._phase_a_chunk_cache = {}
+
+        block_size = 16
+        budget_blocks = phase_a_cfg.budget // block_size
+        chunk_blocks = max(1, phase_a_cfg.chunk_size // block_size)
+        sink_blocks = max(1, (phase_a_cfg.sink_tokens + block_size - 1) // block_size)
+
+        # Backups for side-effect-free execution
+        orig_tables: dict[int, torch.Tensor] = {}
+        for gid in self.draft_kv_cache_group_ids:
+            orig_tables[gid] = self.block_tables.input_block_tables[gid][:num_reqs].clone()
+
+        backup_gpu_seq_lens = self.input_buffers.seq_lens[:num_reqs].clone()
+        backup_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs].clone()
+        backup_draft_max_seq_len = self.draft_max_seq_len
+
+        focused_seq_lens: list[int] = []
+
+        for req_idx in range(num_reqs):
+            total_seq_len = int(backup_cpu_upper_bound[req_idx].item())
+            if total_seq_len <= phase_a_cfg.budget:
+                focused_seq_lens.append(int(backup_gpu_seq_lens[req_idx].item()))
+                continue
+
+            r = total_seq_len % block_size
+            q_start_block = total_seq_len // block_size
+            q_end_block = (total_seq_len + num_query_per_req - 1) // block_size
+
+            # Populate chunk representations if prefill step
+            if hasattr(self, "hidden_states") and self.hidden_states.numel() > 0:
+                tok_start = (
+                    int(self.input_buffers.query_start_loc[req_idx].item())
+                    if hasattr(self.input_buffers, "query_start_loc")
+                    and req_idx + 1 < len(self.input_buffers.query_start_loc)
+                    else 0
                 )
-                phase_a_cfg = PhaseAConfig.from_env()
-                q_18 = getattr(self, "_phase_a_target_q", None)
-                target_attn = getattr(self, "_phase_a_target_layer_attn", None)
+                tok_end = (
+                    int(self.input_buffers.query_start_loc[req_idx + 1].item())
+                    if hasattr(self.input_buffers, "query_start_loc")
+                    and req_idx + 1 < len(self.input_buffers.query_start_loc)
+                    else min(total_seq_len, self.hidden_states.shape[0])
+                )
+                num_tok = tok_end - tok_start
+                if num_tok > phase_a_cfg.budget:
+                    # Prefill: compute and cache normalized chunk footprints
+                    ctx_states = self.hidden_states[tok_start:tok_end]
+                    num_chunks = (num_tok + phase_a_cfg.chunk_size - 1) // phase_a_cfg.chunk_size
+                    pad_len = num_chunks * phase_a_cfg.chunk_size - num_tok
+                    padded = F.pad(ctx_states, (0, 0, 0, pad_len)) if pad_len > 0 else ctx_states
+                    chunk_reps = F.normalize(
+                        padded.view(num_chunks, phase_a_cfg.chunk_size, -1).mean(dim=1),
+                        p=2,
+                        dim=-1,
+                    )
+                    self._phase_a_chunk_cache[req_idx] = chunk_reps
 
-                focused_indices = None
-                block_table_0 = None
-                if (
-                    total_ctx_len > phase_a_cfg.budget
-                    and q_18 is not None
-                    and target_attn is not None
-                ):
-                    target_kv = getattr(target_attn.attn, "kv_cache", None)
-                    if target_kv is not None and target_kv.numel() > 0:
-                        head_dim = getattr(target_attn, "head_dim", 128)
-                        num_kv_heads = getattr(target_attn, "num_kv_heads", 2)
-                        num_heads = getattr(target_attn, "num_heads", 16)
-                        key_cache, _ = target_kv.transpose(1, 2).split(
-                            head_dim, dim=-1
-                        )
-                        block_size = key_cache.shape[1]
-                        num_blocks = (total_ctx_len + block_size - 1) // block_size
+            req_chunk_reps = self._phase_a_chunk_cache.get(req_idx)
+            req_query = None
+            if hasattr(self, "hidden_states") and self.hidden_states.numel() > 0:
+                req_query = self.hidden_states[:num_query_per_req]
 
-                        if (
-                            hasattr(self, "block_tables")
-                            and len(self.block_tables.input_block_tables) > 0
-                        ):
-                            block_table_0 = self.block_tables.input_block_tables[0][0]
-                            phys_blocks = block_table_0[:num_blocks]
-                            paged_k = key_cache[phys_blocks].reshape(
-                                -1, num_kv_heads, head_dim
-                            )[:total_ctx_len]
-                            scaling = float(
-                                getattr(target_attn, "scaling", head_dim**-0.5)
-                            )
-                            q_eval = (
-                                q_18[-16:]
-                                .view(1, -1, num_heads, head_dim)
-                                .transpose(1, 2)
-                            )
-                            k_eval = paged_k.unsqueeze(0).transpose(1, 2)
-                            scores = compute_multi_query_scores_from_qk(
-                                q_eval,
-                                k_eval,
-                                scaling,
-                                query_pooling=phase_a_cfg.query_pooling,
-                            )
-                            focused_indices = select_focused_context_indices(
-                                scores, total_ctx_len, phase_a_cfg
-                            )
+            focused_logical = select_focused_paged_blocks_vllm(
+                total_seq_len=total_seq_len,
+                block_size=block_size,
+                budget_blocks=budget_blocks,
+                chunk_blocks=chunk_blocks,
+                sink_blocks=sink_blocks,
+                chunk_reps=req_chunk_reps,
+                q=req_query,
+                query_pooling=phase_a_cfg.query_pooling,
+                device=self.device,
+            )
 
-                draft_model = self.model
-                while hasattr(draft_model, "unwrap"):
-                    draft_model = draft_model.unwrap()
-                core = getattr(draft_model, "model", draft_model)
-                layers = getattr(core, "layers", [])
-                for layer in layers:
-                    self_attn = getattr(layer, "self_attn", None)
-                    if self_attn is not None:
-                        self_attn._phase_a_focused_indices = focused_indices
-                        self_attn._phase_a_block_table = block_table_0
-                        self_attn._phase_a_total_ctx = total_ctx_len
+            M = len(focused_logical)
 
-        return original_propose(self, *args, **kwargs)
+            for gid in self.draft_kv_cache_group_ids:
+                tbl = self.block_tables.input_block_tables[gid]
+                orig_row = orig_tables[gid][req_idx]
+                focused_phys = orig_row[focused_logical]
 
-    DFlashSpeculator.propose = phase_a_propose
+                new_row = orig_row.clone()
+                new_row[:M] = focused_phys
+                new_row[M] = orig_row[q_start_block]
+                if q_end_block > q_start_block and M + 1 < new_row.shape[0]:
+                    new_row[M + 1] = orig_row[q_end_block]
 
-    # 4. Hook DFlashQwen3Attention.forward to execute focused SDPA attention over the 2048 tokens
-    original_attn_forward = DFlashQwen3Attention.forward
+                tbl[req_idx] = new_row
 
-    @wraps(original_attn_forward)
-    def phase_a_attn_forward(
-        self: Any, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        focused_indices = getattr(self, "_phase_a_focused_indices", None)
-        block_table = getattr(self, "_phase_a_block_table", None)
-        if (
-            os.environ.get("VLLM_DFLASH_PHASE_A") != "1"
-            or focused_indices is None
-            or block_table is None
-            or not hasattr(self.attn, "kv_cache")
-            or self.attn.kv_cache.numel() == 0
-        ):
-            return original_attn_forward(self, positions, hidden_states)
+            focused_seq_len = M * block_size + r + num_query_per_req
+            self.input_buffers.seq_lens[req_idx] = focused_seq_len
+            seq_lens_cpu_upper_bound[req_idx] = focused_seq_len - step
+            focused_seq_lens.append(focused_seq_len)
 
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if focused_seq_lens:
+            self.draft_max_seq_len = max(focused_seq_lens)
 
-        # Per-head RMSNorm
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
-        ).view(q_shape)
-        k = self.k_norm(
-            k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
-        ).view(k_shape)
-
-        q, k = self.rotary_emb(positions, q, k)
-
-        # Extract focused context KV from self.attn.kv_cache: [num_blocks, num_kv_heads, block_size, 2*head_dim]
-        key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
-            self.head_dim, dim=-1
+        self._phase_a_backup = (
+            orig_tables,
+            backup_gpu_seq_lens,
+            backup_cpu_upper_bound,
+            backup_draft_max_seq_len,
+            seq_lens_cpu_upper_bound,
         )
-        block_size = key_cache.shape[1]
-        phys_blocks = block_table[focused_indices // block_size]
-        offsets = focused_indices % block_size
 
-        k_focused = key_cache[phys_blocks, offsets]  # [num_focused, num_kv_heads, head_dim]
-        v_focused = value_cache[phys_blocks, offsets]
-
-        # Query tokens KV (17 tokens)
-        k_query = k.view(-1, self.num_kv_heads, self.head_dim)
-        v_query = v.view(-1, self.num_kv_heads, self.head_dim)
-
-        # Combine focused context + query tokens
-        k_all = torch.cat([k_focused, k_query], dim=0).unsqueeze(0)
-        v_all = torch.cat([v_focused, v_query], dim=0).unsqueeze(0)
-
-        # Reshape for GQA in SDPA: [batch, num_heads, seq_len, head_dim]
-        q_in = q.view(1, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        head_rep = self.num_heads // self.num_kv_heads
-        if head_rep > 1:
-            k_in = k_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
-            v_in = v_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
-        else:
-            k_in = k_all.transpose(1, 2)
-            v_in = v_all.transpose(1, 2)
-
-        # FlashAttention via SDPA over the focused context + query tokens
-        attn_output = F.scaled_dot_product_attention(
-            q_in, k_in, v_in, scale=self.scaling
+        return original_build_metadata(
+            self,
+            batch_desc,
+            num_reqs,
+            num_query_per_req,
+            seq_lens_cpu_upper_bound,
+            step,
+            causal=causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
-        attn_output = attn_output.transpose(1, 2).reshape(q.shape[0], -1)
-        output, _ = self.o_proj(attn_output)
-        return output
 
-    DFlashQwen3Attention.forward = phase_a_attn_forward
+    DFlashSpeculator._build_uniform_attn_metadata = phase_a_build_metadata
+
+    # 3. Hook _generate_draft to restore block tables and sequence lengths in finally
+    original_generate_draft = DFlashSpeculator._generate_draft
+
+    @wraps(original_generate_draft)
+    def phase_a_generate_draft(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return original_generate_draft(self, *args, **kwargs)
+        finally:
+            backup = getattr(self, "_phase_a_backup", None)
+            if backup is not None:
+                (
+                    orig_tables,
+                    backup_gpu_seq_lens,
+                    backup_cpu_upper_bound,
+                    backup_draft_max_seq_len,
+                    seq_lens_cpu_upper_bound,
+                ) = backup
+                for gid, orig_tensor in orig_tables.items():
+                    self.block_tables.input_block_tables[gid][: orig_tensor.shape[0]].copy_(orig_tensor)
+                self.input_buffers.seq_lens[: backup_gpu_seq_lens.shape[0]].copy_(backup_gpu_seq_lens)
+                seq_lens_cpu_upper_bound[: backup_cpu_upper_bound.shape[0]].copy_(backup_cpu_upper_bound)
+                self.draft_max_seq_len = backup_draft_max_seq_len
+                self._phase_a_backup = None
+
+    DFlashSpeculator._generate_draft = phase_a_generate_draft
     DFlashSpeculator._fast_infer_phase_a_compat = True
 
 
