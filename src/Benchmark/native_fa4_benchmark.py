@@ -530,6 +530,10 @@ def _warm_method(
     warmup_tokens: int,
 ) -> list[dict[str, Any]]:
     warmup_records = []
+    warmup_collector = [] if method == "dflash_phase_b" else None
+    if warmup_collector is not None:
+        context["_warmup_collector"] = warmup_collector
+
     for sample in samples:
         input_ids = sample["input_ids"].to("cuda:0")
         result, elapsed_ms = _time_call(
@@ -554,6 +558,17 @@ def _warm_method(
                 "warmup_e2e_ms": round(elapsed_ms, 3),
             }
         )
+
+    if method == "dflash_phase_b" and warmup_collector:
+        from TrainingFree.speculation_experiments.survival import fit_hazard_model
+        try:
+            fitted_hazard = fit_hazard_model(warmup_collector, variant="R-Hazard-Present", max_candidates=15)
+            context["verification_prefix_controller"].model = fitted_hazard
+            beta_str = ", ".join(f"{b:.4f}" for b in fitted_hazard["beta"])
+            print(f"[Phase B Warmup] Estimated 3 beta parameters on warmup: [{beta_str}] (transitions: {len(warmup_collector)})", flush=True)
+        except Exception as exc:
+            print(f"[Phase B Warmup] Hazard model fitting failed ({exc}), using default fallback", flush=True)
+
     torch.cuda.synchronize("cuda:0")
     return warmup_records
 
@@ -615,7 +630,8 @@ def _call_method(
             pad_token_id=context["tokenizer"].pad_token_id,
         )
     if method in {"dflash", "dflash_phase_b"}:
-        controller = context.get("verification_prefix_controller") if method == "dflash_phase_b" else None
+        controller = context.get("verification_prefix_controller") if (method == "dflash_phase_b" and not warmup) else None
+        calib_collector = context.get("_warmup_collector") if (method == "dflash_phase_b" and warmup) else None
         return context["dflash_generate"](
             context["draft"],
             target=model,
@@ -626,6 +642,7 @@ def _call_method(
             block_size=DFLASH_BLOCK_SIZE,
             return_stats=True,
             verification_prefix_controller=controller,
+            calibration_collector=calib_collector,
         )
     if method == "domino":
         return context["draft"].spec_generate(

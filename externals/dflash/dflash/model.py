@@ -72,6 +72,7 @@ def dflash_generate(
     mask_token_id: Optional[int] = None,
     return_stats: bool = False,
     verification_prefix_controller: Optional[Any] = None,
+    calibration_collector: Optional[list[Any]] = None,
 ):
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -210,6 +211,24 @@ def dflash_generate(
         past_key_values_target.crop(start)
         acceptance_lengths.append(acceptance_length + 1)
         proposed_lengths.append(verify_k)
+
+        if calibration_collector is not None and block_size > 1:
+            try:
+                cand_k = block_size - 1
+                top_logits, _ = torch.topk(draft_logits[0, :cand_k].float().detach(), k=2, dim=-1)
+                margins = (top_logits[:, 0] - top_logits[:, 1]).cpu().tolist()
+                confidences = torch.softmax(draft_logits[0, :cand_k].float().detach(), dim=-1).max(dim=-1).values.cpu().tolist()
+                calibration_collector.append({
+                    "accepted_candidates": int(acceptance_length),
+                    "draft_uncertainty": {
+                        "confidence": confidences,
+                        "probability_margin": [max(0.0, 2.0 * float(c) - 1.0) for c in confidences],
+                        "logit_margin": margins,
+                    },
+                    "source_group_id": "warmup",
+                })
+            except Exception:
+                pass
 
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
