@@ -7,6 +7,7 @@ from dataclasses import replace
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -68,6 +69,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-samples", type=int,
                         default=int(os.environ.get("VLLM_RESEARCH_MAX_SAMPLES", os.environ.get("RUN_SAMPLES", "2"))))
     result.add_argument("--experiments", default=os.environ.get("VLLM_RESEARCH_EXPERIMENTS", "ALL"))
+    result.add_argument("--variants", default=os.environ.get("VLLM_RESEARCH_VARIANTS", ""),
+                        help="Lọc các variant cụ thể (phân tách dấu phẩy), ví dụ: ar,dflash_full,adaptive_k_R-Hazard-Present-Future")
     result.add_argument("--selectors", default=os.environ.get("VLLM_RESEARCH_SELECTORS", "previous_dflash"))
     result.add_argument("--budgets", type=_budget_csv, default=_budget_csv(os.environ.get("VLLM_RESEARCH_BUDGETS", "2048")))
     result.add_argument("--periods", type=_int_csv, default=_int_csv(os.environ.get("VLLM_RESEARCH_PERIODS", "2,4,8,16")))
@@ -255,6 +258,70 @@ def _runtime_versions() -> dict[str, str | None]:
     return versions
 
 
+def _format_speedup_summary(run_dir: Path, planned_jobs: list[ResearchJob]) -> tuple[dict[str, Any], str]:
+    stats_by_variant: dict[str, dict[str, Any]] = {}
+    for job in planned_jobs:
+        job_dir = run_dir / "jobs" / job.id
+        cells_dir = job_dir / "cells"
+        if not cells_dir.is_dir():
+            continue
+        tpots: list[float] = []
+        e2es: list[float] = []
+        out_toks: list[int] = []
+        for cell_file in sorted(cells_dir.glob("*.json")):
+            try:
+                data = json.loads(cell_file.read_text(encoding="utf-8"))
+                if data.get("execution_status") == "success" or data.get("status") == "success":
+                    tpot = data.get("tpot_ms")
+                    if tpot is not None and math.isfinite(float(tpot)) and float(tpot) > 0:
+                        tpots.append(float(tpot))
+                    e2e = data.get("e2e_ms")
+                    if e2e is not None and math.isfinite(float(e2e)) and float(e2e) > 0:
+                        e2es.append(float(e2e))
+                    out_tok = data.get("output_tokens")
+                    if out_tok is not None:
+                        out_toks.append(int(out_tok))
+            except Exception:
+                continue
+        if tpots:
+            stats_by_variant[job.variant] = {
+                "job_id": job.id,
+                "variant": job.variant,
+                "experiment": job.experiment,
+                "completed_samples": len(tpots),
+                "mean_tpot_ms": round(sum(tpots) / len(tpots), 2),
+                "mean_e2e_ms": round(sum(e2es) / len(e2es), 2) if e2es else None,
+                "mean_output_tokens": round(sum(out_toks) / len(out_toks), 1) if out_toks else None,
+            }
+
+    ar_tpot = stats_by_variant.get("ar", {}).get("mean_tpot_ms")
+    dflash_tpot = stats_by_variant.get("dflash_full", {}).get("mean_tpot_ms")
+
+    for variant, stat in stats_by_variant.items():
+        v_tpot = stat["mean_tpot_ms"]
+        stat["speedup_vs_vanilla"] = round(ar_tpot / v_tpot, 3) if ar_tpot and v_tpot else None
+        stat["speedup_vs_dflash"] = round(dflash_tpot / v_tpot, 3) if dflash_tpot and v_tpot else None
+
+    if not stats_by_variant:
+        return {}, ""
+
+    lines = [
+        "",
+        "=" * 92,
+        f"{'BENCHMARK SPEEDUP SUMMARY':^92}",
+        "=" * 92,
+        f"{'Variant':<38} | {'Samples':<8} | {'TPOT (ms)':<10} | {'vs Vanilla':<12} | {'vs DFlash':<12}",
+        "-" * 92,
+    ]
+    for variant, stat in stats_by_variant.items():
+        s_vanilla = f"{stat['speedup_vs_vanilla']:.2f}x" if stat.get("speedup_vs_vanilla") else "N/A"
+        s_dflash = f"{stat['speedup_vs_dflash']:.2f}x" if stat.get("speedup_vs_dflash") else "N/A"
+        tpot_str = f"{stat['mean_tpot_ms']:.2f}"
+        lines.append(f"{variant:<38} | {stat['completed_samples']:<8} | {tpot_str:<10} | {s_vanilla:<12} | {s_dflash:<12}")
+    lines.append("=" * 92)
+    return stats_by_variant, "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.max_samples < 0 or args.max_new_tokens < 1 or args.max_input_tokens < 0:
@@ -286,6 +353,11 @@ def main(argv: list[str] | None = None) -> int:
 
     jobs = build_jobs(args.experiments, selectors=_csv(args.selectors), budgets=args.budgets,
                       periods=args.periods, gammas=args.gammas)
+    if args.variants:
+        selected_variants = set(_csv(args.variants))
+        jobs = [j for j in jobs if j.variant in selected_variants]
+        if not jobs:
+            raise SystemExit(f"không có job nào khớp với --variants={args.variants}")
     installed = inspect_capabilities()
     replay = describe_replay_support(str(installed.get("native", {}).get("vllm_version") or "unknown"))
     if not installed.get("native", {}).get("available"):
@@ -335,10 +407,16 @@ def main(argv: list[str] | None = None) -> int:
     draft_identity = _model_identity(args.draft_model) if draft_available else None
     implementation = _implementation_identity()
     runtime_versions = _runtime_versions()
+    planned_ids = {job.id for job in jobs}
     planned_jobs = []
     for job in jobs:
         if job.variant != "ar" and not draft_available and job.capability not in {"same_prefix_replay", "cpu_analysis"}:
             job = replace(job, capability=f"missing_draft:{job.id}")
+        if job.capability == "adaptive_verification":
+            # For standalone B3 generation, allow running with calibrated/default models
+            # without requiring offline replay/fit artifacts
+            valid_deps = tuple(dep for dep in job.dependencies if dep in planned_ids)
+            job = replace(job, dependencies=valid_deps)
         planned_jobs.append(job)
     capabilities = _capability_map(planned_jobs, installed, replay, args.draft_model)
     settings = {
@@ -532,6 +610,9 @@ def main(argv: list[str] | None = None) -> int:
 
     results = collect_jobs(planned_jobs, run_dir, capabilities, execute, resume=resuming)
     summary = summarize(results)
+    stats_by_variant, table_str = _format_speedup_summary(run_dir, planned_jobs)
+    if stats_by_variant:
+        summary["speedup_summary"] = stats_by_variant
     summary.update({"run_id": run_id, "plan_signature": plan_signature,
                     "measurement": args.measurement, "sample_count": len(samples),
                     "excluded_samples": len(excluded), "data_sha256": data_hash,
@@ -549,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     atomic_json(run_dir / "report.json", {**summary, "jobs": results})
     atomic_json(run_dir / "progress.json", {"status": "finished", **summary})
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    if table_str:
+        print(table_str, flush=True)
     # Scientific diagnostics and unsupported cells are recorded, not used as a campaign gate.
     return 0
 
