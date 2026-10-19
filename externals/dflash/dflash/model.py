@@ -145,12 +145,15 @@ def dflash_generate(
         verify_k = block_size - 1 if block_size > 1 else 0
         if verification_prefix_controller is not None and block_size > 1:
             try:
-                from TrainingFree.speculation_experiments.signals import summarize_draft_logits
+                if getattr(verification_prefix_controller, "should_bypass_signals", None) and verification_prefix_controller.should_bypass_signals(start):
+                    verify_k = getattr(verification_prefix_controller, "fallback_prefix", block_size - 1)
+                else:
+                    from TrainingFree.speculation_experiments.signals import summarize_draft_logits
 
-                req_entropy = getattr(verification_prefix_controller, "requires_entropy", True)
-                draft_unc = summarize_draft_logits(draft_logits, include_entropy=req_entropy)
-                allowed_p = getattr(verification_prefix_controller, "allowed_prefixes", (3, 7, 11, 15))
-                avail_p = [p for p in allowed_p if p <= min(block_size - 1, max_length - start)]
+                    req_entropy = getattr(verification_prefix_controller, "requires_entropy", False)
+                    draft_unc = summarize_draft_logits(draft_logits, include_entropy=req_entropy)
+                    allowed_p = getattr(verification_prefix_controller, "allowed_prefixes", (3, 7, 11, 15))
+                    avail_p = [p for p in allowed_p if p <= min(block_size - 1, max_length - start)]
                 if not avail_p:
                     avail_p = [min(block_size - 1, max_length - start)]
                 curr_state = SimpleNamespace(

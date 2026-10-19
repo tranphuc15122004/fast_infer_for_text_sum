@@ -1000,21 +1000,27 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
                 except Exception:
                     pass
             if not cost_profiles:
+                # Real B200 FA4 verification has a flat latency profile across prefix lengths (~17.5ms to 20ms)
                 cost_profiles = {
                     f"{d}::context={b}": {
-                        "cost_by_prefix": {"3": 12.0, "7": 18.0, "11": 24.0, "15": 30.0}
+                        "cost_by_prefix": {"3": 17.5, "7": 18.2, "11": 19.0, "15": 20.0}
                     }
                     for d in DATASETS
                     for b in range(4)
                 }
+            allowed_prefixes_env = os.environ.get("PHASE_B_ALLOWED_PREFIXES", "7,11,15")
+            allowed_prefixes = tuple(sorted(set(int(x.strip()) for x in allowed_prefixes_env.split(",") if x.strip())))
+            fallback_prefix = int(os.environ.get("PHASE_B_FALLBACK_PREFIX", "15"))
+            if fallback_prefix not in allowed_prefixes:
+                fallback_prefix = allowed_prefixes[-1]
             controller = VerificationPrefixController(
                 model=hazard_model,
                 cost_profiles=cost_profiles,
                 dataset="gov_report",
-                allowed_prefixes=(3, 7, 11, 15),
+                allowed_prefixes=allowed_prefixes,
                 overhead_ms=0.0,
-                fallback_prefix=15,
-                opportunity_threshold_eta=float(os.environ.get("PHASE_B_ETA", "0.0")),
+                fallback_prefix=fallback_prefix,
+                opportunity_threshold_eta=float(os.environ.get("PHASE_B_ETA", "0.05")),
             )
 
         context.update(
