@@ -112,6 +112,36 @@ def test_b3_opportunity_is_reselected_and_scored_after_overhead() -> None:
     assert report["oracle_gap_j"] > 0.5
 
 
+def test_b3_charges_controller_overhead_only_to_adaptive_policy():
+    rows = []
+    for group in range(3):
+        for split in ("selection", "evaluation"):
+            for prefix in (3, 7, 11, 15):
+                rows.append({"state_id": f"s{group}", "dataset": "gov_report",
+                    "source_group_id": f"d{group}", "k": prefix,
+                    "repetition_split": split, "acceptance_identity_valid": True,
+                    "accepted_candidates": 0, "total_round_ms": 1. if prefix == 3 else 2.})
+    result = _b3_overhead_adjusted_opportunity(rows, overhead_ms=4., bootstrap_replicates=20)
+    assert result["best_fixed_prefix"] == 3
+    assert result["oracle_gap_j"] == pytest.approx(-4.)
+
+
+def test_live_parent_signal_schema_matches_offline_survival_fit():
+    from types import SimpleNamespace
+    from TrainingFree.speculation_experiments.survival import fit_survival_curve
+    from TrainingFree.speculation_experiments.b_controller import VerificationPrefixController
+    rows = [{"source_group_id": f"d{i}", "accepted_candidates": 3, "prompt_tokens": 4096,
+             "parent_signal": {"normalized_entropy": .2, "confidence": .8},
+             "history_ema": .2, "history_missing": False} for i in range(4)]
+    model = fit_survival_curve(rows, variant="R-PreAll")
+    controller = VerificationPrefixController(model=model, dataset="gov_report", cost_profiles={
+        "gov_report::context=1": {"cost_by_prefix": {"3":1.,"7":2.,"11":3.,"15":4.}}})
+    state = SimpleNamespace(logical_length=4096, processed_output_tokens=0,
+                            parent_entropy=.2, parent_confidence=.8, history_acceptance=.2)
+    decision = controller(state=state, draft_uncertainty={}, draft_gamma=15, available_prefixes=(3,7,11,15))
+    assert decision["prefix"] in (3,7,11,15)
+
+
 def test_frozen_policy_lock_rejects_protocol_or_benchmark_drift() -> None:
     args = _parser().parse_args(["--mode", "b3-confirm", "--run-id", "confirm"])
     campaign = {

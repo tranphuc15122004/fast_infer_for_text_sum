@@ -9,6 +9,10 @@ from collections.abc import Mapping, Sequence
 from statistics import mean
 from typing import Any
 
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import expit
+
 from TrainingFree.speculation_experiments.protocol import assign_group_folds
 
 
@@ -35,7 +39,25 @@ LAGGED_VARIANTS: dict[str, tuple[str, ...]] = {
         "lagged_draft_confidence_min",
     ),
 }
-SURVIVAL_VARIANTS = {**DEFAULT_VARIANTS, **LAGGED_VARIANTS}
+
+HAZARD_VARIANTS: dict[str, tuple[str, ...]] = {
+    "R-Hazard-Pos": ("position",),
+    "R-Hazard-Present": ("position", "draft_present_log_margin"),
+    "R-Hazard-Prefix": ("position", "draft_present_log_margin", "draft_prefix_tv"),
+    "R-Hazard-Suffix-Margin": (
+        "position",
+        "draft_present_log_margin",
+        "draft_prefix_tv",
+        "draft_suffix_margin",
+    ),
+    "R-Hazard-Suffix-Entropy": (
+        "position",
+        "draft_present_log_margin",
+        "draft_prefix_tv",
+        "draft_suffix_entropy",
+    ),
+}
+SURVIVAL_VARIANTS = {**DEFAULT_VARIANTS, **LAGGED_VARIANTS, **HAZARD_VARIANTS}
 
 
 def _context_bin(value: int) -> int:
@@ -267,6 +289,180 @@ def _predict_threshold(model: Mapping[str, Any], row: Mapping[str, Any]) -> tupl
     return (successes + 1.0) / (total + 2.0), fallback
 
 
+def _extract_hazard_signals(
+    row: Mapping[str, Any], max_candidates: int = 15
+) -> tuple[list[float], list[float], list[float]]:
+    """Extract margins (m_j), confidences (c_j), and normalized entropies (H_j)."""
+    uncertainty = row.get("draft_uncertainty") or {}
+    confidences = [float(v) for v in (uncertainty.get("confidence") or [])]
+    entropies = [float(v) for v in (uncertainty.get("normalized_entropy") or [])]
+    prob_margins = [float(v) for v in (uncertainty.get("probability_margin") or [])]
+    logit_margins = [float(v) for v in (uncertainty.get("logit_margin") or [])]
+
+    c = [confidences[i] if i < len(confidences) else 0.5 for i in range(max_candidates)]
+    h = [entropies[i] if i < len(entropies) else 0.5 for i in range(max_candidates)]
+
+    m = []
+    for i in range(max_candidates):
+        if i < len(prob_margins) and prob_margins[i] > 1e-6:
+            m.append(prob_margins[i])
+        elif i < len(logit_margins) and logit_margins[i] > 0 and c[i] > 0:
+            delta = max(logit_margins[i], 0.0)
+            m.append(c[i] * (1.0 - math.exp(-delta)))
+        else:
+            m.append(max(2.0 * c[i] - 1.0, 0.0))
+    return m, c, h
+
+
+def _hazard_features_for_position(
+    position: int,
+    m: Sequence[float],
+    c: Sequence[float],
+    h: Sequence[float],
+    variant: str,
+    max_candidates: int = 15,
+) -> list[float]:
+    """Compute feature values for position j in 1..max_candidates for a given hazard variant."""
+    j = int(position)
+    features = HAZARD_VARIANTS[variant]
+    values: list[float] = []
+    for feature in features:
+        if feature == "position":
+            values.append(float(j))
+        elif feature == "draft_present_log_margin":
+            margin = m[j - 1] if j - 1 < len(m) else 0.0
+            values.append(math.log(max(margin, 1e-6)))
+        elif feature == "draft_prefix_tv":
+            val = sum(1.0 - c[i] for i in range(j - 1)) if j > 1 else 0.0
+            values.append(float(val))
+        elif feature == "draft_suffix_margin":
+            val = (
+                sum(1.0 - m[r] for r in range(j, max_candidates)) / float(max_candidates)
+                if j < max_candidates
+                else 0.0
+            )
+            values.append(float(val))
+        elif feature == "draft_suffix_entropy":
+            val = (
+                sum(h[r] for r in range(j, max_candidates)) / float(max_candidates)
+                if j < max_candidates
+                else 0.0
+            )
+            values.append(float(val))
+        else:
+            raise ValueError(f"unknown hazard feature {feature!r}")
+    return values
+
+
+def fit_hazard_model(
+    train_rows: Sequence[Mapping[str, Any]],
+    *,
+    variant: str,
+    max_candidates: int = 15,
+    ridge: float = 1.0,
+) -> dict[str, Any]:
+    """Fit regularized discrete hazard model on observed risk set transitions."""
+    if variant not in HAZARD_VARIANTS:
+        raise ValueError(f"unsupported hazard variant {variant!r}")
+    if not train_rows:
+        raise ValueError("hazard fit requires train_rows")
+
+    x_list: list[list[float]] = []
+    y_list: list[float] = []
+
+    for row in train_rows:
+        accepted = int(row.get("accepted_candidates", -1))
+        if not 0 <= accepted <= max_candidates:
+            raise ValueError(f"candidate_signals accepted_candidates must be within [0, {max_candidates}]")
+        m, c, h = _extract_hazard_signals(row, max_candidates=max_candidates)
+        risk_end = min(accepted + 1, max_candidates)
+        for j in range(1, risk_end + 1):
+            features = _hazard_features_for_position(
+                j, m, c, h, variant, max_candidates=max_candidates
+            )
+            label = 1.0 if j <= accepted else 0.0
+            x_list.append(features)
+            y_list.append(label)
+
+    if not x_list:
+        raise ValueError("no risk set transitions available to fit hazard model")
+
+    X = np.asarray(x_list, dtype=np.float64)
+    y = np.asarray(y_list, dtype=np.float64)
+
+    center = np.mean(X, axis=0)
+    scale = np.std(X, axis=0)
+    scale[scale < 1e-8] = 1.0
+
+    standardized_X = (X - center) / scale
+    Phi = np.column_stack([np.ones(len(X), dtype=np.float64), standardized_X])
+    reg = float(ridge)
+
+    def loss(beta: np.ndarray) -> float:
+        z = Phi @ beta
+        nll = float(np.logaddexp(0.0, z).sum() - y @ z)
+        penalty = 0.5 * reg * float(beta @ beta)
+        return nll + penalty
+
+    def grad(beta: np.ndarray) -> np.ndarray:
+        z = Phi @ beta
+        p = expit(z)
+        return Phi.T @ (p - y) + reg * beta
+
+    initial_beta = np.zeros(Phi.shape[1], dtype=np.float64)
+    fit = minimize(
+        loss,
+        initial_beta,
+        jac=grad,
+        method="L-BFGS-B",
+        options={"maxiter": 500, "gtol": 1e-7},
+    )
+    if not fit.success:
+        raise RuntimeError(f"Hazard logistic fit failed for {variant}: {fit.message}")
+
+    return {
+        "model_type": "hazard",
+        "variant": variant,
+        "training_groups": sorted({str(row["source_group_id"]) for row in train_rows}),
+        "max_candidates": max_candidates,
+        "features": list(HAZARD_VARIANTS[variant]),
+        "beta": [float(v) for v in fit.x],
+        "center": [float(v) for v in center],
+        "scale": [float(v) for v in scale],
+        "ridge": reg,
+        "train_risk_states": len(y),
+    }
+
+
+def predict_hazard_curve(
+    model: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> tuple[list[float], list[str]]:
+    """Predict survival curve S(k) = prod_{j=1..k} p_j^{cond} using fitted hazard model."""
+    variant = str(model["variant"])
+    max_candidates = int(model.get("max_candidates", 15))
+    beta = np.asarray(model["beta"], dtype=np.float64)
+    center = np.asarray(model["center"], dtype=np.float64)
+    scale = np.asarray(model["scale"], dtype=np.float64)
+
+    m, c, h = _extract_hazard_signals(row, max_candidates=max_candidates)
+    features_list = [
+        _hazard_features_for_position(j, m, c, h, variant, max_candidates=max_candidates)
+        for j in range(1, max_candidates + 1)
+    ]
+    X_pred = np.asarray(features_list, dtype=np.float64)
+    standardized = (X_pred - center) / scale
+    Phi = np.column_stack([np.ones(len(X_pred), dtype=np.float64), standardized])
+
+    logits = Phi @ beta
+    log_p_cond = -np.logaddexp(0.0, -logits)
+    log_S = np.cumsum(log_p_cond)
+    S = np.exp(log_S)
+    S = np.clip(S, 0.0, 1.0 - 1e-12)
+
+    return [float(v) for v in S], ["hazard"] * max_candidates
+
+
 def fit_survival_curve(
     train_rows: Sequence[Mapping[str, Any]],
     *,
@@ -275,10 +471,16 @@ def fit_survival_curve(
     min_support_states: int = 8,
     min_support_groups: int = 3,
 ) -> dict[str, Any]:
-    """Fit training-only binned Beta(1,1)-smoothed survival curves."""
+    """Fit training-only binned or hazard survival curves."""
 
     if variant not in SURVIVAL_VARIANTS:
         raise ValueError(f"unsupported survival variant {variant!r}")
+    if variant in HAZARD_VARIANTS:
+        return fit_hazard_model(
+            train_rows,
+            variant=variant,
+            max_candidates=max_candidates,
+        )
     if not train_rows or max_candidates < 1 or min_support_states < 1 or min_support_groups < 1:
         raise ValueError("survival fit requires rows and positive support settings")
     features = SURVIVAL_VARIANTS[variant]
@@ -306,6 +508,20 @@ def serialize_survival_curve(model: Mapping[str, Any]) -> dict[str, Any]:
     variant = str(model.get("variant", ""))
     if variant not in SURVIVAL_VARIANTS:
         raise ValueError(f"unsupported survival variant {variant!r}")
+    if model.get("model_type") == "hazard" or variant in HAZARD_VARIANTS:
+        return {
+            "schema_version": "dflash-speculation-b.survival-model.v1",
+            "model_type": "hazard",
+            "variant": variant,
+            "training_groups": [str(value) for value in model.get("training_groups", ())],
+            "max_candidates": int(model["max_candidates"]),
+            "features": list(model["features"]),
+            "beta": [float(value) for value in model["beta"]],
+            "center": [float(value) for value in model["center"]],
+            "scale": [float(value) for value in model["scale"]],
+            "ridge": float(model.get("ridge", 1.0)),
+            "train_risk_states": int(model.get("train_risk_states", 0)),
+        }
     serialized_models = []
     for threshold_model in model.get("models", ()):
         counts = []
@@ -347,6 +563,27 @@ def deserialize_survival_curve(payload: Mapping[str, Any]) -> dict[str, Any]:
     variant = str(payload.get("variant", ""))
     if variant not in SURVIVAL_VARIANTS:
         raise ValueError(f"unsupported survival variant {variant!r}")
+    if payload.get("model_type") == "hazard" or "beta" in payload:
+        max_candidates = int(payload.get("max_candidates", 0))
+        if max_candidates < 1:
+            raise ValueError("hazard model artifact has invalid max_candidates")
+        beta = [float(v) for v in payload.get("beta", ())]
+        center = [float(v) for v in payload.get("center", ())]
+        scale = [float(v) for v in payload.get("scale", ())]
+        if len(beta) != len(center) + 1 or len(center) != len(scale):
+            raise ValueError("hazard model artifact has mismatched parameter dimensions")
+        return {
+            "model_type": "hazard",
+            "variant": variant,
+            "training_groups": [str(value) for value in payload.get("training_groups", ())],
+            "max_candidates": max_candidates,
+            "features": tuple(str(value) for value in payload.get("features", ())),
+            "beta": beta,
+            "center": center,
+            "scale": scale,
+            "ridge": float(payload.get("ridge", 1.0)),
+            "train_risk_states": int(payload.get("train_risk_states", 0)),
+        }
     models = []
     for raw_model in payload.get("models", ()):
         counts: dict[tuple[Any, ...], list[Any]] = {}
@@ -387,6 +624,8 @@ def deserialize_survival_curve(payload: Mapping[str, Any]) -> dict[str, Any]:
 def predict_survival_curve(
     model: Mapping[str, Any], row: Mapping[str, Any]
 ) -> tuple[list[float], list[str]]:
+    if model.get("model_type") == "hazard" or str(model.get("variant", "")) in HAZARD_VARIANTS:
+        return predict_hazard_curve(model, row)
     probabilities: list[float] = []
     fallback: list[str] = []
     for threshold_model in model["models"]:
@@ -602,6 +841,10 @@ def cross_validated_survival(
             ("R-DAll", "R-DAll-noDH"),
             ("R-A-LDH", "R-A"),
             ("R-A-LDC", "R-A"),
+            ("R-Hazard-Present", "R-Hazard-Pos"),
+            ("R-Hazard-Prefix", "R-Hazard-Present"),
+            ("R-Hazard-Suffix-Margin", "R-Hazard-Prefix"),
+            ("R-Hazard-Suffix-Entropy", "R-Hazard-Prefix"),
         )
         if variant in variant_values and control in variant_values
     }

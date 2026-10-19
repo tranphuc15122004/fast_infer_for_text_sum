@@ -155,8 +155,9 @@ def execute_analysis(job: ResearchJob,
             if not signals:
                 raise EvidenceMissing('Chưa có candidate_signals hợp lệ.')
             variant = job.parameters['model_variant']
-            from TrainingFree.speculation_experiments.survival import DEFAULT_VARIANTS
-            if any(feature in DEFAULT_VARIANTS[variant] for feature in ('parent_entropy', 'parent_confidence')) and any(not row.get('parent_signal') for row in signals):
+            from TrainingFree.speculation_experiments.survival import SURVIVAL_VARIANTS
+            features = SURVIVAL_VARIANTS.get(variant, ())
+            if any(feature in features for feature in ('parent_entropy', 'parent_confidence')) and any(not row.get('parent_signal') for row in signals):
                 raise EvidenceMissing(f'{variant} cần parent target-logit signals chưa có trong B0 trace.')
             payload = serialize_survival_curve(fit_survival_curve(signals, variant=variant))
         elif operation == 'survival_cross_validation':

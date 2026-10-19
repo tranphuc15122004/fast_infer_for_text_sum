@@ -17,9 +17,10 @@ SERVER_MODEL_ENV = {
     "dflash": "MODEL_DFLASH_DRAFT",
     "domino": "MODEL_DOMINO_DRAFT",
     "dspark": "MODEL_DSPARK_DRAFT",
+    "dflash_phase_b": "MODEL_DFLASH_DRAFT",
 }
 
-SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark")
+SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_b")
 
 def resolve_server_models(
     environ: Mapping[str, str], methods: str = "all"

@@ -47,7 +47,18 @@ def rank_chunks(
             scores = scores_by_layer[layer_index] if scores_by_layer and layer_index < len(scores_by_layer) else None
         else:
             scores = scores_by_layer[0] if scores_by_layer else None
-        if selector in {"target_parent", "draft_refresh"}:
+        if selector in {
+            "target_parent",
+            "multi_query_max_pooling",
+            "duo_ensemble",
+            "target_multi_query",
+            "m1_multi_query",
+            "m4_duo_ensemble",
+            "multi_query_mean_pooling",
+            "m2_chunk_mean",
+            "m2_p1_chunk128",
+            "draft_refresh",
+        }:
             key = lambda index: (-_chunk_score(layout.source_chunks[index], scores), layout.source_chunks[index][0])
         elif selector == "recent_only":
             key = lambda index: (-layout.source_chunks[index][-1], layout.source_chunks[index][0])

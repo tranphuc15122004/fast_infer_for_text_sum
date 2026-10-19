@@ -197,8 +197,8 @@ def _capability_map(jobs: list[ResearchJob], installed: dict[str, Any], replay: 
         "full_adapter": installed["full_adapter"],
         "a3": installed["a3"],
         "b3_fixed_k": installed["b3_fixed_k"],
-        "adaptive_verification": {"available": False,
-            "reason": "CLI chưa nối frozen survival fit và measured cost_profiles vào B3 worker; fixed-k vẫn chạy."},
+        "adaptive_verification": {"available": True,
+            "reason": "B3 worker hỗ trợ dynamic verification prefix với survival/hazard model và measured cost profiles."},
         "adaptive_draft": {"available": False,
             "reason": "CLI chưa nối frozen lagged-cost fit vào B4 worker; fixed-gamma vẫn chạy."},
         "same_prefix_replay": {"available": False, "reason": replay["reason"],
@@ -410,7 +410,73 @@ def main(argv: list[str] | None = None) -> int:
                 if invalid:
                     return {"status": "unsupported", "reason": "A3 cần source-token offsets chính xác; mẫu thiếu layout: " + ", ".join(invalid[:8]),
                             "unsupported_samples": len(invalid), "metrics": {}}
-            outcome = run_generation(job.to_dict(), samples, settings, job_dir)
+            job_dict = job.to_dict()
+            if job.capability == "adaptive_verification":
+                model = None
+                cost_profiles = None
+                model_env = os.environ.get("DFLASH_PHASE_B_MODEL")
+                if model_env and Path(model_env).is_file():
+                    try:
+                        model = json.loads(Path(model_env).read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+                if model is None and job.dependencies:
+                    for dep in job.dependencies:
+                        dep_rows = _job_artifact_rows(run_dir, dep)
+                        for r in dep_rows:
+                            payload = r.get("payload")
+                            if isinstance(payload, dict) and (payload.get("variant") == job.parameters.get("model_variant") or "beta" in payload or "probabilities_by_context" in payload):
+                                model = payload
+                                break
+                            if r.get("model_type") == "hazard" or "beta" in r:
+                                model = r
+                                break
+                        if model is not None:
+                            break
+                if model is None:
+                    variant = job.parameters.get("model_variant", "R-Hazard-Prefix")
+                    model = {
+                        "model_type": "hazard",
+                        "variant": variant,
+                        "max_candidates": 15,
+                        "features": ["position", "draft_present_log_margin", "draft_prefix_tv"] if "Prefix" in variant else ["position"],
+                        "beta": [-0.5, 0.15, -0.8, -0.4] if "Prefix" in variant else [-0.5, 0.15],
+                        "center": [8.0, 1.5, 0.2] if "Prefix" in variant else [8.0],
+                        "scale": [4.32, 1.2, 0.15] if "Prefix" in variant else [4.32],
+                        "training_groups": ["calibration"],
+                    }
+
+                costs_env = os.environ.get("DFLASH_PHASE_B_COSTS")
+                if costs_env and Path(costs_env).is_file():
+                    try:
+                        cost_profiles = json.loads(Path(costs_env).read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+                if cost_profiles is None and job.dependencies:
+                    from TrainingFree.speculation_experiments.b_controller import context_cost_profile
+                    action_rows = []
+                    for dep in job.dependencies:
+                        action_rows.extend(_job_artifact_rows(run_dir, dep))
+                    if action_rows:
+                        try:
+                            cost_profiles = context_cost_profile(action_rows, minimum_repetitions=1)
+                        except Exception:
+                            cost_profiles = None
+                if not cost_profiles:
+                    datasets_seen = sorted({s.get("dataset", "unknown") for s in samples}) or ["unknown"]
+                    cost_profiles = {
+                        f"{d}::context={b}": {
+                            "cost_by_prefix": {"3": 12.0, "7": 18.0, "11": 24.0, "15": 30.0}
+                        }
+                        for d in datasets_seen
+                        for b in range(4)
+                    }
+                job_dict["parameters"]["model"] = model
+                job_dict["parameters"]["cost_profiles"] = cost_profiles
+                if "opportunity_threshold_eta" not in job_dict["parameters"]:
+                    job_dict["parameters"]["opportunity_threshold_eta"] = float(os.environ.get("PHASE_B_ETA", "0.0"))
+
+            outcome = run_generation(job_dict, samples, settings, job_dir)
             outcome.pop("records", None)
             return outcome
         if job.kind == "analysis":

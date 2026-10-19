@@ -76,7 +76,12 @@ def configure_worker_variant(variant: str, parameters: dict | None = None, trace
             raise ValueError('B3 models requiring parent entropy/confidence need a target-logit collector')
         if not model or not parameters.get('cost_profiles'):
             raise ValueError('B3 requires a frozen survival model and measured cost_profiles')
-        if model.get('variant') not in {'R', 'R-A', 'R-DH', 'R-DC', 'R-A-DH', 'R-A-DC'}:
+        allowed_b3_variants = {
+            'R', 'R-A', 'R-DH', 'R-DC', 'R-A-DH', 'R-A-DC',
+            'R-Hazard-Pos', 'R-Hazard-Present', 'R-Hazard-Prefix',
+            'R-Hazard-Suffix-Margin', 'R-Hazard-Suffix-Entropy',
+        }
+        if model.get('variant') not in allowed_b3_variants:
             raise ValueError('B3 worker does not implement the signals required by this survival variant')
     if variant == 'b4' and not parameters.get('model'):
         raise ValueError('B4 requires a frozen lagged cost model')

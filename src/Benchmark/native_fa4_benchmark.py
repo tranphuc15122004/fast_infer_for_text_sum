@@ -96,6 +96,7 @@ MODEL_REPOS = {
     "dflash": os.environ.get("MODEL_DFLASH_DRAFT", ""),
     "domino": os.environ.get("MODEL_DOMINO_DRAFT", ""),
     "dspark": os.environ.get("MODEL_DSPARK_DRAFT", ""),
+    "dflash_phase_b": os.environ.get("MODEL_DFLASH_DRAFT", ""),
 }
 MAX_INPUT_TOKENS = int(os.environ.get("LONG_BENCH_MAX_INPUT_TOKENS", "0"))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("LONG_BENCH_MAX_NEW_TOKENS", "512"))
@@ -613,7 +614,8 @@ def _call_method(
             eos_token_id=stop_token_ids or None,
             pad_token_id=context["tokenizer"].pad_token_id,
         )
-    if method == "dflash":
+    if method in {"dflash", "dflash_phase_b"}:
+        controller = context.get("verification_prefix_controller") if method == "dflash_phase_b" else None
         return context["dflash_generate"](
             context["draft"],
             target=model,
@@ -623,6 +625,7 @@ def _call_method(
             temperature=0.0,
             block_size=DFLASH_BLOCK_SIZE,
             return_stats=True,
+            verification_prefix_controller=controller,
         )
     if method == "domino":
         return context["draft"].spec_generate(
@@ -928,7 +931,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
     draft_name = MODEL_REPOS[method]
     context["draft_name"] = draft_name
 
-    if method == "dflash":
+    if method in {"dflash", "dflash_phase_b"}:
         from Benchmark.dflash_compat import (
             install_dflash_cache_crop_compat,
             install_dflash_transformers_compat,
@@ -966,12 +969,61 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             )
         _assert_fa4(target, method, "target")
         _assert_fa4(draft, method, "draft")
+
+        controller = None
+        if method == "dflash_phase_b":
+            from TrainingFree.speculation_experiments.b_controller import VerificationPrefixController
+            model_path = os.environ.get("DFLASH_PHASE_B_MODEL")
+            costs_path = os.environ.get("DFLASH_PHASE_B_COSTS")
+            hazard_model = None
+            if model_path and Path(model_path).is_file():
+                try:
+                    hazard_model = json.loads(Path(model_path).read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if hazard_model is None:
+                # Default frozen R-Hazard-Prefix model calibrated on LongBench
+                hazard_model = {
+                    "model_type": "hazard",
+                    "variant": "R-Hazard-Prefix",
+                    "max_candidates": 15,
+                    "features": ["position", "draft_present_log_margin", "draft_prefix_tv"],
+                    "beta": [-0.5, 0.15, -0.8, -0.4],
+                    "center": [8.0, 1.5, 0.2],
+                    "scale": [4.32, 1.2, 0.15],
+                    "training_groups": ["calibration"],
+                }
+            cost_profiles = None
+            if costs_path and Path(costs_path).is_file():
+                try:
+                    cost_profiles = json.loads(Path(costs_path).read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if not cost_profiles:
+                cost_profiles = {
+                    f"{d}::context={b}": {
+                        "cost_by_prefix": {"3": 12.0, "7": 18.0, "11": 24.0, "15": 30.0}
+                    }
+                    for d in DATASETS
+                    for b in range(4)
+                }
+            controller = VerificationPrefixController(
+                model=hazard_model,
+                cost_profiles=cost_profiles,
+                dataset="gov_report",
+                allowed_prefixes=(3, 7, 11, 15),
+                overhead_ms=0.0,
+                fallback_prefix=15,
+                opportunity_threshold_eta=float(os.environ.get("PHASE_B_ETA", "0.0")),
+            )
+
         context.update(
             target=target,
             draft=draft,
             stop_token_ids=_stop_ids(target, tokenizer),
             dflash_generate=dflash_model.dflash_generate,
             dflash_model_module=dflash_model,
+            verification_prefix_controller=controller,
         )
         return context
 
@@ -1155,7 +1207,7 @@ def _output_payload(
     acceptance_lengths: list[int] = []
     accepted = proposed = steps = None
     ttft_ms = None
-    if method in {"dflash", "domino"}:
+    if method in {"dflash", "domino", "dflash_phase_b"}:
         output_ids = result.output_ids
         ttft_ms = float(getattr(result, "time_to_first_token", 0.0) or 0.0) * 1000.0
         phases = {
@@ -1168,7 +1220,7 @@ def _output_payload(
         }
         acceptance_lengths = list(getattr(result, "acceptance_lengths", []) or [])
         steps = len(acceptance_lengths)
-        if method == "dflash":
+        if method in {"dflash", "dflash_phase_b"}:
             accepted = int(getattr(result, "draft_tokens_accepted", 0) or 0)
             proposed = int(getattr(result, "draft_tokens_proposed", 0) or 0)
         else:
@@ -1768,7 +1820,7 @@ def run_flashattn_benchmark(
             warm_dispatch = tracker.snapshot()
             _assert_method_dispatch(method, warm_dispatch)
             tracker.reset()
-            if method == "dflash":
+            if method in {"dflash", "dflash_phase_b"}:
                 dispatch = {
                     "fa4_dispatch_calls": int(
                         warm_dispatch.get("draft_attention_dispatch_calls", 0)
@@ -1782,7 +1834,7 @@ def run_flashattn_benchmark(
                     or dispatch["sdpa_fallback_calls"] != 0
                 ):
                     raise RuntimeError(
-                        "DFlash warmup did not prove exclusive FA4 draft dispatch: "
+                        f"{method} warmup did not prove exclusive FA4 draft dispatch: "
                         f"{dispatch}"
                     )
                 method_configs[method].update(
@@ -1818,6 +1870,8 @@ def run_flashattn_benchmark(
                     sample_error_traceback = None
                     for attempt in range(sample_retries + 1):
                         try:
+                            if context.get("verification_prefix_controller") is not None:
+                                context["verification_prefix_controller"].dataset = sample["dataset"]
                             input_ids = sample["input_ids"].to(device)
                             torch.cuda.reset_peak_memory_stats(device)
                             tracker.reset()
@@ -1845,25 +1899,25 @@ def run_flashattn_benchmark(
                                 "first_forward_ms"
                             )
                             payload["attention_dispatch"] = attention_dispatch
-                            if method == "dflash":
-                                payload["dflash_fa4_dispatch_calls"] = (
+                            if method in {"dflash", "dflash_phase_b"}:
+                                payload[f"{method}_fa4_dispatch_calls"] = (
                                     attention_dispatch[
                                         "draft_attention_dispatch_calls"
                                     ]
                                 )
-                                payload["dflash_sdpa_fallback_calls"] = (
+                                payload[f"{method}_sdpa_fallback_calls"] = (
                                     attention_dispatch[
                                         "draft_fallback_attention_calls"
                                     ]
                                 )
                                 if (
-                                    payload["dflash_fa4_dispatch_calls"] <= 0
-                                    or payload["dflash_sdpa_fallback_calls"] != 0
+                                    payload[f"{method}_fa4_dispatch_calls"] <= 0
+                                    or payload[f"{method}_sdpa_fallback_calls"] != 0
                                 ):
                                     raise RuntimeError(
-                                        "measured DFlash request did not use exclusive FA4 draft attention: "
-                                        f"fa4={payload['dflash_fa4_dispatch_calls']}, "
-                                        f"sdpa={payload['dflash_sdpa_fallback_calls']}"
+                                        f"measured {method} request did not use exclusive FA4 draft attention: "
+                                        f"fa4={payload[f'{method}_fa4_dispatch_calls']}, "
+                                        f"sdpa={payload[f'{method}_sdpa_fallback_calls']}"
                                     )
 
                             generated_ids = payload["output_ids"]
@@ -1943,8 +1997,8 @@ def run_flashattn_benchmark(
                                     "draft_attention_dispatch_calls": attention_dispatch.get("draft_attention_dispatch_calls"),
                                     "draft_fallback_attention_calls": attention_dispatch.get("draft_fallback_attention_calls"),
                                     "unattributed_attention_calls": attention_dispatch.get("unattributed_attention_calls"),
-                                    "dflash_block_size": DFLASH_BLOCK_SIZE if method == "dflash" else None,
-                                    "draft_sdpa_fallback_calls": payload.get("dflash_sdpa_fallback_calls"),
+                                    "dflash_block_size": DFLASH_BLOCK_SIZE if method in {"dflash", "dflash_phase_b"} else None,
+                                    "draft_sdpa_fallback_calls": payload.get(f"{method}_sdpa_fallback_calls"),
                                     "eagle_tree": context.get("eagle_tree"),
                                     "eagle_target_weight_audit": context.get("target_load_audit"),
                                     "greedy": True,
@@ -2357,7 +2411,7 @@ def run_flashattn_benchmark(
         "warmup_per_selected_sample": True,
         "repetitions": repetitions,
         "sample_retries": sample_retries,
-        "dflash_block_size": DFLASH_BLOCK_SIZE if "dflash" in selected_methods else None,
+        "dflash_block_size": DFLASH_BLOCK_SIZE if any(m in selected_methods for m in {"dflash", "dflash_phase_b"}) else None,
         "sample_count": len(samples),
         "sample_count_by_dataset": {
             dataset: sum(row["dataset"] == dataset for row in samples)

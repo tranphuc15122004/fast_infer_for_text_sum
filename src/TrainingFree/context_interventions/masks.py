@@ -220,7 +220,19 @@ def build_online_selection_policy(
     Supported live signals are recency, target-parent, and previous dense
     DFlash attention. Oracle/current-draft ranking is intentionally omitted.
     """
-    if selector not in {"recency", "target_parent", "previous_dflash"}:
+    if selector not in {
+        "recency",
+        "target_parent",
+        "multi_query_max_pooling",
+        "duo_ensemble",
+        "target_multi_query",
+        "m1_multi_query",
+        "m4_duo_ensemble",
+        "multi_query_mean_pooling",
+        "m2_chunk_mean",
+        "m2_p1_chunk128",
+        "previous_dflash",
+    }:
         raise ValueError(f"unsupported deployable A3 selector: {selector}")
     if budget < 1:
         raise ValueError("A3 context budget must be positive")
@@ -266,9 +278,19 @@ def build_online_selection_policy(
                 )
                 for _ in range(num_draft_layers)
             ]
-        elif selector == "target_parent":
+        elif selector in {
+            "target_parent",
+            "multi_query_max_pooling",
+            "duo_ensemble",
+            "target_multi_query",
+            "m1_multi_query",
+            "m4_duo_ensemble",
+            "multi_query_mean_pooling",
+            "m2_chunk_mean",
+            "m2_p1_chunk128",
+        }:
             if target_parent_scores is None:
-                raise RuntimeError("target-parent signal unavailable at this prefix")
+                raise RuntimeError(f"{selector} signal unavailable at this prefix")
             masks = [
                 exact_budget_positions(
                     bank_length=bank_length,

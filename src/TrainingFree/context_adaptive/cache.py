@@ -100,6 +100,16 @@ class DraftContextBank:
         for storage, position_list in zip(self.layer_storage, selection.positions_by_layer):
             if not position_list:
                 raise ValueError("each draft layer must retain at least one context position")
+            # Fast zero-copy path when the entire context bank is retained contiguously:
+            if len(position_list) == self.length and position_list[0] == 0 and position_list[-1] == self.length - 1:
+                layers.append(
+                    LayerContext(
+                        key=storage.key[:, :, :self.length, :],
+                        value=storage.value[:, :, :self.length, :],
+                        positions=self.positions[:self.length],
+                    )
+                )
+                continue
             positions = torch.tensor(position_list, dtype=torch.long, device=self.device)
             if positions.min().item() < 0 or positions.max().item() >= self.length:
                 raise ValueError("selection references an unprocessed logical position")

@@ -32,6 +32,7 @@ def choose_verification_prefix(
     allowed_prefixes: Sequence[int] = (3, 7, 11, 15),
     overhead_ms: float = 0.0,
     fallback_prefix: int = 15,
+    opportunity_threshold_eta: float = 0.0,
 ) -> dict[str, Any]:
     """Choose k by predicted full-round milliseconds per committed token.
 
@@ -48,6 +49,8 @@ def choose_verification_prefix(
         raise ValueError("fallback_prefix must belong to allowed_prefixes")
     if not math.isfinite(float(overhead_ms)) or overhead_ms < 0:
         raise ValueError("overhead_ms must be finite and nonnegative")
+    if not math.isfinite(float(opportunity_threshold_eta)) or opportunity_threshold_eta < 0:
+        raise ValueError("opportunity_threshold_eta must be finite and nonnegative")
 
     probabilities = [float(value) for value in survival_probabilities]
     if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in probabilities):
@@ -62,6 +65,27 @@ def choose_verification_prefix(
         if not math.isfinite(cost) or cost <= 0:
             raise ValueError("prefix costs must be finite positive milliseconds")
         costs[prefix] = cost
+
+    # Cost-opportunity gate: if max potential savings delta <= eta, fallback to K.
+    if opportunity_threshold_eta > 0.0 and fallback_prefix in costs:
+        supported_costs = [
+            costs[p] for p in prefixes if p in costs and p <= len(probabilities)
+        ]
+        if supported_costs:
+            c_min = min(supported_costs)
+            c_fallback = costs[fallback_prefix]
+            delta = 1.0 - (c_min / c_fallback)
+            if delta <= float(opportunity_threshold_eta):
+                return {
+                    "prefix": int(fallback_prefix),
+                    "reason": "cost_opportunity_gate_below_threshold",
+                    "predicted_cost_per_commit": None,
+                    "expected_commits": None,
+                    "unsupported_prefixes": [p for p in prefixes if p > len(probabilities) or p not in costs],
+                    "overhead_ms": float(overhead_ms),
+                    "opportunity_delta": float(delta),
+                    "opportunity_threshold_eta": float(opportunity_threshold_eta),
+                }
 
     scored: list[tuple[float, int, float]] = []
     unsupported: list[int] = []
@@ -81,16 +105,31 @@ def choose_verification_prefix(
             "expected_commits": None,
             "unsupported_prefixes": unsupported,
             "overhead_ms": float(overhead_ms),
+            "opportunity_threshold_eta": float(opportunity_threshold_eta),
         }
 
     cost_per_commit, prefix, expected_commits = min(scored, key=lambda item: (item[0], item[1]))
+
+    # Hysteresis threshold: only choose shorter k < K if J(k) < (1 - eta) * J(K).
+    reason = "minimum_predicted_cost_per_commit"
+    if opportunity_threshold_eta > 0.0 and prefix != fallback_prefix:
+        fallback_scored = next((item for item in scored if item[1] == fallback_prefix), None)
+        if fallback_scored is not None:
+            j_fallback = fallback_scored[0]
+            if cost_per_commit >= (1.0 - float(opportunity_threshold_eta)) * j_fallback:
+                prefix = fallback_prefix
+                cost_per_commit = j_fallback
+                expected_commits = fallback_scored[2]
+                reason = "hysteresis_insufficient_gain"
+
     return {
         "prefix": prefix,
-        "reason": "minimum_predicted_cost_per_commit",
+        "reason": reason,
         "predicted_cost_per_commit": cost_per_commit,
         "expected_commits": expected_commits,
         "unsupported_prefixes": unsupported,
         "overhead_ms": float(overhead_ms),
+        "opportunity_threshold_eta": float(opportunity_threshold_eta),
         "candidate_scores": {
             str(k): {
                 "cost_per_commit_ms": score,
@@ -162,6 +201,7 @@ class VerificationPrefixController:
         allowed_prefixes: Sequence[int] = (3, 7, 11, 15),
         overhead_ms: float = 0.0,
         fallback_prefix: int = 15,
+        opportunity_threshold_eta: float = 0.0,
     ) -> None:
         self.model = model
         self.cost_profiles = cost_profiles
@@ -169,11 +209,19 @@ class VerificationPrefixController:
         self.allowed_prefixes = tuple(int(value) for value in allowed_prefixes)
         self.overhead_ms = float(overhead_ms)
         self.fallback_prefix = int(fallback_prefix)
+        if not math.isfinite(float(opportunity_threshold_eta)) or opportunity_threshold_eta < 0:
+            raise ValueError("opportunity_threshold_eta must be finite and nonnegative")
+        self.opportunity_threshold_eta = float(opportunity_threshold_eta)
         from TrainingFree.speculation_experiments.survival import SURVIVAL_VARIANTS
 
+        variant_features = SURVIVAL_VARIANTS.get(str(model.get("variant", "")), ())
         self.requires_uncertainty = any(
             feature.startswith("draft_")
-            for feature in SURVIVAL_VARIANTS.get(str(model.get("variant", "")), ())
+            for feature in variant_features
+        )
+        self.requires_entropy = any(
+            feature.startswith("draft_") and "entropy" in feature
+            for feature in variant_features
         )
         self.observed_policy_ms: list[float] = []
 
@@ -183,6 +231,31 @@ class VerificationPrefixController:
         if not math.isfinite(value) or value < 0:
             raise ValueError("policy overhead must be finite and nonnegative")
         self.overhead_ms = value
+
+    def should_bypass_signals(self, logical_length: int) -> bool:
+        """Check if cost profile for current context has savings delta <= eta."""
+        if self.opportunity_threshold_eta <= 0.0:
+            return False
+        context_bucket = min(max(int(logical_length), 0) // 4096, 3)
+        profile = self.cost_profiles.get(f"{self.dataset}::context={context_bucket}", {})
+        measured_costs = profile.get("cost_by_prefix", {})
+        if not measured_costs:
+            return True
+        k_key = self.fallback_prefix if self.fallback_prefix in measured_costs else str(self.fallback_prefix)
+        if k_key not in measured_costs:
+            return True
+        k_cost = float(measured_costs[k_key])
+        if k_cost <= 0:
+            return True
+        supported = [
+            float(v) for k, v in measured_costs.items()
+            if int(k) in self.allowed_prefixes and float(v) > 0
+        ]
+        if not supported:
+            return True
+        c_min = min(supported)
+        delta = 1.0 - (c_min / k_cost)
+        return delta <= self.opportunity_threshold_eta
 
     def __call__(
         self,
@@ -195,6 +268,28 @@ class VerificationPrefixController:
         from TrainingFree.speculation_experiments.survival import predict_survival_curve
 
         logical_length = int(state.logical_length)
+        context_bucket = min(max(logical_length, 0) // 4096, 3)
+        available = tuple(
+            value for value in self.allowed_prefixes
+            if value in set(int(item) for item in available_prefixes) and value <= int(draft_gamma)
+        )
+        if not available:
+            available = (min(int(draft_gamma), self.fallback_prefix),)
+        clamped_fallback = self.fallback_prefix if self.fallback_prefix in available else available[-1]
+        if self.should_bypass_signals(logical_length):
+            return {
+                "prefix": clamped_fallback,
+                "reason": "cost_opportunity_gate_below_threshold",
+                "predicted_cost_per_commit": None,
+                "expected_commits": None,
+                "unsupported_prefixes": [],
+                "overhead_ms": float(self.overhead_ms),
+                "opportunity_threshold_eta": float(self.opportunity_threshold_eta),
+                "survival_fallback_levels": [],
+                "survival_model_variant": self.model.get("variant"),
+                "cost_context_key": f"{self.dataset}::context={context_bucket}",
+            }
+
         processed = int(state.processed_output_tokens)
         row = {
             "accepted_candidates": 0,  # Decision occurs before verifier outcomes are known.
@@ -202,15 +297,20 @@ class VerificationPrefixController:
             "context_tokens": logical_length,
             "processed_output_tokens": processed,
             "parent_entropy": state.parent_entropy,
+            "parent_signal": {
+                "normalized_entropy": state.parent_entropy,
+                "confidence": getattr(state, "parent_confidence", None),
+            },
             "history_ema": state.history_acceptance,
             "history_missing": state.history_acceptance is None,
             "draft_uncertainty": {
                 "normalized_entropy": list(draft_uncertainty.get("normalized_entropy") or ()),
                 "confidence": list(draft_uncertainty.get("confidence") or ()),
+                "probability_margin": list(draft_uncertainty.get("probability_margin") or ()),
+                "logit_margin": list(draft_uncertainty.get("logit_margin") or ()),
             },
         }
         survival, fallback = predict_survival_curve(self.model, row)
-        context_bucket = min(max(logical_length, 0) // 4096, 3)
         profile = self.cost_profiles.get(f"{self.dataset}::context={context_bucket}", {})
         measured_costs = profile.get("cost_by_prefix", {})
         available = tuple(
@@ -228,6 +328,7 @@ class VerificationPrefixController:
             allowed_prefixes=available,
             overhead_ms=self.overhead_ms + extraction_ms,
             fallback_prefix=(self.fallback_prefix if self.fallback_prefix in available else available[-1]),
+            opportunity_threshold_eta=self.opportunity_threshold_eta,
         )
         return {
             **decision,

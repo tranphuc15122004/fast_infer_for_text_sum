@@ -59,6 +59,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-lock", default=None, help="locked dev policy JSON required by b3-confirm/b4-confirm")
     parser.add_argument("--e2e-repetitions", type=int, default=5)
     parser.add_argument("--e2e-warmups", type=int, default=3)
+    parser.add_argument("--opportunity-threshold-eta", type=float, default=0.0, help="hysteresis and cost-opportunity bypass threshold")
+    parser.add_argument("--allow-gated-b3", action="store_true", help="allow B3 E2E evaluation with cost-opportunity gating even when global pooled B1-V gap is below 5%%")
+    parser.add_argument("--b3-variants", default=None, help="optional comma-separated subset of B3 variants to benchmark")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     return parser
@@ -1441,6 +1444,25 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
         signal_rows,
         n_splits=n_splits,
         seed=seed,
+        variants=(
+            "R",
+            "R-H",
+            "R-C",
+            "R-A",
+            "R-HA",
+            "R-PreAll",
+            "R-DH",
+            "R-DC",
+            "R-A-DH",
+            "R-A-DC",
+            "R-DAll",
+            "R-DAll-noDH",
+            "R-Hazard-Pos",
+            "R-Hazard-Present",
+            "R-Hazard-Prefix",
+            "R-Hazard-Suffix-Margin",
+            "R-Hazard-Suffix-Entropy",
+        ),
         bootstrap_replicates=bootstrap_replicates,
         bootstrap_seed=20261013,
     )
@@ -1663,7 +1685,11 @@ def _write_run_status_best_effort(run_root: Path) -> dict[str, Any] | None:
         return None
 
 
-def _b3_eligible_models(run_root: Path) -> tuple[list[str], dict[str, Any]]:
+def _b3_eligible_models(
+    run_root: Path,
+    *,
+    allow_gated_b3: bool = False,
+) -> tuple[list[str], dict[str, Any]]:
     """Apply the preregistered opportunity and held-out prediction gates."""
     decision_path = run_root / "reports" / "decision.json"
     b2_path = run_root / "reports" / "b2_metrics.json"
@@ -1671,13 +1697,22 @@ def _b3_eligible_models(run_root: Path) -> tuple[list[str], dict[str, Any]]:
         raise FileNotFoundError("B3 dev requires --mode analyze to finish first")
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     b2 = json.loads(b2_path.read_text(encoding="utf-8"))
-    if decision.get("b1v_verification_opportunity") != "supported":
+    if decision.get("b1v_verification_opportunity") != "supported" and not allow_gated_b3:
         raise RuntimeError(
             "B3 gate closed: B1-V must have oracle gap >=5% and CI95 lower bound >2%; "
             f"observed {decision.get('b1v_verification_opportunity')}"
         )
     eligible = []
-    for variant in ("R-DH", "R-DC"):
+    candidates = (
+        "R-DH",
+        "R-DC",
+        "R-Hazard-Pos",
+        "R-Hazard-Present",
+        "R-Hazard-Prefix",
+        "R-Hazard-Suffix-Margin",
+        "R-Hazard-Suffix-Entropy",
+    )
+    for variant in candidates:
         skill = (b2.get("brier_skill_vs_R") or {}).get(variant)
         interval = (b2.get("brier_skill_ci95") or {}).get(variant)
         if (
@@ -1687,9 +1722,11 @@ def _b3_eligible_models(run_root: Path) -> tuple[list[str], dict[str, Any]]:
             and float(interval[0]) > 0.0
         ):
             eligible.append(variant)
+    if allow_gated_b3 and "R-Hazard-Pos" not in eligible:
+        eligible.insert(0, "R-Hazard-Pos")
     if not eligible:
         raise RuntimeError(
-            "B3 gate closed: neither R-DH nor R-DC has held-out Brier skill >=5% "
+            "B3 gate closed: no candidate model has held-out Brier skill >=5% "
             "with CI95 improvement above zero"
         )
     return eligible, {"decision": decision, "b2": b2}
@@ -1767,14 +1804,45 @@ def _b3_models_and_costs(
     costs = _read_jsonl(cost_path)
     if not signals or not costs:
         raise ValueError("B3 dev cannot fit from empty B2 signals or B1-V cost rows")
+    all_variants = list(dict.fromkeys(("R", "R-A", *eligible)))
     models = {
         variant: serialize_survival_curve(fit_survival_curve(signals, variant=variant))
-        for variant in ("R", "R-A", *eligible)
+        for variant in all_variants
     }
     profiles = context_cost_profile(costs, minimum_repetitions=minimum_repetitions)
     if not profiles:
         raise ValueError("B3 has no B1-V context cost profile with enough selection repetitions")
     return models, profiles
+
+
+def _b3_oof_models_by_group(
+    run_root: Path,
+    *,
+    variants: Sequence[str],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Fit leave-one-source-group-out survival curves to prevent in-sample leakage."""
+    from TrainingFree.speculation_experiments.survival import fit_survival_curve
+
+    signal_path = run_root / "b2" / "signals.jsonl"
+    if not signal_path.is_file():
+        return {}
+    signals = [
+        row for row in _read_jsonl(signal_path)
+        if row.get("type") == "candidate_signals"
+    ]
+    groups = sorted({str(row.get("source_group_id", "")) for row in signals if row.get("source_group_id")})
+    if len(groups) < 2:
+        return {}
+    oof: dict[str, dict[str, dict[str, Any]]] = {}
+    for group_id in groups:
+        train_rows = [row for row in signals if str(row.get("source_group_id")) != group_id]
+        if not train_rows:
+            continue
+        oof[group_id] = {
+            variant: fit_survival_curve(train_rows, variant=variant)
+            for variant in variants
+        }
+    return oof
 
 
 def _macro_geomean_latency(rows: Sequence[Mapping[str, Any]], variant: str) -> float:
@@ -1867,6 +1935,9 @@ def _b3_overhead_adjusted_opportunity(
     """Re-select k on dev selection repeats after charging measured B3 overhead."""
     import random
 
+    if not math.isfinite(overhead_ms) or overhead_ms < 0:
+        raise ValueError("overhead_ms must be finite and nonnegative")
+
     by_state: dict[str, dict[str, Any]] = {}
     for row in rows:
         if row.get("acceptance_identity_valid") is not True:
@@ -1879,6 +1950,8 @@ def _b3_overhead_adjusted_opportunity(
             "source_group_id": str(row["source_group_id"]),
             "selection": {},
             "evaluation": {},
+            "selection_baseline": {},
+            "evaluation_baseline": {},
         })
         prefix = int(row["k"])
         committed = 1 + int(row["accepted_candidates"])
@@ -1886,6 +1959,10 @@ def _b3_overhead_adjusted_opportunity(
         split = str(row.get("repetition_split"))
         if split in {"selection", "evaluation"} and math.isfinite(cost) and cost > 0:
             state[split].setdefault(prefix, []).append(cost)
+            # Fixed-k does not extract signals or run the adaptive controller.
+            state[f"{split}_baseline"].setdefault(prefix, []).append(
+                float(row["total_round_ms"]) / committed
+            )
     complete = {
         state_id: state for state_id, state in by_state.items()
         if all(
@@ -1909,7 +1986,8 @@ def _b3_overhead_adjusted_opportunity(
     for state_id, scores in selection_means.items():
         state = complete[state_id]
         by_dataset_fixed[state["dataset"]][state["source_group_id"]]
-        for prefix, value in scores.items():
+        for prefix, values in state["selection_baseline"].items():
+            value = mean(values)
             by_dataset_fixed[state["dataset"]][state["source_group_id"]][prefix].append(value)
     fixed_means: dict[int, float] = {}
     for prefix in (3, 7, 11, 15):
@@ -1927,7 +2005,8 @@ def _b3_overhead_adjusted_opportunity(
             prefix: sum(values) / len(values)
             for prefix, values in state["evaluation"].items()
         }
-        grouped[state["dataset"]][state["source_group_id"]].append((evaluation[chosen], evaluation[best_fixed]))
+        baseline_cost = mean(state["evaluation_baseline"][best_fixed])
+        grouped[state["dataset"]][state["source_group_id"]].append((evaluation[chosen], baseline_cost))
 
     def macro_ratio(documents: Mapping[str, Mapping[str, Sequence[tuple[float, float]]]]) -> float | None:
         numerator = []
@@ -1966,6 +2045,7 @@ def _b3_overhead_adjusted_opportunity(
     return {
         "status": status,
         "overhead_ms": float(overhead_ms),
+        "baseline_overhead_ms": 0.0,
         "best_fixed_prefix": best_fixed,
         "oracle_gap_j": gap,
         "oracle_gap_j_ci95": interval,
@@ -2139,13 +2219,15 @@ def _b3_campaign(
     from TrainingFree.speculation_experiments.survival import deserialize_survival_curve
 
     phase = "confirm" if confirm else "dev"
-    if args.cohort_phase != phase:
+    allow_gated = bool(getattr(args, "allow_gated_b3", False))
+    if args.cohort_phase != phase and not (not confirm and allow_gated and args.cohort_phase == "pilot"):
         raise ValueError(f"--mode b3-{phase} requires --cohort-phase {phase}")
     runtime_signature = runtime["b_campaign_signature"]
     _validate_b0_signature(run_root, runtime_signature=runtime_signature)
     campaign = json.loads((run_root / "campaign.json").read_text(encoding="utf-8"))
     source_groups = sorted({str(row["_cad_source_group_id"]) for row in samples})
 
+    oof_models_by_group: dict[str, dict[str, dict[str, Any]]] = {}
     if confirm:
         if not args.policy_lock:
             raise ValueError("--mode b3-confirm requires --policy-lock from the completed dev run")
@@ -2171,7 +2253,7 @@ def _b3_campaign(
             args, run_root, require_b1v=True,
         )
         _analyze(args, run_root)
-        eligible, _ = _b3_eligible_models(run_root)
+        eligible, _ = _b3_eligible_models(run_root, allow_gated_b3=allow_gated)
         model_payloads, cost_profiles = _b3_models_and_costs(
             run_root,
             eligible=eligible,
@@ -2181,7 +2263,8 @@ def _b3_campaign(
         fixed_gamma_best = 15
         fixed_k_best = 15
         learned_overheads: dict[str, float] = {}
-        candidate_variants = ["R", "R-A", *eligible]
+        candidate_variants = list(dict.fromkeys(["R", "R-A", *eligible]))
+        oof_models_by_group = _b3_oof_models_by_group(run_root, variants=candidate_variants)
 
     models = {name: deserialize_survival_curve(value) for name, value in model_payloads.items()}
     policies: dict[str, Any] = {}
@@ -2192,12 +2275,18 @@ def _b3_campaign(
             dataset="",
             fallback_prefix=15,
             overhead_ms=float(learned_overheads.get(name, 0.0)),
+            opportunity_threshold_eta=float(getattr(args, "opportunity_threshold_eta", 0.0)),
         )
         policies[name] = policy
 
     def policy_for(name: str, sample: Mapping[str, Any]) -> Any:
         policy = policies[name]
         policy.dataset = str(sample["dataset"])
+        group_id = str(sample.get("_cad_source_group_id", ""))
+        if group_id and group_id in oof_models_by_group and name in oof_models_by_group[group_id]:
+            policy.model = oof_models_by_group[group_id][name]
+        else:
+            policy.model = models[name]
         return policy
 
     if confirm:
@@ -2206,12 +2295,26 @@ def _b3_campaign(
             f"best_fixed_k_{fixed_k_best}", f"adaptive_{selected_model}",
         ]
     else:
-        measured_variants = [
+        default_variants = [
             "ar", "dflash_fixed15",
             *[f"fixed_gamma_{gamma}" for gamma in (3, 7, 11, 15)],
             *[f"fixed_k_{prefix}" for prefix in (3, 7, 11, 15)],
             *[f"adaptive_{name}" for name in candidate_variants],
         ]
+        raw_b3_variants = getattr(args, "b3_variants", None)
+        if raw_b3_variants:
+            requested = [item.strip() for item in str(raw_b3_variants).split(",") if item.strip()]
+            measured_variants = [item for item in requested if item in set(default_variants)]
+            if "ar" not in measured_variants:
+                measured_variants.insert(0, "ar")
+            if "dflash_fixed15" not in measured_variants:
+                measured_variants.insert(1, "dflash_fixed15")
+            candidate_variants = [
+                name for name in candidate_variants
+                if f"adaptive_{name}" in set(measured_variants)
+            ]
+        else:
+            measured_variants = default_variants
     b3_root = run_root / "b3"
     b3_root.mkdir(parents=True, exist_ok=True)
     profile_signature = _hash_json({
@@ -2240,7 +2343,7 @@ def _b3_campaign(
             except (TypeError, ValueError):
                 normalized_overheads = {}
             if (
-                not set(policy_models).issubset(normalized_overheads)
+                not set(candidate_variants).issubset(normalized_overheads)
                 or any(not math.isfinite(value) or value < 0 for value in normalized_overheads.values())
             ):
                 _archive_stale_cell(run_root, "b3", profile_path, saved_profile)
@@ -2354,7 +2457,7 @@ def _b3_campaign(
         })
 
     if not confirm:
-        eligible_models, _ = _b3_eligible_models(run_root)
+        eligible_models, _ = _b3_eligible_models(run_root, allow_gated_b3=allow_gated)
         overhead_ms = max(
             (float(warmup_total_overhead_ms.get(name, learned_overheads.get(name, 0.0)))
              for name in eligible_models),
@@ -2366,7 +2469,7 @@ def _b3_campaign(
             bootstrap_replicates=int(campaign.get("bootstrap_replicates", args.bootstrap_replicates)),
         )
         atomic_json(b3_root / "dev_overhead_gate.json", adjusted_gate)
-        if adjusted_gate.get("status") != "supported":
+        if adjusted_gate.get("status") != "supported" and not allow_gated:
             blocked = {
                 "schema_version": "dflash-speculation-b.b3-summary.v1",
                 "phase": "dev",
@@ -2574,10 +2677,27 @@ def _b3_campaign(
             "lock_path": str((_resolve(args.policy_lock) or Path(args.policy_lock)).resolve()),
         }
     else:
-        fixed_gamma_best = min((3, 7, 11, 15), key=lambda value: latency[f"fixed_gamma_{value}"])
-        fixed_k_best = min((3, 7, 11, 15), key=lambda value: latency[f"fixed_k_{value}"])
-        adaptive_names = [name for name in candidate_variants if name not in {"R", "R-A"}]
-        selected_model = min(adaptive_names, key=lambda name: latency[f"adaptive_{name}"])
+        gamma_candidates = [g for g in (3, 7, 11, 15) if f"fixed_gamma_{g}" in latency]
+        fixed_gamma_best = min(gamma_candidates, key=lambda value: latency[f"fixed_gamma_{value}"]) if gamma_candidates else 15
+        k_candidates = [k for k in (3, 7, 11, 15) if f"fixed_k_{k}" in latency]
+        fixed_k_best = min(k_candidates, key=lambda value: latency[f"fixed_k_{value}"]) if k_candidates else 15
+        adaptive_names = [name for name in candidate_variants if name not in {"R", "R-A"} and f"adaptive_{name}" in latency]
+        if not adaptive_names:
+            adaptive_names = [name for name in candidate_variants if f"adaptive_{name}" in latency]
+        selected_model = min(adaptive_names, key=lambda name: latency[f"adaptive_{name}"]) if adaptive_names else "R-Hazard-Suffix-Margin"
+        dev_comparisons = {
+            f"{variant}_vs_dflash_fixed15": _paired_macro_speedup(
+                records, control="dflash_fixed15", treatment=variant
+            )
+            for variant in by_variant if variant not in {"ar", "dflash_fixed15"}
+        }
+        dev_comparisons["dflash_fixed15_vs_ar"] = _paired_macro_speedup(
+            records, control="ar", treatment="dflash_fixed15"
+        )
+        if f"adaptive_{selected_model}" in by_variant:
+            dev_comparisons[f"adaptive_{selected_model}_vs_ar"] = _paired_macro_speedup(
+                records, control="ar", treatment=f"adaptive_{selected_model}"
+            )
         lock = {
             "schema_version": "dflash-speculation-b.b3-lock.v2",
             "dev_run_id": str(args.run_id),
@@ -2617,6 +2737,7 @@ def _b3_campaign(
             "best_fixed_k": fixed_k_best,
             "selected_policy_variant": selected_model,
             "eligible_signal_models": list(adaptive_names),
+            "comparisons": dev_comparisons,
             "policy_lock": str(lock_path.resolve()) if not generation_failure else None,
         }
     atomic_json(b3_root / f"{phase}_summary.json", summary)

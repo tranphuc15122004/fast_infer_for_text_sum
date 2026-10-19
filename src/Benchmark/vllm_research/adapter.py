@@ -195,12 +195,19 @@ def _b3_decision(call, proposal):
     from TrainingFree.speculation_experiments.b_controller import VerificationPrefixController
     state = call.states[0]
     dataset = state.metadata.get('dataset', parameters.get('dataset', 'unknown'))
-    controller = VerificationPrefixController(model=parameters['model'],
-        cost_profiles=parameters['cost_profiles'], dataset=dataset,
-        overhead_ms=float(parameters.get('overhead_ms', 0)))
-    decision = controller(state=_round_state(state, call.rows[0]['bank_length']),
-        draft_uncertainty=call.uncertainty[0], draft_gamma=proposal.shape[1],
-        available_prefixes=tuple(k for k in (3, 7, 11, 15) if k <= proposal.shape[1]))
+    controller = VerificationPrefixController(
+        model=parameters['model'],
+        cost_profiles=parameters['cost_profiles'],
+        dataset=dataset,
+        overhead_ms=float(parameters.get('overhead_ms', 0)),
+        opportunity_threshold_eta=float(parameters.get('opportunity_threshold_eta', 0.0)),
+    )
+    decision = controller(
+        state=_round_state(state, call.rows[0]['bank_length']),
+        draft_uncertainty=call.uncertainty[0],
+        draft_gamma=proposal.shape[1],
+        available_prefixes=tuple(k for k in (3, 7, 11, 15) if k <= proposal.shape[1]),
+    )
     return int(decision['prefix']), decision
 
 
@@ -414,17 +421,25 @@ def install() -> bool:
         collect = call.config['variant'] in {'b3', 'b4', 'trace'} or call.config['parameters'].get('collect_uncertainty', False)
         if collect:
             start = time.perf_counter()
+            top_vals, top_inds = torch.topk(logits.float(), 2, dim=-1)
+            logit_margin = top_vals[..., 0] - top_vals[..., 1]
             log_probs = logits.float().log_softmax(dim=-1)
             probabilities = log_probs.exp()
             terms = torch.where(probabilities > 0, probabilities * log_probs, 0.)
             entropy = -terms.sum(dim=-1) / max(math.log(logits.shape[-1]), 1e-12)
-            confidence = probabilities.max(dim=-1).values
+            top_probs = log_probs.gather(-1, top_inds).exp()
+            confidence = top_probs[..., 0]
+            prob_margin = top_probs[..., 0] - top_probs[..., 1]
+
             entropy = entropy.reshape(len(call.states), call.drafted_gamma).tolist()
             confidence = confidence.reshape(len(call.states), call.drafted_gamma).tolist()
+            prob_margin = prob_margin.reshape(len(call.states), call.drafted_gamma).tolist()
+            logit_margin = logit_margin.reshape(len(call.states), call.drafted_gamma).tolist()
             duration = (time.perf_counter() - start) * 1000
             call.uncertainty = [{'normalized_entropy': e, 'confidence': c,
+                                 'probability_margin': pm, 'logit_margin': lm,
                                  'signal_extraction_ms': duration}
-                                for e, c in zip(entropy, confidence)]
+                                for e, c, pm, lm in zip(entropy, confidence, prob_margin, logit_margin)]
         return logits
 
     GPUModelRunner.propose_draft_token_ids = runner_propose

@@ -1,7 +1,7 @@
 import time
 import torch
 from types import SimpleNamespace
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from typing_extensions import Unpack
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -55,7 +55,8 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 
 
 def _cuda_time() -> float:
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     return time.perf_counter()
 
 
@@ -70,6 +71,7 @@ def dflash_generate(
     block_size: Optional[int] = None,
     mask_token_id: Optional[int] = None,
     return_stats: bool = False,
+    verification_prefix_controller: Optional[Any] = None,
 ):
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -101,17 +103,22 @@ def dflash_generate(
 
     decode_start = _cuda_time() if return_stats else None
     acceptance_lengths = []
+    proposed_lengths = []
     draft_events = []
     verification_events = []
     start = num_input_tokens
     draft_prefill = True
+    last_parent_entropy = None
+    last_parent_confidence = None
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
             draft_start_event = (
-                torch.cuda.Event(enable_timing=True) if return_stats else None
+                torch.cuda.Event(enable_timing=True)
+                if (return_stats and torch.cuda.is_available())
+                else None
             )
             if draft_start_event is not None:
                 draft_start_event.record()
@@ -134,32 +141,73 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = _cuda_time()
 
+        # Phase B: adaptive verification prefix length selection
+        verify_k = block_size - 1 if block_size > 1 else 0
+        if verification_prefix_controller is not None and block_size > 1:
+            try:
+                from TrainingFree.speculation_experiments.signals import summarize_draft_logits
+                from types import SimpleNamespace
+
+                req_entropy = getattr(verification_prefix_controller, "requires_entropy", True)
+                draft_unc = summarize_draft_logits(draft_logits, include_entropy=req_entropy)
+                allowed_p = getattr(verification_prefix_controller, "allowed_prefixes", (3, 7, 11, 15))
+                avail_p = [p for p in allowed_p if p <= min(block_size - 1, max_length - start)]
+                if not avail_p:
+                    avail_p = [min(block_size - 1, max_length - start)]
+                curr_state = SimpleNamespace(
+                    logical_length=start,
+                    processed_output_tokens=start - num_input_tokens,
+                    parent_entropy=last_parent_entropy,
+                    parent_confidence=last_parent_confidence,
+                    history_acceptance=(
+                        (sum(acceptance_lengths) / (len(acceptance_lengths) * (block_size - 1)))
+                        if acceptance_lengths else None
+                    ),
+                )
+                decision = verification_prefix_controller(
+                    state=curr_state,
+                    draft_uncertainty=draft_unc,
+                    draft_gamma=block_size - 1,
+                    available_prefixes=avail_p,
+                )
+                chosen_k = int(decision.get("prefix", block_size - 1))
+                verify_k = max(1, min(chosen_k, block_size - 1, max_length - start))
+            except Exception:
+                verify_k = min(block_size - 1, max_length - start)
+
+        verify_len = verify_k + 1
+        curr_verify_ids = block_output_ids[:, :verify_len]
+        curr_verify_pos = block_position_ids[:, :verify_len]
+
         verification_start_event = (
-            torch.cuda.Event(enable_timing=True) if return_stats else None
+            torch.cuda.Event(enable_timing=True)
+            if (return_stats and torch.cuda.is_available())
+            else None
         )
         if verification_start_event is not None:
             verification_start_event.record()
         output = target(
-            block_output_ids,
-            position_ids=block_position_ids,
+            curr_verify_ids,
+            position_ids=curr_verify_pos,
             past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=block_size > 1,
         )
 
         posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        acceptance_length = (curr_verify_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
         if verification_start_event is not None:
             verification_end_event = torch.cuda.Event(enable_timing=True)
             verification_end_event.record()
             verification_events.append(
                 (verification_start_event, verification_end_event)
             )
-        output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+        output_ids[:, start : start + acceptance_length + 1] = curr_verify_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
         past_key_values_target.crop(start)
         acceptance_lengths.append(acceptance_length + 1)
+        proposed_lengths.append(verify_k)
 
         if block_size > 1:
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
@@ -182,9 +230,9 @@ def dflash_generate(
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = _cuda_time() - decode_start
     def _event_total_ms(events):
-        return round(sum(start.elapsed_time(end) for start, end in events), 3)
+        return round(sum(start.elapsed_time(end) for start, end in events), 3) if events else 0.0
 
-    proposed = sum(max(int(block_size) - 1, 0) for _ in acceptance_lengths)
+    proposed = sum(proposed_lengths) if proposed_lengths else sum(max(int(block_size) - 1, 0) for _ in acceptance_lengths)
     accepted = sum(max(int(length) - 1, 0) for length in acceptance_lengths)
     acceptance_rate = accepted / proposed if proposed else None
     return SimpleNamespace(
@@ -206,6 +254,7 @@ def dflash_generate(
             round(sum(acceptance_lengths) / len(acceptance_lengths), 4)
             if acceptance_lengths else None
         ),
+        proposed_lengths=proposed_lengths,
     )
 
 
@@ -394,6 +443,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        verification_prefix_controller: Optional[Any] = None,
     ):
         self.eval()
         return dflash_generate(
@@ -403,4 +453,5 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             max_new_tokens=max_new_tokens,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
+            verification_prefix_controller=verification_prefix_controller,
         )

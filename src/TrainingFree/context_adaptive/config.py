@@ -27,6 +27,9 @@ class AdaptiveConfig:
     gammas: tuple[int, ...] = (3, 7, 11, 15)
     selector: str = "target_parent"
     target_layer: str | int = "middle"
+    duo_deep_layer: str | int = "deep"
+    ensemble_alpha: float = 0.5
+    query_pooling: str = "max"
     refresh_period: int = 4
     signal_update_period: int = 1
     source_chunk_size: int = 128
@@ -55,10 +58,32 @@ class AdaptiveConfig:
             raise ValueError("gammas must be positive candidate counts; AR gamma 0 is a separate mode")
         if any(b != "full" and (not isinstance(b, int) or b < 1) for b in self.budgets):
             raise ValueError("budgets must be positive integers or 'full'")
-        if self.selector not in {"target_parent", "draft_refresh", "recent_only", "random", "lexical", "feature_cosine"}:
+        valid_selectors = {
+            "target_parent",
+            "multi_query_max_pooling",
+            "duo_ensemble",
+            "target_multi_query",
+            "m1_multi_query",
+            "m4_duo_ensemble",
+            "multi_query_mean_pooling",
+            "m2_chunk_mean",
+            "m2_p1_chunk128",
+            "draft_refresh",
+            "recent_only",
+            "random",
+            "lexical",
+            "feature_cosine",
+        }
+        if self.selector not in valid_selectors:
             raise ValueError(f"unknown deployable selector: {self.selector}")
+        if not 0.0 <= self.ensemble_alpha <= 1.0:
+            raise ValueError("ensemble_alpha must be in [0, 1]")
+        if self.query_pooling not in {"max", "mean"}:
+            raise ValueError("query_pooling must be 'max' or 'mean'")
         if self.target_layer != "middle" and (not isinstance(self.target_layer, int) or self.target_layer < 0):
             raise ValueError("target_layer must be 'middle' or a nonnegative layer index")
+        if self.duo_deep_layer != "deep" and (not isinstance(self.duo_deep_layer, int) or self.duo_deep_layer < 0):
+            raise ValueError("duo_deep_layer must be 'deep' or a nonnegative layer index")
         if self.refresh_period < 1 or self.signal_update_period < 1:
             raise ValueError("refresh and signal update periods must be positive")
         if self.source_chunk_size < 1 or self.source_anchors < 0 or self.recent_output < 0:
@@ -104,11 +129,17 @@ class AdaptiveConfig:
         target_layer: str | int = env.get("CAD_TARGET_LAYER", "middle")
         if target_layer != "middle":
             target_layer = int(target_layer)
+        duo_deep_layer: str | int = env.get("CAD_DUO_DEEP_LAYER", "deep")
+        if duo_deep_layer != "deep":
+            duo_deep_layer = int(duo_deep_layer)
         return cls(
             budgets=tuple(budgets),
             gammas=_csv_ints(env.get("CAD_GAMMAS", "3,7,11,15"), "CAD_GAMMAS"),
             selector=env.get("CAD_SELECTOR", "target_parent"),
             target_layer=target_layer,
+            duo_deep_layer=duo_deep_layer,
+            ensemble_alpha=float(env.get("CAD_ENSEMBLE_ALPHA", "0.5")),
+            query_pooling=env.get("CAD_QUERY_POOLING", "max"),
             refresh_period=int(env.get("CAD_REFRESH_PERIOD", "4")),
             signal_update_period=int(env.get("CAD_SIGNAL_UPDATE_PERIOD", "1")),
             source_chunk_size=int(env.get("CAD_SOURCE_CHUNK_SIZE", "128")),

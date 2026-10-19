@@ -128,6 +128,7 @@ def draft_block(
     collect_refresh_scores: bool = False,
     collect_full_context_scores: bool = False,
     collect_uncertainty: bool = False,
+    collect_uncertainty_entropy: bool = True,
 ) -> DraftProposal:
     if anchor_and_masks.shape[1] != action.block_size:
         raise ValueError("draft input shape must equal gamma + 1")
@@ -177,9 +178,23 @@ def draft_block(
     if collect_uncertainty:
         from TrainingFree.speculation_experiments.signals import summarize_draft_logits
 
-        uncertainty_started = time.perf_counter()
-        uncertainty = summarize_draft_logits(logits)
-        signal_extraction_ms = (time.perf_counter() - uncertainty_started) * 1000.0
+        if logits.is_cuda and torch.cuda.is_available():
+            sig_start = torch.cuda.Event(enable_timing=True)
+            sig_end = torch.cuda.Event(enable_timing=True)
+            sig_start.record()
+            uncertainty = summarize_draft_logits(
+                logits,
+                include_entropy=collect_uncertainty_entropy,
+                cuda_end_event=sig_end,
+            )
+            signal_extraction_ms = float(sig_start.elapsed_time(sig_end))
+        else:
+            uncertainty_started = time.perf_counter()
+            uncertainty = summarize_draft_logits(
+                logits,
+                include_entropy=collect_uncertainty_entropy,
+            )
+            signal_extraction_ms = (time.perf_counter() - uncertainty_started) * 1000.0
     return DraftProposal(
         token_ids=candidates,
         draft_entropy=(tuple(uncertainty["raw_entropy"]) if uncertainty else None),

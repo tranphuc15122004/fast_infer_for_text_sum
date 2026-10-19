@@ -11,6 +11,10 @@ from .cache import _rotate_half
 
 
 def normalized_entropy(logits: torch.Tensor, temperature: float = 1.0) -> float:
+    return normalized_entropy_and_confidence(logits, temperature)[0]
+
+
+def normalized_entropy_and_confidence(logits: torch.Tensor, temperature: float = 1.0) -> tuple[float, float]:
     if temperature <= 0:
         raise ValueError("entropy temperature must be positive")
     values = logits.float() / float(temperature)
@@ -18,7 +22,21 @@ def normalized_entropy(logits: torch.Tensor, temperature: float = 1.0) -> float:
     probs = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=-1)
     scale = max(math.log(logits.shape[-1]), 1e-12)
-    return float((entropy / scale).reshape(-1)[-1].item())
+    values = torch.stack(((entropy / scale).reshape(-1)[-1], probs.amax(dim=-1).reshape(-1)[-1]))
+    return tuple(float(value) for value in values.detach().cpu().tolist())
+
+
+def causal_query_positions(query_positions, num_queries: int, *, device) -> torch.Tensor:
+    """A scalar denotes the LAST position of consecutive causal query rows."""
+    if isinstance(query_positions, int):
+        positions = torch.arange(query_positions - num_queries + 1, query_positions + 1, device=device)
+    else:
+        positions = torch.as_tensor(query_positions, dtype=torch.long, device=device)
+    if positions.ndim != 1 or positions.numel() != num_queries or num_queries < 1:
+        raise ValueError("query_positions must contain one position per query")
+    if bool((positions < 0).any()) or bool((positions[1:] <= positions[:-1]).any()):
+        raise ValueError("query_positions must be nonnegative and strictly increasing")
+    return positions
 
 
 class TargetQueryCapture:
@@ -124,6 +142,135 @@ def target_parent_scores(
     concentration = sum(sorted(chunk_masses, reverse=True)[:8]) / total_source if total_source > 0 else None
     if concentration is None:
         token_scores = {}
+    return token_scores, concentration
+
+
+def target_multi_query_scores(
+    query: torch.Tensor,
+    target_cache: Any,
+    layer_index: int,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    source_chunks: Sequence[Sequence[int]],
+    *,
+    head_groups: int,
+    scaling: float,
+    sliding_window: int | None = None,
+    pooling_mode: str = "max",
+) -> tuple[dict[int, float], float | None]:
+    """Causal multi-query attention with max or mean pooling across verified queries."""
+    key = _cache_key(target_cache, layer_index)
+    num_queries = query.shape[-2]
+    positions_tensor = causal_query_positions(query_positions, num_queries, device=key.device)
+    max_allowed = min(int(positions_tensor[-1].item()) + 1, key.shape[-2])
+
+    if max_allowed < 1 or num_queries < 1:
+        return {}, None
+
+    q = query[:, :, :num_queries, :].float()
+    k = key[:, :, :max_allowed, :].float()
+    if head_groups > 1:
+        k = k.repeat_interleave(head_groups, dim=1)
+
+    scores = torch.matmul(q, k.transpose(-1, -2)) * float(scaling)
+    key_positions = torch.arange(max_allowed, device=key.device)
+    causal_mask = key_positions.view(1, 1, 1, -1) <= positions_tensor.view(1, 1, -1, 1)
+    if sliding_window is not None:
+        window_mask = key_positions.view(1, 1, 1, -1) >= (positions_tensor.view(1, 1, -1, 1) - int(sliding_window) + 1)
+        causal_mask = causal_mask & window_mask
+
+    scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+    probabilities = torch.softmax(scores, dim=-1)
+    mean_prob = probabilities.mean(dim=(0, 1))
+
+    if pooling_mode == "mean":
+        pooled_prob = mean_prob.mean(dim=0)
+    else:
+        pooled_prob = mean_prob.amax(dim=0)
+
+    total_mass = pooled_prob.sum()
+    if total_mass > 0:
+        norm_prob = (pooled_prob / total_mass).detach().cpu().tolist()
+    else:
+        norm_prob = pooled_prob.detach().cpu().tolist()
+
+    token_scores: dict[int, float] = {}
+    chunk_masses: list[float] = []
+    for chunk in source_chunks:
+        valid = [position for position in chunk if 0 <= position < max_allowed]
+        mass = sum(float(norm_prob[position]) for position in valid) if valid else 0.0
+        chunk_masses.append(mass)
+        for position in valid:
+            token_scores[position] = float(norm_prob[position])
+
+    total_source = sum(chunk_masses)
+    concentration = sum(sorted(chunk_masses, reverse=True)[:8]) / total_source if total_source > 0 else None
+    if concentration is None:
+        token_scores = {}
+    return token_scores, concentration
+
+
+def target_duo_ensemble_scores(
+    queries_by_layer: Mapping[int, torch.Tensor],
+    target_cache: Any,
+    layer_mid: int,
+    layer_deep: int,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    source_chunks: Sequence[Sequence[int]],
+    *,
+    head_groups: int,
+    scaling: float,
+    alpha: float = 0.5,
+    sliding_window: int | None = None,
+    pooling_mode: str = "max",
+) -> tuple[dict[int, float], float | None]:
+    """Duo-Layer Ensemble combining Middle Retrieval Core and Deep Output Sink."""
+    if layer_mid not in queries_by_layer or layer_deep not in queries_by_layer:
+        raise ValueError(f"Duo-Ensemble requires queries for layers {layer_mid} and {layer_deep}")
+
+    scores_mid, _ = target_multi_query_scores(
+        queries_by_layer[layer_mid],
+        target_cache,
+        layer_mid,
+        query_positions,
+        source_chunks,
+        head_groups=head_groups,
+        scaling=scaling,
+        sliding_window=sliding_window,
+        pooling_mode=pooling_mode,
+    )
+    scores_deep, _ = target_multi_query_scores(
+        queries_by_layer[layer_deep],
+        target_cache,
+        layer_deep,
+        query_positions,
+        source_chunks,
+        head_groups=head_groups,
+        scaling=scaling,
+        sliding_window=sliding_window,
+        pooling_mode=pooling_mode,
+    )
+
+    if not scores_mid and not scores_deep:
+        return {}, None
+    if not scores_mid:
+        return scores_deep, None
+    if not scores_deep:
+        return scores_mid, None
+
+    all_positions = set(scores_mid.keys()).union(scores_deep.keys())
+    token_scores: dict[int, float] = {}
+    for pos in all_positions:
+        val_mid = scores_mid.get(pos, 0.0)
+        val_deep = scores_deep.get(pos, 0.0)
+        token_scores[pos] = float(alpha * val_mid + (1.0 - alpha) * val_deep)
+
+    chunk_masses: list[float] = []
+    for chunk in source_chunks:
+        mass = sum(token_scores.get(pos, 0.0) for pos in chunk)
+        chunk_masses.append(mass)
+
+    total_source = sum(chunk_masses)
+    concentration = sum(sorted(chunk_masses, reverse=True)[:8]) / total_source if total_source > 0 else None
     return token_scores, concentration
 
 

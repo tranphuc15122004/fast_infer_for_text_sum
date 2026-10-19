@@ -126,13 +126,22 @@ def model_summary(vector: np.ndarray, prompt_length: int, prefix_length: int) ->
 
 
 class TargetAttentionCollector:
-    """Tính attention target cho 3 layer khi target đang verify block DFlash."""
+    """Thu attention các tầng đã khai báo, giữ riêng từng query để đánh giá Phase A."""
 
     def __init__(self, target, target_layer_ids: list[int], *,
-                 capture_parent_attention: bool = False):
+                 capture_parent_attention: bool = False,
+                 save_all_rounds: bool = False,
+                 vector_dir: Path | None = None,
+                 parent_snapshot_dir: Path | None = None):
         self.target = target
         self.target_layer_ids = target_layer_ids
         self.capture_parent_attention = capture_parent_attention
+        self.save_all_rounds = save_all_rounds
+        self.vector_dir = vector_dir
+        self.parent_snapshot_dir = parent_snapshot_dir
+        self.saved_snapshot_count = 0
+        self.sample_index = 0
+        self.current_parent_vectors = None
         self.active = False
         self.prefix_length = 0
         self.prompt_length = 0
@@ -200,10 +209,8 @@ class TargetAttentionCollector:
                 # Target q[0:15] predicts the same token as DFlash's mask q[1:16].
                 pooled = probabilities[:, :, :aligned_queries, :].mean(dim=(0, 1, 2))
                 self.target_vectors[layer] = pooled
-                if self.capture_parent_attention:
-                    # [batch, heads, query, key] -> [query, key], retaining
-                    # each target query while averaging only its heads.
-                    self.target_query_probabilities[layer] = probabilities[0].mean(dim=0)
+                # Giữ chiều query cho mean/max ablation và accepted-prefix scope.
+                self.target_query_probabilities[layer] = probabilities[0].mean(dim=0)
             return self.original_sdpa(
                 module, query, key, value, attention_mask,
                 dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs
@@ -225,6 +232,7 @@ class TargetAttentionCollector:
         if self.capture_parent_attention:
             if round_index == 0:
                 self.pending_parent = None
+                self.current_parent_vectors = None
             else:
                 parent = self.pending_parent
                 if parent is None:
@@ -238,6 +246,7 @@ class TargetAttentionCollector:
                     )
                 parent_vectors = np.stack([parent["vectors"][layer]
                                            for layer in self.target_layer_ids])
+                self.current_parent_vectors = parent_vectors
                 draft_vectors = np.asarray(draft_vectors, dtype=np.float64)
                 parent_comparison = {
                     "parent_round": parent["round_index"] + 1,
@@ -334,18 +343,6 @@ class TargetAttentionCollector:
                     "metrics": measures,
                 })
 
-        if not self.capture_parent_attention:
-            for name, expected in [("first", 0), ("middle", self.expected_rounds // 2),
-                                   ("last", self.expected_rounds - 1)]:
-                if self.expected_rounds and self.round_index == expected:
-                    self.snapshots.setdefault((self.sample_id, self.context_cap), {})[name] = {
-                        "draft": draft_vectors.astype(np.float16),
-                        "target": target_vectors.astype(np.float16),
-                        "prefix_length": self.prefix_length,
-                        "prompt_length": self.prompt_length,
-                        "round": self.round_index + 1,
-                    }
-
         if self.capture_parent_attention:
             if accepted_proposals is None:
                 raise ValueError("Cần accepted_proposals để chọn query sinh anchor kế tiếp")
@@ -372,7 +369,61 @@ class TargetAttentionCollector:
                 "prefix_length": next_prefix_length,
                 "vectors": parent_vectors,
             }
+        # Build unified snapshot (draft, target, parent_target)
+        snapshot = {
+            "schema_version": "phase-a.snapshot.v2",
+            "target_layer_ids": np.asarray(self.target_layer_ids, dtype=np.int64),
+            "target_query_attention": np.stack([
+                self.target_query_probabilities[layer].detach().float().cpu().numpy()
+                for layer in self.target_layer_ids
+            ]).astype(np.float16),
+            "accepted_candidates": int(accepted_proposals) if accepted_proposals is not None else -1,
+            "sample_id": self.sample_id,
+            "context_cap": self.context_cap,
+            "target_pooling": "mean_heads_mean_aligned_15_queries",
+            "draft": draft_vectors.astype(np.float16),
+            "target": target_vectors.astype(np.float16),
+            "prefix_length": self.prefix_length,
+            "prompt_length": self.prompt_length,
+            "round": self.round_index + 1,
+        }
+        if getattr(self, "current_parent_vectors", None) is not None:
+            snapshot["parent_target"] = self.current_parent_vectors.astype(np.float16)
+            snapshot["parent_origin_round"] = self.round_index
         self.target_query_probabilities.clear()
+
+        # Write directly to disk
+        if self.vector_dir is not None:
+            sample_idx = getattr(self, "sample_index", 0)
+            prefix = f"sample_{sample_idx:02d}_context_{self.context_cap}"
+            if self.save_all_rounds:
+                round_fname = f"{prefix}_round_{self.round_index+1:03d}.npz"
+                np.savez_compressed(self.vector_dir / round_fname, **snapshot)
+                if self.parent_snapshot_dir is not None:
+                    np.savez_compressed(self.parent_snapshot_dir / round_fname, **snapshot)
+                self.saved_snapshot_count += 1
+
+            expected = self.expected_rounds or 0
+            is_first = (self.round_index == 1) or (self.round_index == 0 and expected <= 1)
+            is_middle = bool(expected and self.round_index == expected // 2)
+            is_last = bool(expected and self.round_index == expected - 1)
+
+            if is_first:
+                np.savez_compressed(self.vector_dir / f"{prefix}_first.npz", **snapshot)
+                if self.parent_snapshot_dir is not None:
+                    np.savez_compressed(self.parent_snapshot_dir / f"{prefix}_first.npz", **snapshot)
+                    np.savez_compressed(self.parent_snapshot_dir / f"{prefix}_first_transition.npz", **snapshot)
+                self.saved_snapshot_count += 1
+            if is_middle:
+                np.savez_compressed(self.vector_dir / f"{prefix}_middle.npz", **snapshot)
+                if self.parent_snapshot_dir is not None:
+                    np.savez_compressed(self.parent_snapshot_dir / f"{prefix}_middle.npz", **snapshot)
+                self.saved_snapshot_count += 1
+            if is_last:
+                np.savez_compressed(self.vector_dir / f"{prefix}_last.npz", **snapshot)
+                if self.parent_snapshot_dir is not None:
+                    np.savez_compressed(self.parent_snapshot_dir / f"{prefix}_last.npz", **snapshot)
+                self.saved_snapshot_count += 1
 
         def compact(summary):
             return {key: value for key, value in summary.items() if key != "top_cache"}
@@ -410,6 +461,12 @@ def main():
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--capture-parent-attention", action="store_true",
                         help="Ghép query target sinh anchor với DFlash ở lượt kế tiếp")
+    parser.add_argument("--all-layers", action="store_true",
+                        help="Thu thập attention của toàn bộ các layer (0..35)")
+    parser.add_argument("--target-layers", type=str, default="",
+                        help="Danh sách các layer cần thu thập (phân tách bởi dấu phẩy)")
+    parser.add_argument("--save-all-rounds", action="store_true",
+                        help="Lưu attention của toàn bộ các lượt draft thay vì chỉ 3 phases")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("Phép so sánh model thật cần GPU")
@@ -440,15 +497,29 @@ def main():
         str(draft_path), dtype=torch.bfloat16, attn_implementation="eager",
         local_files_only=True).to("cuda").eval()
     layer_count = len(target.model.layers)
-    target_layers = sorted({0, layer_count // 2, layer_count - 1})
-    if len(target_layers) != 3:
-        raise ValueError(f"Target cần >= 3 layer, nhận {layer_count}")
+    if args.all_layers:
+        target_layers = list(range(layer_count))
+    elif args.target_layers:
+        target_layers = sorted([int(x.strip()) for x in args.target_layers.split(",") if x.strip()])
+    else:
+        target_layers = sorted({0, layer_count // 2, layer_count - 1})
+    if len(target_layers) < 1:
+        raise ValueError(f"Target cần >= 1 layer, nhận {layer_count}")
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    vector_dir = args.output / "vector_snapshots"
+    vector_dir.mkdir(parents=True, exist_ok=True)
+    parent_snapshot_dir = args.output / "parent_transition_snapshots"
+    parent_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
     comparison = TargetAttentionCollector(
         target, target_layers,
-        capture_parent_attention=args.capture_parent_attention)
+        capture_parent_attention=args.capture_parent_attention,
+        save_all_rounds=args.save_all_rounds,
+        vector_dir=vector_dir,
+        parent_snapshot_dir=parent_snapshot_dir)
     dflash_collector = AttentionCollector(draft)
 
-    args.output.mkdir(parents=True, exist_ok=False)
     manifest = {
         "status": "running",
         "source_run": source_manifest.get("source_run", "dflash-attention-fullmass-govreport10-l40s-20261006"),
@@ -456,9 +527,12 @@ def main():
         "source_run_summary_sha256": hashlib.sha256((args.source_run / "summary.json").read_bytes()).hexdigest(),
         "target": source_manifest["target"], "draft": source_manifest["draft"],
         "target_layers": target_layers, "target_layer_count": layer_count,
+        "snapshot_schema": "phase-a.snapshot.v2",
+        "query_attention": "mean over heads, query dimension retained including bonus; no substituted parent query",
         "draft_layers": len(draft.layers), "caps": caps,
         "samples": [s["sample_id"] for s in selected_samples], "sample_count": len(selected_samples),
         "sample_seed": args.sample_seed, "block_size": 16,
+        "save_all_rounds": args.save_all_rounds,
         "query_alignment": "DFlash mask positions 1..15 vs target verifier positions 0..14; both predict the same proposal token index.",
         "primary_metric": (
             "Jensen-Shannon divergence (base 2) between the previous target next-anchor query padded on the full next-round key scope and the next DFlash block distribution."
@@ -481,8 +555,9 @@ def main():
     started = time.perf_counter()
     try:
         for sample_index, sample in enumerate(selected_samples):
+            comparison.sample_index = sample_index
             sample_dir = args.output / f"sample_{sample_index:02d}"
-            sample_dir.mkdir()
+            sample_dir.mkdir(parents=True, exist_ok=True)
             for cap in caps:
                 input_path = args.source_run / f"sample_{sample_index:02d}/context_{cap}_input_ids.npy"
                 if not input_path.exists():
@@ -518,25 +593,7 @@ def main():
                     )
                 torch.cuda.empty_cache()
 
-        saved_snapshots = 0
-        if not args.capture_parent_attention:
-            vector_dir = args.output / "vector_snapshots"
-            vector_dir.mkdir()
-            for (sample_id, cap), phases in comparison.snapshots.items():
-                sample_index = next(i for i, s in enumerate(selected_samples) if s["sample_id"] == sample_id)
-                for phase, snapshot in phases.items():
-                    name = f"sample_{sample_index:02d}_context_{cap}_{phase}.npz"
-                    np.savez_compressed(vector_dir / name, **snapshot)
-                    saved_snapshots += 1
-        parent_snapshot_dir = args.output / "parent_transition_snapshots"
-        if args.capture_parent_attention:
-            parent_snapshot_dir.mkdir()
-            for (sample_id, cap), phases in comparison.parent_snapshots.items():
-                sample_index = next(i for i, s in enumerate(selected_samples)
-                                    if s["sample_id"] == sample_id)
-                for phase, snapshot in phases.items():
-                    name = f"sample_{sample_index:02d}_context_{cap}_{phase}.npz"
-                    np.savez_compressed(parent_snapshot_dir / name, **snapshot)
+        saved_snapshots = comparison.saved_snapshot_count
         summary = {
             "type": "summary", "status": "success", "run_count": len(run_summaries),
             "draft_rounds": sum(r["draft_rounds"] for r in run_summaries),

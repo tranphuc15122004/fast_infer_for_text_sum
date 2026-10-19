@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import torch
 
-from TrainingFree.context_adaptive.signals import _cache_key
+from TrainingFree.context_adaptive.signals import _cache_key, causal_query_positions
 
 
 def full_key_attention_scores(
@@ -60,6 +60,134 @@ def target_full_key_scores(
         head_groups=int(attention.num_key_value_groups),
         scaling=float(attention.scaling),
         sliding_window=getattr(attention, "sliding_window", None),
+    )
+
+
+def multi_query_full_key_attention_scores(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    head_groups: int,
+    scaling: float,
+    sliding_window: int | None = None,
+    pooling_mode: str = "max",
+) -> dict[int, float]:
+    """Mean-head softmax across verified queries with max/mean pooling over queries."""
+    if query.ndim != 4 or key.ndim != 4 or query.shape[0] != key.shape[0]:
+        raise ValueError("query and key must have [batch, heads, sequence, head_dim] shape")
+    num_queries = query.shape[-2]
+    if head_groups < 1 or query.shape[1] != key.shape[1] * head_groups:
+        raise ValueError("head_groups do not match query/key head counts")
+    if pooling_mode not in {"max", "mean"}:
+        raise ValueError("pooling_mode must be max or mean")
+    positions_tensor = causal_query_positions(query_positions, num_queries, device=key.device)
+    max_allowed = min(int(positions_tensor[-1].item()) + 1, key.shape[-2])
+    if max_allowed < 1 or num_queries < 1:
+        return {}
+    q = query[:, :, :num_queries, :].float()
+    k = key[:, :, :max_allowed, :].float().repeat_interleave(head_groups, dim=1)
+    logits = torch.matmul(q, k.transpose(-1, -2)) * float(scaling)
+    key_positions = torch.arange(max_allowed, device=key.device)
+    causal_mask = key_positions.view(1, 1, 1, -1) <= positions_tensor.view(1, 1, -1, 1)
+    if sliding_window is not None:
+        window_mask = key_positions.view(1, 1, 1, -1) >= (positions_tensor.view(1, 1, -1, 1) - int(sliding_window) + 1)
+        causal_mask = causal_mask & window_mask
+    logits = logits.masked_fill(~causal_mask, torch.finfo(logits.dtype).min)
+    probabilities = torch.softmax(logits, dim=-1).mean(dim=(0, 1))
+    if pooling_mode == "mean":
+        pooled = probabilities.mean(dim=0)
+    else:
+        pooled = probabilities.amax(dim=0)
+    total = pooled.sum()
+    if total > 0:
+        pooled = pooled / total
+    values = pooled.detach().cpu().tolist()
+    return {position: float(value) for position, value in enumerate(values)}
+
+
+def duo_ensemble_full_key_attention_scores(
+    query_mid: torch.Tensor,
+    key_mid: torch.Tensor,
+    query_deep: torch.Tensor,
+    key_deep: torch.Tensor,
+    *,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    head_groups: int,
+    scaling: float,
+    alpha: float = 0.5,
+    sliding_window: int | None = None,
+    pooling_mode: str = "max",
+) -> dict[int, float]:
+    """Full-key attention blending multi-query scores from Middle and Deep layers."""
+    scores_mid = multi_query_full_key_attention_scores(
+        query_mid,
+        key_mid,
+        query_positions=query_positions,
+        head_groups=head_groups,
+        scaling=scaling,
+        sliding_window=sliding_window,
+        pooling_mode=pooling_mode,
+    )
+    scores_deep = multi_query_full_key_attention_scores(
+        query_deep,
+        key_deep,
+        query_positions=query_positions,
+        head_groups=head_groups,
+        scaling=scaling,
+        sliding_window=sliding_window,
+        pooling_mode=pooling_mode,
+    )
+    all_pos = set(scores_mid.keys()).union(scores_deep.keys())
+    return {
+        pos: float(alpha * scores_mid.get(pos, 0.0) + (1.0 - alpha) * scores_deep.get(pos, 0.0))
+        for pos in all_pos
+    }
+
+
+def target_multi_query_full_key_scores(
+    query: torch.Tensor,
+    target_cache: Any,
+    layer_index: int,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    attention: Any,
+    pooling_mode: str = "max",
+) -> dict[int, float]:
+    key = _cache_key(target_cache, layer_index)
+    return multi_query_full_key_attention_scores(
+        query,
+        key,
+        query_positions=query_positions,
+        head_groups=int(attention.num_key_value_groups),
+        scaling=float(attention.scaling),
+        sliding_window=getattr(attention, "sliding_window", None),
+        pooling_mode=pooling_mode,
+    )
+
+
+def target_duo_ensemble_full_key_scores(
+    queries_by_layer: Mapping[int, torch.Tensor],
+    target_cache: Any,
+    layer_mid: int,
+    layer_deep: int,
+    query_positions: Sequence[int] | torch.Tensor | int,
+    attention: Any,
+    alpha: float = 0.5,
+    pooling_mode: str = "max",
+) -> dict[int, float]:
+    key_mid = _cache_key(target_cache, layer_mid)
+    key_deep = _cache_key(target_cache, layer_deep)
+    return duo_ensemble_full_key_attention_scores(
+        queries_by_layer[layer_mid],
+        key_mid,
+        queries_by_layer[layer_deep],
+        key_deep,
+        query_positions=query_positions,
+        head_groups=int(attention.num_key_value_groups),
+        scaling=float(attention.scaling),
+        alpha=alpha,
+        sliding_window=getattr(attention, "sliding_window", None),
+        pooling_mode=pooling_mode,
     )
 
 

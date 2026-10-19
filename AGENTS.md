@@ -96,6 +96,13 @@ experimental; chưa xác nhận parity hoặc benchmark trên GPU).
 - Model gated (Llama) cần `HF_TOKEN`; ưu tiên snapshot local.
 - `flash-attn`, `flashinfer`, Triton và vLLM phải khớp torch/CUDA/GPU.
 - Kết quả nằm ở `outputs/` (gitignored), không commit artifact.
+- **Modal GPU**: workspace thực nghiệm hiện tại là `phuclk30`. Trước khi chạy
+  Modal, kiểm tra `modal profile current`; mọi lệnh `modal run`, `modal volume`
+  và lệnh CLI Modal khác phải chỉ định `--profile phuclk30` để tránh gửi job
+  hoặc truy cập resource nhầm workspace `tdphuc-work`. Với script Python tự gọi
+  Modal CLI, đặt `MODAL_PROFILE=phuclk30` nếu script dùng biến này. Không suy ra
+  profile hiện tại từ URL/app ID trong experiment log cũ; chúng chỉ ghi lại
+  workspace của lần chạy lịch sử. Hướng dẫn chi tiết: `docs/modal_gpu_phuclk30.md`.
 
 ## Dev CPU local (máy tuantb@teslaT4) — ĐỌC KỸ TRƯỚC KHI DEBUG
 

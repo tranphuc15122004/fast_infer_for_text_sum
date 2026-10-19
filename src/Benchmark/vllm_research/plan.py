@@ -9,7 +9,7 @@ from typing import Any
 
 from TrainingFree.context_interventions.matrix import a1_matrix, a2_matrix, a3_matrix
 from TrainingFree.speculation_experiments.protocol import SUPPORTED_GAMMAS
-from TrainingFree.speculation_experiments.survival import DEFAULT_VARIANTS
+from TrainingFree.speculation_experiments.survival import DEFAULT_VARIANTS, SURVIVAL_VARIANTS
 from TrainingFree.speculation_experiments.lagged import _COST_VARIANTS
 
 
@@ -164,7 +164,7 @@ def build_jobs(experiments: Iterable[str], *, selectors: Iterable[str] = ('previ
             add(job)
     fits = {variant: _job('B2', f'survival_fit_{variant}', 'analysis', 'cpu_analysis',
                          {'analysis': 'survival_fit', 'model_variant': variant, 'source_group_folds': 4,
-                          'requires_positive_result': False}, (signal.id,)) for variant in DEFAULT_VARIANTS}
+                          'requires_positive_result': False}, (signal.id,)) for variant in SURVIVAL_VARIANTS}
     if 'B2' in selected:
         add(_job('B2', 'survival_cross_validation', 'analysis', 'cpu_analysis',
                  {'analysis': 'survival_cross_validation', 'source_group_folds': 4,
@@ -178,11 +178,17 @@ def build_jobs(experiments: Iterable[str], *, selectors: Iterable[str] = ('previ
         for k in gammas:
             add(_job('B3', f'fixed_k_{k}', 'generation', 'b3_fixed_k',
                      {'draft_gamma': 15, 'k': k, 'decision_timing': 'after_draft_before_verify'}))
-        for variant in ('R', 'R-A', 'R-DH', 'R-DC'):
-            add(_job('B3', f'adaptive_k_{variant}', 'generation', 'adaptive_verification',
-                     {'draft_gamma': 15, 'allowed_prefixes': list(gammas), 'model_variant': variant,
-                      'decision_timing': 'after_draft_before_verify', 'requires_positive_result': False},
-                     (fits[variant].id, *(job.id for job in prefix_actions))))
+        b3_variants = (
+            'R', 'R-A', 'R-DH', 'R-DC',
+            'R-Hazard-Pos', 'R-Hazard-Present', 'R-Hazard-Prefix',
+            'R-Hazard-Suffix-Margin', 'R-Hazard-Suffix-Entropy',
+        )
+        for variant in b3_variants:
+            if variant in fits:
+                add(_job('B3', f'adaptive_k_{variant}', 'generation', 'adaptive_verification',
+                         {'draft_gamma': 15, 'allowed_prefixes': list(gammas), 'model_variant': variant,
+                          'decision_timing': 'after_draft_before_verify', 'requires_positive_result': False},
+                         (fits[variant].id, *(job.id for job in prefix_actions))))
     if 'B4' in selected:
         for gamma in gammas:
             if gamma != 15:

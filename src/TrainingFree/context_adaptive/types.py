@@ -57,6 +57,7 @@ class RoundState:
     ranking_age: int
     refresh_required: bool
     source_origin_round: int | None = None
+    parent_confidence: float | None = None
 
 
 @dataclass(frozen=True)

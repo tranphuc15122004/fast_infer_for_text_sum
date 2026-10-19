@@ -15,7 +15,15 @@ from .cache import DraftContextBank
 from .config import AdaptiveConfig
 from .controller import AdaptiveController
 from .selection import rank_chunks, select_context
-from .signals import TargetQueryCapture, normalized_entropy, refresh_concentration, target_parent_scores
+from .signals import (
+    TargetQueryCapture,
+    normalized_entropy,
+    normalized_entropy_and_confidence,
+    refresh_concentration,
+    target_parent_scores,
+    target_multi_query_scores,
+    target_duo_ensemble_scores,
+)
 from .statistics import AdaptiveStatistics, state_bucket
 from .types import Action, GenerationResult, PromptLayout, RoundState, Selection
 
@@ -50,8 +58,90 @@ def _eos_ids(target: Any) -> set[int]:
     return {int(item) for item in value}
 
 
+def _capture_target_signals(
+    query: torch.Tensor | Mapping[int, torch.Tensor] | None,
+    cache: Any,
+    layout: PromptLayout,
+    target_attention: Any,
+    *,
+    selector: str,
+    target_layer_mid: int,
+    target_layer_deep: int,
+    accepted: int,
+    logical_length: int,
+    alpha: float = 0.5,
+    pooling_mode: str = "max",
+) -> tuple[dict[int, float] | None, float | None]:
+    if query is None or not layout.source_chunks:
+        return None, None
+
+    if selector in {"duo_ensemble", "m4_duo_ensemble"}:
+        if not isinstance(query, Mapping):
+            raise ValueError("Duo-Ensemble requires distinct captured queries for both target layers")
+        queries_by_layer = {
+            layer: q[:, :, : accepted + 1, :] if q.ndim == 4 else q
+            for layer, q in query.items()
+        }
+        return target_duo_ensemble_scores(
+            queries_by_layer,
+            cache,
+            target_layer_mid,
+            target_layer_deep,
+            logical_length + accepted,
+            layout.source_chunks,
+            head_groups=int(target_attention.num_key_value_groups),
+            scaling=float(target_attention.scaling),
+            alpha=alpha,
+            sliding_window=getattr(target_attention, "sliding_window", None),
+            pooling_mode=pooling_mode,
+        )
+
+    if selector in {
+        "multi_query_max_pooling",
+        "target_multi_query",
+        "m1_multi_query",
+        "multi_query_mean_pooling",
+        "m2_chunk_mean",
+        "m2_p1_chunk128",
+    }:
+        if isinstance(query, Mapping):
+            q_tensor = query[target_layer_mid]
+        else:
+            q_tensor = query
+        q_slice = q_tensor[:, :, : accepted + 1, :]
+        return target_multi_query_scores(
+            q_slice,
+            cache,
+            target_layer_mid,
+            logical_length + accepted,
+            layout.source_chunks,
+            head_groups=int(target_attention.num_key_value_groups),
+            scaling=float(target_attention.scaling),
+            sliding_window=getattr(target_attention, "sliding_window", None),
+            pooling_mode=pooling_mode,
+        )
+
+    # Backwards-compatible single-query target_parent
+    if isinstance(query, Mapping):
+        q_tensor = query[target_layer_mid]
+    else:
+        q_tensor = query
+    scores, concentration = target_parent_scores(
+        q_tensor,
+        cache,
+        target_layer_mid,
+        accepted,
+        logical_length + accepted,
+        layout.source_chunks,
+        head_groups=int(target_attention.num_key_value_groups),
+        scaling=float(target_attention.scaling),
+        sliding_window=getattr(target_attention, "sliding_window", None),
+    )
+    return scores, concentration
+
+
 def _capture_parent(
-    query: torch.Tensor | None,
+    query: torch.Tensor | Mapping[int, torch.Tensor] | None,
     cache: Any,
     layer_index: int,
     query_index: int,
@@ -61,8 +151,12 @@ def _capture_parent(
 ) -> tuple[dict[int, float] | None, float | None]:
     if query is None or not layout.source_chunks:
         return None, None
+    if isinstance(query, Mapping):
+        q_tensor = query.get(layer_index, next(iter(query.values())))
+    else:
+        q_tensor = query
     scores, concentration = target_parent_scores(
-        query,
+        q_tensor,
         cache,
         layer_index,
         query_index,
@@ -207,6 +301,7 @@ def _draft_and_verify_action(
     collect_refresh_scores: bool,
     collect_full_context_scores: bool,
     collect_uncertainty: bool = False,
+    collect_uncertainty_entropy: bool = True,
     query_capture: TargetQueryCapture | None,
     verification_prefix_policy: VerificationPrefixPolicy | None = None,
     round_state: RoundState | None = None,
@@ -231,6 +326,7 @@ def _draft_and_verify_action(
         collect_refresh_scores=collect_refresh_scores,
         collect_full_context_scores=collect_full_context_scores,
         collect_uncertainty=collect_uncertainty,
+        collect_uncertainty_entropy=collect_uncertainty_entropy,
     )
     block[0, 1:] = proposal.token_ids[0]
     verify_gamma = int(action.gamma)
@@ -342,6 +438,33 @@ def _clone_dynamic_cache(cache: Any) -> Any:
     return DynamicCache(ddp_cache_data=rows)
 
 
+def _crop_cache(cache: Any, target_length: int) -> None:
+    """Crop cache past key/values across transformers 4.x and 5.x."""
+    if hasattr(cache, "crop"):
+        try:
+            cache.crop(target_length)
+            return
+        except ValueError:
+            pass
+    for layer in getattr(cache, "layers", []):
+        seq_len = getattr(layer, "get_seq_length", lambda: None)()
+        if seq_len is None and hasattr(layer, "keys") and layer.keys is not None:
+            seq_len = layer.keys.shape[-2]
+        if seq_len is not None and seq_len > target_length:
+            try:
+                layer.crop(target_length)
+            except ValueError:
+                tokens_to_remove = -(seq_len - target_length)
+                try:
+                    layer.crop(tokens_to_remove)
+                except Exception:
+                    layer.keys = layer.keys[..., :target_length, :]
+                    layer.values = layer.values[..., :target_length, :]
+        elif hasattr(layer, "keys") and layer.keys is not None and layer.keys.shape[-2] > target_length:
+            layer.keys = layer.keys[..., :target_length, :]
+            layer.values = layer.values[..., :target_length, :]
+
+
 def _replay_calibration_actions(
     *,
     rows: list[dict[str, Any]],
@@ -367,6 +490,7 @@ def _replay_calibration_actions(
     query_capture: TargetQueryCapture | None,
     target_layer: int,
     target_attention: Any,
+    duo_deep_layer: int = 35,
 ) -> None:
     """Replay feasible actions against one immutable causal prefix.
 
@@ -425,14 +549,18 @@ def _replay_calibration_actions(
         bank.append(retained, torch.arange(logical_length, logical_length + 1 + committed, device=input_ids.device))
         bank.length = bank_length
         if query is not None and eos_offset is None:
-            _capture_parent(
+            _capture_target_signals(
                 query,
                 cloned_cache,
-                target_layer,
-                accepted,
-                logical_length + accepted,
                 layout,
                 target_attention,
+                selector=config.selector,
+                target_layer_mid=target_layer,
+                target_layer_deep=duo_deep_layer,
+                accepted=accepted,
+                logical_length=logical_length,
+                alpha=config.ensemble_alpha,
+                pooling_mode=config.query_pooling,
             )
         if state.refresh_required and draft_scores:
             refresh_concentration(draft_scores, layout.source_chunks)
@@ -534,14 +662,30 @@ def generate_adaptive(
     if target_layer >= len(target.model.layers):
         raise ValueError("target attention layer is outside target model")
     target_attention = target.model.layers[target_layer].self_attn
+    duo_deep_layer = target.config.num_hidden_layers - 1 if config.duo_deep_layer == "deep" else int(config.duo_deep_layer)
+    if duo_deep_layer >= len(target.model.layers):
+        raise ValueError("duo deep attention layer is outside target model")
     if fixed_gamma > int(draft.block_size) - 1 or gamma_reference > int(draft.block_size) - 1:
         raise ValueError("fixed_gamma/gamma_reference exceeds DFlash checkpoint capability")
     bank = DraftContextBank(draft, max_length)
-    query_capture = (
-        TargetQueryCapture(target, target_layer)
-        if config.selector == "target_parent" or collect_full_target_scores
-        else None
-    )
+    is_duo = config.selector in {"duo_ensemble", "m4_duo_ensemble"}
+    is_multi = config.selector in {
+        "multi_query_max_pooling",
+        "target_multi_query",
+        "m1_multi_query",
+        "multi_query_mean_pooling",
+        "m2_chunk_mean",
+        "m2_p1_chunk128",
+    }
+    is_target_parent = config.selector == "target_parent"
+    if is_duo:
+        from TrainingFree.context_interventions.attention import MultiLayerTargetQueryCapture
+
+        query_capture = MultiLayerTargetQueryCapture(target, [target_layer, duo_deep_layer])
+    elif is_multi or is_target_parent or collect_full_target_scores:
+        query_capture = TargetQueryCapture(target, target_layer)
+    else:
+        query_capture = None
     capture_cleanup = query_capture.close if query_capture is not None else (lambda: None)
     controller = AdaptiveController(
         config,
@@ -595,6 +739,7 @@ def generate_adaptive(
     calibration_points = tuple(sorted({int(value) for value in calibration_checkpoints if int(value) >= 0}))
     calibration_checkpoint_index = 0
     parent_entropy: float | None = None
+    parent_confidence: float | None = None
     parent_entropy_origin_round: int | None = None
     parent_query_index_for_state: int | None = None
     initial_query: torch.Tensor | None = None
@@ -606,7 +751,7 @@ def generate_adaptive(
         anchor = int(anchor_tensor.item())
         ttft_ms = (time.perf_counter() - start_time) * 1000.0
         prefill_ms = ttft_ms
-        parent_entropy = normalized_entropy(prefill_logits, config.entropy_signal_temperature)
+        parent_entropy, parent_confidence = normalized_entropy_and_confidence(prefill_logits, config.entropy_signal_temperature)
         parent_entropy_origin_round = -1
         parent_query_index_for_state = prompt_length - 1
         prefill_features = _feature_rows(prefill_output.hidden_states, layer_ids)
@@ -616,19 +761,56 @@ def generate_adaptive(
         del prefill_output, prefill_features
         generated = [anchor]
         if query_capture is not None:
-            target_scores, source_concentration = _capture_parent(
-                initial_query, target_cache, target_layer, 0, prompt_length - 1, layout, target_attention
+            target_scores, source_concentration = _capture_target_signals(
+                initial_query,
+                target_cache,
+                layout,
+                target_attention,
+                selector=config.selector,
+                target_layer_mid=target_layer,
+                target_layer_deep=duo_deep_layer,
+                accepted=0,
+                logical_length=prompt_length - 1,
+                alpha=config.ensemble_alpha,
+                pooling_mode=config.query_pooling,
             )
             if collect_full_target_scores:
-                from TrainingFree.context_interventions.attention import target_full_key_scores
+                if is_duo:
+                    from TrainingFree.context_interventions.attention import target_duo_ensemble_full_key_scores
 
-                target_parent_scores_full = target_full_key_scores(
-                    initial_query, target_cache, target_layer, 0, prompt_length - 1, target_attention
-                )
+                    init_q_map = initial_query if isinstance(initial_query, Mapping) else {target_layer: initial_query, duo_deep_layer: initial_query}
+                    target_parent_scores_full = target_duo_ensemble_full_key_scores(
+                        init_q_map,
+                        target_cache,
+                        target_layer,
+                        duo_deep_layer,
+                        prompt_length - 1,
+                        target_attention,
+                        alpha=config.ensemble_alpha,
+                        pooling_mode=config.query_pooling,
+                    )
+                elif is_multi:
+                    from TrainingFree.context_interventions.attention import target_multi_query_full_key_scores
+
+                    init_q_tens = initial_query if not isinstance(initial_query, Mapping) else initial_query.get(target_layer, next(iter(initial_query.values())))
+                    target_parent_scores_full = target_multi_query_full_key_scores(
+                        init_q_tens,
+                        target_cache,
+                        target_layer,
+                        prompt_length - 1,
+                        target_attention,
+                        pooling_mode=config.query_pooling,
+                    )
+                else:
+                    from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                    target_parent_scores_full = target_full_key_scores(
+                        initial_query, target_cache, target_layer, 0, prompt_length - 1, target_attention
+                    )
             if target_scores:
                 ranking_by_layer = rank_chunks(
                     layout,
-                    selector="target_parent",
+                    selector=config.selector,
                     scores_by_layer=[target_scores],
                     num_draft_layers=len(draft.layers),
                 )
@@ -680,22 +862,59 @@ def generate_adaptive(
                 if processed_output_tokens < max_new_tokens:
                     generated.append(next_anchor)
                 if query_capture is not None and ar_query is not None:
-                    target_scores, source_concentration = _capture_parent(
-                        ar_query, target_cache, target_layer, 0, logical_length, layout, target_attention
+                    target_scores, source_concentration = _capture_target_signals(
+                        ar_query,
+                        target_cache,
+                        layout,
+                        target_attention,
+                        selector=config.selector,
+                        target_layer_mid=target_layer,
+                        target_layer_deep=duo_deep_layer,
+                        accepted=0,
+                        logical_length=logical_length,
+                        alpha=config.ensemble_alpha,
+                        pooling_mode=config.query_pooling,
                     )
                     if collect_full_target_scores:
-                        from TrainingFree.context_interventions.attention import target_full_key_scores
+                        if is_duo:
+                            from TrainingFree.context_interventions.attention import target_duo_ensemble_full_key_scores
 
-                        target_parent_scores_full = target_full_key_scores(
-                            ar_query, target_cache, target_layer, 0, logical_length, target_attention
-                        )
+                            ar_q_map = ar_query if isinstance(ar_query, Mapping) else {target_layer: ar_query, duo_deep_layer: ar_query}
+                            target_parent_scores_full = target_duo_ensemble_full_key_scores(
+                                ar_q_map,
+                                target_cache,
+                                target_layer,
+                                duo_deep_layer,
+                                logical_length,
+                                target_attention,
+                                alpha=config.ensemble_alpha,
+                                pooling_mode=config.query_pooling,
+                            )
+                        elif is_multi:
+                            from TrainingFree.context_interventions.attention import target_multi_query_full_key_scores
+
+                            ar_q_tens = ar_query if not isinstance(ar_query, Mapping) else ar_query.get(target_layer, next(iter(ar_query.values())))
+                            target_parent_scores_full = target_multi_query_full_key_scores(
+                                ar_q_tens,
+                                target_cache,
+                                target_layer,
+                                logical_length,
+                                target_attention,
+                                pooling_mode=config.query_pooling,
+                            )
+                        else:
+                            from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                            target_parent_scores_full = target_full_key_scores(
+                                ar_query, target_cache, target_layer, 0, logical_length, target_attention
+                            )
                     if target_scores:
-                        ranking_by_layer = rank_chunks(layout, selector="target_parent", scores_by_layer=[target_scores], num_draft_layers=len(draft.layers))
+                        ranking_by_layer = rank_chunks(layout, selector=config.selector, scores_by_layer=[target_scores], num_draft_layers=len(draft.layers))
                         source_origin_round = round_index
                     else:
                         ranking_by_layer = ()
                         source_origin_round = None
-                parent_entropy = normalized_entropy(logits, config.entropy_signal_temperature)
+                parent_entropy, parent_confidence = normalized_entropy_and_confidence(logits, config.entropy_signal_temperature)
                 parent_entropy_origin_round = round_index
                 parent_query_index_for_state = 0
                 rounds.append({
@@ -744,6 +963,7 @@ def generate_adaptive(
                 ranking_age=(round_index - ranking_origin_round) if ranking_origin_round is not None else 10**9,
                 refresh_required=refresh_required,
                 source_origin_round=source_origin_round,
+                parent_confidence=parent_confidence,
             )
             state_parent_entropy_origin = parent_entropy_origin_round
             state_parent_query_index = parent_query_index_for_state
@@ -778,7 +998,17 @@ def generate_adaptive(
                 action = Action("full", action.gamma, action.length_mode)
                 action_reason += ":refresh_full"
 
-            if config.selector == "target_parent":
+            if config.selector in {
+                "target_parent",
+                "multi_query_max_pooling",
+                "duo_ensemble",
+                "target_multi_query",
+                "m1_multi_query",
+                "m4_duo_ensemble",
+                "multi_query_mean_pooling",
+                "m2_chunk_mean",
+                "m2_p1_chunk128",
+            }:
                 rankings = ranking_by_layer
                 source_scores_for_refresh = None
             elif config.selector == "draft_refresh":
@@ -804,7 +1034,17 @@ def generate_adaptive(
                 source_scores_for_refresh = None
             if not rankings:
                 rankings = tuple(tuple(range(len(layout.source_chunks))) for _ in range(len(draft.layers)))
-            if config.selector == "target_parent" and not ranking_by_layer:
+            if config.selector in {
+                "target_parent",
+                "multi_query_max_pooling",
+                "duo_ensemble",
+                "target_multi_query",
+                "m1_multi_query",
+                "m4_duo_ensemble",
+                "multi_query_mean_pooling",
+                "m2_chunk_mean",
+                "m2_p1_chunk128",
+            } and not ranking_by_layer:
                 action = Action("full", action.gamma, action.length_mode)
                 action_reason += ":missing_target_signal_full"
             selection_started = time.perf_counter()
@@ -892,6 +1132,7 @@ def generate_adaptive(
                     query_capture=query_capture if collect_target_signal else None,
                     target_layer=target_layer,
                     target_attention=target_attention,
+                    duo_deep_layer=duo_deep_layer,
                 )
 
             if config.timing_mode == "diagnostic" and torch.cuda.is_available():
@@ -900,6 +1141,18 @@ def generate_adaptive(
             gpu_end = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
             if gpu_start is not None:
                 gpu_start.record()
+            policy_needs_uncertainty = (
+                verification_prefix_policy is not None
+                and bool(getattr(verification_prefix_policy, "requires_uncertainty", True))
+                and not (
+                    hasattr(verification_prefix_policy, "should_bypass_signals")
+                    and bool(verification_prefix_policy.should_bypass_signals(logical_length))
+                )
+            )
+            draft_policy_needs_uncertainty = (
+                draft_length_policy is not None
+                and bool(getattr(draft_length_policy, "requires_uncertainty", True))
+            )
             (
                 block,
                 target_output,
@@ -934,13 +1187,18 @@ def generate_adaptive(
                 collect_full_context_scores=collect_full_draft_scores and refresh_required,
                 collect_uncertainty=(
                     collect_uncertainty
+                    or policy_needs_uncertainty
+                    or draft_policy_needs_uncertainty
+                ),
+                collect_uncertainty_entropy=(
+                    collect_uncertainty
                     or (
-                        verification_prefix_policy is not None
-                        and bool(getattr(verification_prefix_policy, "requires_uncertainty", True))
+                        policy_needs_uncertainty
+                        and bool(getattr(verification_prefix_policy, "requires_entropy", True))
                     )
                     or (
-                        draft_length_policy is not None
-                        and bool(getattr(draft_length_policy, "requires_uncertainty", True))
+                        draft_policy_needs_uncertainty
+                        and bool(getattr(draft_length_policy, "requires_entropy", True))
                     )
                 ),
                 query_capture=query_capture if collect_target_signal else None,
@@ -975,23 +1233,27 @@ def generate_adaptive(
                 pending_anchor = -1
             signal_started = time.perf_counter()
             parent_logits = target_output.logits[:, accepted, :]
-            parent_entropy = normalized_entropy(parent_logits, config.entropy_signal_temperature)
+            parent_entropy, parent_confidence = normalized_entropy_and_confidence(parent_logits, config.entropy_signal_temperature)
             parent_entropy_origin_round = round_index
             parent_query_index_for_state = accepted
             if target_query is not None and not eos_in_accepted:
-                target_scores, source_concentration = _capture_parent(
+                target_scores, source_concentration = _capture_target_signals(
                     target_query,
                     target_cache,
-                    target_layer,
-                    accepted,
-                    logical_length + accepted,
                     layout,
                     target_attention,
+                    selector=config.selector,
+                    target_layer_mid=target_layer,
+                    target_layer_deep=duo_deep_layer,
+                    accepted=accepted,
+                    logical_length=logical_length,
+                    alpha=config.ensemble_alpha,
+                    pooling_mode=config.query_pooling,
                 )
                 if target_scores:
                     ranking_by_layer = rank_chunks(
                         layout,
-                        selector="target_parent",
+                        selector=config.selector,
                         scores_by_layer=[target_scores],
                         num_draft_layers=len(draft.layers),
                     )
@@ -1002,20 +1264,62 @@ def generate_adaptive(
                     ranking_by_layer = ()
                     source_origin_round = None
                 if collect_full_target_scores:
-                    from TrainingFree.context_interventions.attention import target_full_key_scores
+                    if is_duo:
+                        from TrainingFree.context_interventions.attention import target_duo_ensemble_full_key_scores
 
-                    target_parent_scores_full = target_full_key_scores(
-                        target_query,
-                        target_cache,
-                        target_layer,
-                        accepted,
-                        logical_length + accepted,
-                        target_attention,
-                    )
+                        target_q_map = (
+                            target_query
+                            if isinstance(target_query, Mapping)
+                            else {target_layer: target_query, duo_deep_layer: target_query}
+                        )
+                        target_q_map = {layer: q[:, :, :accepted + 1, :] for layer, q in target_q_map.items()}
+                        target_parent_scores_full = target_duo_ensemble_full_key_scores(
+                            target_q_map,
+                            target_cache,
+                            target_layer,
+                            duo_deep_layer,
+                            logical_length + accepted,
+                            target_attention,
+                            alpha=config.ensemble_alpha,
+                            pooling_mode=config.query_pooling,
+                        )
+                    elif is_multi:
+                        from TrainingFree.context_interventions.attention import target_multi_query_full_key_scores
+
+                        target_q_tens = (
+                            target_query
+                            if not isinstance(target_query, Mapping)
+                            else target_query.get(target_layer, next(iter(target_query.values())))
+                        )
+                        q_slice = target_q_tens[:, :, : accepted + 1, :]
+                        target_parent_scores_full = target_multi_query_full_key_scores(
+                            q_slice,
+                            target_cache,
+                            target_layer,
+                            logical_length + accepted,
+                            target_attention,
+                            pooling_mode=config.query_pooling,
+                        )
+                    else:
+                        from TrainingFree.context_interventions.attention import target_full_key_scores
+
+                        target_q_tens = (
+                            target_query
+                            if not isinstance(target_query, Mapping)
+                            else target_query.get(target_layer, next(iter(target_query.values())))
+                        )
+                        target_parent_scores_full = target_full_key_scores(
+                            target_q_tens,
+                            target_cache,
+                            target_layer,
+                            accepted,
+                            logical_length + accepted,
+                            target_attention,
+                        )
             signal_ms = (time.perf_counter() - signal_started) * 1000.0
             bank_started = time.perf_counter()
             retained = _feature_rows(target_output.hidden_states, layer_ids)[:, :commits_for_output, :]
-            target_cache.crop(logical_after)
+            _crop_cache(target_cache, logical_after)
             bank.append(
                 retained,
                 torch.arange(logical_length, logical_after, device=input_ids.device),
@@ -1230,6 +1534,9 @@ def generate_adaptive(
         "draft_tokens_proposed": proposed_total,
         "draft_tokens_accepted": accepted_total,
         "useful_draft_tokens_accepted": useful_accepted_total,
+        "speculative_rounds": speculative_rounds,
+        "accepted_total": accepted_total,
+        "useful_accepted_total": useful_accepted_total,
         "mean_accept_length": sum(accepted_lengths) / len(accepted_lengths) if accepted_lengths else None,
         "mean_effective_accept_length": sum(useful_accepted_lengths) / len(useful_accepted_lengths) if useful_accepted_lengths else None,
         "acceptance_rate": acceptance_rate,

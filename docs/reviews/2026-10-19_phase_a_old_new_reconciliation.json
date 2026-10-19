@@ -1,0 +1,37 @@
+{
+  "legacy_M1_reproduction": {
+    "formula": "mean-query target[L18], normalize on recorded prefix, protect sink16/recent32, top remaining B; no max-query input available",
+    "records_checked": 570,
+    "maximum_absolute_error": 4.440892098500626e-16,
+    "mean_absolute_error": 6.992457295446161e-17,
+    "reported_16k_B2048_mean": 0.9161762204425974,
+    "recomputed_16k_B2048_mean": 0.9161762204425974,
+    "record_prefix_minus_raw_prefix_counts_16k_B2048": {
+      "2": 5,
+      "0": 20,
+      "1": 5
+    }
+  },
+  "legacy_candidate_duplicates": {
+    "shared_records": 3420,
+    "L18_L27_band_equal_records": 3420
+  },
+  "old_pilot": {
+    "dense_wall_ms": 2422.22,
+    "M1_wall_ms": 2015.18,
+    "M0_wall_ms": 2048.65,
+    "ratio_dense_over_M1": 1.2019869192826447,
+    "ratio_M0_over_M1": 1.0166089381593704,
+    "actual_historical_code_hash": "not recorded",
+    "actual_historical_input_ids": "not recorded"
+  },
+  "prompt_reconstruction": {
+    "assumption": "current old launcher defaults and local dataset unchanged from historical run; historical JSON does not record sample index/input hashes",
+    "default_sample_id": "gov_report_d12c96ef5c9b24f7",
+    "default_sample_in_new_cohort": false,
+    "rendered_equals_raw_context": true,
+    "old_input_hash_int64": "d14b7b142f8e20ce170b20d5fdf599f2b7c84f45f537960818cb8a86da62cdc8",
+    "new_prompt_has_summary_instruction_and_chat_template": true
+  },
+  "scope": "CPU artifact/source investigation. No new GPU run; no causal latency attribution."
+}
