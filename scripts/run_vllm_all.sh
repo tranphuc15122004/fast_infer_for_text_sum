@@ -18,23 +18,48 @@ for arg in "$@"; do
   fi
 done
 
-OUTPUT_DIR="${VLLM_OUTPUT_DIR:-$ROOT/outputs/vllm_unified}"
+NEW_ARGS=()
+CLI_OUTPUT_DIR=""
+CLI_RUN_ID=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir)
+      CLI_OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    --output-dir=*)
+      CLI_OUTPUT_DIR="${1#*=}"
+      shift
+      ;;
+    --run-id)
+      CLI_RUN_ID="$2"
+      shift 2
+      ;;
+    --run-id=*)
+      CLI_RUN_ID="${1#*=}"
+      shift
+      ;;
+    *)
+      NEW_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [[ ${#NEW_ARGS[@]} -gt 0 ]]; then
+  set -- "${NEW_ARGS[@]}"
+else
+  set --
+fi
+
+OUTPUT_DIR="${CLI_OUTPUT_DIR:-${VLLM_OUTPUT_DIR:-$ROOT/outputs/vllm_unified}}"
 if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$ROOT/$OUTPUT_DIR"
 fi
-RUN_ID="${VLLM_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID}"
+RUN_ID="${CLI_RUN_ID:-${VLLM_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID}}"
 if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "VLLM_RUN_ID may contain only letters, digits, '.', '_' and '-'" >&2
   exit 2
 fi
-for arg in "$@"; do
-  case "$arg" in
-    --run-id|--run-id=*|--output-dir|--output-dir=*)
-      echo "Use VLLM_RUN_ID or VLLM_OUTPUT_DIR so the run artifacts and console log stay linked." >&2
-      exit 2
-      ;;
-  esac
-done
 mkdir -p "$OUTPUT_DIR"
 RUN_DIR="$OUTPUT_DIR/$RUN_ID"
 if [[ -e "$RUN_DIR" ]]; then
