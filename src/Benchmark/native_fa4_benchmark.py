@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full batch-one native Transformers FA4 benchmark for LongBench baselines."""
+"""Full batch-one native Transformers benchmark for LongBench baselines."""
 
 from __future__ import annotations
 
@@ -102,10 +102,29 @@ MODEL_REPOS = {
 MAX_INPUT_TOKENS = int(os.environ.get("LONG_BENCH_MAX_INPUT_TOKENS", "0"))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("LONG_BENCH_MAX_NEW_TOKENS", "512"))
 DFLASH_BLOCK_SIZE = 16
-ATTENTION = "flash_attention_4"
-REMOTE_OUTPUT_ROOT = Path(
-    os.environ.get("FA4_OUTPUT_ROOT", PROJECT_ROOT / "outputs" / "fa4_native_benchmark")
-).expanduser()
+ATTENTION = os.environ.get(
+    "FAST_INFER_ATTENTION_BACKEND", "flash_attention_4"
+).strip().lower()
+if ATTENTION not in {"flash_attention_4", "sdpa"}:
+    raise ValueError(f"unsupported native attention backend: {ATTENTION!r}")
+_default_output_root = (
+    PROJECT_ROOT
+    / "outputs"
+    / (
+        "fa4_native_benchmark"
+        if ATTENTION == "flash_attention_4"
+        else "sdpa_native_benchmark"
+    )
+)
+_configured_output_root = os.environ.get("NATIVE_ATTENTION_OUTPUT_ROOT")
+if not _configured_output_root:
+    output_env = (
+        "FA4_OUTPUT_ROOT"
+        if ATTENTION == "flash_attention_4"
+        else "SDPA_NATIVE_OUTPUT_ROOT"
+    )
+    _configured_output_root = os.environ.get(output_env)
+REMOTE_OUTPUT_ROOT = Path(_configured_output_root or _default_output_root).expanduser()
 if not REMOTE_OUTPUT_ROOT.is_absolute():
     REMOTE_OUTPUT_ROOT = PROJECT_ROOT / REMOTE_OUTPUT_ROOT
 TRACKED_DISTRIBUTIONS = {
@@ -173,6 +192,9 @@ def _runtime_base(
         "torch_cuda": torch.version.cuda,
         "gpu_name": torch.cuda.get_device_name(0),
         "gpu_capability": torch.cuda.get_device_capability(0),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "visible_gpu_count": torch.cuda.device_count(),
+        "attention_backend": ATTENTION,
         "methods": {
             method: {
                 "target_attention": ATTENTION,
@@ -320,13 +342,90 @@ def _fa4_tree_mask_gpu_probe(torch) -> dict[str, Any]:
     }
 
 
+def _sdpa_tree_mask_gpu_probe(torch) -> dict[str, Any]:
+    """Check additive tree masks and cached one-token SDPA semantics on CUDA."""
+
+    import torch.nn.functional as F
+
+    from Benchmark.common.sdpa_attention import sdpa_attention
+
+    device = torch.device("cuda:0")
+    dtype = torch.bfloat16
+    q = torch.randn((1, 4, 2, 32), device=device, dtype=dtype)
+    k = torch.randn((1, 2, 6, 32), device=device, dtype=dtype)
+    v = torch.randn((1, 2, 6, 32), device=device, dtype=dtype)
+    keep = torch.tensor(
+        [[[1, 1, 1, 0, 0, 0], [1, 1, 0, 1, 1, 0]]],
+        dtype=torch.bool,
+        device=device,
+    )
+    additive_mask = torch.where(
+        keep[:, None],
+        torch.zeros((), dtype=torch.float32, device=device),
+        torch.full((), torch.finfo(torch.float32).min, dtype=torch.float32, device=device),
+    )
+    actual = sdpa_attention(
+        q, k, v, additive_mask, scaling=32**-0.5, is_causal=False
+    )
+    reference = F.scaled_dot_product_attention(
+        q.float(),
+        k.float(),
+        v.float(),
+        attn_mask=keep[:, None],
+        dropout_p=0.0,
+        is_causal=False,
+        scale=32**-0.5,
+        enable_gqa=True,
+    )
+    tree_mask_error = float((actual.float() - reference).abs().max().item())
+    if not torch.allclose(actual.float(), reference, atol=0.02, rtol=0.02):
+        raise RuntimeError(
+            "SDPA tree-mask probe disagrees with the boolean-mask reference: "
+            f"max_abs_error={tree_mask_error:.6g}"
+        )
+
+    # A one-query decode has a cached prefix. With no explicit mask it must
+    # attend to all cached keys; is_causal=True would use top-left alignment.
+    cached_query = q[:, :, :1]
+    cached_actual = sdpa_attention(
+        cached_query, k, v, None, scaling=32**-0.5, is_causal=False
+    )
+    cached_reference = F.scaled_dot_product_attention(
+        cached_query.float(),
+        k.float(),
+        v.float(),
+        dropout_p=0.0,
+        is_causal=False,
+        scale=32**-0.5,
+        enable_gqa=True,
+    )
+    cached_error = float(
+        (cached_actual.float() - cached_reference).abs().max().item()
+    )
+    if not torch.allclose(cached_actual.float(), cached_reference, atol=0.02, rtol=0.02):
+        raise RuntimeError(
+            "SDPA cached one-token probe failed: "
+            f"max_abs_error={cached_error:.6g}"
+        )
+    torch.cuda.synchronize(device)
+    return {
+        "passed": True,
+        "tree_mask_max_abs_error": tree_mask_error,
+        "cached_single_token_max_abs_error": cached_error,
+        "query_heads": 4,
+        "kv_heads": 2,
+        "query_length": 2,
+        "key_length": 6,
+    }
+
+
 def _config_attention(model: Any) -> str | None:
     config = getattr(model, "config", None)
     value = getattr(config, "_attn_implementation", None)
     return str(value) if value is not None else None
 
 
-def _assert_fa4(model: Any, method: str, role: str) -> str:
+def _assert_attention(model: Any, method: str, role: str) -> str:
     value = _config_attention(model)
     if value != ATTENTION:
         raise RuntimeError(
@@ -349,17 +448,17 @@ def _assert_method_dispatch(method: str, stats: dict[str, Any]) -> None:
         fallbacks = int(stats.get(f"{role}_fallback_attention_calls", 0) or 0)
         if backend != ATTENTION or calls <= 0 or fallbacks:
             raise RuntimeError(
-                f"{method} {role} did not exclusively dispatch through FA4: "
-                f"backend={backend!r}, fa4_calls={calls}, fallback_calls={fallbacks}, "
+                f"{method} {role} did not exclusively dispatch through {ATTENTION}: "
+                f"backend={backend!r}, backend_calls={calls}, fallback_calls={fallbacks}, "
                 f"fallback_backends={stats.get(f'{role}_fallback_attention_backends', {})}"
             )
 
 
 def _new_dispatch_totals() -> dict[str, Any]:
     return {
-        "target_fa4_calls": 0,
+        "target_backend_calls": 0,
         "target_fallback_backends": {},
-        "draft_fa4_calls": 0,
+        "draft_backend_calls": 0,
         "draft_fallback_backends": {},
         "unattributed_attention_calls": {},
     }
@@ -367,7 +466,7 @@ def _new_dispatch_totals() -> dict[str, Any]:
 
 def _add_dispatch_stats(totals: dict[str, Any], stats: dict[str, Any]) -> None:
     for role in ("target", "draft"):
-        totals[f"{role}_fa4_calls"] += int(
+        totals[f"{role}_backend_calls"] += int(
             stats.get(f"{role}_attention_dispatch_calls", 0) or 0
         )
         key = f"{role}_fallback_backends"
@@ -381,12 +480,12 @@ def _add_dispatch_stats(totals: dict[str, Any], stats: dict[str, Any]) -> None:
 def _dispatch_config_fields(totals: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for role in ("target", "draft"):
-        fa4_calls = int(totals[f"{role}_fa4_calls"])
+        expected_calls = int(totals[f"{role}_backend_calls"])
         fallback_backends = dict(totals[f"{role}_fallback_backends"])
         fields.update(
             {
-                f"{role}_attention_dispatch": ATTENTION if fa4_calls else None,
-                f"{role}_attention_dispatch_calls": fa4_calls,
+                f"{role}_attention_dispatch": ATTENTION if expected_calls else None,
+                f"{role}_attention_dispatch_calls": expected_calls,
                 f"{role}_fallback_attention_calls": sum(fallback_backends.values()),
                 f"{role}_fallback_attention_backends": fallback_backends,
             }
@@ -972,7 +1071,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
     }
     if method == "vanilla_hf":
         target = _target_model(target_name, dtype=torch.bfloat16, device=device)
-        _assert_fa4(target, method, "target")
+        _assert_attention(target, method, "target")
         context.update(target=target, stop_token_ids=_stop_ids(target, tokenizer))
         return context
 
@@ -1015,8 +1114,8 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
                 f"DFlash checkpoint block_size={draft.block_size}, "
                 f"expected {DFLASH_BLOCK_SIZE}"
             )
-        _assert_fa4(target, method, "target")
-        _assert_fa4(draft, method, "draft")
+        _assert_attention(target, method, "target")
+        _assert_attention(draft, method, "draft")
 
         controller = None
         if method == "dflash_phase_b":
@@ -1122,8 +1221,8 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             attn_implementation=ATTENTION,
             low_cpu_mem_usage=True,
         ).to(device).eval()
-        _assert_fa4(target, method, "target")
-        _assert_fa4(draft, method, "draft")
+        _assert_attention(target, method, "target")
+        _assert_attention(draft, method, "draft")
         context.update(
             target=target,
             draft=draft,
@@ -1152,8 +1251,8 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             low_cpu_mem_usage=True,
         ).to(device).eval()
         assert_no_final_target_layer(target, draft.target_layer_ids)
-        _assert_fa4(target, method, "target")
-        _assert_fa4(draft, method, "draft")
+        _assert_attention(target, method, "target")
+        _assert_attention(draft, method, "draft")
         from types import SimpleNamespace
 
         evaluator = object.__new__(Qwen3DSparkEvaluator)
@@ -1187,10 +1286,6 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             reload_eagle_target_weights,
             repair_eagle_rotary_embeddings,
         )
-        from Benchmark.eagle_fa4_attention import (
-            install_eagle_draft_fa4_attention,
-            install_eagle_fa4_attention,
-        )
         from Benchmark.eagle_compat import install_eagle_transformers_compat
 
         install_eagle_transformers_compat()
@@ -1198,8 +1293,17 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
 
         install_eagle_qwen3_tied_weights_compat(modeling_qwen3_kv)
         install_eagle_qwen3_mask_compat(modeling_qwen3_kv)
-        install_eagle_fa4_attention(modeling_qwen3_kv)
-        install_eagle_draft_fa4_attention(cnets)
+        from Benchmark.eagle_fa4_attention import (
+            install_eagle_draft_fa4_attention,
+            install_eagle_fa4_attention,
+            install_eagle_sdpa_attention,
+        )
+
+        if ATTENTION == "sdpa":
+            install_eagle_sdpa_attention(modeling_qwen3_kv, cnets)
+        else:
+            install_eagle_fa4_attention(modeling_qwen3_kv)
+            install_eagle_draft_fa4_attention(cnets)
         from eagle.model.ea_model import EaModel
         from eagle.model.kv_cache import initialize_past_key_values
 
@@ -1227,11 +1331,11 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
         repair_eagle_rotary_embeddings(eagle_model.base_model.model)
         eagle_model.eval()
         eagle_model.tokenizer = tokenizer
-        # This vendored EAGLE fork hardcodes eager attention in its original
-        # Qwen3 forward.  The patched forward routes to FA4 only when this
-        # config flag is explicit, so set it after loading the custom model.
+        # The vendored EAGLE fork hardcodes its attention path. The native
+        # adapter routes target and tree verification through the selected
+        # backend, so set its config flags after loading the custom model.
         eagle_model.base_model.config._attn_implementation = ATTENTION
-        _assert_fa4(eagle_model.base_model, method, "target")
+        _assert_attention(eagle_model.base_model, method, "target")
         eagle_model.ea_layer.config._attn_implementation = ATTENTION
         draft_attentions = [
             module
@@ -1527,7 +1631,8 @@ def run_flashattn_benchmark(
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if debug_cuda_launch_blocking:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    _install_fa4_compat()
+    if ATTENTION == "flash_attention_4":
+        _install_fa4_compat()
 
     import torch
     from importlib import metadata
@@ -1566,7 +1671,7 @@ def run_flashattn_benchmark(
 
     if not torch.cuda.is_available():
         raise RuntimeError("Benchmark process did not expose a CUDA GPU")
-    if torch.cuda.get_device_capability(0)[0] < 10:
+    if ATTENTION == "flash_attention_4" and torch.cuda.get_device_capability(0)[0] < 10:
         raise RuntimeError("FA4 benchmark requires a Blackwell-class GPU (SM100+)")
     if mode not in {"smoke", "representative", "full"}:
         raise ValueError("mode must be smoke, representative, or full")
@@ -1615,11 +1720,14 @@ def run_flashattn_benchmark(
     if not run_id.replace("-", "").replace("_", "").isalnum():
         raise ValueError("run-id may contain only letters, numbers, hyphen and underscore")
     actual_versions = _version_snapshot()
-    try:
-        import flash_attn.cute  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError(f"FA4 CuTe runtime failed to import: {exc}") from exc
-    install_attention_dispatch_tracking(ALL_ATTENTION_FUNCTIONS)
+    if ATTENTION == "flash_attention_4":
+        try:
+            import flash_attn.cute  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(f"FA4 CuTe runtime failed to import: {exc}") from exc
+    install_attention_dispatch_tracking(
+        ALL_ATTENTION_FUNCTIONS, expected_backend=ATTENTION
+    )
     runtime = _runtime_base(
         torch, actual_versions, methods=selected_methods
     )
@@ -1627,8 +1735,12 @@ def run_flashattn_benchmark(
         runtime,
         methods=selected_methods,
         allow_installed_vllm=SERVER_MODE,
+        expected_backend=ATTENTION,
     )
-    runtime["fa4_tree_mask_gpu_probe"] = _fa4_tree_mask_gpu_probe(torch)
+    if ATTENTION == "flash_attention_4":
+        runtime["tree_mask_attention_probe"] = _fa4_tree_mask_gpu_probe(torch)
+    else:
+        runtime["tree_mask_attention_probe"] = _sdpa_tree_mask_gpu_probe(torch)
     runtime["dataset_validation"] = _validate_longbench_data(selected_datasets, data_root=active_data_root)
 
     if preflight_only:
@@ -1847,7 +1959,7 @@ def run_flashattn_benchmark(
     _commit_artifacts()
 
     for method in selected_methods:
-        print(f"[FA4] loading {method}: {MODEL_REPOS[method]}", flush=True)
+        print(f"[{ATTENTION}] loading {method}: {MODEL_REPOS[method]}", flush=True)
         context = None
         tracker = None
         dispatch_totals = _new_dispatch_totals()
@@ -1867,18 +1979,18 @@ def run_flashattn_benchmark(
                 },
             )
             method_configs[method] = {
-                "target_attention": _assert_fa4(context["target"], method, "target"),
+                "target_attention": _assert_attention(context["target"], method, "target"),
                 "draft_attention": (
                     None
                     if method == "vanilla_hf"
                     else (
-                        _assert_fa4(
+                        _assert_attention(
                             context["eagle_model"].ea_layer,
                             method,
                             "draft",
                         )
                         if method == "eagle3"
-                        else _assert_fa4(context["draft"], method, "draft")
+                        else _assert_attention(context["draft"], method, "draft")
                     )
                 ),
             }
@@ -1897,7 +2009,9 @@ def run_flashattn_benchmark(
                 eagle_model.current_length_data = current_length
 
             tracker = AttentionDispatchTracker(
-                context["target"], _dispatch_draft_model(method, context)
+                context["target"],
+                _dispatch_draft_model(method, context),
+                expected_backend=ATTENTION,
             )
             with tracker.recording():
                 warmup_rows = _warm_method(
@@ -1916,33 +2030,33 @@ def run_flashattn_benchmark(
             tracker.reset()
             if method in {"dflash", "dflash_phase_b"}:
                 dispatch = {
-                    "fa4_dispatch_calls": int(
+                    "backend_dispatch_calls": int(
                         warm_dispatch.get("draft_attention_dispatch_calls", 0)
                     ),
-                    "sdpa_fallback_calls": int(
+                    "alternate_backend_calls": int(
                         warm_dispatch.get("draft_fallback_attention_calls", 0)
                     ),
                 }
                 if (
-                    dispatch["fa4_dispatch_calls"] <= 0
-                    or dispatch["sdpa_fallback_calls"] != 0
+                    dispatch["backend_dispatch_calls"] <= 0
+                    or dispatch["alternate_backend_calls"] != 0
                 ):
                     raise RuntimeError(
-                        f"{method} warmup did not prove exclusive FA4 draft dispatch: "
+                        f"{method} warmup did not prove exclusive {ATTENTION} draft dispatch: "
                         f"{dispatch}"
                     )
                 method_configs[method].update(
                     {
                         "draft_attention_dispatch": ATTENTION,
                         "draft_attention_dispatch_calls": dispatch[
-                            "fa4_dispatch_calls"
+                            "backend_dispatch_calls"
                         ],
-                        "draft_sdpa_fallback_calls": dispatch[
-                            "sdpa_fallback_calls"
+                        "draft_alternate_backend_calls": dispatch[
+                            "alternate_backend_calls"
                         ],
                     }
                 )
-            print(f"[FA4] warmup complete: {method}", flush=True)
+            print(f"[{ATTENTION}] warmup complete: {method}", flush=True)
             for sample in samples:
                 sample_id = _sample_record_id(sample)
                 for repeat_index in range(repetitions):
@@ -1994,24 +2108,24 @@ def run_flashattn_benchmark(
                             )
                             payload["attention_dispatch"] = attention_dispatch
                             if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
-                                payload[f"{method}_fa4_dispatch_calls"] = (
+                                payload[f"{method}_attention_dispatch_calls"] = (
                                     attention_dispatch[
                                         "draft_attention_dispatch_calls"
                                     ]
                                 )
-                                payload[f"{method}_sdpa_fallback_calls"] = (
+                                payload[f"{method}_alternate_backend_calls"] = (
                                     attention_dispatch[
                                         "draft_fallback_attention_calls"
                                     ]
                                 )
                                 if (
-                                    payload[f"{method}_fa4_dispatch_calls"] <= 0
-                                    or payload[f"{method}_sdpa_fallback_calls"] != 0
+                                    payload[f"{method}_attention_dispatch_calls"] <= 0
+                                    or payload[f"{method}_alternate_backend_calls"] != 0
                                 ):
                                     raise RuntimeError(
-                                        f"measured {method} request did not use exclusive FA4 draft attention: "
-                                        f"fa4={payload[f'{method}_fa4_dispatch_calls']}, "
-                                        f"sdpa={payload[f'{method}_sdpa_fallback_calls']}"
+                                        f"measured {method} request did not use exclusive {ATTENTION} draft attention: "
+                                        f"backend={payload[f'{method}_attention_dispatch_calls']}, "
+                                        f"alternate={payload[f'{method}_alternate_backend_calls']}"
                                     )
 
                             generated_ids = payload["output_ids"]
@@ -2092,7 +2206,7 @@ def run_flashattn_benchmark(
                                     "draft_fallback_attention_calls": attention_dispatch.get("draft_fallback_attention_calls"),
                                     "unattributed_attention_calls": attention_dispatch.get("unattributed_attention_calls"),
                                     "dflash_block_size": DFLASH_BLOCK_SIZE if method in {"dflash", "dflash_phase_a", "dflash_phase_b"} else None,
-                                    "draft_sdpa_fallback_calls": payload.get(f"{method}_sdpa_fallback_calls"),
+                                    "draft_alternate_backend_calls": payload.get(f"{method}_alternate_backend_calls"),
                                     "eagle_tree": context.get("eagle_tree"),
                                     "eagle_target_weight_audit": context.get("target_load_audit"),
                                     "greedy": True,
@@ -2101,7 +2215,7 @@ def run_flashattn_benchmark(
                                         "native_method_ttft" if payload["ttft_ms"] is not None
                                         else "cuda_event_first_target_forward"
                                     ),
-                                    "tree_mask_probe_passed": runtime["fa4_tree_mask_gpu_probe"]["passed"],
+                                    "tree_mask_probe_passed": runtime["tree_mask_attention_probe"]["passed"],
                                 },
                             }
                             record = build_sample_record(
@@ -2190,7 +2304,7 @@ def run_flashattn_benchmark(
                             if len(records) % checkpoint_interval == 0:
                                 _commit_artifacts()
                             print(
-                                f"[FA4] {method} {sample_id} r{repeat_index}: {num_output_tokens} tokens, "
+                                f"[{ATTENTION}] {method} {sample_id} r{repeat_index}: {num_output_tokens} tokens, "
                                 f"{elapsed_ms:.1f} ms, {record['throughput_tok_s']} tok/s",
                                 flush=True,
                             )
@@ -2204,7 +2318,7 @@ def run_flashattn_benchmark(
                                 break
                             if attempt < sample_retries:
                                 print(
-                                    f"[FA4] retry {attempt + 1}/{sample_retries} {method} {sample_id} r{repeat_index}: "
+                                    f"[{ATTENTION}] retry {attempt + 1}/{sample_retries} {method} {sample_id} r{repeat_index}: "
                                     f"{type(exc).__name__}: {exc}",
                                     flush=True,
                                 )
@@ -2241,7 +2355,7 @@ def run_flashattn_benchmark(
                         records.append(failure_record)
                         append_jsonl(partial_path, failure_record)
                         _commit_artifacts()
-                        print(f"[FA4] sample failed {method} {sample_id}: {error_text}", flush=True)
+                        print(f"[{ATTENTION}] sample failed {method} {sample_id}: {error_text}", flush=True)
                     if gpu_context_lost:
                         break
                 if gpu_context_lost:
@@ -2282,7 +2396,7 @@ def run_flashattn_benchmark(
         except Exception as exc:
             failures[method] = f"{type(exc).__name__}: {exc}"
             gpu_context_lost = is_cuda_context_failure(exc)
-            print(f"[FA4] ERROR {method}: {failures[method]}", flush=True)
+            print(f"[{ATTENTION}] ERROR {method}: {failures[method]}", flush=True)
             print(traceback.format_exc(), flush=True)
             for sample in samples:
                 sample_id = _sample_record_id(sample)
@@ -2342,7 +2456,7 @@ def run_flashattn_benchmark(
             except Exception as cleanup_exc:
                 gpu_context_lost = True
                 print(
-                    "[FA4] CUDA cleanup failed; marking worker GPU context unusable: "
+                    f"[{ATTENTION}] CUDA cleanup failed; marking worker GPU context unusable: "
                     f"{type(cleanup_exc).__name__}: {cleanup_exc}",
                     flush=True,
                 )
@@ -2458,6 +2572,7 @@ def run_flashattn_benchmark(
                 methods=selected_methods,
                 require_dispatch_proof=True,
                 allow_installed_vllm=SERVER_MODE,
+                expected_backend=ATTENTION,
             )
         except ValueError as exc:
             runtime_validation = {
@@ -2510,7 +2625,7 @@ def run_flashattn_benchmark(
                 "decay": phase_a_config.controller_decay,
                 "recheck_rounds": phase_a_config.controller_recheck_rounds,
                 "objective": "round_wall_ms_per_committed_token",
-                "runtime": "native_fa4",
+                "runtime": f"native_{ATTENTION}",
             }
         except Exception as exc:
             phase_a_policy = {"configuration_error": f"{type(exc).__name__}: {exc}"}
@@ -2521,7 +2636,7 @@ def run_flashattn_benchmark(
         "started_at_utc": started_at_utc,
         "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "evaluation_runtime_seconds": round(time.perf_counter() - started_perf, 3),
-        "method": "native_transformers_fa4_all_baselines",
+        "method": f"native_transformers_{ATTENTION}_all_baselines",
         "execution_backend": "server",
         "status": run_status,
         "backend": "transformers_native",
@@ -2760,7 +2875,7 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Chế độ: {summary.get('mode')}; GPU: {summary.get('gpu')}; attention: {summary.get('attention_backend')}; batch size: 1",
         f"- Dataset: {', '.join(summary.get('datasets', []))}; số mẫu: {summary.get('sample_count')} ({summary.get('sample_count_by_dataset', {})})",
         f"- Methods: {', '.join(summary.get('methods', []))}; tối đa {summary.get('max_new_tokens')} token đầu ra; giới hạn input {summary.get('max_input_tokens')} token",
-        f"- Runtime FA4/no-fallback: {summary.get('runtime_validation', {}).get('passed')}; greedy parity: {summary.get('correctness_pass')}; quality gate: {summary.get('quality_pass')}",
+        f"- Runtime {summary.get('attention_backend')}/no-fallback: {summary.get('runtime_validation', {}).get('passed')}; greedy parity: {summary.get('correctness_pass')}; quality gate: {summary.get('quality_pass')}",
         f"- Thời gian: {fmt(summary.get('evaluation_runtime_seconds'))} giây; repeats: {summary.get('repetitions')}; seed: {summary.get('seed')}",
         "",
         "| Method | Thành công | ROUGE-L | BLEU-4 | E2E TB (ms) | E2E p90 (ms) | Prefill TB (ms) | TPOT TB (ms/token) | Tok/s TB | DSR | ESR | Accept (%) | Accept len | Greedy exact | LCS overlap | Output hợp lệ |",
@@ -2786,9 +2901,9 @@ def _render_report(result: dict[str, Any]) -> str:
     lines.extend(["", "## Kiểm chứng runtime", ""])
     for method, dispatch in summary.get("runtime_validation", {}).get("methods", {}).items():
         lines.append(
-            f"- {method}: target FA4={dispatch.get('target_attention_dispatch_calls')}, "
+            f"- {method}: target {summary.get('attention_backend')}={dispatch.get('target_attention_dispatch_calls')}, "
             f"target fallback={dispatch.get('target_fallback_attention_calls')}; "
-            f"draft FA4={dispatch.get('draft_attention_dispatch_calls')}, "
+            f"draft {summary.get('attention_backend')}={dispatch.get('draft_attention_dispatch_calls')}, "
             f"draft fallback={dispatch.get('draft_fallback_attention_calls')}."
         )
     lines.extend(
@@ -2802,7 +2917,7 @@ def _render_report(result: dict[str, Any]) -> str:
             "- Quality hợp lệ khi output không rỗng, có ít nhất 4 token và không có cờ repetition collapse. JSONL lưu ROUGE, ROUGE-Lsum, BLEU, length ratio, token IDs, acceptance counters và latency đầy đủ.",
             "- Accept len: mean acceptance length (tau) = (draft tokens accepted + 1 target token) / verification step.",
             "",
-            "Runtime gate yêu cầu tất cả target/draft attention dispatch qua FA4, không fallback. Runner dùng Transformers native, không nạp vLLM.",
+            f"Runtime gate yêu cầu tất cả target/draft attention dispatch qua {summary.get('attention_backend')}, không fallback. Runner dùng Transformers native, không nạp vLLM.",
         ]
     )
     if summary.get("failures"):

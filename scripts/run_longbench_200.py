@@ -2017,6 +2017,7 @@ def _run_baseline_bundle(
     warmup_runs: int,
     max_input_tokens: int,
     seed: int,
+    attention_backend: str,
     smoke: bool,
     strict: bool,
     allow_unsupported: bool,
@@ -2055,6 +2056,7 @@ def _run_baseline_bundle(
         warmup_runs=warmup_runs,
         max_input_tokens=max_input_tokens,
         seed=seed,
+        attention_backend=attention_backend,
         smoke=smoke,
         max_new_tokens=max_new_tokens,
     )
@@ -2630,6 +2632,14 @@ def print_gpu_inventory(report: Mapping[str, Any]) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["smoke", "representative", "full"], default=os.environ.get("LONG_BENCH_MODE", "smoke"))
+    parser.add_argument(
+        "--attention-backend",
+        choices=("native", "sdpa"),
+        default=os.environ.get("LONG_BENCH_BACKEND_POLICY", "native"),
+        help="native keeps each baseline's current backend; sdpa runs only "
+        "adapters verified to use PyTorch SDPA and records other rows as "
+        "unsupported_backend",
+    )
     parser.add_argument("--baselines", default=os.environ.get("LONG_BENCH_BASELINES", " ".join(BASELINES)))
     parser.add_argument("--datasets", default=os.environ.get("LONG_BENCH_DATASETS", " ".join(DATASETS)))
     parser.add_argument("--data-dir", type=Path, default=os.environ.get("LONG_BENCH_DATA_DIR", "data/longbench_100_14k"))
@@ -3077,6 +3087,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "temperature": temperature,
         "warmup_runs": warmup_runs,
         "max_input_tokens": max_input_tokens,
+        "attention_backend": args.attention_backend,
         "min_free_gb": min_free_gb,
         "gpu_guard_reason": gpu_guard_reason,
         "seed": seed,
@@ -3151,6 +3162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warmup_runs=warmup_runs,
                 max_input_tokens=max_input_tokens,
                 seed=seed,
+                attention_backend=args.attention_backend,
                 smoke=args.mode == "smoke",
                 strict=bool(args.strict),
                 allow_unsupported=bool(args.allow_unsupported),
@@ -3194,6 +3206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warmup_runs=warmup_runs,
                 max_input_tokens=max_input_tokens,
                 seed=seed,
+                attention_backend=args.attention_backend,
                 smoke=args.mode == "smoke",
                 max_new_tokens=max_new_tokens,
             )

@@ -9,21 +9,24 @@ import torch
 
 from Benchmark.common.flashattn4_tree_attention import flashattn4_attention
 from Benchmark.common.flashattn_runtime import record_attention_dispatch
+from Benchmark.common.sdpa_attention import sdpa_attention
 
 
 def install_eagle_fa4_attention(
     modeling_module: Any | None = None,
     *,
     attention_fn: Callable[..., torch.Tensor] = flashattn4_attention,
+    attention_backend: str = "flash_attention_4",
 ) -> None:
-    """Route EAGLE Qwen3 attention through FA4 while preserving its tree mask."""
+    """Route EAGLE Qwen3 target attention through a selected backend."""
 
     if modeling_module is None:
         from eagle.model import modeling_qwen3_kv as modeling_module
 
     attention_class = modeling_module.Qwen3Attention
     current_forward = attention_class.forward
-    if getattr(current_forward, "_fast_infer_fa4_tree_mask", False):
+    marker = f"_fast_infer_tree_mask_{attention_backend}"
+    if getattr(current_forward, marker, False):
         return
     original_forward = current_forward
     apply_rotary_pos_emb = modeling_module.apply_rotary_pos_emb
@@ -37,7 +40,7 @@ def install_eagle_fa4_attention(
         cache_position=None,
         **kwargs,
     ):
-        if getattr(self.config, "_attn_implementation", None) != "flash_attention_4":
+        if getattr(self.config, "_attn_implementation", None) != attention_backend:
             record_attention_dispatch(
                 str(getattr(self.config, "_attn_implementation", None) or "eager"),
                 module=self,
@@ -53,8 +56,10 @@ def install_eagle_fa4_attention(
                 **kwargs,
             )
         if kwargs.get("output_attentions", False):
-            raise ValueError("EAGLE FA4 attention does not return attention weights")
-        record_attention_dispatch("flash_attention_4", module=self, role="target")
+            raise ValueError(f"EAGLE {attention_backend} attention does not return attention weights")
+        if attention_backend == "sdpa" and self.sliding_window is not None:
+            raise ValueError("EAGLE SDPA attention does not support sliding windows")
+        record_attention_dispatch(attention_backend, module=self, role="target")
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -76,17 +81,28 @@ def install_eagle_fa4_attention(
             key_states = past_key_value[0].cat(key_states, dim=2)
             value_states = past_key_value[1].cat(value_states, dim=2)
 
-        # Match Transformers' fast FA4 path for ordinary prefill and one-token
-        # decode. EAGLE's tree mask is needed only when a multi-token verify
-        # block follows a non-empty cached prefix. Inputs in this batch-one
-        # runner are unpadded, so prefill's mask is pure causal and q_len=1 can
-        # attend to the full prefix through bottom-right causal semantics.
+        # For ordinary prefill, the empty cache uses a causal mask. EAGLE's
+        # tree mask is needed when a multi-token verify block follows a cached
+        # prefix. A cached single-token query attends to the complete prefix;
+        # SDPA handles that case with is_causal=False below.
         if attention_mask is not None and (
             (past_key_value is not None and input_shape[-1] > 1 and cached_length == 0)
             or (past_key_value is not None and input_shape[-1] == 1)
         ):
             attention_mask = None
+        if (
+            attention_backend == "sdpa"
+            and cached_length > 0
+            and input_shape[-1] > 1
+            and attention_mask is None
+        ):
+            raise RuntimeError("EAGLE SDPA verification requires its tree attention mask")
 
+        is_cached_single_token = (
+            past_key_value is not None
+            and input_shape[-1] == 1
+            and cached_length > 0
+        )
         attention_output = attention_fn(
             query_states,
             key_states,
@@ -94,12 +110,13 @@ def install_eagle_fa4_attention(
             attention_mask,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            is_causal=not is_cached_single_token,
         )
         attention_output = attention_output.reshape(*input_shape, -1).contiguous()
         attention_output = self.o_proj(attention_output)
         return attention_output, None, None
 
-    forward._fast_infer_fa4_tree_mask = True
+    setattr(forward, marker, True)
     attention_class.forward = forward
 
 
@@ -107,15 +124,17 @@ def install_eagle_draft_fa4_attention(
     modeling_module: Any | None = None,
     *,
     attention_fn: Callable[..., torch.Tensor] = flashattn4_attention,
+    attention_backend: str = "flash_attention_4",
 ) -> None:
-    """Route EAGLE-3's vendored draft attention through the same FA4 mask path."""
+    """Route EAGLE-3 draft attention through a selected backend."""
 
     if modeling_module is None:
         from eagle.model import cnets as modeling_module
 
     attention_class = modeling_module.LlamaAttention
     current_forward = attention_class.forward
-    if getattr(current_forward, "_fast_infer_fa4_tree_mask", False):
+    marker = f"_fast_infer_tree_mask_{attention_backend}"
+    if getattr(current_forward, marker, False):
         return
     original_forward = current_forward
     apply_rotary_pos_emb = modeling_module.apply_rotary_pos_emb
@@ -129,7 +148,7 @@ def install_eagle_draft_fa4_attention(
         output_attentions: bool = False,
         use_cache: bool = False,
     ):
-        if getattr(self.config, "_attn_implementation", None) != "flash_attention_4":
+        if getattr(self.config, "_attn_implementation", None) != attention_backend:
             record_attention_dispatch(
                 str(getattr(self.config, "_attn_implementation", None) or "eager"),
                 module=self,
@@ -145,8 +164,10 @@ def install_eagle_draft_fa4_attention(
                 use_cache=use_cache,
             )
         if output_attentions:
-            raise ValueError("EAGLE FA4 attention does not return attention weights")
-        record_attention_dispatch("flash_attention_4", module=self, role="draft")
+            raise ValueError(f"EAGLE {attention_backend} attention does not return attention weights")
+        if attention_backend == "sdpa" and getattr(self, "sliding_window", None) is not None:
+            raise ValueError("EAGLE SDPA attention does not support sliding windows")
+        record_attention_dispatch(attention_backend, module=self, role="draft")
 
         batch_size, query_length, _ = hidden_states.shape
         if self.config.pretraining_tp > 1:
@@ -191,9 +212,18 @@ def install_eagle_draft_fa4_attention(
             batch_size, query_length, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
+        past_length = 0
         key_length = key_states.shape[-2]
         if past_key_value is not None:
-            key_length += past_key_value[0].shape[-2]
+            past_length = int(past_key_value[0].shape[-2])
+            key_length += past_length
+        if (
+            attention_backend == "sdpa"
+            and past_length > 0
+            and query_length > 1
+            and attention_mask is None
+        ):
+            raise RuntimeError("EAGLE SDPA drafting requires its tree attention mask")
         cos, sin = self.rotary_emb(value_states, seq_len=key_length)
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, position_ids
@@ -212,6 +242,7 @@ def install_eagle_draft_fa4_attention(
             attention_mask,
             scaling=self.head_dim**-0.5,
             sliding_window=None,
+            is_causal=not (query_length == 1 and past_length > 0),
         )
         attention_output = attention_output.reshape(
             batch_size, query_length, self.num_heads * self.head_dim
@@ -229,5 +260,23 @@ def install_eagle_draft_fa4_attention(
             attention_output = self.o_proj(attention_output)
         return attention_output, None, present_key_value
 
-    forward._fast_infer_fa4_tree_mask = True
+    setattr(forward, marker, True)
     attention_class.forward = forward
+
+
+def install_eagle_sdpa_attention(
+    target_modeling_module: Any | None = None,
+    draft_modeling_module: Any | None = None,
+) -> None:
+    """Route EAGLE target verification and draft tree attention through SDPA."""
+
+    install_eagle_fa4_attention(
+        target_modeling_module,
+        attention_fn=sdpa_attention,
+        attention_backend="sdpa",
+    )
+    install_eagle_draft_fa4_attention(
+        draft_modeling_module,
+        attention_fn=sdpa_attention,
+        attention_backend="sdpa",
+    )

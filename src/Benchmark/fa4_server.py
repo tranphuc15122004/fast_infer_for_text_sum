@@ -1,4 +1,4 @@
-"""CLI for the native Transformers + FA4 LongBench benchmark."""
+"""CLI for the native Transformers LongBench benchmark."""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def resolve_server_models(
         if len(requested) != len(set(requested)):
             raise ValueError("Duplicate method in --methods")
         if "vanilla_hf" not in requested or "dflash" not in requested:
-            raise ValueError("FA4 comparisons require both vanilla_hf and dflash")
+            raise ValueError("native comparisons require both vanilla_hf and dflash")
         selected = tuple(method for method in SUPPORTED_METHODS if method in requested)
 
     resolved: dict[str, str] = {}
@@ -125,7 +125,13 @@ def resolve_server_models(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Chạy benchmark LongBench batch-1 native Transformers + FA4."
+        description="Chạy benchmark LongBench batch-1 bằng Transformers native."
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=("flash_attention_4", "sdpa"),
+        default=os.environ.get("FAST_INFER_ATTENTION_BACKEND", "flash_attention_4"),
+        help="Backend attention native; mặc định flash_attention_4.",
     )
     parser.add_argument(
         "--mode",
@@ -153,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-cuda-launch-blocking", action="store_true")
     parser.add_argument("--config", default=os.environ.get("FAST_INFER_MASTER_CONFIG", ""), help="Đường dẫn file master config shell-env (mặc định lấy theo config/master.path)")
     parser.add_argument("--data-dir", default=os.environ.get("FA4_DATA_DIR", os.environ.get("LONG_BENCH_DATA_DIR", "data/longbench_100_14k")))
-    parser.add_argument("--output-dir", default=os.environ.get("FA4_OUTPUT_ROOT", "outputs/fa4_native_benchmark"))
+    parser.add_argument("--output-dir", default=None)
     return parser
 
 
@@ -199,6 +205,7 @@ def runner_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     auto_load_master_config(args.config)
+    os.environ["FAST_INFER_ATTENTION_BACKEND"] = args.attention_backend
     args.methods = ",".join(args.methods.replace(",", " ").split())
     try:
         models = resolve_server_models(os.environ, args.methods)
@@ -232,12 +239,24 @@ def main(argv: list[str] | None = None) -> int:
                     args.data_dir = str(candidate)
                     break
 
+    if args.output_dir is None:
+        if os.environ.get("NATIVE_ATTENTION_OUTPUT_ROOT"):
+            args.output_dir = os.environ["NATIVE_ATTENTION_OUTPUT_ROOT"]
+        elif args.attention_backend == "sdpa":
+            args.output_dir = os.environ.get(
+                "SDPA_NATIVE_OUTPUT_ROOT", "outputs/sdpa_native_benchmark"
+            )
+        else:
+            args.output_dir = os.environ.get(
+                "FA4_OUTPUT_ROOT", "outputs/fa4_native_benchmark"
+            )
     output_dir = Path(args.output_dir).expanduser()
     if not output_dir.is_absolute():
         output_dir = root / output_dir
     os.environ["FA4_EXECUTION_BACKEND"] = "server"
     os.environ["FA4_DATA_DIR"] = str(data_dir.resolve())
     os.environ["FA4_OUTPUT_ROOT"] = str(output_dir.resolve())
+    os.environ["NATIVE_ATTENTION_OUTPUT_ROOT"] = str(output_dir.resolve())
     for method, model_path in models.items():
         os.environ[SERVER_MODEL_ENV[method]] = model_path
     if os.environ.get("FI_OFFLINE", "1") == "1":

@@ -31,6 +31,20 @@ BASELINES = (
     "fafo",
 )
 
+# A uniform SDPA run is only valid for adapters that expose the target and
+# draft attention through PyTorch's scaled_dot_product_attention path.  Keep
+# this list deliberately narrow: several baseline names encode or depend on a
+# different attention implementation, so silently overriding them would
+# produce mislabeled benchmark results.
+SDPA_BASELINES = frozenset({"vanilla_hf", "dflash"})
+SDPA_UNSUPPORTED_REASONS = {
+    "vanilla_fa": "vanilla_fa is defined by its FlashAttention kernel",
+    "magicdec": "MagicDec's attention path is implemented with FlashInfer",
+    "eagle3": "EAGLE-3 currently uses its vendored eager attention path",
+    "specextend": "SpecExtend uses its hybrid tree-attention kernels",
+    "fafo": "FAFO's current adapter uses its custom eager attention path",
+}
+
 # These adapters remain available for standalone diagnostics, but are excluded
 # from the default LongBench comparison because their current server paths are
 # not comparable/reproducible (LongSpec is offline-incomplete; SSSD lacks its
@@ -271,12 +285,31 @@ def preflight_baseline(
         "baseline": baseline,
         "requires_cuda": baseline in CUDA_BASELINES,
         "cuda_available": bool(cuda_available),
+        "requested_attention_backend": str(
+            cfg.get("attention_backend", "native")
+        ).lower(),
         "status": "ready",
         "reason": None,
         "requirements": {},
     }
 
-    if baseline in CUDA_BASELINES and not cuda_available:
+    if (
+        str(cfg.get("attention_backend", "native")).lower() == "sdpa"
+        and baseline not in SDPA_BASELINES
+    ):
+        result.update(
+            status="unsupported_backend",
+            reason=SDPA_UNSUPPORTED_REASONS.get(
+                baseline,
+                f"{baseline} has no verified SDPA adapter in the LongBench runner",
+            ),
+        )
+
+    if (
+        baseline in CUDA_BASELINES
+        and not cuda_available
+        and result["status"] == "ready"
+    ):
         result.update(status="unsupported_cpu", reason="CUDA is unavailable")
         # Continue collecting path/dependency facts for a useful manifest.
 
@@ -548,7 +581,7 @@ def build_adapter_command(
     ]
 
     if baseline == "vanilla_hf":
-        return [
+        command = [
             python,
             str(ROOT / "scripts" / "infer_vanilla_hf.py"),
             "--model",
@@ -570,6 +603,9 @@ def build_adapter_command(
             "--local-files-only" if bool(cfg.get("local_files_only", True)) else "--no-local-files-only",
             *common,
         ] + (["--smoke"] if smoke else [])
+        if str(cfg.get("attention_backend", "native")).lower() == "sdpa":
+            command += ["--attention-backend", "sdpa"]
+        return command
 
     if baseline == "vanilla_fa":
         command = build_adapter_command(
@@ -648,6 +684,8 @@ def build_adapter_command(
         ] + (["--smoke"] if smoke else [])
         if bool(cfg.get("skip_reference")):
             command.append("--skip-reference")
+        if str(cfg.get("attention_backend", "native")).lower() == "sdpa":
+            command += ["--attention-backend", "sdpa"]
         return command
 
     if baseline == "longspec":

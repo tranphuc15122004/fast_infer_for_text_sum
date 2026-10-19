@@ -118,11 +118,18 @@ def normalize_generation_token_ids(config, tokenizer) -> dict[str, tuple[int, in
     return changed
 
 
-def _dtype_and_attention() -> tuple[torch.dtype, str]:
+def _dtype_and_attention(requested_backend: str = "auto") -> tuple[torch.dtype, str]:
     if not torch.cuda.is_available():
         raise SystemExit("DFlash Transformers adapter requires CUDA")
     capability = torch.cuda.get_device_capability()
     dtype = torch.bfloat16 if capability[0] >= 8 else torch.float16
+
+    if requested_backend == "sdpa":
+        return dtype, "sdpa"
+    if requested_backend != "auto":
+        raise SystemExit(
+            f"unsupported DFlash attention backend: {requested_backend!r}"
+        )
 
     # FA2 is not a supported Blackwell backend.  Prefer FA4 on B200, using
     # the same process-local CUTLASS compatibility shim as vanilla_fa; if the
@@ -221,6 +228,13 @@ def main() -> None:
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
+        "--attention-backend",
+        choices=("auto", "sdpa"),
+        default="auto",
+        help="auto selects the existing GPU-specific backend; sdpa forces the "
+        "PyTorch SDPA implementation for both target and draft models",
+    )
+    parser.add_argument(
         "--fixed-output-tokens", type=int, default=None,
         help="disable EOS stopping and generate exactly this many tokens",
     )
@@ -258,7 +272,7 @@ def main() -> None:
             raise SystemExit("--fixed-output-tokens must be positive")
         args.max_new_tokens = args.fixed_output_tokens
 
-    dtype, attn_impl = _dtype_and_attention()
+    dtype, attn_impl = _dtype_and_attention(args.attention_backend)
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from dflash.model import DFlashDraftModel, dflash_generate
 
@@ -293,6 +307,16 @@ def main() -> None:
         low_cpu_mem_usage=True,
         config=draft_config,
     ).to(device).eval()
+    target_attention_backend = getattr(target.config, "_attn_implementation", None)
+    draft_attention_backend = getattr(draft.config, "_attn_implementation", None)
+    if args.attention_backend == "sdpa" and (
+        target_attention_backend != "sdpa" or draft_attention_backend != "sdpa"
+    ):
+        raise RuntimeError(
+            "DFlash SDPA was requested, but resolved backends differ: "
+            f"target={target_attention_backend!r}, "
+            f"draft={draft_attention_backend!r}"
+        )
     torch.cuda.synchronize(device)
     model_load_ms = round((time.perf_counter() - load_start) * 1000.0, 3)
 
@@ -328,8 +352,12 @@ def main() -> None:
                 input_cap=max(args.max_input_tokens, 0),
                 output_tokens=args.max_new_tokens,
                 seed=args.seed,
-                dtype=str(dtype),
-                attention_backend="paired",
+                dtype=str(dtype).removeprefix("torch."),
+                attention_backend=(
+                    f"paired:{attn_impl}"
+                    if args.attention_backend == "sdpa"
+                    else "paired"
+                ),
                 temperature=args.temperature,
             )["run_config_hash"]
 
@@ -393,6 +421,8 @@ def main() -> None:
             "temperature": args.temperature,
             "dtype": str(dtype),
             "attention_backend": attn_impl,
+            "target_attention_backend": target_attention_backend or attn_impl,
+            "draft_attention_backend": draft_attention_backend or attn_impl,
             "input_tokens": input_len,
             "original_input_tokens": prepared.original_input_tokens,
             "input_truncated": prepared.input_truncated,

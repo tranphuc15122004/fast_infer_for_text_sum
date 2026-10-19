@@ -324,6 +324,16 @@ khi card chật và retry shard OOM thay vì kill job — xem mục "Tận dụn
 Ở `--mode full`, mặc định runner bundle toàn bộ dataset theo từng baseline để
 mỗi shard giữ model trong process và xử lý lần lượt các dataset; dùng
 `--no-reuse-model-per-baseline` nếu cần quay về từng cell độc lập.
+Muốn benchmark bằng PyTorch SDPA cho các adapter hỗ trợ, truyền
+`--attention-backend sdpa`; hiện `vanilla_hf` và `dflash` được hỗ trợ, các
+baseline phụ thuộc kernel eager/FlashAttention/FlashInfer riêng trong
+`run_longbench_200.sh` sẽ được ghi `unsupported_backend`. Với ma trận native
+trong `src/Benchmark` có thêm profile `sdpa_native` cho `vanilla_hf`, `dflash`,
+`eagle3`, `domino`, `dspark`; chạy preflight và smoke trên server trước khi full.
+Lệnh server và ma trận hỗ trợ nằm trong
+[`docs/longbench_200_benchmark.md`](longbench_200_benchmark.md#chạy-các-adapter-hỗ-trợ-sdpa),
+bao gồm hướng dẫn chọn GPU vật lý số 1 cho profile native tại mục
+[`Native Transformers SDPA`](longbench_200_benchmark.md#native-transformers-sdpa-trên-một-gpu).
 Trước mỗi job, kiểm tra VRAM
 trống bằng `bash scripts/runners/run_gpu_check.sh --config <master> [--gpu-ids N]
 [--min-free-gb GB]` (xem cùng mục tài liệu).

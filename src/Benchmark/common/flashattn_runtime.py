@@ -1,4 +1,4 @@
-"""Runtime guards for the native Transformers FlashAttention pilot."""
+"""Runtime guards for native Transformers attention benchmarks."""
 
 from __future__ import annotations
 
@@ -38,7 +38,16 @@ def is_cuda_context_failure(error: BaseException) -> bool:
 class AttentionDispatchTracker:
     """Attribute Transformers attention-registry calls to target or draft models."""
 
-    def __init__(self, target_model: Any, draft_model: Any | None = None) -> None:
+    def __init__(
+        self,
+        target_model: Any,
+        draft_model: Any | None = None,
+        *,
+        expected_backend: str = EXPECTED_ATTENTION_BACKEND,
+    ) -> None:
+        if expected_backend not in _TRACKED_REGISTRY_BACKENDS:
+            raise ValueError(f"untracked attention backend: {expected_backend!r}")
+        self.expected_backend = expected_backend
         self._module_roles: dict[int, str] = {}
         for module in target_model.modules():
             self._module_roles[id(module)] = "target"
@@ -83,18 +92,18 @@ class AttentionDispatchTracker:
         result: dict[str, Any] = {}
         for role in ("target", "draft"):
             calls = self._calls[role]
-            fa4_calls = int(calls[EXPECTED_ATTENTION_BACKEND])
+            expected_calls = int(calls[self.expected_backend])
             fallback_backends = {
                 backend: int(count)
                 for backend, count in calls.items()
-                if backend != EXPECTED_ATTENTION_BACKEND and count
+                if backend != self.expected_backend and count
             }
             result.update(
                 {
                     f"{role}_attention_dispatch": (
-                        EXPECTED_ATTENTION_BACKEND if fa4_calls else None
+                        self.expected_backend if expected_calls else None
                     ),
-                    f"{role}_attention_dispatch_calls": fa4_calls,
+                    f"{role}_attention_dispatch_calls": expected_calls,
                     f"{role}_fallback_attention_calls": sum(
                         fallback_backends.values()
                     ),
@@ -122,8 +131,12 @@ def record_attention_dispatch(
         tracker.record(backend, module=module, role=role)
 
 
-def install_attention_dispatch_tracking(registry: Any) -> None:
-    """Wrap FA4 and fallback registry entries without changing their behavior."""
+def install_attention_dispatch_tracking(
+    registry: Any,
+    *,
+    expected_backend: str = EXPECTED_ATTENTION_BACKEND,
+) -> None:
+    """Wrap attention registry entries without changing their behavior."""
 
     installed_backends = set()
     for backend in _TRACKED_REGISTRY_BACKENDS:
@@ -146,15 +159,15 @@ def install_attention_dispatch_tracking(registry: Any) -> None:
             return tracked
 
         registry[backend] = make_wrapper(backend, original)
-    if EXPECTED_ATTENTION_BACKEND not in installed_backends:
+    if expected_backend not in installed_backends:
         raise RuntimeError(
             "Transformers attention registry does not expose "
-            f"{EXPECTED_ATTENTION_BACKEND!r}; cannot verify real FA4 dispatch"
+            f"{expected_backend!r}; cannot verify requested dispatch"
         )
 
 
 def resolve_flashattn_methods(value: str) -> tuple[str, ...]:
-    """Resolve a native FA4 method subset, including the Vanilla/DFlash pair."""
+    """Resolve a native attention subset, including its Vanilla/DFlash pair."""
 
     specification = str(value).strip()
     if specification.lower() == "all":
@@ -162,14 +175,14 @@ def resolve_flashattn_methods(value: str) -> tuple[str, ...]:
     else:
         methods = tuple(part.strip() for part in specification.split(",") if part.strip())
     if not methods:
-        raise ValueError("at least one FlashAttention method must be selected")
+        raise ValueError("at least one native attention method must be selected")
     if len(set(methods)) != len(methods):
-        raise ValueError("FlashAttention method names must be unique")
+        raise ValueError("native method names must be unique")
     unknown = sorted(set(methods) - set(SUPPORTED_METHODS))
     if unknown:
-        raise ValueError(f"unknown FlashAttention methods: {unknown}")
+        raise ValueError(f"unknown native attention methods: {unknown}")
     if "vanilla_hf" not in methods or "dflash" not in methods:
-        raise ValueError("comparison requires both vanilla_hf and dflash")
+        raise ValueError("native comparison requires both vanilla_hf and dflash")
     return methods
 
 
@@ -196,15 +209,16 @@ def validate_flashattn_runtime(
     methods: Iterable[str],
     require_dispatch_proof: bool = False,
     allow_installed_vllm: bool = False,
+    expected_backend: str = EXPECTED_ATTENTION_BACKEND,
 ) -> dict[str, Any]:
-    """Fail closed unless the run is batch-1, does not import vLLM, and uses FA4.
+    """Fail closed unless the run is batch-1 and exclusively uses its backend.
 
     ``require_dispatch_proof`` additionally checks that each selected method's
-    target path, and every speculative draft path, actually entered FA4 during
-    inference without an observed alternate attention backend. Some shared
-    server environments install vLLM and related distributions for unrelated
-    jobs; ``allow_installed_vllm`` permits them to be present while still
-    rejecting any vLLM import.
+    target path, and every speculative draft path, actually entered the
+    requested attention backend during inference without an observed alternate
+    backend. Some shared server environments install vLLM and related
+    distributions for unrelated jobs; ``allow_installed_vllm`` permits them to
+    be present while still rejecting any vLLM import.
     """
 
     installed = {
@@ -221,18 +235,21 @@ def validate_flashattn_runtime(
     vllm_installed = bool(vllm_related_distributions)
     if vllm_installed and not allow_installed_vllm:
         raise ValueError(
-            "vLLM must not be installed in the native FA4 runtime, including adapter "
+            "vLLM must not be installed in the native attention runtime, including adapter "
             f"plugins; found {vllm_related_distributions}"
         )
     vllm_imported = any("vllm" in value for value in imported)
     if vllm_imported:
         raise ValueError(
-            "vLLM modules or plugins must not be imported in the native FA4 runtime"
+            "vLLM modules or plugins must not be imported in the native attention runtime"
         )
-    if "flash-attn-4" not in installed:
-        raise ValueError("flash-attn-4 must be installed in the native FA4 runtime")
-    if not any(value == "flash_attn" or value.startswith("flash_attn.") for value in imported):
-        raise ValueError("flash_attn.cute must be imported in the native FA4 runtime")
+    if expected_backend == "flash_attention_4":
+        if "flash-attn-4" not in installed:
+            raise ValueError("flash-attn-4 must be installed in the native FA4 runtime")
+        if not any(value == "flash_attn" or value.startswith("flash_attn.") for value in imported):
+            raise ValueError("flash_attn.cute must be imported in the native FA4 runtime")
+    elif expected_backend != "sdpa":
+        raise ValueError(f"unsupported native attention backend: {expected_backend!r}")
     if int(runtime.get("batch_size", 0)) != 1:
         raise ValueError("batch_size must be 1 for the synchronized pilot")
 
@@ -245,18 +262,18 @@ def validate_flashattn_runtime(
         if not isinstance(config, Mapping):
             raise ValueError(f"{method} attention configuration is missing")
         target_attention = config.get("target_attention")
-        if target_attention != EXPECTED_ATTENTION_BACKEND:
+        if target_attention != expected_backend:
             raise ValueError(
                 f"{method} target attention resolved to {target_attention!r}; "
-                f"expected {EXPECTED_ATTENTION_BACKEND!r}"
+                f"expected {expected_backend!r}"
             )
         draft_attention = config.get("draft_attention")
         if str(method) != "vanilla_hf" and draft_attention is None:
             raise ValueError(f"{method} draft attention is missing")
-        if draft_attention is not None and draft_attention != EXPECTED_ATTENTION_BACKEND:
+        if draft_attention is not None and draft_attention != expected_backend:
             raise ValueError(
                 f"{method} draft attention resolved to {draft_attention!r}; "
-                f"expected {EXPECTED_ATTENTION_BACKEND!r}"
+                f"expected {expected_backend!r}"
             )
         checked_method = {
             "target_attention": target_attention,
@@ -276,17 +293,17 @@ def validate_flashattn_runtime(
                     fallback_calls_value = config.get("draft_sdpa_fallback_calls", 0)
                 fallback_calls = int(fallback_calls_value or 0)
                 if (
-                    dispatch != EXPECTED_ATTENTION_BACKEND
+                    dispatch != expected_backend
                     or dispatch_calls <= 0
                     or fallback_calls != 0
                 ):
                     if str(method) in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
-                        detail = f"{method} FA4 dispatch was not observed"
+                        detail = f"{method} {expected_backend} dispatch was not observed"
                     else:
-                        detail = f"{method} {role} FA4 dispatch was not observed"
+                        detail = f"{method} {role} {expected_backend} dispatch was not observed"
                     raise ValueError(
                         f"{detail} (or alternate attention backend was used): "
-                        f"dispatch={dispatch!r}, fa4_calls={dispatch_calls}, "
+                        f"dispatch={dispatch!r}, expected_backend_calls={dispatch_calls}, "
                         f"fallback_calls={fallback_calls}, "
                         f"fallback_backends={config.get(f'{role}_fallback_attention_backends', {})}"
                     )
@@ -305,7 +322,7 @@ def validate_flashattn_runtime(
     return {
         "passed": True,
         "batch_size": 1,
-        "attention_backend": EXPECTED_ATTENTION_BACKEND,
+        "attention_backend": expected_backend,
         "vllm_installed": vllm_installed,
         "vllm_related_distributions": vllm_related_distributions,
         "vllm_imported": vllm_imported,

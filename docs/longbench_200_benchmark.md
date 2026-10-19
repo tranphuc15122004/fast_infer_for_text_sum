@@ -97,6 +97,80 @@ Trước khi chạy toàn ma trận, kiểm tra baseline có adapter phù hợp 
 `task_type`. Không dùng prompt summarization cho LCC/RepoBench-P và không đưa
 ROUGE vào báo cáo code-completion.
 
+### Chạy các adapter hỗ trợ SDPA
+
+Runner `run_longbench_200.sh` có `--attention-backend sdpa` để ép backend
+Transformers của `vanilla_hf` và cả target/draft của DFlash sang PyTorch SDPA.
+Trong adapter registry này, chỉ hai baseline được xác nhận dùng SDPA end-to-end;
+các baseline không tương thích được ghi `unsupported_backend` trước khi
+inference, không bị đổi ngầm sang kernel khác:
+
+| Baseline | Trạng thái trong chế độ SDPA | Lý do |
+|---|---|---|
+| `vanilla_hf` | Hỗ trợ | Transformers `attn_implementation=sdpa` |
+| `dflash` | Hỗ trợ | Cùng SDPA cho target và draft |
+| `vanilla_fa` | Không hỗ trợ | Baseline này đo FlashAttention |
+| `magicdec` | Không hỗ trợ | Attention của MagicDec dùng FlashInfer |
+| `eagle3` | Không hỗ trợ | Attention trong EAGLE vendored hiện dùng đường eager riêng |
+| `specextend` | Không hỗ trợ | Có hybrid tree-attention kernels riêng |
+| `fafo` | Không hỗ trợ | Adapter hiện khóa attention eager tùy biến |
+
+SDPA ở đây là API `torch.nn.functional.scaled_dot_product_attention`; PyTorch
+có thể tự chọn kernel CUDA nội bộ phù hợp. Đây không phải lệnh ép riêng math
+kernel và không có nghĩa là tắt mọi kernel fused.
+
+Muốn kiểm tra cả bảy row mặc định và lưu trạng thái tương thích vào manifest,
+chạy preflight-only này; `--allow-unsupported` cho phép lệnh kết thúc mà không
+báo lỗi chỉ vì baseline không có SDPA adapter:
+
+```bash
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+bash scripts/run_longbench_200.sh --config "$MASTER" \
+  --mode full --attention-backend sdpa \
+  --baselines "vanilla_hf vanilla_fa magicdec eagle3 dflash specextend fafo" \
+  --datasets gov_report --allow-unsupported --preflight-only
+```
+
+Trên server, dùng đúng master config như benchmark chuẩn. Trước inference hãy
+chạy GPU check và preflight-only cho hai adapter hỗ trợ. Preflight-only không
+nạp model, nên vẫn cần một lượt smoke có inference trước full:
+
+```bash
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+
+bash scripts/runners/run_gpu_check.sh --config "$MASTER" \
+  --gpu-ids 0,1,2,3 --min-free-gb 32
+
+bash scripts/run_longbench_200.sh --config "$MASTER" \
+  --mode full --attention-backend sdpa \
+  --baselines "vanilla_hf dflash" \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --gpu-ids 0,1,2,3 --data-parallel --preflight-only
+```
+
+Sau đó chạy smoke 1 mẫu trên một GPU, rồi mới chạy full 100 mẫu/dataset (hoặc
+số mẫu full đã cấu hình trong master):
+
+```bash
+bash scripts/run_longbench_200.sh --config "$MASTER" \
+  --mode smoke --attention-backend sdpa \
+  --baselines "vanilla_hf dflash" --datasets gov_report \
+  --gpu-ids 0
+
+bash scripts/run_longbench_200.sh --config "$MASTER" \
+  --mode full --attention-backend sdpa \
+  --baselines "vanilla_hf dflash" \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --gpu-ids 0,1,2,3 --data-parallel --dp-processes-per-gpu 1
+```
+
+`--dp-processes-per-gpu 1` giữ một process batch-1 trên mỗi GPU để latency và
+throughput theo sample còn so sánh được. Kết quả nằm dưới
+`outputs/longbench_100_14k/<run-id>/`; kiểm tra `run_manifest.json` và JSONL của
+mỗi baseline để xác nhận `attention_backend=sdpa`. Không thể nhận đủ 7 baseline
+với SDPA trong cấu hình hiện tại; chạy cả danh sách sẽ ghi năm baseline không
+tương thích thành `unsupported_backend`.
+
 ### Bốn baseline speculative bằng FlashAttention-4 trên B200
 
 Ma trận `run_longbench_200.sh` không đăng ký Domino và DsPark. Trên B200,
@@ -135,6 +209,55 @@ toàn bộ mẫu trong dataset đã chọn; đặt `--max-input-tokens` và
 `run_report.json`, `report_vi.md` và `console.log`. Chỉ diễn giải tốc độ khi
 report ghi `flash_attention_4` cho cả target lẫn draft và có record thành công
 ghép với `vanilla_hf` trên cùng sample IDs.
+
+### Native Transformers SDPA trên một GPU
+
+Để chạy `dflash`, `eagle3`, `domino`, `dspark` bằng PyTorch SDPA, dùng profile
+`sdpa_native`; runner thêm `vanilla_hf` làm reference bắt buộc. Profile này dùng
+native Transformers trong `src/Benchmark`, không dùng `vllm_all`: ở vLLM 0.30,
+registry đánh dấu `TORCH_SDPA` chỉ dành cho ViT, không phải decoder LLM
+([registry v0.30.0](https://docs.vllm.ai/en/v0.30.0/api/vllm/v1/attention/backends/registry/)).
+
+`FI_GPU_IDS=1` và `CUDA_VISIBLE_DEVICES=1` giới hạn process vào GPU vật lý số 1;
+process sẽ thấy card đó là `cuda:0`. Trước tiên chạy preflight trên GPU 1, sau
+đó chạy smoke có inference. Chỉ chạy full nếu smoke kết thúc với
+`runtime_validation.passed=true` và `correctness_pass=true`:
+
+```bash
+cd /workspace/storage-shared/nlp/dungdx4/phuc_projects/fast_infer_text_sum
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+METHODS="vanilla_hf,dflash,eagle3,domino,dspark"
+
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --preflight-only \
+  --datasets gov_report --methods "$METHODS"
+
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --mode smoke \
+  --datasets gov_report --samples-per-dataset 1 \
+  --max-input-tokens 4096 --max-new-tokens 8 --methods "$METHODS"
+```
+
+Full chạy đủ 100 mẫu trên từng dataset LongBench trong cùng một GPU, lần lượt
+từng method để thu hồi model giữa các lượt:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --mode full \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --methods "$METHODS"
+```
+
+Kết quả mặc định nằm ở `outputs/sdpa_native_benchmark/<run-id>/`. Kiểm tra
+`run_report.json` có `attention_backend: "sdpa"`,
+`runtime_environment.cuda_visible_devices: "1"`, và mỗi method có dispatch
+SDPA cho target/draft mà không có backend thay thế. Runner cũng ghi
+`tree_mask_attention_probe` để xác nhận SDPA nhận additive tree mask và xử lý
+đúng cached single-token decode. GPU smoke/full chưa được chạy trên máy dev CPU;
+chạy preflight và smoke ở trên trên server trước full.
 
 ## Orchestrator 3 profile
 

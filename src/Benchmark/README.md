@@ -156,3 +156,46 @@ Controller tìm budget theo từng request bằng round wall-time trên token đ
 commit. Trajectory và quyết định từng round nằm trong record của
 `dflash_phase_a`; cấu hình đầy đủ và các biến điều khiển được mô tả ở
 [`docs/baselines/dflash_phase_a.md`](../../docs/baselines/dflash_phase_a.md).
+
+## 6. Pipeline native Transformers + SDPA
+
+Profile `sdpa_native` dùng cùng loader, schema, greedy decoding và method
+adapters native của `fa4_native`, nhưng nạp target/draft với
+`attn_implementation="sdpa"`. EAGLE3 có adapter riêng cho target attention và
+tree-mask verifier; runner kiểm tra dispatch SDPA của target/draft và dừng nếu
+phát hiện backend attention khác. `vanilla_hf` và `dflash` là cặp đối chứng
+bắt buộc; bốn method speculative được so sánh là `dflash`, `eagle3`, `domino`
+và `dspark`.
+
+Trên server, đặt `CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1` để dùng đúng GPU vật lý
+số 1. Chạy preflight, rồi smoke trước khi full:
+
+```bash
+MASTER=/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/fast_infer_master.env
+METHODS="vanilla_hf,dflash,eagle3,domino,dspark"
+
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --preflight-only \
+  --datasets gov_report --methods "$METHODS"
+
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --mode smoke \
+  --datasets gov_report --samples-per-dataset 1 \
+  --max-input-tokens 4096 --max-new-tokens 8 --methods "$METHODS"
+
+CUDA_VISIBLE_DEVICES=1 FI_GPU_IDS=1 \
+  bash scripts/run.sh sdpa_native "$MASTER" \
+  --attention-backend sdpa --mode full \
+  --datasets "gov_report qmsum multi_news lcc repobench-p" \
+  --methods "$METHODS"
+```
+
+Full run dùng 100 mẫu/dataset theo dữ liệu master config và chạy lần lượt trên
+một GPU. Kết quả nằm dưới `outputs/sdpa_native_benchmark/<run-id>/`; trong
+`run_report.json` kiểm tra `attention_backend="sdpa"`,
+`runtime_environment.cuda_visible_devices="1"`,
+`runtime_validation.passed=true` và `correctness_pass=true`. Local T4 CPU không
+thể xác nhận hiệu năng hay correctness GPU; smoke phải chạy trên server trước
+full.

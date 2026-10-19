@@ -284,9 +284,13 @@ def build_parser(default_backend: str, description: str) -> argparse.ArgumentPar
     parser.add_argument(
         "--attention-backend",
         choices=sorted(
-            {default_backend, "flash_attention_4"}
-            if default_backend == "flash_attention_2"
-            else {default_backend}
+            {"eager", "sdpa"}
+            if default_backend == "eager"
+            else (
+                {default_backend, "flash_attention_4"}
+                if default_backend == "flash_attention_2"
+                else {default_backend}
+            )
         ),
         default=os.environ.get("LONG_BENCH_ATTENTION_BACKEND", default_backend),
     )
@@ -720,6 +724,11 @@ def run(args: argparse.Namespace, *, method: str) -> int:
     effective_attention_backend = getattr(
         getattr(model, "config", None), "_attn_implementation", None
     )
+    if args.attention_backend == "sdpa" and effective_attention_backend != "sdpa":
+        raise RuntimeError(
+            "SDPA was requested for vanilla_hf, but the loaded model resolved "
+            f"attention backend to {effective_attention_backend!r}"
+        )
     config = {
         "device": str(device),
         "gpu_name": metadata.get("gpu_name"),
@@ -772,8 +781,12 @@ def run(args: argparse.Namespace, *, method: str) -> int:
                 input_cap=max(args.max_input_tokens, 0),
                 output_tokens=args.max_new_tokens,
                 seed=args.seed,
-                dtype=args.dtype,
-                attention_backend="paired",
+                dtype=str(_dtype(args.dtype)).removeprefix("torch."),
+                attention_backend=(
+                    f"paired:{effective_attention_backend}"
+                    if requested_attention_backend == "sdpa"
+                    else "paired"
+                ),
                 temperature=args.temperature,
             )["run_config_hash"]
         sample_config = {
