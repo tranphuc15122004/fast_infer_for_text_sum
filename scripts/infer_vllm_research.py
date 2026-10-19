@@ -434,17 +434,51 @@ def main(argv: list[str] | None = None) -> int:
                         if model is not None:
                             break
                 if model is None:
-                    variant = job.parameters.get("model_variant", "R-Hazard-Prefix")
-                    model = {
-                        "model_type": "hazard",
-                        "variant": variant,
-                        "max_candidates": 15,
-                        "features": ["position", "draft_present_log_margin", "draft_prefix_tv"] if "Prefix" in variant else ["position"],
-                        "beta": [-0.5, 0.15, -0.8, -0.4] if "Prefix" in variant else [-0.5, 0.15],
-                        "center": [8.0, 1.5, 0.2] if "Prefix" in variant else [8.0],
-                        "scale": [4.32, 1.2, 0.15] if "Prefix" in variant else [4.32],
-                        "training_groups": ["calibration"],
-                    }
+                    variant = job.parameters.get("model_variant", "R-Hazard-Present")
+                    if variant == "R-Hazard-Present":
+                        model = {
+                            "model_type": "hazard",
+                            "variant": "R-Hazard-Present",
+                            "max_candidates": 15,
+                            "features": ["position", "draft_present_log_margin"],
+                            "beta": [-0.5, 0.15, -0.8],
+                            "center": [8.0, 1.5],
+                            "scale": [4.32, 1.2],
+                            "training_groups": ["calibration"],
+                        }
+                    elif variant == "R-Hazard-Present-Future":
+                        model = {
+                            "model_type": "hazard",
+                            "variant": variant,
+                            "max_candidates": 15,
+                            "features": ["position", "draft_present_log_margin", "draft_suffix_margin"],
+                            "beta": [0.2, -0.6, 0.8, -0.5],
+                            "center": [8.0, 1.5, 0.25],
+                            "scale": [4.32, 1.2, 0.15],
+                            "training_groups": ["calibration"],
+                        }
+                    elif "Prefix" in variant:
+                        model = {
+                            "model_type": "hazard",
+                            "variant": variant,
+                            "max_candidates": 15,
+                            "features": ["position", "draft_present_log_margin", "draft_prefix_tv"],
+                            "beta": [-0.5, 0.15, -0.8, -0.4],
+                            "center": [8.0, 1.5, 0.2],
+                            "scale": [4.32, 1.2, 0.15],
+                            "training_groups": ["calibration"],
+                        }
+                    else:
+                        model = {
+                            "model_type": "hazard",
+                            "variant": variant,
+                            "max_candidates": 15,
+                            "features": ["position"],
+                            "beta": [-0.5, 0.15],
+                            "center": [8.0],
+                            "scale": [4.32],
+                            "training_groups": ["calibration"],
+                        }
 
                 costs_env = os.environ.get("DFLASH_PHASE_B_COSTS")
                 if costs_env and Path(costs_env).is_file():
@@ -474,7 +508,9 @@ def main(argv: list[str] | None = None) -> int:
                 job_dict["parameters"]["model"] = model
                 job_dict["parameters"]["cost_profiles"] = cost_profiles
                 if "opportunity_threshold_eta" not in job_dict["parameters"]:
-                    job_dict["parameters"]["opportunity_threshold_eta"] = float(os.environ.get("PHASE_B_ETA", "0.0"))
+                    job_dict["parameters"]["opportunity_threshold_eta"] = float(os.environ.get("PHASE_B_ETA", "0.10"))
+                if "allowed_prefixes" not in job_dict["parameters"]:
+                    job_dict["parameters"]["allowed_prefixes"] = (7, 11, 15)
 
             outcome = run_generation(job_dict, samples, settings, job_dir)
             outcome.pop("records", None)

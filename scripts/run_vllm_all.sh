@@ -66,7 +66,7 @@ MAX_INPUT_TOKENS="${VLLM_MAX_INPUT_TOKENS:-${RUN_MAX_INPUT_TOKENS:-8192}}"
 MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}"
 DTYPE="${VLLM_DTYPE:-bfloat16}"
 GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
-METHODS="${VLLM_METHODS:-vanilla_vllm,eagle3,dflash,domino,dspark}"
+METHODS="${VLLM_METHODS:-vanilla_vllm,eagle3,dflash,domino,dspark,dflash_phase_a}"
 
 cd "$ROOT"
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"

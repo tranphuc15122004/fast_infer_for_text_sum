@@ -33,6 +33,7 @@ from Benchmark.common.rouge import add_rouge, aggregate_rouge
 from Benchmark.common.speculative_metrics import normalize_speculative_acceptance
 from Benchmark.common.vllm_pilot import (
     install_domino_vllm_compat,
+    install_phase_a_vllm_compat,
     paired_vllm_metrics,
     resolve_eagle3_aux_hidden_state_layers,
     select_pilot_methods,
@@ -40,12 +41,13 @@ from Benchmark.common.vllm_pilot import (
 )
 
 
-METHODS = ("vanilla_vllm", "eagle3", "dflash", "domino", "dspark")
+METHODS = ("vanilla_vllm", "eagle3", "dflash", "domino", "dspark", "dflash_phase_a")
 DRAFT_ARGUMENTS = {
     "eagle3": "eagle3_model",
     "dflash": "dflash_model",
     "domino": "domino_model",
     "dspark": "dspark_model",
+    "dflash_phase_a": "dflash_model",
 }
 
 
@@ -102,7 +104,7 @@ def build_speculative_config(
 
     raw = draft_config.to_dict() if hasattr(draft_config, "to_dict") else dict(draft_config)
     speculative_tokens = speculative_token_count(method, draft_config)
-    vllm_method = "dflash" if method == "domino" else method
+    vllm_method = "dflash" if method in {"domino", "dflash_phase_a"} else method
     speculative = {
         "method": vllm_method,
         "model": str(draft_path),
@@ -1158,6 +1160,11 @@ def _evaluate(args: argparse.Namespace) -> int:
                 speculative_tokens = int(method_metadata["num_speculative_tokens"])
             if method == "domino":
                 install_domino_vllm_compat()
+            elif method == "dflash_phase_a":
+                install_phase_a_vllm_compat()
+                os.environ["VLLM_DFLASH_PHASE_A"] = "1"
+            else:
+                os.environ.pop("VLLM_DFLASH_PHASE_A", None)
 
             model_configs[method] = {
                 **method_metadata,
@@ -1789,6 +1796,8 @@ def main(argv: list[str] | None = None) -> int:
             draft_checks[method] = metadata
         if "domino" in methods:
             install_domino_vllm_compat()
+        if "dflash_phase_a" in methods:
+            install_phase_a_vllm_compat()
 
         cuda_available = bool(torch.cuda.is_available())
         blackwell_gpu = (

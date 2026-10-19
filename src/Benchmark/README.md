@@ -40,12 +40,13 @@ Trước đây, mỗi phương pháp suy đoán (Speculative Decoding) sử dụ
 | **`vanilla_vllm`** | Autoregressive Baseline | — | **Dense Reference** chuẩn cho toàn bộ benchmark |
 | **`eagle3`** | Tree-based Speculative Drafting | 16 | vLLM 0.30 native với aux hidden state layer resolution |
 | **`dflash`** | Block-Diffusion Parallel Drafting | 16 | vLLM 0.30 native DFlash backbone |
+| **`dflash_phase_a`** | Target Context Focusing DFlash | 16 | Phase A winning recipe ($L_{18}, M_1$, chunk 128, budget 2048) |
 | **`domino`** | Block-parallel + Causal Correction (GRU) | 16 | Tích hợp qua monkey-patching adapter trên đường dẫn DFlash của vLLM |
 | **`dspark`** | SpecForge Parallel Draft Model | 7 | vLLM 0.30 native DSpark backend |
 
-### Cơ chế Adapter & Monkey-patching cho Domino (`vllm_pilot.py`)
-Do vLLM 0.30 gốc chưa có native runner cho Domino (sử dụng GRU prefix và causal projection head), repo cung cấp một giải pháp tích hợp trực tiếp:
-- [`src/Benchmark/common/vllm_pilot.py`](file:///home/tuantb/fast_infer_text_sum/src/Benchmark/common/vllm_pilot.py) bổ sung `prefix_gru` và `embed_proj` vào `DFlashQwen3Model` và chèn hàm `domino_greedy_sample` vào `DFlashProposer._sample_draft_tokens` và `DFlashSpeculator.load_draft_model`.
+### Cơ chế Adapter & Monkey-patching cho Domino & DFlash Phase A (`vllm_pilot.py`)
+- **Domino**: Bổ sung `prefix_gru` và `embed_proj` vào `DFlashQwen3Model`, chèn hàm `domino_greedy_sample` vào `DFlashProposer._sample_draft_tokens` và `DFlashSpeculator.load_draft_model`.
+- **DFlash Phase A**: Sử dụng Zero-Overhead Context Selector (`src/Benchmark/common/phase_a_selector.py`), lọc ngữ cảnh Drafter về ngân sách $B=2048$ tokens bằng cách chọn các chunk 128 tokens có độ tương quan attention cao nhất với Target Layer 18, kích hoạt qua `install_phase_a_vllm_compat()` và biến môi trường `VLLM_DFLASH_PHASE_A="1"`.
 - Đăng ký tự động qua **vLLM General Plugin** (`src/Benchmark/common/vllm_pilot_plugin.py` và `src/fast_infer_vllm_plugin-0.1.0.dist-info/`).
 
 ---

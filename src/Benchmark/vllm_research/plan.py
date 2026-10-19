@@ -181,6 +181,7 @@ def build_jobs(experiments: Iterable[str], *, selectors: Iterable[str] = ('previ
         b3_variants = (
             'R', 'R-A', 'R-DH', 'R-DC',
             'R-Hazard-Pos', 'R-Hazard-Present', 'R-Hazard-Prefix',
+            'R-Hazard-Present-Future',
             'R-Hazard-Suffix-Margin', 'R-Hazard-Suffix-Entropy',
         )
         for variant in b3_variants:

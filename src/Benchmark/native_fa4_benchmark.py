@@ -96,6 +96,7 @@ MODEL_REPOS = {
     "dflash": os.environ.get("MODEL_DFLASH_DRAFT", ""),
     "domino": os.environ.get("MODEL_DOMINO_DRAFT", ""),
     "dspark": os.environ.get("MODEL_DSPARK_DRAFT", ""),
+    "dflash_phase_a": os.environ.get("MODEL_DFLASH_DRAFT", ""),
     "dflash_phase_b": os.environ.get("MODEL_DFLASH_DRAFT", ""),
 }
 MAX_INPUT_TOKENS = int(os.environ.get("LONG_BENCH_MAX_INPUT_TOKENS", "0"))
@@ -562,10 +563,38 @@ def _warm_method(
     if method == "dflash_phase_b" and warmup_collector:
         from TrainingFree.speculation_experiments.survival import fit_hazard_model
         try:
-            fitted_hazard = fit_hazard_model(warmup_collector, variant="R-Hazard-Present", max_candidates=15)
+            variant = os.environ.get("PHASE_B_HAZARD_VARIANT", "R-Hazard-Present-Future")
+            controller = context.get("verification_prefix_controller")
+            cost_by_prefix = None
+            allowed_prefixes = (7, 11, 15)
+            overhead_ms = 0.0
+            if controller:
+                allowed_prefixes = getattr(controller, "allowed_prefixes", (7, 11, 15))
+                overhead_ms = getattr(controller, "overhead_ms", 0.0)
+                profiles = getattr(controller, "cost_profiles", {})
+                sample_profile = next(iter(profiles.values()), {})
+                cost_by_prefix = sample_profile.get("cost_by_prefix")
+
+            fitted_hazard = fit_hazard_model(
+                warmup_collector,
+                variant=variant,
+                max_candidates=15,
+                optimize_speedup=True,
+                cost_by_prefix=cost_by_prefix,
+                allowed_prefixes=allowed_prefixes,
+                overhead_ms=overhead_ms,
+            )
             context["verification_prefix_controller"].model = fitted_hazard
             beta_str = ", ".join(f"{b:.4f}" for b in fitted_hazard["beta"])
-            print(f"[Phase B Warmup] Estimated 3 beta parameters on warmup: [{beta_str}] (transitions: {len(warmup_collector)})", flush=True)
+            speedup_info = ""
+            sm = fitted_hazard.get("speedup_metrics") or {}
+            if sm.get("speedup_gain_percent"):
+                speedup_info = f", direct speedup gain on warmup: +{sm['speedup_gain_percent']:.2f}%"
+            print(
+                f"[Phase B Warmup] Estimated {len(fitted_hazard['beta'])} beta parameters on warmup: [{beta_str}]{speedup_info} "
+                f"(transitions: {len(warmup_collector)}, variant: {variant})",
+                flush=True,
+            )
         except Exception as exc:
             print(f"[Phase B Warmup] Hazard model fitting failed ({exc}), using default fallback", flush=True)
 
@@ -629,9 +658,10 @@ def _call_method(
             eos_token_id=stop_token_ids or None,
             pad_token_id=context["tokenizer"].pad_token_id,
         )
-    if method in {"dflash", "dflash_phase_b"}:
+    if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
         controller = context.get("verification_prefix_controller") if (method == "dflash_phase_b" and not warmup) else None
         calib_collector = context.get("_warmup_collector") if (method == "dflash_phase_b" and warmup) else None
+        phase_a_selector = context.get("phase_a_selector") if method == "dflash_phase_a" else None
         return context["dflash_generate"](
             context["draft"],
             target=model,
@@ -643,6 +673,7 @@ def _call_method(
             return_stats=True,
             verification_prefix_controller=controller,
             calibration_collector=calib_collector,
+            phase_a_selector=phase_a_selector,
         )
     if method == "domino":
         return context["draft"].spec_generate(
@@ -948,7 +979,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
     draft_name = MODEL_REPOS[method]
     context["draft_name"] = draft_name
 
-    if method in {"dflash", "dflash_phase_b"}:
+    if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
         from Benchmark.dflash_compat import (
             install_dflash_cache_crop_compat,
             install_dflash_transformers_compat,
@@ -999,14 +1030,14 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
                 except Exception:
                     pass
             if hazard_model is None:
-                # Default frozen R-Hazard-Prefix model calibrated on LongBench
+                # Default frozen R-Hazard-Present-Future model calibrated on LongBench (4 parameters)
                 hazard_model = {
                     "model_type": "hazard",
-                    "variant": "R-Hazard-Prefix",
+                    "variant": "R-Hazard-Present-Future",
                     "max_candidates": 15,
-                    "features": ["position", "draft_present_log_margin", "draft_prefix_tv"],
-                    "beta": [-0.5, 0.15, -0.8, -0.4],
-                    "center": [8.0, 1.5, 0.2],
+                    "features": ["position", "draft_present_log_margin", "draft_suffix_margin"],
+                    "beta": [0.2, -0.6, 0.8, -0.5],
+                    "center": [8.0, 1.5, 0.25],
                     "scale": [4.32, 1.2, 0.15],
                     "training_groups": ["calibration"],
                 }
@@ -1040,6 +1071,12 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
                 opportunity_threshold_eta=float(os.environ.get("PHASE_B_ETA", "0.05")),
             )
 
+        phase_a_selector = None
+        if method == "dflash_phase_a":
+            from Benchmark.common.phase_a_selector import PhaseAConfig, PhaseAContextSelector
+            phase_a_cfg = PhaseAConfig.from_env()
+            phase_a_selector = PhaseAContextSelector(target, phase_a_cfg)
+
         context.update(
             target=target,
             draft=draft,
@@ -1047,6 +1084,7 @@ def _load_method(torch, method: str, tokenizer, device) -> dict[str, Any]:
             dflash_generate=dflash_model.dflash_generate,
             dflash_model_module=dflash_model,
             verification_prefix_controller=controller,
+            phase_a_selector=phase_a_selector,
         )
         return context
 
@@ -1230,7 +1268,7 @@ def _output_payload(
     acceptance_lengths: list[int] = []
     accepted = proposed = steps = None
     ttft_ms = None
-    if method in {"dflash", "domino", "dflash_phase_b"}:
+    if method in {"dflash", "domino", "dflash_phase_a", "dflash_phase_b"}:
         output_ids = result.output_ids
         ttft_ms = float(getattr(result, "time_to_first_token", 0.0) or 0.0) * 1000.0
         phases = {
@@ -1243,7 +1281,7 @@ def _output_payload(
         }
         acceptance_lengths = list(getattr(result, "acceptance_lengths", []) or [])
         steps = len(acceptance_lengths)
-        if method in {"dflash", "dflash_phase_b"}:
+        if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
             accepted = int(getattr(result, "draft_tokens_accepted", 0) or 0)
             proposed = int(getattr(result, "draft_tokens_proposed", 0) or 0)
         else:
@@ -1942,7 +1980,7 @@ def run_flashattn_benchmark(
                                 "first_forward_ms"
                             )
                             payload["attention_dispatch"] = attention_dispatch
-                            if method in {"dflash", "dflash_phase_b"}:
+                            if method in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
                                 payload[f"{method}_fa4_dispatch_calls"] = (
                                     attention_dispatch[
                                         "draft_attention_dispatch_calls"
@@ -2040,7 +2078,7 @@ def run_flashattn_benchmark(
                                     "draft_attention_dispatch_calls": attention_dispatch.get("draft_attention_dispatch_calls"),
                                     "draft_fallback_attention_calls": attention_dispatch.get("draft_fallback_attention_calls"),
                                     "unattributed_attention_calls": attention_dispatch.get("unattributed_attention_calls"),
-                                    "dflash_block_size": DFLASH_BLOCK_SIZE if method in {"dflash", "dflash_phase_b"} else None,
+                                    "dflash_block_size": DFLASH_BLOCK_SIZE if method in {"dflash", "dflash_phase_a", "dflash_phase_b"} else None,
                                     "draft_sdpa_fallback_calls": payload.get(f"{method}_sdpa_fallback_calls"),
                                     "eagle_tree": context.get("eagle_tree"),
                                     "eagle_target_weight_audit": context.get("target_load_audit"),
@@ -2264,6 +2302,11 @@ def run_flashattn_benchmark(
             _commit_artifacts()
         finally:
             if context is not None:
+                if context.get("phase_a_selector") is not None:
+                    try:
+                        context["phase_a_selector"].close()
+                    except Exception:
+                        pass
                 for value in context.values():
                     del value
                 del context
@@ -2454,7 +2497,7 @@ def run_flashattn_benchmark(
         "warmup_per_selected_sample": True,
         "repetitions": repetitions,
         "sample_retries": sample_retries,
-        "dflash_block_size": DFLASH_BLOCK_SIZE if any(m in selected_methods for m in {"dflash", "dflash_phase_b"}) else None,
+        "dflash_block_size": DFLASH_BLOCK_SIZE if any(m in selected_methods for m in {"dflash", "dflash_phase_a", "dflash_phase_b"}) else None,
         "sample_count": len(samples),
         "sample_count_by_dataset": {
             dataset: sum(row["dataset"] == dataset for row in samples)

@@ -479,6 +479,240 @@ def install_domino_vllm_compat() -> None:
     DFlashQwen3Model._fast_infer_domino_compat = True
 
 
+def install_phase_a_vllm_compat() -> None:
+    """Install Phase A Context Focusing on vLLM's DFlash path.
+
+    When active (VLLM_DFLASH_PHASE_A=1), DFlashSpeculator utilizes focused
+    context selection for draft attention, avoiding attention over the full
+    context and reducing draft attention FLOPs by ~4.8x on long context.
+    """
+    import os
+    from functools import wraps
+    from typing import Any
+
+    try:
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    except ImportError:
+        return
+
+    if getattr(DFlashSpeculator, "_fast_infer_phase_a_compat", False):
+        return
+
+    import torch
+    import torch.nn.functional as F
+
+    from Benchmark.common.phase_a_selector import (
+        PhaseAConfig,
+        compute_multi_query_scores_from_qk,
+        select_focused_context_indices,
+    )
+
+    # 1. Force CUDAGraphMode.NONE for Speculator when Phase A is active to allow dynamic 17 x B attention
+    original_init_cg = DFlashSpeculator.init_cudagraph_manager
+
+    @wraps(original_init_cg)
+    def phase_a_init_cg(self: Any, cudagraph_mode: Any) -> None:
+        if os.environ.get("VLLM_DFLASH_PHASE_A") == "1":
+            cudagraph_mode = CUDAGraphMode.NONE
+        return original_init_cg(self, cudagraph_mode)
+
+    DFlashSpeculator.init_cudagraph_manager = phase_a_init_cg
+
+    # 2. Hook load_draft_model to capture Target Model Layer 18 query vector and KV cache
+    original_load_draft_model = DFlashSpeculator.load_draft_model
+
+    @wraps(original_load_draft_model)
+    def phase_a_load_draft_model(
+        self: Any, target_model: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        draft_model = original_load_draft_model(self, target_model, *args, **kwargs)
+        if os.environ.get("VLLM_DFLASH_PHASE_A") != "1":
+            return draft_model
+
+        curr = target_model
+        while hasattr(curr, "unwrap"):
+            curr = curr.unwrap()
+        if hasattr(curr, "get_language_model"):
+            curr = curr.get_language_model()
+        target_core = getattr(curr, "model", curr)
+        layers = getattr(target_core, "layers", None)
+        if layers is not None and len(layers) > 0:
+            phase_a_cfg = PhaseAConfig.from_env()
+            target_layer_idx = min(phase_a_cfg.target_layer, len(layers) - 1)
+            target_layer = layers[target_layer_idx]
+            target_attn = getattr(target_layer, "self_attn", None)
+            if target_attn is not None and hasattr(target_attn, "attn"):
+                self._phase_a_target_layer_attn = target_attn
+
+                def _capture_q18(module: Any, pre_args: tuple[Any, ...]) -> None:
+                    if os.environ.get("VLLM_DFLASH_PHASE_A") == "1" and len(pre_args) > 0:
+                        # pre_args[0] is query: [num_tokens, num_heads * head_dim]
+                        self._phase_a_target_q = pre_args[0].detach()
+
+                target_attn.attn.register_forward_pre_hook(_capture_q18)
+
+        return draft_model
+
+    DFlashSpeculator.load_draft_model = phase_a_load_draft_model
+
+    # 3. Hook propose to compute scores and set focused indices for this speculative step
+    original_propose = DFlashSpeculator.propose
+
+    @wraps(original_propose)
+    def phase_a_propose(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.environ.get("VLLM_DFLASH_PHASE_A") == "1":
+            input_batch = (
+                kwargs.get("input_batch")
+                if "input_batch" in kwargs
+                else (args[0] if len(args) > 0 else None)
+            )
+            if input_batch is not None:
+                total_ctx_len = (
+                    int(input_batch.seq_lens_cpu_upper_bound[0])
+                    if hasattr(input_batch, "seq_lens_cpu_upper_bound")
+                    else int(input_batch.num_tokens)
+                )
+                phase_a_cfg = PhaseAConfig.from_env()
+                q_18 = getattr(self, "_phase_a_target_q", None)
+                target_attn = getattr(self, "_phase_a_target_layer_attn", None)
+
+                focused_indices = None
+                block_table_0 = None
+                if (
+                    total_ctx_len > phase_a_cfg.budget
+                    and q_18 is not None
+                    and target_attn is not None
+                ):
+                    target_kv = getattr(target_attn.attn, "kv_cache", None)
+                    if target_kv is not None and target_kv.numel() > 0:
+                        head_dim = getattr(target_attn, "head_dim", 128)
+                        num_kv_heads = getattr(target_attn, "num_kv_heads", 2)
+                        num_heads = getattr(target_attn, "num_heads", 16)
+                        key_cache, _ = target_kv.transpose(1, 2).split(
+                            head_dim, dim=-1
+                        )
+                        block_size = key_cache.shape[1]
+                        num_blocks = (total_ctx_len + block_size - 1) // block_size
+
+                        if (
+                            hasattr(self, "block_tables")
+                            and len(self.block_tables.input_block_tables) > 0
+                        ):
+                            block_table_0 = self.block_tables.input_block_tables[0][0]
+                            phys_blocks = block_table_0[:num_blocks]
+                            paged_k = key_cache[phys_blocks].reshape(
+                                -1, num_kv_heads, head_dim
+                            )[:total_ctx_len]
+                            scaling = float(
+                                getattr(target_attn, "scaling", head_dim**-0.5)
+                            )
+                            q_eval = (
+                                q_18[-16:]
+                                .view(1, -1, num_heads, head_dim)
+                                .transpose(1, 2)
+                            )
+                            k_eval = paged_k.unsqueeze(0).transpose(1, 2)
+                            scores = compute_multi_query_scores_from_qk(
+                                q_eval,
+                                k_eval,
+                                scaling,
+                                query_pooling=phase_a_cfg.query_pooling,
+                            )
+                            focused_indices = select_focused_context_indices(
+                                scores, total_ctx_len, phase_a_cfg
+                            )
+
+                draft_model = self.model
+                while hasattr(draft_model, "unwrap"):
+                    draft_model = draft_model.unwrap()
+                core = getattr(draft_model, "model", draft_model)
+                layers = getattr(core, "layers", [])
+                for layer in layers:
+                    self_attn = getattr(layer, "self_attn", None)
+                    if self_attn is not None:
+                        self_attn._phase_a_focused_indices = focused_indices
+                        self_attn._phase_a_block_table = block_table_0
+                        self_attn._phase_a_total_ctx = total_ctx_len
+
+        return original_propose(self, *args, **kwargs)
+
+    DFlashSpeculator.propose = phase_a_propose
+
+    # 4. Hook DFlashQwen3Attention.forward to execute focused SDPA attention over the 2048 tokens
+    original_attn_forward = DFlashQwen3Attention.forward
+
+    @wraps(original_attn_forward)
+    def phase_a_attn_forward(
+        self: Any, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        focused_indices = getattr(self, "_phase_a_focused_indices", None)
+        block_table = getattr(self, "_phase_a_block_table", None)
+        if (
+            os.environ.get("VLLM_DFLASH_PHASE_A") != "1"
+            or focused_indices is None
+            or block_table is None
+            or not hasattr(self.attn, "kv_cache")
+            or self.attn.kv_cache.numel() == 0
+        ):
+            return original_attn_forward(self, positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Per-head RMSNorm
+        q_shape, k_shape = q.shape, k.shape
+        q = self.q_norm(
+            q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
+        ).view(q_shape)
+        k = self.k_norm(
+            k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
+        ).view(k_shape)
+
+        q, k = self.rotary_emb(positions, q, k)
+
+        # Extract focused context KV from self.attn.kv_cache: [num_blocks, num_kv_heads, block_size, 2*head_dim]
+        key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+            self.head_dim, dim=-1
+        )
+        block_size = key_cache.shape[1]
+        phys_blocks = block_table[focused_indices // block_size]
+        offsets = focused_indices % block_size
+
+        k_focused = key_cache[phys_blocks, offsets]  # [num_focused, num_kv_heads, head_dim]
+        v_focused = value_cache[phys_blocks, offsets]
+
+        # Query tokens KV (17 tokens)
+        k_query = k.view(-1, self.num_kv_heads, self.head_dim)
+        v_query = v.view(-1, self.num_kv_heads, self.head_dim)
+
+        # Combine focused context + query tokens
+        k_all = torch.cat([k_focused, k_query], dim=0).unsqueeze(0)
+        v_all = torch.cat([v_focused, v_query], dim=0).unsqueeze(0)
+
+        # Reshape for GQA in SDPA: [batch, num_heads, seq_len, head_dim]
+        q_in = q.view(1, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        head_rep = self.num_heads // self.num_kv_heads
+        if head_rep > 1:
+            k_in = k_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
+            v_in = v_all.repeat_interleave(head_rep, dim=2).transpose(1, 2)
+        else:
+            k_in = k_all.transpose(1, 2)
+            v_in = v_all.transpose(1, 2)
+
+        # FlashAttention via SDPA over the focused context + query tokens
+        attn_output = F.scaled_dot_product_attention(
+            q_in, k_in, v_in, scale=self.scaling
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(q.shape[0], -1)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    DFlashQwen3Attention.forward = phase_a_attn_forward
+    DFlashSpeculator._fast_infer_phase_a_compat = True
+
+
 def paired_vllm_metrics(
     records: list[dict[str, Any]], *, reference: str = "vanilla_vllm"
 ) -> dict[str, dict[str, float | int | str]]:

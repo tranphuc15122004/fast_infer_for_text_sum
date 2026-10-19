@@ -44,6 +44,11 @@ HAZARD_VARIANTS: dict[str, tuple[str, ...]] = {
     "R-Hazard-Pos": ("position",),
     "R-Hazard-Present": ("position", "draft_present_log_margin"),
     "R-Hazard-Prefix": ("position", "draft_present_log_margin", "draft_prefix_tv"),
+    "R-Hazard-Present-Future": (
+        "position",
+        "draft_present_log_margin",
+        "draft_suffix_margin",
+    ),
     "R-Hazard-Suffix-Margin": (
         "position",
         "draft_present_log_margin",
@@ -354,14 +359,133 @@ def _hazard_features_for_position(
     return values
 
 
+def optimize_hazard_for_e2e_speedup(
+    beta_init: np.ndarray,
+    train_rows: Sequence[Mapping[str, Any]],
+    variant: str,
+    center: np.ndarray,
+    scale: np.ndarray,
+    *,
+    cost_by_prefix: Mapping[int | str, float] | None = None,
+    allowed_prefixes: Sequence[int] = (7, 11, 15),
+    max_candidates: int = 15,
+    overhead_ms: float = 0.0,
+    reg_to_init: float = 0.01,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Directly fine-tunes hazard parameters beta to maximize empirical token throughput (E2E speedup)
+    across consecutive warmup draft rounds."""
+    if not train_rows:
+        return beta_init, {"initial_cost_per_commit": 0.0, "optimized_cost_per_commit": 0.0}
+
+    costs: dict[int, float] = {}
+    if cost_by_prefix:
+        for k, v in cost_by_prefix.items():
+            costs[int(k)] = float(v)
+    else:
+        # Default B200 FA4 flat costs
+        costs = {3: 17.5, 7: 18.2, 11: 19.0, 15: 20.0}
+
+    valid_prefixes = tuple(sorted(p for p in allowed_prefixes if p in costs and p <= max_candidates))
+    if not valid_prefixes:
+        valid_prefixes = (min(max_candidates, max(costs.keys())),)
+
+    # Pre-extract features for all rounds to make evaluation vector-fast
+    rounds_data = []
+    for row in train_rows:
+        accepted = int(row.get("accepted_candidates", 0))
+        m, c, h = _extract_hazard_signals(row, max_candidates=max_candidates)
+        features_list = [
+            _hazard_features_for_position(j, m, c, h, variant, max_candidates=max_candidates)
+            for j in range(1, max_candidates + 1)
+        ]
+        X_pred = np.asarray(features_list, dtype=np.float64)
+        standardized = (X_pred - center) / scale
+        Phi = np.column_stack([np.ones(len(X_pred), dtype=np.float64), standardized])
+        rounds_data.append((Phi, accepted))
+
+    def evaluate_cost_per_commit(beta: np.ndarray) -> float:
+        total_commits = 0.0
+        total_cost = 0.0
+        for Phi, accepted in rounds_data:
+            logits = Phi @ beta
+            log_p = -np.logaddexp(0.0, -logits)
+            log_S = np.cumsum(log_p)
+            S = np.exp(log_S)
+            S = np.clip(S, 0.0, 1.0 - 1e-12)
+
+            best_k = valid_prefixes[-1]
+            min_expected_cost = float("inf")
+            for k in valid_prefixes:
+                expected_commits = 1.0 + float(np.sum(S[:k]))
+                cost_k = costs[k] + overhead_ms
+                score = cost_k / max(expected_commits, 1e-6)
+                if score < min_expected_cost:
+                    min_expected_cost = score
+                    best_k = k
+
+            actual_commits = 1.0 + min(best_k, accepted)
+            actual_cost = costs[best_k] + overhead_ms
+            total_commits += actual_commits
+            total_cost += actual_cost
+
+        return total_cost / max(total_commits, 1e-6)
+
+    initial_cpc = evaluate_cost_per_commit(beta_init)
+    best_beta = beta_init.copy()
+    best_cpc = initial_cpc
+
+    # Multi-pass coordinate scan to find optimal basins across plateaus
+    for _ in range(2):
+        for dim in range(len(best_beta)):
+            cur = best_beta[dim]
+            deltas = np.linspace(-2.0, 2.0, 41) if dim == 0 else np.linspace(-1.5, 1.5, 31)
+            for d in deltas:
+                cand = best_beta.copy()
+                cand[dim] = cur + d
+                cpc = evaluate_cost_per_commit(cand)
+                if cpc < best_cpc - 1e-6:
+                    best_cpc = cpc
+                    best_beta = cand
+
+    def objective(beta: np.ndarray) -> float:
+        cpc = evaluate_cost_per_commit(beta)
+        penalty = 0.5 * reg_to_init * float(np.sum((beta - best_beta) ** 2))
+        return cpc + penalty
+
+    res = minimize(
+        objective,
+        best_beta,
+        method="Nelder-Mead",
+        options={"maxiter": 150, "xatol": 1e-4, "fatol": 1e-4},
+    )
+
+    if res.success and evaluate_cost_per_commit(res.x) <= best_cpc:
+        opt_beta = res.x
+        opt_cpc = evaluate_cost_per_commit(res.x)
+    else:
+        opt_beta = best_beta
+        opt_cpc = best_cpc
+
+    metrics = {
+        "initial_cost_per_commit": float(initial_cpc),
+        "optimized_cost_per_commit": float(opt_cpc),
+        "speedup_gain_percent": float(max(0.0, (initial_cpc - opt_cpc) / max(initial_cpc, 1e-6) * 100.0)),
+    }
+    return opt_beta, metrics
+
+
 def fit_hazard_model(
     train_rows: Sequence[Mapping[str, Any]],
     *,
     variant: str,
     max_candidates: int = 15,
     ridge: float = 1.0,
+    optimize_speedup: bool = False,
+    cost_by_prefix: Mapping[int | str, float] | None = None,
+    allowed_prefixes: Sequence[int] = (7, 11, 15),
+    overhead_ms: float = 0.0,
 ) -> dict[str, Any]:
-    """Fit regularized discrete hazard model on observed risk set transitions."""
+    """Fit regularized discrete hazard model on observed risk set transitions with optional direct speedup tuning."""
     if variant not in HAZARD_VARIANTS:
         raise ValueError(f"unsupported hazard variant {variant!r}")
     if not train_rows:
@@ -420,17 +544,33 @@ def fit_hazard_model(
     if not fit.success:
         raise RuntimeError(f"Hazard logistic fit failed for {variant}: {fit.message}")
 
+    opt_beta = fit.x
+    speedup_metrics: dict[str, float] = {}
+    if optimize_speedup and len(train_rows) > 0:
+        opt_beta, speedup_metrics = optimize_hazard_for_e2e_speedup(
+            fit.x,
+            train_rows,
+            variant,
+            center,
+            scale,
+            cost_by_prefix=cost_by_prefix,
+            allowed_prefixes=allowed_prefixes,
+            max_candidates=max_candidates,
+            overhead_ms=overhead_ms,
+        )
+
     return {
         "model_type": "hazard",
         "variant": variant,
-        "training_groups": sorted({str(row["source_group_id"]) for row in train_rows}),
+        "training_groups": sorted({str(row.get("source_group_id", "default")) for row in train_rows}),
         "max_candidates": max_candidates,
         "features": list(HAZARD_VARIANTS[variant]),
-        "beta": [float(v) for v in fit.x],
+        "beta": [float(v) for v in opt_beta],
         "center": [float(v) for v in center],
         "scale": [float(v) for v in scale],
         "ridge": reg,
         "train_risk_states": len(y),
+        "speedup_metrics": speedup_metrics,
     }
 
 

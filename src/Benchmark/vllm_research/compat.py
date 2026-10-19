@@ -79,6 +79,7 @@ def configure_worker_variant(variant: str, parameters: dict | None = None, trace
         allowed_b3_variants = {
             'R', 'R-A', 'R-DH', 'R-DC', 'R-A-DH', 'R-A-DC',
             'R-Hazard-Pos', 'R-Hazard-Present', 'R-Hazard-Prefix',
+            'R-Hazard-Present-Future',
             'R-Hazard-Suffix-Margin', 'R-Hazard-Suffix-Entropy',
         }
         if model.get('variant') not in allowed_b3_variants:

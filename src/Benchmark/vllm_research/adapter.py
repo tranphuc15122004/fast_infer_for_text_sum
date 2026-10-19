@@ -195,18 +195,19 @@ def _b3_decision(call, proposal):
     from TrainingFree.speculation_experiments.b_controller import VerificationPrefixController
     state = call.states[0]
     dataset = state.metadata.get('dataset', parameters.get('dataset', 'unknown'))
+    allowed = tuple(parameters.get('allowed_prefixes', (7, 11, 15)))
     controller = VerificationPrefixController(
         model=parameters['model'],
         cost_profiles=parameters['cost_profiles'],
         dataset=dataset,
         overhead_ms=float(parameters.get('overhead_ms', 0)),
-        opportunity_threshold_eta=float(parameters.get('opportunity_threshold_eta', 0.0)),
+        opportunity_threshold_eta=float(parameters.get('opportunity_threshold_eta', 0.10)),
     )
     decision = controller(
         state=_round_state(state, call.rows[0]['bank_length']),
         draft_uncertainty=call.uncertainty[0],
         draft_gamma=proposal.shape[1],
-        available_prefixes=tuple(k for k in (3, 7, 11, 15) if k <= proposal.shape[1]),
+        available_prefixes=tuple(k for k in allowed if k <= proposal.shape[1]),
     )
     return int(decision['prefix']), decision
 
@@ -423,13 +424,21 @@ def install() -> bool:
             start = time.perf_counter()
             top_vals, top_inds = torch.topk(logits.float(), 2, dim=-1)
             logit_margin = top_vals[..., 0] - top_vals[..., 1]
-            log_probs = logits.float().log_softmax(dim=-1)
-            probabilities = log_probs.exp()
-            terms = torch.where(probabilities > 0, probabilities * log_probs, 0.)
-            entropy = -terms.sum(dim=-1) / max(math.log(logits.shape[-1]), 1e-12)
-            top_probs = log_probs.gather(-1, top_inds).exp()
-            confidence = top_probs[..., 0]
-            prob_margin = top_probs[..., 0] - top_probs[..., 1]
+            model_variant = call.config.get('parameters', {}).get('model', {}).get('variant', '')
+            req_entropy = model_variant in ('R-Hazard-Suffix-Entropy', 'R-DH', 'R-HA', 'R-PreAll', 'R-DAll') or call.config.get('parameters', {}).get('require_entropy', False)
+            if req_entropy:
+                log_probs = logits.float().log_softmax(dim=-1)
+                probabilities = log_probs.exp()
+                terms = torch.where(probabilities > 0, probabilities * log_probs, 0.)
+                entropy = -terms.sum(dim=-1) / max(math.log(logits.shape[-1]), 1e-12)
+                top_probs = log_probs.gather(-1, top_inds).exp()
+                confidence = top_probs[..., 0]
+                prob_margin = top_probs[..., 0] - top_probs[..., 1]
+            else:
+                top_probs = torch.softmax(top_vals, dim=-1)
+                confidence = top_probs[..., 0]
+                prob_margin = top_probs[..., 0] - top_probs[..., 1]
+                entropy = torch.zeros_like(confidence)
 
             entropy = entropy.reshape(len(call.states), call.drafted_gamma).tolist()
             confidence = confidence.reshape(len(call.states), call.drafted_gamma).tolist()

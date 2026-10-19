@@ -17,6 +17,7 @@ SERVER_MODEL_ENV = {
     "dflash": "MODEL_DFLASH_DRAFT",
     "domino": "MODEL_DOMINO_DRAFT",
     "dspark": "MODEL_DSPARK_DRAFT",
+    "dflash_phase_a": "MODEL_DFLASH_DRAFT",
     "dflash_phase_b": "MODEL_DFLASH_DRAFT",
 }
 
@@ -26,10 +27,11 @@ SERVER_MODEL_ALIASES = {
     "dflash": ("MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
     "domino": ("MODEL_DOMINO_DRAFT", "B200_DOMINO_MODEL"),
     "dspark": ("MODEL_DSPARK_DRAFT", "B200_DSPARK_MODEL"),
+    "dflash_phase_a": ("MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
     "dflash_phase_b": ("MODEL_DFLASH_DRAFT", "B200_DFLASH_MODEL"),
 }
 
-SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_b")
+SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_a", "dflash_phase_b")
 
 LENGTH_BIN_DATASETS = (
     "bin1_00k_02k",

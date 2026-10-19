@@ -1460,6 +1460,7 @@ def _analyze(args: argparse.Namespace, run_root: Path) -> dict[str, Any]:
             "R-Hazard-Pos",
             "R-Hazard-Present",
             "R-Hazard-Prefix",
+            "R-Hazard-Present-Future",
             "R-Hazard-Suffix-Margin",
             "R-Hazard-Suffix-Entropy",
         ),
@@ -1709,6 +1710,7 @@ def _b3_eligible_models(
         "R-Hazard-Pos",
         "R-Hazard-Present",
         "R-Hazard-Prefix",
+        "R-Hazard-Present-Future",
         "R-Hazard-Suffix-Margin",
         "R-Hazard-Suffix-Entropy",
     )

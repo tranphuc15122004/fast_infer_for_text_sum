@@ -73,6 +73,7 @@ def dflash_generate(
     return_stats: bool = False,
     verification_prefix_controller: Optional[Any] = None,
     calibration_collector: Optional[list[Any]] = None,
+    phase_a_selector: Optional[Any] = None,
 ):
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -87,6 +88,8 @@ def dflash_generate(
     past_key_values_draft = DynamicCache()
 
     prefill_start = _cuda_time() if return_stats else None
+    if phase_a_selector is not None and block_size > 1:
+        phase_a_selector.begin_verification_round()
     output = target(
         input_ids,
         position_ids=position_ids[:, :num_input_tokens],
@@ -100,6 +103,16 @@ def dflash_generate(
     output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
+        if phase_a_selector is not None:
+            try:
+                focused_indices = phase_a_selector.end_verification_round(
+                    past_key_values_target,
+                    accepted_length=1,
+                    total_length=num_input_tokens,
+                )
+                model.config._phase_a_focused_indices = focused_indices
+            except Exception:
+                model.config._phase_a_focused_indices = None
     time_to_first_token = _cuda_time() - prefill_start if return_stats else None
 
     decode_start = _cuda_time() if return_stats else None
@@ -189,6 +202,8 @@ def dflash_generate(
         )
         if verification_start_event is not None:
             verification_start_event.record()
+        if phase_a_selector is not None:
+            phase_a_selector.begin_verification_round()
         output = target(
             curr_verify_ids,
             position_ids=curr_verify_pos,
@@ -211,6 +226,17 @@ def dflash_generate(
         past_key_values_target.crop(start)
         acceptance_lengths.append(acceptance_length + 1)
         proposed_lengths.append(verify_k)
+
+        if phase_a_selector is not None:
+            try:
+                focused_indices = phase_a_selector.end_verification_round(
+                    past_key_values_target,
+                    accepted_length=acceptance_length + 1,
+                    total_length=start,
+                )
+                model.config._phase_a_focused_indices = focused_indices
+            except Exception:
+                model.config._phase_a_focused_indices = None
 
         if calibration_collector is not None and block_size > 1:
             try:
@@ -245,6 +271,9 @@ def dflash_generate(
         if stop_token_indices.numel() > 0:
             output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
 
+    if hasattr(getattr(model, "config", None), "_phase_a_focused_indices"):
+        model.config._phase_a_focused_indices = None
+
     if not return_stats:
         return output_ids
 
@@ -276,6 +305,12 @@ def dflash_generate(
             if acceptance_lengths else None
         ),
         proposed_lengths=proposed_lengths,
+        phase_a_budget=phase_a_selector.config.budget if phase_a_selector is not None else None,
+        phase_a_selected_tokens=(
+            len(phase_a_selector.selected_indices)
+            if (phase_a_selector is not None and phase_a_selector.selected_indices is not None)
+            else None
+        ),
     )
 
 
@@ -346,6 +381,12 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        focused_indices = getattr(self.config, "_phase_a_focused_indices", None)
+        if focused_indices is not None:
+            past_len = k.shape[-2] - q_len
+            if past_len > 0 and len(focused_indices) < past_len:
+                k = torch.cat([k[:, :, focused_indices, :], k[:, :, past_len:, :]], dim=-2)
+                v = torch.cat([v[:, :, focused_indices, :], v[:, :, past_len:, :]], dim=-2)
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

@@ -55,6 +55,7 @@ def test_hazard_variants_registered_and_uncertainty_flags():
         "R-Hazard-Pos",
         "R-Hazard-Present",
         "R-Hazard-Prefix",
+        "R-Hazard-Present-Future",
         "R-Hazard-Suffix-Margin",
         "R-Hazard-Suffix-Entropy",
     )
@@ -71,7 +72,7 @@ def test_hazard_variants_registered_and_uncertainty_flags():
     assert controller_pos.requires_uncertainty is False
 
     # Draft-aware hazard variants require draft uncertainty
-    for variant in ("R-Hazard-Present", "R-Hazard-Prefix", "R-Hazard-Suffix-Margin", "R-Hazard-Suffix-Entropy"):
+    for variant in ("R-Hazard-Present", "R-Hazard-Prefix", "R-Hazard-Present-Future", "R-Hazard-Suffix-Margin", "R-Hazard-Suffix-Entropy"):
         controller = VerificationPrefixController(
             model={"variant": variant},
             cost_profiles={},
@@ -255,4 +256,24 @@ def test_controller_bypass_signals_when_gate_triggers():
     )
     assert boundary_decision["prefix"] == 7
     assert boundary_decision["reason"] == "cost_opportunity_gate_below_threshold"
+
+
+def test_hazard_direct_speedup_optimization():
+    rows = [_make_candidate_state(i, (i * 3) % 15, base_conf=0.3 + 0.03 * ((i * 3) % 15)) for i in range(40)]
+    costs = {7: 18.2, 11: 19.0, 15: 20.0}
+    model = fit_hazard_model(
+        rows,
+        variant="R-Hazard-Present-Future",
+        optimize_speedup=True,
+        cost_by_prefix=costs,
+        allowed_prefixes=(7, 11, 15),
+    )
+    assert model["variant"] == "R-Hazard-Present-Future"
+    assert len(model["beta"]) == 4  # intercept + 3 features
+    assert "speedup_metrics" in model
+    metrics = model["speedup_metrics"]
+    assert "initial_cost_per_commit" in metrics
+    assert "optimized_cost_per_commit" in metrics
+    assert metrics["optimized_cost_per_commit"] <= metrics["initial_cost_per_commit"] + 1e-6
+    assert metrics["speedup_gain_percent"] >= 0.0
 

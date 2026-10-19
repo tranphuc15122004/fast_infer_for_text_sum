@@ -10,7 +10,7 @@ from typing import Any
 
 
 EXPECTED_ATTENTION_BACKEND = "flash_attention_4"
-SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_b")
+SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_a", "dflash_phase_b")
 _ACTIVE_DISPATCH_TRACKER: ContextVar["AttentionDispatchTracker | None"] = ContextVar(
     "fast_infer_attention_dispatch_tracker", default=None
 )
@@ -272,7 +272,7 @@ def validate_flashattn_runtime(
                 fallback_calls_value = config.get(
                     f"{role}_fallback_attention_calls"
                 )
-                if fallback_calls_value is None and str(method) in {"dflash", "dflash_phase_b"} and role == "draft":
+                if fallback_calls_value is None and str(method) in {"dflash", "dflash_phase_a", "dflash_phase_b"} and role == "draft":
                     fallback_calls_value = config.get("draft_sdpa_fallback_calls", 0)
                 fallback_calls = int(fallback_calls_value or 0)
                 if (
@@ -280,7 +280,7 @@ def validate_flashattn_runtime(
                     or dispatch_calls <= 0
                     or fallback_calls != 0
                 ):
-                    if str(method) in {"dflash", "dflash_phase_b"}:
+                    if str(method) in {"dflash", "dflash_phase_a", "dflash_phase_b"}:
                         detail = f"{method} FA4 dispatch was not observed"
                     else:
                         detail = f"{method} {role} FA4 dispatch was not observed"
