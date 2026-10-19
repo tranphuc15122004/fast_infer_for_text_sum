@@ -34,10 +34,10 @@
 - Budgets are integer multiples of 128 relative to the configured starting point and are clamped to configured bounds/context length.
 - `PhaseAConfig` gains budget-mode and adaptive-bound environment settings. Its default remains fixed.
 
-- [ ] Implement config parsing with defaults: mode `fixed`, initial 2048, minimum 512, maximum 8192, chunk step 128, window 3, minimum predicted gain 3%.
-- [ ] Implement discounted per-budget timing/commit statistics, a local direction search with adaptive step size, a 3-round dwell, and a stable incumbent when neighboring actions do not improve cost per committed token.
-- [ ] Expose a budget override in the selector without mutating the frozen config or changing fixed-mode defaults.
-- [ ] Validate malformed mode, bounds, and window settings with actionable `ValueError` messages.
+- [x] Implement config parsing with defaults: mode `fixed`, initial 2048, minimum 512, maximum 8192, chunk step 128, window 3, minimum predicted gain 3%.
+- [x] Implement discounted per-budget timing/commit statistics, a local direction search with adaptive step size, a 3-round dwell, and a stable incumbent when neighboring actions do not improve cost per committed token.
+- [x] Expose a budget override in the selector without mutating the frozen config or changing fixed-mode defaults.
+- [x] Validate malformed mode, bounds, and window settings with actionable `ValueError` messages.
 
 ### Task 2: FA4 DFlash round feedback and selector correctness
 
@@ -50,12 +50,12 @@
 - The generation loop observes the actually executed budget and accepted commit count, then chooses the next budget before selecting its context.
 - Every Phase A round trace records executed/next budgets, selected-token count, committed tokens, round wall time, draft CUDA time, verification CUDA time, and controller decision.
 
-- [ ] At prompt prefill, score the final prompt query and initialize the first draft context.
-- [ ] At target verification, score exactly the parent plus accepted query rows and mask key positions causally before pooling.
-- [ ] Measure each round with `perf_counter`; retain existing CUDA event draft/verify measurements and read them only after `query()` reports completion.
-- [ ] For adaptive mode, call the controller with the executed budget, wall interval and commits; select next-round indices with the returned budget.
-- [ ] Preserve the complete draft KV bank and keep all changes behind an active Phase A selector.
-- [ ] Return the adaptive configuration, budget trajectory and cumulative controller metrics with generation stats.
+- [x] At prompt prefill, score the final prompt query and initialize the first draft context.
+- [x] At target verification, score exactly the parent plus accepted query rows and mask key positions causally before pooling.
+- [x] Measure each round with `perf_counter`; retain existing CUDA event draft/verify measurements and read them only after `query()` reports completion.
+- [x] For adaptive mode, call the controller with the executed budget, wall interval and commits; select next-round indices with the returned budget.
+- [x] Preserve the complete draft KV bank and keep all changes behind an active Phase A selector.
+- [x] Return the adaptive configuration, budget trajectory and cumulative controller metrics with generation stats.
 
 ### Task 3: Benchmark record, server invocation, and operator guide
 
@@ -69,7 +69,7 @@
 - Per-sample record includes `phase_a_budget_mode`, initial/min/max budget, selected-token count, budget trajectory, and per-round controller trace.
 - Summary names the active Phase A policy and configured bounds.
 
-- [ ] Add adaptive controller configuration and runtime policy to sample and summary metadata without changing the common schema envelope.
-- [ ] Add a representative command and the full B200 command using `bash scripts/run_fa4_benchmark.sh --full --methods vanilla_hf,dflash,dflash_phase_a` with adaptive env settings.
-- [ ] Document the expected round trace, fixed-mode control command, and limitations on short outputs that provide too few rounds to adapt.
-- [ ] Run Python syntax compilation on touched Python files, `git diff --check`, inspect CLI/config forwarding, and report that GPU parity/speedup still require the server run.
+- [x] Add adaptive controller configuration and runtime policy to sample and summary metadata without changing the common schema envelope.
+- [x] Add a representative command and the full B200 command using `bash scripts/run_fa4_benchmark.sh --full --methods vanilla_hf,dflash,dflash_phase_a` with adaptive env settings.
+- [x] Document the expected round trace, fixed-mode control command, and limitations on short outputs that provide too few rounds to adapt.
+- [x] Run Python syntax compilation on touched Python files, `git diff --check`, inspect CLI/config forwarding, and report that GPU parity/speedup still require the server run.

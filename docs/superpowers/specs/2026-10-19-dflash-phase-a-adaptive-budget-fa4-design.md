@@ -224,6 +224,7 @@ Overhead selector/controller được đo và gắn vào quan sát budget kế t
 đồng bộ của cả request vẫn là thước đo cuối cùng, gồm cả bootstrap, exploration
 và overhead tìm kiếm.
 
-Per-request state reset ở đầu mỗi generation. Round cuối bị clip theo output
-cap/EOS không tham gia cập nhật thường lệ. Adaptive trace được xuất cùng từng
-record sample để có thể kiểm tra budget trajectory và từng quyết định.
+Per-request state reset ở đầu mỗi generation. Khi request kết thúc, controller
+không chọn budget tiếp theo; trace vẫn giữ observation cuối nếu có boundary đo
+hợp lệ. Adaptive trace được xuất cùng từng record sample để kiểm tra trajectory
+và từng quyết định.

@@ -78,7 +78,6 @@ class AdaptiveBudgetController:
         self.settled = False
         self.stats: dict[int, _BudgetStats] = {}
         self.last_reason = "initial_budget"
-        self.controller_time_ms = 0.0
 
     def _snap_budget(self, budget: int) -> int:
         steps = round((int(budget) - self.initial_budget) / self.chunk_size)

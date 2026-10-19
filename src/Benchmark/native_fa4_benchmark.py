@@ -2495,22 +2495,25 @@ def run_flashattn_benchmark(
     summary_runtime = {**summary_metadata, **runtime, "methods": method_configs}
     phase_a_policy = None
     if "dflash_phase_a" in selected_methods:
-        from Benchmark.common.phase_a_selector import PhaseAConfig
+        try:
+            from Benchmark.common.phase_a_selector import PhaseAConfig
 
-        phase_a_config = PhaseAConfig.from_env()
-        phase_a_policy = {
-            "mode": phase_a_config.budget_mode,
-            "initial_budget": phase_a_config.budget,
-            "min_budget": phase_a_config.min_budget,
-            "max_budget": phase_a_config.max_budget,
-            "chunk_size": phase_a_config.chunk_size,
-            "window_rounds": phase_a_config.controller_window_rounds,
-            "minimum_gain": phase_a_config.controller_min_gain,
-            "decay": phase_a_config.controller_decay,
-            "recheck_rounds": phase_a_config.controller_recheck_rounds,
-            "objective": "round_wall_ms_per_committed_token",
-            "runtime": "native_fa4",
-        }
+            phase_a_config = PhaseAConfig.from_env()
+            phase_a_policy = {
+                "mode": phase_a_config.budget_mode,
+                "initial_budget": phase_a_config.budget,
+                "min_budget": phase_a_config.min_budget,
+                "max_budget": phase_a_config.max_budget,
+                "chunk_size": phase_a_config.chunk_size,
+                "window_rounds": phase_a_config.controller_window_rounds,
+                "minimum_gain": phase_a_config.controller_min_gain,
+                "decay": phase_a_config.controller_decay,
+                "recheck_rounds": phase_a_config.controller_recheck_rounds,
+                "objective": "round_wall_ms_per_committed_token",
+                "runtime": "native_fa4",
+            }
+        except Exception as exc:
+            phase_a_policy = {"configuration_error": f"{type(exc).__name__}: {exc}"}
     summary = {
         "record_type": "summary",
         "scope": "summary",
