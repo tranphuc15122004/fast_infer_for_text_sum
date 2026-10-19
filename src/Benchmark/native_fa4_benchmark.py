@@ -1508,6 +1508,26 @@ def run_flashattn_benchmark(
         selected_datasets = detect_default_datasets(active_data_root)
     else:
         selected_datasets = parse_selection(datasets, DATASETS, "dataset")
+
+    if selected_datasets and all(dataset in LENGTH_BIN_DATASETS for dataset in selected_datasets):
+        has_bins = False
+        manifest_file = active_data_root / "manifest.json"
+        if manifest_file.is_file():
+            try:
+                has_bins = "bins" in json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if not has_bins:
+            for candidate in (
+                Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/length_bins"),
+                PROJECT_ROOT / "data" / "length_bins",
+                active_data_root.parent / "length_bins",
+                active_data_root / "length_bins",
+            ):
+                if candidate.is_dir() and (candidate / "manifest.json").is_file():
+                    active_data_root = candidate
+                    break
+
     selected_methods = resolve_flashattn_methods(methods)
     available_per_dataset = (
         50 if selected_datasets and all(dataset in LENGTH_BIN_DATASETS for dataset in selected_datasets)

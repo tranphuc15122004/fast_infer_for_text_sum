@@ -10,7 +10,7 @@
 flowchart TD
     A["1. Motivation: Thách thức DFlash & Mục đích Context Focusing (Giảm tính toán + Drafter sinh token đúng hơn)"] 
     --> B["2. Xác định Target Attention qua tầng nào? (5 Core Candidates + C4 Early Syntax Ablation)"]
-    --> C["3. Khảo sát 6 Context Selectors (M0 FastKV, M1 DFlash-MQ, M2 SnapKV, M3 RocketKV, M4 Duo-Ens, M5 DeepSink)"]
+    --> C["3. Khảo sát 5 Context Selectors (M0 FastKV, M1 DFlash-MQ, M2 SnapKV, M3 RocketKV, M5 DeepSink)"]
     --> D["4. Thực nghiệm Ma trận Cross-Candidate Attention Coverage (Figure Heatmap Multi-Budget Grid)"]
     --> E["5. Rút ra Giải pháp M1 (DFlash-MQ / max_L18_accepted) & Cân bằng Pareto Chunk 128"]
     --> F["6. Áp dụng vào Phase A Runtime: Tăng vọt E[L] (+43.3%) & E2E Speedup trên GPU L40S"]

@@ -31,6 +31,14 @@ SERVER_MODEL_ALIASES = {
 
 SUPPORTED_METHODS = ("vanilla_hf", "eagle3", "dflash", "domino", "dspark", "dflash_phase_b")
 
+LENGTH_BIN_DATASETS = (
+    "bin1_00k_02k",
+    "bin2_02k_04k",
+    "bin3_04k_08k",
+    "bin4_08k_12k",
+    "bin5_12k_16k",
+)
+
 
 def auto_load_master_config(config_arg: str | None = None) -> Path | None:
     """Auto-load master config into os.environ if models or paths are missing."""
@@ -200,6 +208,28 @@ def main(argv: list[str] | None = None) -> int:
     data_dir = Path(args.data_dir).expanduser()
     if not data_dir.is_absolute():
         data_dir = root / data_dir
+
+    requested_datasets = [d.strip() for d in args.datasets.replace(",", " ").split() if d.strip()]
+    if any(d in LENGTH_BIN_DATASETS for d in requested_datasets):
+        has_bins = False
+        manifest_file = data_dir / "manifest.json"
+        if manifest_file.is_file():
+            try:
+                has_bins = "bins" in json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if not has_bins:
+            for candidate in (
+                Path("/workspace/storage-shared/nlp/dungdx4/phuc_projects/data/length_bins"),
+                root / "data" / "length_bins",
+                data_dir.parent / "length_bins",
+                data_dir / "length_bins",
+            ):
+                if candidate.is_dir() and (candidate / "manifest.json").is_file():
+                    data_dir = candidate
+                    args.data_dir = str(candidate)
+                    break
+
     output_dir = Path(args.output_dir).expanduser()
     if not output_dir.is_absolute():
         output_dir = root / output_dir
